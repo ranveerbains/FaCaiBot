@@ -33,6 +33,7 @@ questdb-rs = "4.0"
 
 # Fixed-point arithmetic (no floats)
 rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
 
 # CPU core pinning for ingestor thread
 core_affinity = "0.8"
@@ -48,16 +49,32 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Environment config
 dotenvy = "0.15"
 
+# TOML config file parsing
+toml = "0.8"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# HTTP client (order submission, REST polling)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# HMAC-SHA256 (L2 API auth header generation)
+hmac = "0.12"
+sha2 = "0.10"
+
+# Hex encoding (HMAC signature output)
+hex = "0.4"
+
+# Base64 decoding (API secret is base64-encoded)
+base64 = "0.22"
 
 # Hyper (required by fastwebsockets upgrade)
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1"
 
 [profile.release]

@@ -1,0 +1,38 @@
+# FaCaiBot Tuning Parameters
+# All trading constants are configurable here. Secrets stay in .env.
+# Override this file path with CONFIG_FILE env var.
+
+[spike_detection]
+multiplier = 2.0              # |delta| > X * ATR triggers spike candidate
+atr_alpha = 0.1               # EMA smoothing for 1-min ATR
+window_ms = 400               # Time window for initial spike detection
+sustain_ms = 300              # Min sustain duration before confirmation
+sustain_low_vol_ext_ms = 300  # Extra sustain in low-vol conditions
+phantom_revert_fraction = 0.5 # Reject if price reverts > X of spike
+phantom_check_ms = 100        # Phantom reversion check window
+
+[entry_guards]
+max_spread_pct = 0.10         # Max bid-ask spread (fraction of mid)
+depth_min_pct = 0.15          # Min book depth as fraction of required
+entry_cutoff_secs = 180       # No entries within X seconds of expiry
+stale_book_ms = 1000          # Max book age before blocking entry
+
+[capital]
+fixed_alloc = 100             # Total USDC per session
+max_alloc_pct = 0.30          # Max allocation per trade (fraction)
+
+[confidence]
+high_threshold = 0.8          # >= this -> HIGH tier (2.5% target, 30% alloc)
+med_threshold = 0.5           # >= this -> MED tier (1.5% target, 20% alloc)
+sustain_window_ms = 200       # Sustain window for confidence normalization
+
+[risk]
+adverse_threshold = 0.003     # Price reversal triggering emergency FOK
+adverse_grace_period_ms = 3000 # Grace period after fill before monitoring
+emergency_deadline_secs = 90  # Seconds before expiry to force FOK hedge
+erosion_interval_ms = 5000    # Leg 2 erosion step interval
+depth_wall_multiplier = 4.0   # Level > X * avg = competitor wall
+quick_reversal_threshold = 0.0005 # Quick cancel within 100ms of fill
+
+[simulation]
+fill_delay_ms = 500           # Simulated fill latency

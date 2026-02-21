@@ -1,46 +1,255 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Side of a trade.
+use super::market::{Direction, OrderBook, SpikeInfo};
+
+// ─── Side ────────────────────────────────────────────────────────────────────
+
+/// Side of a trade on the Polymarket CLOB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
 }
 
-/// Signal emitted by the strategy engine to the executor.
-#[derive(Debug, Clone)]
-pub struct TradeSignal {
-    pub side: Side,
-    pub token_id: String,
-    pub price: Decimal,
-    pub size: Decimal,
-    /// Binance reference price at signal generation time.
-    pub reference_price: Decimal,
-    pub timestamp_ms: u64,
+// ─── Order Type ──────────────────────────────────────────────────────────────
+
+/// Order time-in-force / execution type for the Polymarket CLOB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderType {
+    /// Good-Til-Cancelled — rests on book until filled or cancelled.
+    /// Used for normal post-only maker orders.
+    Gtc,
+    /// Good-Til-Date — rests on book until `expiration` timestamp.
+    Gtd,
+    /// Fill-Or-Kill — must fill entirely or cancel. Crosses the spread (taker).
+    /// Reserved for emergency hedges only.
+    Fok,
+    /// Fill-And-Kill — fills as much as possible, cancels remainder.
+    Fak,
 }
 
-/// Request submitted to the Polymarket CLOB.
+// ─── Profit Tier ─────────────────────────────────────────────────────────────
+
+/// Confidence-based profit target tier.
+///
+/// Determines the initial profit target percentage, erosion step size,
+/// and allocation percentage for a trade signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfitTier {
+    /// Confidence >= 0.8 → 2.5% target, 30% allocation.
+    High,
+    /// Confidence >= 0.5 → 1.5% target, 20% allocation.
+    Med,
+    /// Confidence < 0.5  → 1.0% target, 10% allocation.
+    Low,
+}
+
+impl ProfitTier {
+    /// Initial profit target as a decimal fraction (e.g., 0.025 for 2.5%).
+    pub fn target_pct(&self) -> Decimal {
+        match self {
+            ProfitTier::High => Decimal::new(25, 3), // 0.025
+            ProfitTier::Med => Decimal::new(15, 3),  // 0.015
+            ProfitTier::Low => Decimal::new(10, 3),  // 0.010
+        }
+    }
+
+    /// Erosion step size: `target_pct / 5`.
+    /// Each erosion step raises the Leg 2 bid by this amount.
+    /// All tiers reach break-even in exactly 5 steps.
+    pub fn step_size(&self) -> Decimal {
+        match self {
+            ProfitTier::High => Decimal::new(5, 3), // 0.005
+            ProfitTier::Med => Decimal::new(3, 3),  // 0.003
+            ProfitTier::Low => Decimal::new(2, 3),  // 0.002
+        }
+    }
+
+    /// Allocation as a fraction of FIXED_ALLOC (e.g., 0.30 for 30%).
+    pub fn alloc_pct(&self) -> Decimal {
+        match self {
+            ProfitTier::High => Decimal::new(30, 2), // 0.30
+            ProfitTier::Med => Decimal::new(20, 2),  // 0.20
+            ProfitTier::Low => Decimal::new(10, 2),  // 0.10
+        }
+    }
+
+    /// Determine the tier from a confidence score (0.0–1.0) using configurable thresholds.
+    pub fn from_confidence(
+        confidence: Decimal,
+        high_threshold: Decimal,
+        med_threshold: Decimal,
+    ) -> Self {
+        if confidence >= high_threshold {
+            ProfitTier::High
+        } else if confidence >= med_threshold {
+            ProfitTier::Med
+        } else {
+            ProfitTier::Low
+        }
+    }
+
+    /// Human-readable label for logging and Telegram messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProfitTier::High => "HIGH",
+            ProfitTier::Med => "MED",
+            ProfitTier::Low => "LOW",
+        }
+    }
+}
+
+// ─── Trade Signal ────────────────────────────────────────────────────────────
+
+/// Signal emitted by the Strategy Engine to the Executor layer.
+///
+/// Contains all information the Executor needs to submit (or simulate) an order.
+/// Must be `Send + 'static` for crossbeam channel transport.
+#[derive(Debug, Clone)]
+pub struct TradeSignal {
+    // ── Order parameters ─────────────────────────────────────────────────
+    /// Buy or Sell.
+    pub side: Side,
+    /// Polymarket token ID to trade (YES or NO token).
+    pub token_id: String,
+    /// Target price for this order (already rounded to tick_size).
+    pub price: Decimal,
+    /// Number of shares to trade.
+    pub size: Decimal,
+
+    // ── Binance reference ────────────────────────────────────────────────
+    /// Binance mid-price at the moment the signal was generated.
+    pub reference_price: Decimal,
+
+    // ── Confidence & allocation ──────────────────────────────────────────
+    /// Composite confidence score (0.0–1.0), computed from spike/ATR, sustain,
+    /// depth, and time remaining.
+    pub confidence: Decimal,
+    /// Profit target tier derived from confidence.
+    pub profit_target_tier: ProfitTier,
+    /// Initial profit target as a decimal fraction (e.g., 0.025).
+    pub profit_target_pct: Decimal,
+    /// USDC amount allocated to this signal (after confidence weighting).
+    pub alloc_amount: Decimal,
+
+    // ── Directional context ──────────────────────────────────────────────
+    /// Spike direction that triggered this signal.
+    pub direction: Direction,
+    /// Full spike details (magnitude, sustain duration, etc.).
+    pub spike_info: SpikeInfo,
+
+    // ── Leg context ──────────────────────────────────────────────────────
+    /// `false` = Leg 1 (directional entry), `true` = Leg 2 (hedge).
+    pub is_leg2: bool,
+    /// If this is a Leg 2 signal, the fill price of Leg 1. `None` for Leg 1 signals.
+    pub leg1_fill_price: Option<Decimal>,
+
+    // ── Market context ───────────────────────────────────────────────────
+    /// Epoch ms when this signal was generated.
+    pub entry_timestamp_ms: u64,
+    /// Epoch ms when the market expires.
+    pub market_end_timestamp_ms: u64,
+    /// Tick size for price rounding.
+    pub tick_size: Decimal,
+    /// Taker fee rate in basis points (for emergency taker fee calculations).
+    pub fee_rate_bps: u16,
+
+    // ── Analytics flags ──────────────────────────────────────────────────
+    /// Whether a competitor depth wall was detected during signal generation.
+    pub bot_contested: bool,
+
+    // ── Book snapshot ────────────────────────────────────────────────────
+    /// Snapshot of the Polymarket orderbook at signal generation time.
+    /// Used by the executor to simulate fills without a separate book feed.
+    pub book_snapshot: Option<OrderBook>,
+}
+
+// ─── Executor Command ────────────────────────────────────────────────────────
+
+/// Commands sent from the Engine layer to the Executor layer.
+/// Wraps trade signals plus control events (market rotation).
+#[derive(Debug, Clone)]
+pub enum ExecutorCommand {
+    /// A trade signal (Leg 1 or Leg 2).
+    Signal(TradeSignal),
+    /// Market rotation — executor should close open positions and send summary.
+    MarketRotation {
+        /// Condition ID of the market that just rotated.
+        condition_id: String,
+    },
+}
+
+// ─── Order Request ───────────────────────────────────────────────────────────
+
+/// Request submitted to the Polymarket CLOB (or simulated).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub token_id: String,
     pub side: Side,
     pub price: Decimal,
     pub size: Decimal,
+    /// Order time-in-force type. Default: `Gtc`.
+    pub order_type: OrderType,
+    /// If `true`, the order is rejected (not filled) if it would cross the spread.
+    /// Default: `true` for all normal orders. `false` only for emergency FOK fills.
+    pub post_only: bool,
+    /// Optional expiration timestamp (epoch ms). Used with `Gtd` orders.
+    pub expiration: Option<u64>,
 }
+
+impl OrderRequest {
+    /// Convenience constructor for a standard post-only GTC order.
+    pub fn post_only_gtc(token_id: String, side: Side, price: Decimal, size: Decimal) -> Self {
+        Self {
+            token_id,
+            side,
+            price,
+            size,
+            order_type: OrderType::Gtc,
+            post_only: true,
+            expiration: None,
+        }
+    }
+
+    /// Convenience constructor for an emergency FOK taker order (crosses spread).
+    pub fn emergency_fok(token_id: String, side: Side, price: Decimal, size: Decimal) -> Self {
+        Self {
+            token_id,
+            side,
+            price,
+            size,
+            order_type: OrderType::Fok,
+            post_only: false,
+            expiration: None,
+        }
+    }
+}
+
+// ─── Order Response ──────────────────────────────────────────────────────────
 
 /// Response from the Polymarket CLOB after order placement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResponse {
     pub order_id: String,
     pub status: OrderStatus,
+    /// Epoch ms when the CLOB accepted the order.
+    pub timestamp_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ─── Order Status ────────────────────────────────────────────────────────────
+
+/// Status of an order on the Polymarket CLOB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
+    /// Order accepted and resting on book.
     Placed,
+    /// Order fully filled.
     Filled,
+    /// Order partially filled (some size remains on book).
     PartiallyFilled,
+    /// Order cancelled (by user or system).
     Cancelled,
+    /// Order rejected by the CLOB (e.g., post-only would cross spread, tick size violation).
     Rejected,
 }
