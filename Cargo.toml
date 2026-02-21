@@ -1,0 +1,67 @@
+[package]
+name = "facaibot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Polymarket CLOB client (market reads, orders, WebSocket streaming)
+polymarket-client-sdk = "0.4"
+
+# EVM / Polygon interactions, EIP-712 signing
+alloy = { version = "1.7", features = ["signers", "signer-local", "eip712"] }
+
+# Binance WebSocket streams (@depth, @ticker)
+binance = "0.21"
+
+# Low-latency SIMD-accelerated WebSocket client
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+
+# Lock-free channels (SPSC between layers)
+crossbeam-channel = "0.5"
+
+# Zero-copy serialization for internal messaging
+rkyv = { version = "0.8", features = ["alloc"] }
+
+# Hot storage — Redis with async tokio support
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+
+# Cold storage — QuestDB time-series ingestion
+questdb-rs = "4.0"
+
+# Fixed-point arithmetic (no floats)
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# CPU core pinning for ingestor thread
+core_affinity = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Environment config
+dotenvy = "0.15"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Hyper (required by fastwebsockets upgrade)
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
