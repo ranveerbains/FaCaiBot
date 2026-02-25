@@ -37,12 +37,10 @@ pub use rotation::MarketInfo;
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 /// Public Market WebSocket — book + price events for any token IDs.
-pub(super) const MARKET_WS_URL: &str =
-    "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+pub(super) const MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 /// Authenticated User WebSocket — trade fills + order events.
-pub(super) const USER_WS_URL: &str =
-    "wss://ws-subscriptions-clob.polymarket.com/ws/user";
+pub(super) const USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 
 /// CLOB REST base URL.
 pub(super) const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
@@ -139,6 +137,7 @@ impl PolymarketWsGateway {
     }
 
     /// Signal all background loops (heartbeat, market WS, user WS) to shut down.
+    #[allow(dead_code)] // graceful shutdown infrastructure
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
@@ -186,8 +185,8 @@ impl PolymarketWsGateway {
     /// Send `POST /heartbeat` every 5 seconds to the CLOB.
     ///
     /// Skipped in simulation mode.
-    pub async fn run_heartbeat(&self) -> Result<()> {
-        heartbeat::run_heartbeat(self.shutdown.clone(), self.sim_mode).await
+    pub async fn run_heartbeat(&self, tx: Sender<IngestorEvent>) -> Result<()> {
+        heartbeat::run_heartbeat(self.shutdown.clone(), self.sim_mode, tx).await
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -198,6 +197,7 @@ impl PolymarketWsGateway {
     ///
     /// Returns info for the market with the soonest non-expired `endTimestamp`.
     /// PRD: poll every 10 minutes (Section 5.3).
+    #[allow(dead_code)] // convenience wrapper for manual market queries
     pub async fn discover_next_market(&self) -> Result<MarketInfo> {
         rotation::discover_next_market().await
     }
@@ -205,8 +205,9 @@ impl PolymarketWsGateway {
     /// Long-running market rotation manager.
     ///
     /// - Polls Gamma API every 10 minutes for the next market.
-    /// - At <180s remaining on the current market, emits `MarketRotation`
-    ///   and the caller should re-subscribe WS to new token IDs.
+    /// - At T-180s (3 min before expiry), discovers the next market and
+    ///   pre-warms its order books. Instant switch when the current market expires.
+    /// - Falls back to immediate Gamma poll if pre-warming was not possible.
     /// - Emits `IngestorEvent::MarketRotation` once per market transition.
     pub async fn run_market_rotation(
         &self,

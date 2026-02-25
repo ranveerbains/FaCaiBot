@@ -17,10 +17,10 @@ use tracing::{debug, error, info, warn};
 use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
 use crate::types::market::{Direction, OrderBook};
-use crate::types::order::{ExecutorCommand, TradeSignal};
-use crate::types::simulation::{PositionStatus, SimulationState};
+use crate::types::order::{ExecutorCommand, ExitReason, TradeSignal};
+use crate::types::simulation::{PositionStatus, SimFill, SimulationState};
 
-use super::fill_engine::{epoch_ms, FillSimulator, Leg1Result, Leg2Result};
+use super::fill_engine::{epoch_ms, opposite_side};
 
 // ─── SimulationExecutor ──────────────────────────────────────────────────────
 
@@ -46,8 +46,8 @@ pub struct SimulationExecutor {
     tick_size: Decimal,
     /// Total capital allocated for each session (from FIXED_ALLOC config).
     fixed_alloc: Decimal,
-    /// Fill condition checker (stateless fill-check rules).
-    fill_sim: FillSimulator,
+    /// Epoch ms of last 60s diagnostic log.
+    last_diag_ms: u64,
 }
 
 impl SimulationExecutor {
@@ -73,7 +73,7 @@ impl SimulationExecutor {
             market_end_ms: 0,
             tick_size: default_tick,
             fixed_alloc,
-            fill_sim: FillSimulator::new(default_tick),
+            last_diag_ms: 0,
         }
     }
 
@@ -94,7 +94,6 @@ impl SimulationExecutor {
     pub fn update_market_params(&mut self, market_end_ms: u64, tick_size: Decimal) {
         self.market_end_ms = market_end_ms;
         self.tick_size = tick_size;
-        self.fill_sim.update_tick_size(tick_size);
     }
 
     // ─── Market rotation ──────────────────────────────────────────────────────
@@ -107,16 +106,19 @@ impl SimulationExecutor {
     /// 2. Build and send the per-market Telegram summary.
     /// 3. Reset per-market counters via `SimulationState::on_market_rotation()`.
     pub fn on_market_rotation(&mut self, market_id: &str) {
-        info!(
-            market_id,
-            "simulation: market rotation — closing open positions"
-        );
-
         let now_ms = epoch_ms();
 
         // Force-close or lock for resolution any positions still in this market.
         // We iterate in reverse so that removal by index remains stable.
         let open_count = self.state.open_positions.len();
+        if open_count > 0 {
+            info!(
+                market_id,
+                open_count, "simulation: market rotation — closing open positions"
+            );
+        } else {
+            debug!(market_id, "simulation: market rotation — no open positions");
+        }
         for idx in (0..open_count).rev() {
             // Extract fields before borrowing self.state mutably.
             let (pos_market, pos_open) = {
@@ -132,7 +134,8 @@ impl SimulationExecutor {
                     warn!(
                         market_id,
                         position_idx = idx,
-                        net_profit = %trade.net_profit,
+                        net_profit_usdc = %trade.net_profit,
+                        leg1_cost_usdc = %(trade.leg1.price * trade.leg1.size),
                         "simulation: position force-closed at rotation — no Leg 2 fill"
                     );
                     self.reporter.send_trade_completed(&trade);
@@ -151,17 +154,38 @@ impl SimulationExecutor {
             }
         }
 
-        // Build period label (simple epoch-based placeholder).
-        let period_label = format!("market:{}", &market_id[..market_id.len().min(8)]);
+        // Reset per-market counters.
+        // Note: the market summary is already sent at the x-min cutoff via
+        // on_market_cutoff() — no second summary is needed here.
+        self.state.on_market_rotation();
+    }
 
-        // Generate and send market summary via Telegram.
+    /// Handle the x-minute entry cutoff event.
+    ///
+    /// Sends a market summary to Telegram immediately. Does NOT reset per-market
+    /// counters — that only happens on actual `MarketRotation`.
+    pub fn on_market_cutoff(&mut self, market_id: &str, market_end_ms: u64) {
+        info!(
+            market_id,
+            "simulation: 3-min cutoff — sending market summary"
+        );
+
+        // Compute UTC period label from market_end_ms.
+        let end_secs = market_end_ms / 1_000;
+        let hh = (end_secs % 86_400) / 3_600;
+        let mm = (end_secs % 3_600) / 60;
+        let start_secs = end_secs.saturating_sub(900);
+        let start_hh = (start_secs % 86_400) / 3_600;
+        let start_mm = (start_secs % 3_600) / 60;
+        let period_label = format!(
+            "{:02}:{:02} - {:02}:{:02} UTC (3-min cutoff)",
+            start_hh, start_mm, hh, mm
+        );
+
         let summary = self
             .state
             .market_summary(market_id, period_label, self.fixed_alloc);
         self.reporter.send_market_summary(&summary);
-
-        // Reset per-market counters.
-        self.state.on_market_rotation();
     }
 
     /// Generate and send a session summary via Telegram. Call this on shutdown.
@@ -205,12 +229,6 @@ impl SimulationExecutor {
                         self.update_binance_mid(signal.reference_price);
                         self.update_market_params(signal.market_end_timestamp_ms, signal.tick_size);
 
-                        self.state.record_signal();
-
-                        if signal.bot_contested {
-                            self.state.record_wall_outbid();
-                        }
-
                         if signal.is_leg2 {
                             self.handle_leg2(&signal);
                         } else {
@@ -220,6 +238,37 @@ impl SimulationExecutor {
                     ExecutorCommand::MarketRotation { condition_id } => {
                         self.on_market_rotation(&condition_id);
                     }
+                    ExecutorCommand::MarketCutoff {
+                        condition_id,
+                        market_end_ms,
+                    } => {
+                        self.on_market_cutoff(&condition_id, market_end_ms);
+                    }
+                }
+
+                // 60-second session diagnostic (cumulative, same source as Telegram).
+                let now_ms = epoch_ms();
+                if self.last_diag_ms == 0 {
+                    self.last_diag_ms = now_ms;
+                }
+                if now_ms.saturating_sub(self.last_diag_ms) >= 60_000 {
+                    let uptime_secs = now_ms.saturating_sub(self.state.session_start) / 1_000;
+                    info!(
+                        uptime_min  = uptime_secs / 60,
+                        markets     = self.state.markets_observed,
+                        signals     = self.state.signals_detected,
+                        leg1_fills  = self.state.leg1_fills,
+                        hedged      = self.state.trades_hedged,
+                        emergency   = self.state.trades_emergency_taker,
+                        emergency_maker = self.state.emergency_maker_fills,
+                        adverse_fok = self.state.trades_adverse_hedged,
+                        be_fok      = self.state.trades_break_even_fok,
+                        pnl         = %self.state.total_pnl,
+                        win_rate    = %self.state.win_rate_pct(),
+                        open        = self.state.open_positions.len(),
+                        "session 60s"
+                    );
+                    self.last_diag_ms = now_ms;
                 }
             }
 
@@ -233,119 +282,82 @@ impl SimulationExecutor {
 
     // ─── Leg 1 simulation ─────────────────────────────────────────────────────
 
-    /// Simulate a post-only Leg 1 fill.
+    /// Handle a Leg 1 signal.
     ///
-    /// Rules:
-    /// 1. Requires a live orderbook snapshot. If none, record unfilled_liquidity.
-    /// 2. Post-only check: if `signal.price >= best_ask`, reject (would cross spread).
-    /// 3. Depth check: check for sell-side liquidity within 2 ticks of our bid.
-    ///    - Depth > 0 → simulated maker fill at `signal.price`.
-    ///    - No depth   → record unfilled_liquidity.
-    /// 4. On fill: record in SimulationState, send Telegram opportunity alert,
-    ///    log signal to QuestDB.
+    /// Two paths based on `sim_confirmed_fill`:
+    /// - `false` (from `evaluate()`): record signal detection only.
+    /// - `true` (from `advance_simulation()`): record confirmed fill.
     fn handle_leg1(&mut self, signal: &TradeSignal) {
-        let book = match &self.current_book {
-            Some(b) => b.clone(),
-            None => {
-                warn!(
-                    token_id = %signal.token_id,
-                    "Leg 1: no orderbook available — recording unfilled_liquidity"
-                );
-                self.state.record_unfilled_liquidity();
-                self.log_signal_to_cold(signal, "aborted_liquidity");
-                return;
+        if !signal.sim_confirmed_fill {
+            // Signal detection — record for session stats.
+            self.state.record_signal();
+            if signal.bot_contested {
+                self.state.record_wall_outbid();
             }
+            self.log_signal_to_cold(signal, "detected");
+            return;
+        }
+
+        // Confirmed fill from advance_simulation().
+        let now_ms = epoch_ms();
+        let fill = SimFill {
+            side: signal.side,
+            price: signal.price,
+            size: signal.size,
+            timestamp_ms: now_ms,
+            was_partial: false,
+            was_taker: false,
+            taker_fee: Decimal::ZERO,
         };
 
-        match self.fill_sim.check_leg1_fill(signal, &book) {
-            Leg1Result::NoAsks => {
-                warn!(token_id = %signal.token_id, "Leg 1: book has no asks — unfilled_liquidity");
-                self.state.record_unfilled_liquidity();
-                self.log_signal_to_cold(signal, "aborted_liquidity");
-            }
-            Leg1Result::CrossesSpread => {
-                debug!(
-                    token_id = %signal.token_id,
-                    bid = %signal.price,
-                    "Leg 1: post-only bid would cross spread — rejected"
-                );
-                self.state.record_unfilled_post_only();
-                self.log_signal_to_cold(signal, "unfilled_postonly");
-            }
-            Leg1Result::NoNearbyDepth => {
-                let two_ticks = self.tick_size * Decimal::TWO;
-                let depth_window_top = signal.price + two_ticks;
-                debug!(
-                    token_id = %signal.token_id,
-                    bid = %signal.price,
-                    depth_window_top = %depth_window_top,
-                    "Leg 1: no sell-side depth within 2 ticks — unfilled_liquidity"
-                );
-                self.state.record_unfilled_liquidity();
-                self.log_signal_to_cold(signal, "aborted_liquidity");
-            }
-            Leg1Result::Fill(fill) => {
-                let fill_size = fill.size;
-                let position_idx = self.state.record_leg1_fill(
-                    fill.clone(),
-                    signal.token_id.clone(),
-                    signal.direction,
-                    signal.confidence,
-                    signal.profit_target_tier,
-                    signal.alloc_amount,
-                );
+        let fill_size = fill.size;
+        let position_idx = self.state.record_leg1_fill(
+            fill,
+            signal.condition_id.clone(),
+            signal.direction,
+            signal.confidence,
+            signal.profit_target_tier,
+            signal.alloc_amount,
+        );
 
-                info!(
-                    token_id = %signal.token_id,
-                    price = %signal.price,
-                    size = %fill_size,
-                    position_idx,
-                    confidence = %signal.confidence,
-                    tier = signal.profit_target_tier.label(),
-                    "Leg 1: simulated maker fill"
-                );
+        // Record spike magnitude for QuestDB outcome correlation.
+        self.state
+            .set_spike_magnitude(position_idx, signal.spike_info.magnitude);
 
-                // Send Telegram opportunity alert.
-                self.reporter
-                    .send_opportunity_alert(signal, signal.price, fill_size, &book);
+        info!(
+            token_id = %signal.token_id,
+            price = %signal.price,
+            size = %fill_size,
+            position_idx,
+            confidence = %signal.confidence,
+            tier = signal.profit_target_tier.label(),
+            "Leg 1: confirmed fill"
+        );
 
-                // Log signal to QuestDB.
-                self.log_signal_to_cold(signal, "entered");
-            }
-        }
+        // Send Telegram opportunity alert.
+        let book = self.current_book.clone().unwrap_or_else(|| OrderBook {
+            asset_id: signal.token_id.clone(),
+            bids: vec![],
+            asks: vec![],
+            timestamp_ms: now_ms,
+        });
+        self.reporter
+            .send_opportunity_alert(signal, signal.price, fill_size, &book);
+
+        // Log signal to QuestDB.
+        self.log_signal_to_cold(signal, "entered");
     }
 
     // ─── Leg 2 simulation ─────────────────────────────────────────────────────
 
-    /// Simulate a Leg 2 hedge fill.
+    /// Handle a Leg 2 signal.
     ///
-    /// Finds the matching open position (by token_id + is_leg2 flag) and
-    /// evaluates whether:
-    ///   - A normal maker fill is possible (`best_ask <= signal.price`).
-    ///   - An emergency taker fill should be used (signal carries emergency
-    ///     context — detected when `signal.price` has eroded to or past break-even,
-    ///     or when the signal was generated by the adverse movement protocol).
-    ///
-    /// For this simulation, we determine "emergency" by checking if the signal
-    /// price is at or below the break-even threshold. The engine sets prices
-    /// accordingly for the erosion cascade.
+    /// Two paths based on `sim_confirmed_fill`:
+    /// - `false` (erosion step from `evaluate_leg2()`): just record the step.
+    /// - `true` (from `advance_simulation()`): record confirmed fill, categorize
+    ///   by `exit_reason`, close trade, report to Telegram + QuestDB.
     fn handle_leg2(&mut self, signal: &TradeSignal) {
-        // We need a Leg 1 fill price to compute break-even.
-        let entry_price = match signal.leg1_fill_price {
-            Some(p) => p,
-            None => {
-                warn!(
-                    token_id = %signal.token_id,
-                    "Leg 2: signal has no leg1_fill_price — skipping"
-                );
-                return;
-            }
-        };
-
         // Find the matching open position.
-        // Leg 2 token_id is the opposing token (YES when Leg 1 was NO, and vice versa),
-        // so we cannot match by token_id. Instead find the first Open position —
-        // the engine self-gates to one trade at a time, so at most one will be open.
         let position_idx = match self
             .state
             .open_positions
@@ -362,88 +374,168 @@ impl SimulationExecutor {
             }
         };
 
-        let book = match &self.current_book {
-            Some(b) => b.clone(),
-            None => {
-                warn!(
-                    token_id = %signal.token_id,
-                    "Leg 2: no orderbook — cannot simulate hedge"
-                );
-                return;
-            }
-        };
+        if !signal.sim_confirmed_fill {
+            // Erosion step only — record step count.
+            debug!(
+                token_id = %signal.token_id,
+                our_bid = %signal.price,
+                "Leg 2: erosion step posted — awaiting fill"
+            );
+            self.state.record_erosion_step(position_idx);
+            return;
+        }
 
+        // Confirmed fill from advance_simulation().
         let now_ms = epoch_ms();
         let leg1_size = self.state.open_positions[position_idx].leg1.size;
 
-        match self
-            .fill_sim
-            .check_leg2_fill(signal, &book, leg1_size, entry_price)
-        {
-            Leg2Result::NoAsks => {
-                warn!(token_id = %signal.token_id, "Leg 2: book has no asks — cannot hedge");
-            }
-            Leg2Result::EmergencyFill { fill, is_adverse } => {
-                info!(
-                    token_id = %signal.token_id,
-                    taker_price = %fill.price,
-                    taker_fee = %fill.taker_fee,
-                    position_idx,
-                    "Leg 2: emergency taker fill (FOK)"
-                );
+        // Emergency fills are taker only when sim_was_taker is true (FOK fallback).
+        // Post-only emergency fills (sim_was_taker=false) are maker with zero fee.
+        let is_taker = signal.exit_reason.is_some() && signal.sim_was_taker;
+        let taker_fee = if is_taker {
+            SimFill::compute_taker_fee(signal.price, leg1_size)
+        } else {
+            Decimal::ZERO
+        };
 
-                if is_adverse {
-                    self.state.record_adverse_hedge(position_idx, fill.clone());
-                } else {
-                    self.state
-                        .record_emergency_taker(position_idx, fill.clone());
-                }
+        let fill = SimFill {
+            side: opposite_side(signal.side),
+            price: signal.price,
+            size: leg1_size,
+            timestamp_ms: now_ms,
+            was_partial: false,
+            was_taker: is_taker,
+            taker_fee,
+        };
 
-                if let Some(trade) = self.state.close_trade(position_idx, now_ms) {
+        match signal.exit_reason {
+            Some(ExitReason::AdverseMovement) => {
+                if is_taker {
                     info!(
-                        market_id = %trade.market_id,
-                        net_profit = %trade.net_profit,
-                        profit_pct = %trade.profit_pct,
-                        "Leg 2 emergency: trade closed"
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: adverse movement FOK fallback"
                     );
-                    self.reporter.send_trade_completed(&trade);
-                    if let Err(e) = self.cold.record_simulated_trade(&trade) {
-                        error!(error = %e, "failed to write simulated trade to QuestDB");
-                    }
+                    self.state.record_adverse_hedge(position_idx, fill);
+                } else {
+                    info!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: adverse movement post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(
+                        position_idx,
+                        fill,
+                        &ExitReason::AdverseMovement,
+                    );
                 }
             }
-            Leg2Result::MakerFill(fill) => {
+            Some(ExitReason::BreakEvenBreach) => {
+                if is_taker {
+                    info!(
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: break-even breach FOK fallback"
+                    );
+                    self.state.trades_break_even_fok += 1;
+                    self.state.record_emergency_taker(position_idx, fill);
+                } else {
+                    info!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: break-even breach post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(
+                        position_idx,
+                        fill,
+                        &ExitReason::BreakEvenBreach,
+                    );
+                }
+            }
+            Some(ExitReason::MarketExpiry) => {
+                if is_taker {
+                    warn!(
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: market expiry emergency FOK fallback"
+                    );
+                    self.state.trades_deadline_fok += 1;
+                    self.state.record_emergency_taker(position_idx, fill);
+                } else {
+                    warn!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: market expiry post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(
+                        position_idx,
+                        fill,
+                        &ExitReason::MarketExpiry,
+                    );
+                }
+            }
+            Some(ExitReason::FavorableTaker) => {
+                if is_taker {
+                    info!(
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: favorable taker fill (ask < posted bid)"
+                    );
+                    self.state.record_favorable_taker(position_idx, fill);
+                } else {
+                    info!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: favorable exit post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(
+                        position_idx,
+                        fill,
+                        &ExitReason::FavorableTaker,
+                    );
+                }
+            }
+            None => {
                 info!(
                     token_id = %signal.token_id,
                     price = %fill.price,
                     position_idx,
                     "Leg 2: maker fill (normal erosion cascade)"
                 );
-
-                self.state.record_leg2_fill(position_idx, fill.clone());
-
-                if let Some(trade) = self.state.close_trade(position_idx, now_ms) {
-                    info!(
-                        market_id = %trade.market_id,
-                        net_profit = %trade.net_profit,
-                        profit_pct = %trade.profit_pct,
-                        erosion_steps = trade.erosion_steps,
-                        "Leg 2 maker: trade closed"
-                    );
-                    self.reporter.send_trade_completed(&trade);
-                    if let Err(e) = self.cold.record_simulated_trade(&trade) {
-                        error!(error = %e, "failed to write simulated trade to QuestDB");
-                    }
-                }
+                self.state.record_leg2_fill(position_idx, fill);
             }
-            Leg2Result::NotFilled { best_ask } => {
-                debug!(
-                    token_id = %signal.token_id,
-                    our_bid = %signal.price,
-                    best_ask = %best_ask,
-                    "Leg 2: not filled yet — recording erosion step"
-                );
-                self.state.record_erosion_step(position_idx);
+        }
+
+        // Record exit reason for QuestDB loss attribution.
+        if let Some(reason) = signal.exit_reason {
+            self.state.set_exit_reason(position_idx, reason);
+        }
+
+        if let Some(trade) = self.state.close_trade(position_idx, now_ms) {
+            info!(
+                market_id = %trade.market_id,
+                net_profit_usdc = %trade.net_profit,
+                profit_pct = %trade.profit_pct,
+                pair_cost_per_share = %trade.pair_cost,
+                size = %trade.leg1.size,
+                exit_reason = ?signal.exit_reason,
+                "Leg 2: trade closed"
+            );
+            self.reporter.send_trade_completed(&trade);
+            if let Err(e) = self.cold.record_simulated_trade(&trade) {
+                error!(error = %e, "failed to write simulated trade to QuestDB");
             }
         }
     }
@@ -488,8 +580,8 @@ impl SimulationExecutor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fill_engine::{compute_fill_size, opposite_side};
     use super::*;
-    use super::super::fill_engine::{compute_fill_size, is_near_deadline, opposite_side};
     use crate::types::market::{Direction, PriceLevel, SpikeInfo};
     use crate::types::order::{ProfitTier, Side, TradeSignal};
     use crate::types::simulation::{PositionStatus, SimFill, SimulationState};
@@ -519,41 +611,13 @@ mod tests {
         }
     }
 
-    /// Build a minimal `TradeSignal` for Leg 1 testing.
-    fn make_leg1_signal(price: Decimal) -> TradeSignal {
-        TradeSignal {
-            side: Side::Buy,
-            token_id: "test_token".to_string(),
-            price,
-            size: Decimal::from(10),
-            reference_price: Decimal::from(50_000),
-            confidence: d("0.85"),
-            profit_target_tier: ProfitTier::High,
-            profit_target_pct: d("0.025"),
-            alloc_amount: Decimal::from(30),
-            direction: Direction::Up,
-            spike_info: SpikeInfo {
-                direction: Direction::Up,
-                magnitude: d("0.005"),
-                sustained_ms: 200,
-                timestamp_ms: 1_000_000,
-            },
-            is_leg2: false,
-            leg1_fill_price: None,
-            entry_timestamp_ms: 1_000_000,
-            market_end_timestamp_ms: 1_900_000,
-            tick_size: d("0.01"),
-            fee_rate_bps: 156,
-            bot_contested: false,
-            book_snapshot: None,
-        }
-    }
-
     /// Build a minimal `TradeSignal` for Leg 2 testing.
     fn make_leg2_signal(price: Decimal, leg1_price: Decimal, token_id: &str) -> TradeSignal {
         TradeSignal {
+            exit_reason: None,
             side: Side::Buy,
             token_id: token_id.to_string(),
+            condition_id: "test_condition".to_string(),
             price,
             size: Decimal::from(10),
             reference_price: Decimal::from(50_000),
@@ -576,6 +640,8 @@ mod tests {
             fee_rate_bps: 156,
             bot_contested: false,
             book_snapshot: None,
+            sim_confirmed_fill: false,
+            sim_was_taker: false,
         }
     }
 
@@ -741,10 +807,11 @@ mod tests {
 
         // Close the trade and verify PnL.
         let trade = state.close_trade(idx, now_ms).expect("trade should close");
-        assert_eq!(trade.pair_cost, d("0.98"));
-        assert_eq!(trade.gross_profit, d("0.02"));
+        let size = Decimal::from(10);
+        assert_eq!(trade.pair_cost, d("0.98")); // per-share
+        assert_eq!(trade.gross_profit, d("0.02") * size); // 0.20 USDC
         assert_eq!(trade.taker_fee, Decimal::ZERO);
-        assert_eq!(trade.net_profit, d("0.02"));
+        assert_eq!(trade.net_profit, d("0.02") * size); // 0.20 USDC
         assert!(!trade.leg2_was_taker);
         assert!(state.open_positions.is_empty());
         assert_eq!(state.closed_trades.len(), 1);
@@ -798,9 +865,11 @@ mod tests {
         let trade = state.close_trade(idx, now_ms).expect("trade should close");
         assert!(trade.leg2_was_taker);
         assert_eq!(trade.taker_fee, taker_fee);
-        // net_profit = gross_profit - taker_fee
+        // gross_profit = (1.0 - pair_cost) * size  [USDC]
+        // net_profit   = gross_profit - taker_fee  [USDC]
         let leg1_price = d("0.45");
-        let expected_gross = Decimal::ONE - (leg1_price + taker_price);
+        let size = Decimal::from(10);
+        let expected_gross = (Decimal::ONE - (leg1_price + taker_price)) * size;
         assert_eq!(trade.gross_profit, expected_gross);
         assert_eq!(trade.net_profit, expected_gross - taker_fee);
     }
@@ -886,15 +955,16 @@ mod tests {
         state.record_leg2_fill(idx1, fill1_leg2);
         let trade1 = state.close_trade(idx1, now_ms).unwrap();
 
-        // pair_cost = 0.46 + 0.51 = 0.97; gross = 1.0 - 0.97 = 0.03
-        assert_eq!(trade1.pair_cost, d("0.97"));
-        assert_eq!(trade1.gross_profit, d("0.03"));
-        assert_eq!(trade1.net_profit, d("0.03"));
+        // pair_cost = 0.46 + 0.51 = 0.97 per share; gross = (1 - 0.97) * 10 = 0.30 USDC
+        let size1 = Decimal::from(10);
+        assert_eq!(trade1.pair_cost, d("0.97")); // per-share
+        assert_eq!(trade1.gross_profit, d("0.03") * size1); // 0.30 USDC
+        assert_eq!(trade1.net_profit, d("0.03") * size1); // 0.30 USDC
         // profit_pct should be positive.
         assert!(trade1.profit_pct > Decimal::ZERO);
 
-        // Session PnL equals net_profit (per-share).
-        assert_eq!(state.total_pnl, d("0.03"));
+        // Session PnL accumulates USDC amounts.
+        assert_eq!(state.total_pnl, d("0.03") * size1); // 0.30 USDC
 
         // Trade 2: adverse — pair_cost > 1.0 → loss.
         let fill2_leg1 = SimFill {
@@ -928,9 +998,13 @@ mod tests {
         state.record_emergency_taker(0, fill2_leg2);
         let trade2 = state.close_trade(0, now_ms).unwrap();
 
-        // pair_cost = 0.55 + 0.52 = 1.07; gross = 1.0 - 1.07 = -0.07
-        assert_eq!(trade2.pair_cost, d("0.55") + d("0.52"));
-        assert_eq!(trade2.gross_profit, Decimal::ONE - (d("0.55") + d("0.52")));
+        // pair_cost = 0.55 + 0.52 = 1.07 per share; gross = (1 - 1.07) * 10 = -0.70 USDC
+        let size2 = Decimal::from(10);
+        assert_eq!(trade2.pair_cost, d("0.55") + d("0.52")); // per-share
+        assert_eq!(
+            trade2.gross_profit,
+            (Decimal::ONE - (d("0.55") + d("0.52"))) * size2
+        ); // -0.70 USDC
         assert!(
             trade2.net_profit < Decimal::ZERO,
             "losing trade should have negative net_profit"
@@ -960,14 +1034,16 @@ mod tests {
 
     #[test]
     fn test_taker_fee_formula() {
+        // Polymarket 15-min crypto: fee = C × 0.25 × (p × (1 - p))²
         // At price = 0.50, size = 100:
-        //   fee = 100 * 0.25 * (0.5 * 0.5)^2 = 100 * 0.25 * 0.0625 = 1.5625
+        //   fee = 100 * 0.25 * (0.50 * 0.50)^2 = 100 * 0.25 * 0.0625 = 1.5625
         let price = d("0.50");
         let size = Decimal::from(100);
         let fee = SimFill::compute_taker_fee(price, size);
-        let expected =
-            size * d("0.25") * (price * (Decimal::ONE - price)) * (price * (Decimal::ONE - price));
+        let inner = price * (Decimal::ONE - price);
+        let expected = size * d("0.25") * inner * inner;
         assert_eq!(fee, expected);
+        assert_eq!(fee, d("1.5625"));
 
         // Fee is always >= 0.
         assert!(fee >= Decimal::ZERO);
@@ -988,26 +1064,7 @@ mod tests {
         assert_eq!(opposite_side(Side::Sell), Side::Buy);
     }
 
-    // ─── 12. is_near_deadline helper ─────────────────────────────────────────
-
-    #[test]
-    fn test_is_near_deadline() {
-        // Signal expiry at 1_000_000 ms. Deadline = 1_000_000 - 90_000 = 910_000 ms.
-        let signal = make_leg1_signal(d("0.45"));
-        // The signal has market_end_timestamp_ms = 1_900_000.
-        // Deadline = 1_900_000 - 90_000 = 1_810_000 ms.
-
-        // now_ms well before deadline — not near.
-        assert!(!is_near_deadline(&signal, 1_000_000));
-
-        // now_ms exactly at deadline — near.
-        assert!(is_near_deadline(&signal, 1_810_000));
-
-        // now_ms past deadline — near.
-        assert!(is_near_deadline(&signal, 1_900_000));
-    }
-
-    // ─── 13. make_leg2_signal helper (coverage of unused helper) ────────────
+    // ─── 12. make_leg2_signal helper (coverage of unused helper) ────────────
 
     #[test]
     fn test_make_leg2_signal_fields() {

@@ -51,9 +51,11 @@ pub enum OrderState {
     },
     /// Order has been fully or partially filled.
     Filled {
+        #[allow(dead_code)] // stored for QuestDB trade recording
         order_id: String,
         price: Decimal,
         size: Decimal,
+        #[allow(dead_code)] // stored for QuestDB trade recording
         fill_timestamp_ms: u64,
     },
 }
@@ -91,14 +93,6 @@ impl OrderBook {
     /// Returns the best (lowest) ask, or `None` if the ask side is empty.
     pub fn best_ask(&self) -> Option<&PriceLevel> {
         self.asks.first()
-    }
-
-    /// Returns the spread (best_ask - best_bid), or `None` if either side is empty.
-    pub fn spread(&self) -> Option<Decimal> {
-        match (self.best_ask(), self.best_bid()) {
-            (Some(ask), Some(bid)) => Some(ask.price - bid.price),
-            _ => None,
-        }
     }
 
     /// Total depth (sum of sizes) on the bid side.
@@ -163,7 +157,7 @@ impl BinanceDepth {
 
 // ─── Spike Info ──────────────────────────────────────────────────────────────
 
-/// Describes a detected Binance price spike that survived the sustain + phantom filters.
+/// Describes a detected Binance price spike that survived the sustain + momentum filters.
 #[derive(Debug, Clone, Copy)]
 pub struct SpikeInfo {
     /// Whether price spiked up or down.
@@ -224,7 +218,7 @@ pub struct MarketState {
     // ── Spike / volatility ───────────────────────────────────────────────
     /// Rolling EMA-ATR (1-minute window, alpha=0.1). `None` until enough data.
     pub atr: Option<Decimal>,
-    /// Whether a spike has been detected and survived sustain + phantom filters.
+    /// Whether a spike has been detected and survived sustain + momentum filters.
     pub spike_detected: bool,
     /// Details of the latest surviving spike (cleared on market rotation).
     pub last_spike: Option<SpikeInfo>,
@@ -233,10 +227,12 @@ pub struct MarketState {
     /// Total USDC allocated in the current market window.
     pub cumulative_used: Decimal,
     /// USDC locked in markets awaiting UMA resolution.
+    #[allow(dead_code)] // data model field, set via set_locked_in_resolution()
     pub locked_in_resolution: Decimal,
     /// Available capital = total_capital - locked_in_resolution.
     pub available_capital: Decimal,
     /// Running daily PnL (reset at UTC midnight or session start).
+    #[allow(dead_code)] // data model field for live mode PnL tracking
     pub daily_pnl: Decimal,
 
     // ── Staleness ────────────────────────────────────────────────────────
@@ -279,6 +275,7 @@ impl MarketState {
     /// Available allocation for the next signal in the current market:
     /// `min(FIXED_ALLOC, available_capital) - cumulative_used`.
     /// Caller must pass `fixed_alloc` (from config).
+    #[allow(dead_code)] // used in tests
     pub fn remaining_alloc(&self, fixed_alloc: Decimal) -> Decimal {
         let cap = fixed_alloc.min(self.available_capital);
         (cap - self.cumulative_used).max(Decimal::ZERO)
@@ -320,6 +317,7 @@ pub enum IngestorEvent {
         asset_id: String,
         best_bid: Decimal,
         best_ask: Decimal,
+        #[allow(dead_code)] // delivered by WS, not read yet
         spread: Decimal,
     },
 
@@ -351,6 +349,9 @@ pub enum IngestorEvent {
 
     /// Depth snapshot from `@depth20@100ms` stream.
     BinanceDepth(BinanceDepth),
+
+    /// Confirmed spike from the Binance spike detector (all 6 gates passed).
+    SpikeConfirmed(SpikeInfo),
 
     // ── Lifecycle ────────────────────────────────────────────────────────
     /// Emitted when the active 15-min market rotates (anticipatory loading complete).

@@ -78,9 +78,6 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 /// Zero-address used as the `taker` field in all orders (open taker).
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
-/// Maximum orders per batch POST to `/orders`.
-pub const MAX_BATCH_SIZE: usize = 15;
-
 /// EOA signature type (type 0 — wallet signs its own orders, pays its own gas).
 const SIGNATURE_TYPE_EOA: u8 = 0;
 
@@ -134,12 +131,6 @@ struct PostOrderBody {
     post_only: bool,
 }
 
-/// Top-level body for `POST /orders` (batch).
-#[derive(Debug, Clone, Serialize)]
-struct PostOrdersBody {
-    orders: Vec<PostOrderBody>,
-}
-
 /// Cancel-by-ID request body for `DELETE /order`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,16 +152,8 @@ struct ClobOrderResponse {
     error_msg: String,
 }
 
-/// Raw JSON response from `POST /orders` (batch).
-#[derive(Debug, Clone, Deserialize)]
-struct ClobBatchResponse {
-    #[serde(default)]
-    success: bool,
-    #[serde(default)]
-    results: Vec<ClobOrderResponse>,
-}
-
 /// Raw order book response from `GET /book`.
+#[allow(dead_code)] // used by REST accessors (live mode market param fetching)
 #[derive(Debug, Clone, Deserialize)]
 struct ClobBookResponse {
     #[serde(default)]
@@ -183,6 +166,7 @@ struct ClobBookResponse {
     timestamp: serde_json::Value,
 }
 
+#[allow(dead_code)] // used by REST accessors (live mode market param fetching)
 #[derive(Debug, Clone, Deserialize)]
 struct ClobPriceLevel {
     price: String,
@@ -190,6 +174,7 @@ struct ClobPriceLevel {
 }
 
 /// Response from scalar price endpoints (`/midpoint`, `/price`, `/tick-size`, `/fee-rate`).
+#[allow(dead_code)] // used by REST accessors (live mode market param fetching)
 #[derive(Debug, Clone, Deserialize)]
 struct ClobScalarResponse {
     /// The CLOB returns the value under different keys per endpoint; we try all.
@@ -344,59 +329,6 @@ impl PolymarketGateway {
         })
     }
 
-    /// Place up to [`MAX_BATCH_SIZE`] orders in a single `POST /orders` request.
-    ///
-    /// Orders beyond the limit are silently truncated (the caller should chunk
-    /// at the [`MAX_BATCH_SIZE`] boundary).
-    pub async fn place_orders(&self, orders: &[OrderRequest]) -> Result<Vec<OrderResponse>> {
-        if orders.is_empty() {
-            return Ok(Vec::new());
-        }
-        let batch = &orders[..orders.len().min(MAX_BATCH_SIZE)];
-        info!(count = batch.len(), "placing batch of orders");
-
-        let mut bodies: Vec<PostOrderBody> = Vec::with_capacity(batch.len());
-        for order in batch {
-            let fee_rate_bps: u16 = 0;
-            let payload = self.build_signed_order(order, fee_rate_bps)?;
-            bodies.push(PostOrderBody {
-                owner: self.address.clone(),
-                order_type: order_type_to_str(order.order_type).to_string(),
-                post_only: order.post_only,
-                order: payload,
-            });
-        }
-
-        let body_json = serde_json::to_string(&PostOrdersBody { orders: bodies })
-            .context("failed to serialise PostOrdersBody")?;
-        let path = "/orders";
-        let ts = current_timestamp_secs();
-        let headers = generate_api_headers(
-            &self.api_key,
-            &self.secret,
-            &self.passphrase,
-            &self.address,
-            &ts,
-            "POST",
-            path,
-            &body_json,
-        )?;
-
-        let url = format!("{CLOB_BASE_URL}{path}");
-        let resp_bytes = self.authenticated_post(&url, &body_json, &headers).await?;
-
-        // The batch endpoint may return an array or an object wrapping an array.
-        let responses = parse_batch_response(&resp_bytes)?;
-        Ok(responses
-            .into_iter()
-            .map(|r| OrderResponse {
-                order_id: r.order_id,
-                status: parse_insert_status(&r.status),
-                timestamp_ms: now_ms(),
-            })
-            .collect())
-    }
-
     /// Cancel an open order by its ID.
     ///
     /// Sends `DELETE /order` with `{"orderID": "<id>"}` and L2 headers.
@@ -457,6 +389,7 @@ impl PolymarketGateway {
     /// Fetch the current order book for a token from the CLOB REST API.
     ///
     /// `GET /book?token_id={token_id}` — public endpoint, no auth required.
+    #[allow(dead_code)] // live mode market param fetching
     pub async fn get_orderbook(&self, token_id: &str) -> Result<OrderBook> {
         debug!(token_id, "fetching orderbook from CLOB");
 
@@ -509,6 +442,7 @@ impl PolymarketGateway {
     /// Get the mid-point price for a token.
     ///
     /// `GET /midpoint?token_id={token_id}` — public endpoint.
+    #[allow(dead_code)] // live mode market param fetching
     pub async fn get_midpoint(&self, token_id: &str) -> Result<Decimal> {
         debug!(token_id, "fetching midpoint from CLOB");
 
@@ -533,6 +467,7 @@ impl PolymarketGateway {
     ///
     /// `GET /price?token_id={token_id}&side=BUY` — public endpoint.
     /// Returns the best ask for BUY and best bid for SELL queries.
+    #[allow(dead_code)] // live mode market param fetching
     pub async fn get_price(&self, token_id: &str) -> Result<Decimal> {
         debug!(token_id, "fetching price from CLOB");
 
@@ -559,6 +494,7 @@ impl PolymarketGateway {
     /// `GET /tick-size?token_id={token_id}` — public endpoint.
     /// The tick size is cached once per market rotation and updated on
     /// `tick_size_change` WS events.
+    #[allow(dead_code)] // live mode market param fetching
     pub async fn get_tick_size(&self, token_id: &str) -> Result<Decimal> {
         debug!(token_id, "fetching tick size from CLOB");
 
@@ -584,6 +520,7 @@ impl PolymarketGateway {
     /// `GET /fee-rate?token_id={token_id}` — public endpoint.
     /// The fee rate must be included in the signed order payload;
     /// always fetch dynamically — never hardcode.
+    #[allow(dead_code)] // live mode market param fetching
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<u16> {
         debug!(token_id, "fetching fee rate from CLOB");
 
@@ -610,6 +547,7 @@ impl PolymarketGateway {
     /// Real WebSocket streaming is implemented in `market_ws.rs` (Ingestor
     /// layer).  This method exists only for interface completeness and logs a
     /// warning to flag any accidental caller.
+    #[allow(dead_code)] // interface completeness — real streaming in market_ws.rs
     pub async fn stream_orderbook(&self, token_id: &str, tx: Sender<IngestorEvent>) -> Result<()> {
         warn!(
             token_id,
@@ -882,22 +820,8 @@ fn parse_insert_status(s: &str) -> OrderStatus {
     }
 }
 
-/// Parse a `ClobBatchResponse` from raw bytes.
-///
-/// The `/orders` endpoint returns either:
-/// - `{"success": true, "results": [...]}` — wrapped form
-/// - `[{...}, {...}]` — bare array
-fn parse_batch_response(bytes: &[u8]) -> Result<Vec<ClobOrderResponse>> {
-    // Try wrapped form first.
-    if let Ok(wrapped) = serde_json::from_slice::<ClobBatchResponse>(bytes) {
-        return Ok(wrapped.results);
-    }
-    // Fall back to bare array.
-    serde_json::from_slice::<Vec<ClobOrderResponse>>(bytes)
-        .context("failed to parse POST /orders response as wrapped or bare array")
-}
-
 /// Parse a CLOB `timestamp` field which may be a string or number (epoch s or ms).
+#[allow(dead_code)] // used by get_orderbook (live mode)
 fn parse_timestamp_value(val: &serde_json::Value) -> u64 {
     let n = match val {
         serde_json::Value::String(s) => s.parse::<u64>().ok(),
@@ -1015,29 +939,6 @@ mod tests {
     #[test]
     fn test_parse_insert_status_unknown_defaults_to_placed() {
         assert_eq!(parse_insert_status("some_new_status"), OrderStatus::Placed);
-    }
-
-    // ── parse_batch_response ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_batch_response_wrapped_form() {
-        let json = r#"{"success":true,"results":[{"orderId":"abc","status":"live"},{"orderId":"def","status":"matched"}]}"#;
-        let results = parse_batch_response(json.as_bytes()).expect("parse failed");
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_batch_response_bare_array() {
-        let json = r#"[{"orderId":"abc","status":"live"}]"#;
-        let results = parse_batch_response(json.as_bytes()).expect("parse failed");
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_batch_response_empty_results() {
-        let json = r#"{"success":true,"results":[]}"#;
-        let results = parse_batch_response(json.as_bytes()).expect("parse failed");
-        assert!(results.is_empty());
     }
 
     // ── parse_timestamp_value ──────────────────────────────────────────────────

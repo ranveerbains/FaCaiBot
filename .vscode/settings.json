@@ -1,0 +1,13 @@
+{
+  // Ensure TOML files are properly recognized
+  "files.associations": {
+    "*.toml": "toml"
+  },
+  
+  // TOML-specific settings for better readability
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml",
+    "editor.formatOnSave": false,
+    "editor.wordWrap": "off"
+  }
+}

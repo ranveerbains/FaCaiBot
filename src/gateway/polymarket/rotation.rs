@@ -1,8 +1,11 @@
 //! Market rotation manager — Gamma API discovery and market lifecycle management.
 //!
 //! Polls the Gamma API every 10 minutes for upcoming BTC/ETH 15-minute markets.
-//! At <180s remaining on the current market, emits `MarketRotation` and warms
-//! the orderbook cache.
+//! At T-180s (3 minutes before the current market expires), anticipatorily
+//! discovers the next market and pre-fetches its order books via REST.
+//! When the current market expires, the pre-warmed rotation is emitted
+//! instantly (zero gap). Falls back to immediate Gamma poll if pre-warming
+//! was not possible.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,31 +36,42 @@ pub struct MarketInfo {
     pub end_timestamp_ms: u64,
 }
 
+/// How far before the current market expires we discover and pre-warm the next
+/// market (3 minutes). At this point we query Gamma for a market ending AFTER
+/// the current one, fetch its order books, and cache them for instant switch.
+const PREWARM_LEAD_MS: u64 = 180_000;
+
 /// Long-running market rotation manager.
 ///
 /// - Polls Gamma API every 10 minutes for the next market.
-/// - At <180s remaining on the current market, emits `MarketRotation`
-///   and the caller should re-subscribe WS to new token IDs.
+/// - At T-180s (3 minutes before expiry), discovers the NEXT market and
+///   pre-warms its order books via REST. When the current market expires,
+///   the pre-warmed rotation is emitted instantly (zero gap).
+/// - Falls back to immediate Gamma poll if pre-warming failed.
 /// - Emits `IngestorEvent::MarketRotation` once per market transition.
 ///
 /// The caller (`main.rs` / integration layer) is responsible for:
 ///   1. Re-calling `run_market_ws` with the new token IDs.
 ///   2. Caching tick_size + fee_rate via `GET /tick-size` and `GET /fee-rate`
 ///      for the new market (done by Executor Dev via polymarket.rs).
-///   3. Updating Redis `active_market` via `HotStorage::set_active_market`.
+///   3. Updating engine state with new market IDs.
 pub(super) async fn run_market_rotation(
     shutdown: Arc<AtomicBool>,
     tx: Sender<IngestorEvent>,
     token_tx: tokio::sync::watch::Sender<Vec<String>>,
 ) -> Result<()> {
-    let mut poll_interval =
-        tokio::time::interval(Duration::from_millis(GAMMA_POLL_INTERVAL_MS));
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(GAMMA_POLL_INTERVAL_MS));
     let mut last_emitted_condition_id: Option<String> = None;
     let mut current_market: Option<MarketInfo> = None;
-    // Check for anticipatory loading more frequently (every 5s).
+    // Check lifecycle every 5s (pre-warm window + expiry detection).
     let mut rotation_check = tokio::time::interval(Duration::from_secs(5));
-    // Set when expiry is detected — triggers immediate Gamma poll on next rotation_check tick.
+    // Set when expiry is detected without a pre-warmed market — triggers immediate Gamma poll.
     let mut needs_immediate_poll = false;
+
+    // ── Anticipatory pre-warming state ────────────────────────────────────
+    let mut next_market: Option<MarketInfo> = None;
+    let mut prewarmed_books: Vec<OrderBook> = Vec::new();
+    let mut prewarm_attempted = false;
 
     loop {
         tokio::select! {
@@ -76,13 +90,98 @@ pub(super) async fn run_market_rotation(
 
                 let now_ms = now_epoch_ms();
 
-                // Check if current market expired — trigger immediate re-discovery.
                 if let Some(ref market) = current_market {
                     let remaining_ms = market.end_timestamp_ms.saturating_sub(now_ms);
+
+                    // ── Pre-warm at T-180s ────────────────────────────────
+                    // Discover the NEXT market (ending after current) and
+                    // pre-fetch its order books so the switch is instant.
+                    if remaining_ms > 0
+                        && remaining_ms <= PREWARM_LEAD_MS
+                        && !prewarm_attempted
+                    {
+                        prewarm_attempted = true;
+                        info!(
+                            remaining_secs = remaining_ms / 1000,
+                            current_condition_id = %market.condition_id,
+                            "T-180s: pre-warming next market"
+                        );
+
+                        match discover_market_after(market.end_timestamp_ms).await {
+                            Ok(info) => {
+                                let next_remaining =
+                                    info.end_timestamp_ms.saturating_sub(now_ms);
+                                info!(
+                                    condition_id = %info.condition_id,
+                                    end_ts_ms = info.end_timestamp_ms,
+                                    remaining_secs = next_remaining / 1000,
+                                    "pre-warmed next market discovered"
+                                );
+
+                                // Pre-fetch order books.
+                                let mut books = Vec::new();
+                                for (label, token_id) in
+                                    [("YES", &info.yes_token_id), ("NO", &info.no_token_id)]
+                                {
+                                    match fetch_order_book(token_id).await {
+                                        Ok(book) => {
+                                            info!(
+                                                side = label,
+                                                bids = book.bids.len(),
+                                                asks = book.asks.len(),
+                                                "pre-warmed book fetched"
+                                            );
+                                            books.push(book);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                side = label,
+                                                error = %e,
+                                                "failed to pre-warm book"
+                                            );
+                                        }
+                                    }
+                                }
+                                prewarmed_books = books;
+                                next_market = Some(info);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "failed to discover next market for pre-warming \
+                                     — will poll Gamma on expiry"
+                                );
+                            }
+                        }
+                    }
+
+                    // ── Expiry: instant switch or fallback poll ───────────
                     if remaining_ms == 0 {
-                        info!("current market expired — polling Gamma immediately for next market");
-                        current_market = None;
-                        needs_immediate_poll = true;
+                        if let Some(next) = next_market.take() {
+                            info!(
+                                condition_id = %next.condition_id,
+                                "instant switch to pre-warmed market (zero gap)"
+                            );
+                            emit_rotation_events(
+                                &tx,
+                                &token_tx,
+                                &next,
+                                &prewarmed_books,
+                                &mut last_emitted_condition_id,
+                            );
+                            current_market = Some(next);
+                            prewarmed_books.clear();
+                            prewarm_attempted = false;
+                        } else {
+                            info!(
+                                "current market expired, no pre-warmed market \
+                                 — polling Gamma immediately"
+                            );
+                            current_market = None;
+                            prewarmed_books.clear();
+                            prewarm_attempted = false;
+                            needs_immediate_poll = true;
+                        }
                     }
                 }
 
@@ -99,8 +198,51 @@ pub(super) async fn run_market_rotation(
     }
 }
 
+/// Emit a `MarketRotation` event, push new token IDs to the Market WS, and
+/// send any pre-fetched order books through the ingestor channel.
+///
+/// Shared by both the scheduled poll path (books fetched inline) and the
+/// pre-warmed instant-switch path (books already cached).
+fn emit_rotation_events(
+    tx: &Sender<IngestorEvent>,
+    token_tx: &tokio::sync::watch::Sender<Vec<String>>,
+    info: &MarketInfo,
+    books: &[OrderBook],
+    last_emitted_condition_id: &mut Option<String>,
+) {
+    let event = IngestorEvent::MarketRotation {
+        condition_id: info.condition_id.clone(),
+        yes_token_id: info.yes_token_id.clone(),
+        no_token_id: info.no_token_id.clone(),
+        end_timestamp_ms: info.end_timestamp_ms,
+    };
+
+    // MarketRotation is critical — use send() to block rather than drop.
+    // The channel has 8192 slots; blocking only occurs if the engine is
+    // severely behind, in which case back-pressure is the correct behavior.
+    if let Err(e) = tx.send(event) {
+        warn!(error = %e, "channel disconnected — MarketRotation event lost");
+    }
+
+    // Push new token IDs to Market WS via watch channel.
+    let new_tokens = vec![info.yes_token_id.clone(), info.no_token_id.clone()];
+    let _ = token_tx.send(new_tokens);
+
+    // Send pre-fetched order books so the engine has book data immediately.
+    for book in books {
+        if tx
+            .try_send(IngestorEvent::PolymarketBook(book.clone()))
+            .is_err()
+        {
+            warn!("channel full — initial book dropped (WS will provide updates)");
+        }
+    }
+
+    *last_emitted_condition_id = Some(info.condition_id.clone());
+}
+
 /// Poll Gamma API, emit `MarketRotation` for any newly discovered market, and warm
-/// the orderbook cache. Shared by the scheduled poll and the immediate-on-expiry path.
+/// the orderbook cache. Shared by the scheduled poll and the immediate-on-expiry fallback.
 pub(super) async fn poll_gamma_and_emit(
     tx: &Sender<IngestorEvent>,
     token_tx: &tokio::sync::watch::Sender<Vec<String>>,
@@ -131,41 +273,27 @@ pub(super) async fn poll_gamma_and_emit(
                     "emitting MarketRotation on discovery"
                 );
 
-                let event = IngestorEvent::MarketRotation {
-                    condition_id: info.condition_id.clone(),
-                    yes_token_id: info.yes_token_id.clone(),
-                    no_token_id: info.no_token_id.clone(),
-                    end_timestamp_ms: info.end_timestamp_ms,
-                };
-
-                if tx.try_send(event).is_err() {
-                    warn!("channel full — MarketRotation event dropped");
-                }
-
-                // Push new token IDs to Market WS via watch channel.
-                let new_tokens = vec![info.yes_token_id.clone(), info.no_token_id.clone()];
-                let _ = token_tx.send(new_tokens);
-
-                // Fetch initial order book via REST for the YES token
+                // Fetch initial order books via REST for both YES and NO tokens
                 // so the engine has book data before WS events arrive.
-                match fetch_order_book(&info.yes_token_id).await {
-                    Ok(book) => {
-                        info!(
-                            asset_id = %book.asset_id,
-                            bids = book.bids.len(),
-                            asks = book.asks.len(),
-                            "fetched initial order book via REST"
-                        );
-                        if tx.try_send(IngestorEvent::PolymarketBook(book)).is_err() {
-                            warn!("channel full — initial PolymarketBook dropped");
+                let mut books = Vec::new();
+                for (label, token_id) in [("YES", &info.yes_token_id), ("NO", &info.no_token_id)] {
+                    match fetch_order_book(token_id).await {
+                        Ok(book) => {
+                            info!(
+                                side = label,
+                                bids = book.bids.len(),
+                                asks = book.asks.len(),
+                                "fetched initial book via REST"
+                            );
+                            books.push(book);
+                        }
+                        Err(e) => {
+                            warn!(side = label, error = %e, "failed to fetch initial book — will rely on WS");
                         }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "failed to fetch initial order book — will rely on WS");
-                    }
                 }
 
-                *last_emitted_condition_id = Some(info.condition_id.clone());
+                emit_rotation_events(tx, token_tx, &info, &books, last_emitted_condition_id);
             }
 
             *current_market = Some(info);
@@ -185,10 +313,28 @@ pub(super) async fn discover_next_market() -> Result<MarketInfo> {
     debug!(url = %url, "querying Gamma API for next 15-min market");
 
     let response_bytes = http_get(&url).await?;
-    let body_str = std::str::from_utf8(&response_bytes)
-        .context("Gamma API response is not valid UTF-8")?;
+    let body_str =
+        std::str::from_utf8(&response_bytes).context("Gamma API response is not valid UTF-8")?;
 
     parse_gamma_events_response(body_str)
+}
+
+/// Query the Gamma API for a market ending **after** `after_ms`.
+///
+/// Used for anticipatory pre-warming: while Market A is still active, we need
+/// to discover Market B (the next market in the schedule). The standard
+/// `discover_next_market()` would return Market A since it's the soonest
+/// non-expired market. This variant skips any market ending at or before
+/// `after_ms`, so it returns Market B instead.
+async fn discover_market_after(after_ms: u64) -> Result<MarketInfo> {
+    let url = format!("{GAMMA_BASE_URL}{GAMMA_EVENTS_PATH}");
+    debug!(url = %url, after_ms, "querying Gamma API for market after current");
+
+    let response_bytes = http_get(&url).await?;
+    let body_str =
+        std::str::from_utf8(&response_bytes).context("Gamma API response is not valid UTF-8")?;
+
+    parse_gamma_events_response_after(body_str, after_ms)
 }
 
 /// Fetch the order book for a token via the CLOB REST API.
@@ -273,10 +419,18 @@ struct GammaEventMarket {
 /// Filters for BTC/ETH 15-minute markets by slug prefix, selects the
 /// soonest non-expired event that is accepting orders.
 pub(super) fn parse_gamma_events_response(body: &str) -> Result<MarketInfo> {
+    parse_gamma_events_response_after(body, now_epoch_ms())
+}
+
+/// Parse the Gamma API response, skipping any market ending at or before `skip_before_ms`.
+///
+/// This is the core parser used by both `parse_gamma_events_response` (skip_before = now,
+/// i.e. skip expired) and `discover_market_after` (skip_before = current market's end time,
+/// i.e. find the next market in the schedule).
+fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<MarketInfo> {
     let events: Vec<GammaEvent> =
         serde_json::from_str(body).context("Gamma API events parse error")?;
 
-    let now_ms = now_epoch_ms();
     let mut best: Option<(u64, MarketInfo)> = None;
 
     for event in &events {
@@ -295,9 +449,9 @@ pub(super) fn parse_gamma_events_response(body: &str) -> Result<MarketInfo> {
             parse_iso8601_to_epoch_ms(&event.end_date).unwrap_or(0)
         };
 
-        // Skip expired events.
-        if end_ms <= now_ms {
-            debug!(slug = %event.slug, "skipping expired 15-min event");
+        // Skip markets ending at or before the cutoff.
+        if end_ms <= skip_before_ms {
+            debug!(slug = %event.slug, "skipping market (ends before cutoff)");
             continue;
         }
 
@@ -343,36 +497,6 @@ pub(super) fn parse_gamma_events_response(body: &str) -> Result<MarketInfo> {
 
     best.map(|(_, info)| info)
         .ok_or_else(|| anyhow!("no valid upcoming BTC/ETH 15-min market found"))
-}
-
-/// Parse `endTimestamp` from either an integer (epoch seconds),
-/// a float (epoch seconds), or an ISO 8601 string.
-pub(super) fn parse_end_timestamp(val: &serde_json::Value) -> Result<u64> {
-    match val {
-        serde_json::Value::Number(n) => {
-            // Epoch seconds — convert to ms.
-            let secs = n
-                .as_u64()
-                .or_else(|| n.as_f64().map(|f| f as u64))
-                .context("endTimestamp number out of u64 range")?;
-            Ok(secs * 1_000)
-        }
-        serde_json::Value::String(s) => {
-            // Try parsing as plain integer first.
-            if let Ok(secs) = s.parse::<u64>() {
-                return Ok(secs * 1_000);
-            }
-            // Try parsing as f64 (e.g. "1714000000.0").
-            if let Ok(secs) = s.parse::<f64>() {
-                return Ok((secs * 1_000.0) as u64);
-            }
-            // Try ISO 8601 (e.g. "2024-04-25T15:00:00Z").
-            // Use chrono-free parsing: count chars and parse manually.
-            // RFC 3339 format: "YYYY-MM-DDTHH:MM:SSZ"
-            parse_iso8601_to_epoch_ms(s)
-        }
-        _ => Err(anyhow!("unexpected endTimestamp type: {:?}", val)),
-    }
 }
 
 /// Minimal RFC 3339 parser — avoids pulling in `chrono`.
@@ -556,5 +680,68 @@ mod tests {
             delta < 86_400_000,
             "ISO 8601 parse drift too large: got {ms}, expected ~{expected}, delta {delta}ms"
         );
+    }
+
+    // ── Anticipatory discovery (parse_gamma_events_response_after) ─────
+
+    /// Two BTC markets: Market A (ends 2098) and Market B (ends 2099).
+    /// When skip_before = Market A's end time, only Market B should be returned.
+    const GAMMA_EVENTS_TWO_MARKETS: &str = r#"[
+        {
+            "slug": "btc-updown-15m-1111111111",
+            "endDate": "2098-06-15T12:00:00Z",
+            "markets": [{
+                "conditionId": "0xmarketA",
+                "clobTokenIds": "[\"0xyesA\", \"0xnoA\"]",
+                "acceptingOrders": true
+            }]
+        },
+        {
+            "slug": "btc-updown-15m-2222222222",
+            "endDate": "2099-06-15T12:00:00Z",
+            "markets": [{
+                "conditionId": "0xmarketB",
+                "clobTokenIds": "[\"0xyesB\", \"0xnoB\"]",
+                "acceptingOrders": true
+            }]
+        }
+    ]"#;
+
+    #[test]
+    fn test_parse_after_skips_current_market() {
+        // Market A ends at 2098-06-15T12:00:00Z. Use its end_ms as the cutoff.
+        let market_a_end_ms =
+            parse_iso8601_to_epoch_ms("2098-06-15T12:00:00Z").expect("parse A end");
+
+        // With skip_before = market A's end, we should get Market B.
+        let info = parse_gamma_events_response_after(GAMMA_EVENTS_TWO_MARKETS, market_a_end_ms)
+            .expect("should find Market B");
+        assert_eq!(info.condition_id, "0xmarketB");
+        assert_eq!(info.yes_token_id, "0xyesB");
+    }
+
+    #[test]
+    fn test_parse_after_returns_soonest_above_cutoff() {
+        // With skip_before = 0 (epoch), both markets are valid — should pick A (soonest).
+        let info = parse_gamma_events_response_after(GAMMA_EVENTS_TWO_MARKETS, 0)
+            .expect("should find Market A");
+        assert_eq!(info.condition_id, "0xmarketA");
+    }
+
+    #[test]
+    fn test_parse_after_errors_when_all_skipped() {
+        // Market B ends at 2099-06-15T12:00:00Z. If cutoff is beyond that, nothing matches.
+        let beyond_b_ms = parse_iso8601_to_epoch_ms("2099-06-15T12:00:00Z").expect("parse B end");
+        let result = parse_gamma_events_response_after(GAMMA_EVENTS_TWO_MARKETS, beyond_b_ms);
+        assert!(
+            result.is_err(),
+            "should error when all markets end before cutoff"
+        );
+    }
+
+    #[test]
+    fn test_prewarm_lead_constant() {
+        // Sanity check: PREWARM_LEAD_MS is 3 minutes (180 000 ms).
+        assert_eq!(PREWARM_LEAD_MS, 180_000);
     }
 }

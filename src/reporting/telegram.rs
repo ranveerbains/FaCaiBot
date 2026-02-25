@@ -106,7 +106,7 @@ impl TelegramReporter {
     ) {
         let text =
             formatter::format_opportunity_alert(signal, leg1_fill_price, leg1_fill_size, book);
-        self.fire_and_forget(text);
+        self.fire_critical(text);
     }
 
     /// Tier 1 — trade completion alert (both legs filled or hedge failed).
@@ -296,28 +296,23 @@ mod formatter {
         let spike_mag_pct = signal.spike_info.magnitude * Decimal::ONE_HUNDRED;
         let tier_label = signal.profit_target_tier.label();
         let profit_target_pct = signal.profit_target_pct * Decimal::ONE_HUNDRED;
-        let alloc_pct = signal.profit_target_tier.alloc_pct() * Decimal::ONE_HUNDRED;
+        let tick = signal.tick_size;
 
-        // Break-even for Leg 2 (no fee in normal flow).
-        let break_even = Decimal::ONE - leg1_fill_price;
-
-        // Leg 2 target price.
-        let leg2_target = Decimal::ONE - signal.profit_target_pct - leg1_fill_price;
+        // Leg 2 target and break-even, both floored to tick size for display.
+        let leg2_target = floor_to_tick(
+            Decimal::ONE - signal.profit_target_pct - leg1_fill_price,
+            tick,
+        );
+        let break_even = floor_to_tick(Decimal::ONE - leg1_fill_price, tick);
 
         // Emergency taker fee per share at the leg2 target price (for reference only).
         let emergency_fee_per_share = compute_taker_fee_per_share(leg2_target);
 
-        // Orderbook depth summary.
+        // Estimated gross profit in USDC.
+        let est_profit_usdc = signal.profit_target_pct * leg1_fill_size;
+
         let bid_depth = book.total_bid_depth();
-
-        // Bid position context.
-        let bid_context = if signal.bot_contested {
-            "top of book (outbid wall at prev. best)"
-        } else {
-            "top of book"
-        };
-
-        let market_short = short_market_id(&signal.token_id);
+        let market_short = short_market_id(&signal.condition_id);
 
         let leg1_side = match signal.direction {
             Direction::Up => "YES",
@@ -328,27 +323,28 @@ mod formatter {
             Direction::Down => "YES",
         };
 
+        let bid_context = if signal.bot_contested {
+            "Top of book (outbid wall)"
+        } else {
+            "Top of book"
+        };
+
         format!(
             "<b>--- OPPORTUNITY DETECTED ---</b>\n\n\
             Market: {market}\n\
+            Spike: {dir} {sign}{mag:.4}% | {sus}ms sustained\n\
+            Confidence: {conf:.2} ({tier}) | Target: {target:.2}%\n\
+            Capital: ${alloc:.2}\n\
             \n\
-            Spike: {dir} {sign}{mag:.2}% ({sus}ms sustained)\n\
+            <b>Leg 1</b>\n\
+            Buy {l1_side}  <code>${price:.2}</code> \u{00d7} {size:.2}sh = <code>${l1_total:.2}</code>\n\
+            {bid_ctx} | Depth: ${depth:.0}\n\
             \n\
-            Signal confidence: {conf:.2} ({tier})\n\
-            Profit target: {target:.1}% ({tier} tier)\n\
-            Allocated: ${alloc:.2} ({alloc_pct:.0}% of capital)\n\
+            <b>Leg 2 target</b>\n\
+            Buy {l2_side}  <code>${leg2_tgt}</code> | Break-even: ${be}\n\
+            Est. profit: {target:.2}% (~<code>${est_usdc:.2}</code>) | FOK fee: ${ef:.4}/sh\n\
             \n\
-            <b>Leg 1 (simulated):</b>\n\
-              Buy {l1_side} @ <code>${price:.3}</code> x {size:.1} shares (post-only, maker, $0 fee)\n\
-              Bid position: {bid_ctx}\n\
-              Orderbook depth: ${depth:.0} available\n\
-            \n\
-            <b>Leg 2 target:</b>\n\
-              Buy {l2_side} @ <code>${leg2_tgt:.3}</code> (break-even: ${be:.3})\n\
-              Both legs maker → est. profit: {target:.1}%\n\
-              Emergency taker fee (if FOK needed): ${ef:.4}/share\n\
-            \n\
-            Status: WATCHING FOR HEDGE...",
+            Status: Watching for hedge...",
             market = market_short,
             dir = direction_str,
             sign = spike_sign,
@@ -358,93 +354,118 @@ mod formatter {
             tier = tier_label,
             target = profit_target_pct,
             alloc = signal.alloc_amount,
-            alloc_pct = dec_to_f64(alloc_pct),
             l1_side = leg1_side,
             price = leg1_fill_price,
             size = leg1_fill_size,
+            l1_total = leg1_fill_price * leg1_fill_size,
             bid_ctx = bid_context,
             depth = bid_depth,
             l2_side = leg2_side,
             leg2_tgt = leg2_target,
             be = break_even,
+            est_usdc = est_profit_usdc,
             ef = emergency_fee_per_share,
         )
     }
 
     /// Tier 1 — trade completion (both legs simulated).
     pub(super) fn format_trade_completed(trade: &SimTrade) -> String {
+        use crate::types::market::Direction;
+
         let market_short = short_market_id(&trade.market_id);
 
+        let (l1_label, l2_label) = match trade.direction {
+            Direction::Up => ("YES", "NO"),
+            Direction::Down => ("NO", "YES"),
+        };
+
+        let total_cost_usdc = trade.pair_cost * trade.leg1.size;
+
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
-            let fee_label = if leg2.was_taker {
-                format!("TAKER, ${:.4} fee", leg2.taker_fee)
-            } else {
-                "maker, $0 fee".to_owned()
-            };
             let erosion_note = if trade.erosion_steps > 0 {
-                format!(", eroded {}x", trade.erosion_steps)
+                format!(" (eroded {}\u{00d7})", trade.erosion_steps)
+            } else {
+                String::new()
+            };
+            let taker_tag = if trade.adverse_movement_hedge && trade.emergency_maker {
+                " [ADVERSE POST-ONLY]".to_owned()
+            } else if trade.adverse_movement_hedge {
+                " [ADVERSE FOK FALLBACK]".to_owned()
+            } else if trade.favorable_taker && trade.emergency_maker {
+                " [FAVORABLE POST-ONLY]".to_owned()
+            } else if trade.favorable_taker {
+                " [FAVORABLE FOK FALLBACK]".to_owned()
+            } else if trade.emergency_maker {
+                " [EMERGENCY POST-ONLY]".to_owned()
+            } else if leg2.was_taker {
+                " [FOK FALLBACK]".to_owned()
             } else {
                 String::new()
             };
             format!(
-                "Leg 2: {side}  @ <code>${price:.3}</code> x {size:.1} ({fee}{erosion})",
-                side = format!("{:?}", leg2.side),
+                "Leg 2: Buy {side}  <code>${price:.2}</code> \u{00d7} {size:.2}sh{taker}{erosion}",
+                side = l2_label,
                 price = leg2.price,
                 size = leg2.size,
-                fee = fee_label,
+                taker = taker_tag,
                 erosion = erosion_note,
             )
         } else {
             "<i>Leg 2: not filled — awaiting resolution</i>".to_owned()
         };
 
-        let net_label = if trade.leg2_was_taker {
+        let profit_line = if trade.leg2_was_taker && !trade.emergency_maker {
+            let sign_g = if trade.gross_profit >= Decimal::ZERO {
+                "+"
+            } else {
+                ""
+            };
+            let sign_n = if trade.net_profit >= Decimal::ZERO {
+                "+"
+            } else {
+                ""
+            };
             format!(
-                "Net profit: <code>${:.3}</code> ({:.1}%) — taker fee ${:.4}",
-                trade.net_profit, trade.profit_pct, trade.taker_fee,
+                "Gross: {sg}<code>${gross:.2}</code> | Fee: -${fee:.4} | Net: {sn}<code>${net:.2}</code> ({pct:.2}%)",
+                sg = sign_g,
+                gross = trade.gross_profit,
+                fee = trade.taker_fee,
+                sn = sign_n,
+                net = trade.net_profit,
+                pct = trade.profit_pct,
             )
         } else {
+            let sign = if trade.net_profit >= Decimal::ZERO {
+                "+"
+            } else {
+                ""
+            };
             format!(
-                "Net profit: <code>${:.3}</code> ({:.1}%) — both legs maker, zero fee",
-                trade.net_profit, trade.profit_pct,
+                "Profit: {sign}<code>${net:.2}</code> ({pct:.2}%)",
+                sign = sign,
+                net = trade.net_profit,
+                pct = trade.profit_pct,
             )
-        };
-
-        let adverse_note = if trade.adverse_movement_hedge {
-            "\nAdverse movement: emergency FOK triggered"
-        } else {
-            ""
-        };
-
-        let gross_pct = if trade.pair_cost.is_zero() {
-            Decimal::ZERO
-        } else {
-            trade.gross_profit / trade.pair_cost * Decimal::ONE_HUNDRED
         };
 
         format!(
             "<b>--- TRADE COMPLETED ---</b>\n\n\
             Market: {market}\n\
             \n\
-            Leg 1: {l1_side} @ <code>${l1_price:.3}</code> x {l1_size:.1} (maker, $0 fee)\n\
+            Leg 1: Buy {l1_side}  <code>${l1_price:.2}</code> \u{00d7} {l1_size:.2}sh = <code>${l1_total:.2}</code>\n\
             {leg2}\n\
             \n\
-            Pair cost: <code>${pair:.3}</code>\n\
-            Gross profit: <code>${gross:.3}</code> ({gross_pct:.1}%)\n\
-            {net}\n\
-            Erosion: {erosion} step(s)\
-            {adverse}",
+            Pair: <code>${pair:.3}</code>/sh \u{00d7} {l1_size:.2}sh = <code>${total_cost:.2}</code>\n\
+            {profit}",
             market = market_short,
-            l1_side = format!("{:?}", trade.leg1.side),
+            l1_side = l1_label,
             l1_price = trade.leg1.price,
             l1_size = trade.leg1.size,
+            l1_total = trade.leg1.price * trade.leg1.size,
             leg2 = leg2_str,
             pair = trade.pair_cost,
-            gross = trade.gross_profit,
-            gross_pct = gross_pct,
-            net = net_label,
-            erosion = trade.erosion_steps,
-            adverse = adverse_note,
+            total_cost = total_cost_usdc,
+            profit = profit_line,
         )
     }
 
@@ -495,11 +516,13 @@ mod formatter {
                 let leg2_info = if let Some(ref l2) = t.leg2 {
                     let fee_tag = if l2.was_taker { "taker" } else { "maker" };
                     let net_sign = if t.net_profit >= Decimal::ZERO { "+" } else { "" };
+                    // pair_cost is per-share; net_profit is USDC
                     format!(
-                        "YES@{l1:.3} + NO@{l2:.3} = ${pair:.3} → maker+{fee} → net {sign}${net:.3} ({pct:.1}%)",
+                        "YES@{l1:.3} + NO@{l2:.3} = ${pair:.3}/sh × {sz:.2}sh → maker+{fee} → net {sign}${net:.2} USDC ({pct:.2}%)",
                         l1 = t.leg1.price,
                         l2 = l2.price,
                         pair = t.pair_cost,
+                        sz = t.leg1.size,
                         fee = fee_tag,
                         sign = net_sign,
                         net = t.net_profit,
@@ -507,8 +530,9 @@ mod formatter {
                     )
                 } else {
                     format!(
-                        "YES@{l1:.3} — unhedged → awaiting resolution",
+                        "YES@{l1:.3} × {sz:.2}sh — unhedged → awaiting resolution",
                         l1 = t.leg1.price,
+                        sz = t.leg1.size,
                     )
                 };
                 format!(
@@ -533,7 +557,8 @@ mod formatter {
             Leg 1 fills: {l1_fills} ({fill_rate:.0}% fill rate)\n\
             Hedged: {hedged}/{l1_fills} ({hedge_rate:.0}%)\n\
             Walls outbid: {walls}\n\
-            Emergency taker fills: {emergency}\n\
+            Emergency taker fills: {emergency} (post-only: {emergency_maker})\n\
+            Favorable taker fills: {favorable}\n\
             \n\
             {trade_lines}\n\
             \n\
@@ -552,6 +577,8 @@ mod formatter {
             hedge_rate = hedge_rate_pct,
             walls = s.walls_outbid,
             emergency = s.emergency_taker_fills,
+            emergency_maker = s.emergency_maker_fills,
+            favorable = s.favorable_taker_fills,
             trade_lines = trade_lines,
             alloc = s.allocation_used,
             cap = s.allocation_cap,
@@ -639,10 +666,12 @@ mod formatter {
               Depth walls detected: {walls}\n\
               Walls outbid: {walls}\n\
             \n\
-            <b>Emergency taker (Leg 2):</b>\n\
+            <b>Emergency exits (Leg 2):</b>\n\
               Adverse movement FOK: {adverse}\n\
               Break-even breach FOK: {break_even}\n\
               Timer/expiry deadline FOK: {timer}\n\
+              Emergency post-only (maker): {emergency_maker}\n\
+              Favorable taker fills: {favorable}\n\
             \n\
             <b>Allocation:</b>\n\
               High confidence (≥0.8, target 2.5%): {high_n} trades, avg ${high_avg:.0}\n\
@@ -679,6 +708,8 @@ mod formatter {
             adverse = s.adverse_movement_fok,
             break_even = s.break_even_fok,
             timer = s.timer_deadline_fok,
+            emergency_maker = s.emergency_maker_fills,
+            favorable = s.favorable_taker_fills,
             high_n = s.high_conf_trades,
             high_avg = s.high_conf_avg_alloc,
             med_n = s.med_conf_trades,
@@ -709,6 +740,15 @@ mod formatter {
     }
 
     // ─── Formatting Helpers ───────────────────────────────────────────────────
+
+    /// Floor `price` down to the nearest `tick_size` multiple.
+    /// Used to ensure displayed Leg 2 target prices are valid tick-aligned values.
+    fn floor_to_tick(price: Decimal, tick: Decimal) -> Decimal {
+        if tick.is_zero() {
+            return price;
+        }
+        (price / tick).floor() * tick
+    }
 
     /// Compute the taker fee per share at a given price.
     /// `fee = 0.25 * (price * (1 - price))^2`

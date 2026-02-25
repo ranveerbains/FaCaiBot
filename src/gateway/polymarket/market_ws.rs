@@ -312,9 +312,7 @@ pub(super) fn parse_book_event(event: &serde_json::Value) -> Result<OrderBook> {
 /// Polymarket sends an array of changes in a single frame under `"changes"`.
 /// Each change: `{"asset_id": "...", "side": "BUY"|"SELL", "price": "...", "size": "...",
 ///               "best_bid": "...", "best_ask": "..."}`
-pub(super) fn parse_price_change_event(
-    event: &serde_json::Value,
-) -> Result<Vec<IngestorEvent>> {
+pub(super) fn parse_price_change_event(event: &serde_json::Value) -> Result<Vec<IngestorEvent>> {
     let changes = event
         .get("changes")
         .and_then(|v| v.as_array())

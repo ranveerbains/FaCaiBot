@@ -3,6 +3,26 @@ use serde::{Deserialize, Serialize};
 
 use super::market::{Direction, OrderBook, SpikeInfo};
 
+// ─── Exit Reason ─────────────────────────────────────────────────────────────
+
+/// Reason for an emergency Leg 2 exit (post-only first, FOK fallback).
+///
+/// Set by the evaluator when generating emergency signals so the executor
+/// can accurately categorize the exit for session statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExitReason {
+    /// Binance price reversed beyond adverse_threshold.
+    AdverseMovement,
+    /// Opposing ask worsened beyond break-even tolerance.
+    BreakEvenBreach,
+    /// Market rotation arrived while Leg 1 was filled but Leg 2 incomplete.
+    /// Emergency FOK to close the position before state reset.
+    MarketExpiry,
+    /// Opposing ask dropped below posted bid — market-take at ask price.
+    /// Taker fee is acceptable insurance vs leaving Leg 1 unhedged.
+    FavorableTaker,
+}
+
 // ─── Side ────────────────────────────────────────────────────────────────────
 
 /// Side of a trade on the Polymarket CLOB.
@@ -47,31 +67,12 @@ pub enum ProfitTier {
 
 impl ProfitTier {
     /// Initial profit target as a decimal fraction (e.g., 0.025 for 2.5%).
+    #[allow(dead_code)] // used in tests
     pub fn target_pct(&self) -> Decimal {
         match self {
             ProfitTier::High => Decimal::new(25, 3), // 0.025
             ProfitTier::Med => Decimal::new(15, 3),  // 0.015
             ProfitTier::Low => Decimal::new(10, 3),  // 0.010
-        }
-    }
-
-    /// Erosion step size: `target_pct / 5`.
-    /// Each erosion step raises the Leg 2 bid by this amount.
-    /// All tiers reach break-even in exactly 5 steps.
-    pub fn step_size(&self) -> Decimal {
-        match self {
-            ProfitTier::High => Decimal::new(5, 3), // 0.005
-            ProfitTier::Med => Decimal::new(3, 3),  // 0.003
-            ProfitTier::Low => Decimal::new(2, 3),  // 0.002
-        }
-    }
-
-    /// Allocation as a fraction of FIXED_ALLOC (e.g., 0.30 for 30%).
-    pub fn alloc_pct(&self) -> Decimal {
-        match self {
-            ProfitTier::High => Decimal::new(30, 2), // 0.30
-            ProfitTier::Med => Decimal::new(20, 2),  // 0.20
-            ProfitTier::Low => Decimal::new(10, 2),  // 0.10
         }
     }
 
@@ -109,10 +110,14 @@ impl ProfitTier {
 #[derive(Debug, Clone)]
 pub struct TradeSignal {
     // ── Order parameters ─────────────────────────────────────────────────
+    /// Emergency exit reason (set only for Leg 2 emergency signals).
+    pub exit_reason: Option<ExitReason>,
     /// Buy or Sell.
     pub side: Side,
     /// Polymarket token ID to trade (YES or NO token).
     pub token_id: String,
+    /// Polymarket condition ID (market-level identifier, same for YES and NO tokens).
+    pub condition_id: String,
     /// Target price for this order (already rounded to tick_size).
     pub price: Decimal,
     /// Number of shares to trade.
@@ -143,6 +148,7 @@ pub struct TradeSignal {
     /// `false` = Leg 1 (directional entry), `true` = Leg 2 (hedge).
     pub is_leg2: bool,
     /// If this is a Leg 2 signal, the fill price of Leg 1. `None` for Leg 1 signals.
+    #[allow(dead_code)] // set on Leg 2 signals for QuestDB recording
     pub leg1_fill_price: Option<Decimal>,
 
     // ── Market context ───────────────────────────────────────────────────
@@ -153,6 +159,7 @@ pub struct TradeSignal {
     /// Tick size for price rounding.
     pub tick_size: Decimal,
     /// Taker fee rate in basis points (for emergency taker fee calculations).
+    #[allow(dead_code)] // carried for live mode fee computation
     pub fee_rate_bps: u16,
 
     // ── Analytics flags ──────────────────────────────────────────────────
@@ -163,6 +170,14 @@ pub struct TradeSignal {
     /// Snapshot of the Polymarket orderbook at signal generation time.
     /// Used by the executor to simulate fills without a separate book feed.
     pub book_snapshot: Option<OrderBook>,
+
+    /// Simulation only: `true` when this signal is a confirmed fill from
+    /// `advance_simulation()`. Executor records it directly without re-checking.
+    pub sim_confirmed_fill: bool,
+
+    /// Simulation only: `true` when this emergency fill crossed the spread
+    /// (FOK fallback). `false` when it rested as a post-only maker fill.
+    pub sim_was_taker: bool,
 }
 
 // ─── Executor Command ────────────────────────────────────────────────────────
@@ -177,6 +192,13 @@ pub enum ExecutorCommand {
     MarketRotation {
         /// Condition ID of the market that just rotated.
         condition_id: String,
+    },
+    /// x-minute entry cutoff window entered — executor should send market summary.
+    MarketCutoff {
+        /// Condition ID of the current market.
+        condition_id: String,
+        /// Epoch ms when the market ends.
+        market_end_ms: u64,
     },
 }
 
@@ -224,6 +246,26 @@ impl OrderRequest {
             expiration: None,
         }
     }
+
+    /// Convenience constructor for an aggressive post-only GTC order used in
+    /// emergency code paths. Functionally identical to `post_only_gtc()` but
+    /// named distinctly so call sites communicate intent.
+    pub fn aggressive_post_only(
+        token_id: String,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+    ) -> Self {
+        Self {
+            token_id,
+            side,
+            price,
+            size,
+            order_type: OrderType::Gtc,
+            post_only: true,
+            expiration: None,
+        }
+    }
 }
 
 // ─── Order Response ──────────────────────────────────────────────────────────
@@ -252,4 +294,24 @@ pub enum OrderStatus {
     Cancelled,
     /// Order rejected by the CLOB (e.g., post-only would cross spread, tick size violation).
     Rejected,
+}
+
+// ─── Executor Feedback ──────────────────────────────────────────────────
+
+/// Feedback from the live executor to the engine (reverse channel).
+///
+/// The live executor sends these after placing or failing to place orders
+/// on the CLOB, so the engine can update its `OrderState` with the real
+/// CLOB order ID (needed for matching User WS `TradeStatusUpdate` events).
+#[derive(Debug, Clone)]
+pub enum ExecutorFeedback {
+    /// CLOB accepted the order — update `OrderState::Posted` with the real order ID.
+    OrderPosted {
+        is_leg2: bool,
+        order_id: String,
+        price: Decimal,
+        size: Decimal,
+    },
+    /// Order placement failed — reset the leg state to `OrderState::None`.
+    OrderFailed { is_leg2: bool },
 }

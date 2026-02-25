@@ -1,8 +1,7 @@
 //! EMA-ATR spike detector for Binance price feeds.
 //!
 //! Detects large, sustained mid-price movements ("spikes") in the BTC/USDT
-//! depth stream. Uses a rolling EMA-ATR with phantom-reversion filtering to
-//! reduce false positives from momentary liquidity gaps.
+//! depth stream. Uses a rolling EMA-ATR with sustain and momentum filtering.
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
@@ -13,20 +12,10 @@ use crate::types::market::{Direction, SpikeInfo};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// Minimum number of depth samples before the fast ATR is considered reliable.
-/// Below this, the slow 5-min fallback EMA is used.
-pub(super) const MIN_ATR_SAMPLES: usize = 10;
-
-// ─── Internal structs ─────────────────────────────────────────────────────────
-
-/// Pending spike confirmed by sustain but not yet emitted (phantom window active).
-pub(super) struct PendingSpike {
-    pub(super) info: SpikeInfo,
-    /// Mid-price at the moment sustain was confirmed (for phantom reversion check).
-    pub(super) sustain_mid: f64,
-    /// Epoch ms when the sustain check passed.
-    pub(super) sustain_confirmed_ms: u64,
-}
+/// ATR warmup period: no spikes emitted until this many samples have been seen.
+/// Prevents false positives while the EMA initialises from a single data point.
+/// At 100ms/tick this is ~1 second.
+const MIN_ATR_SAMPLES: usize = 10;
 
 // ─── SpikeDetector ────────────────────────────────────────────────────────────
 
@@ -37,18 +26,13 @@ pub struct SpikeDetector {
     atr_alpha: f64,
     window_ms: u64,
     sustain_ms: u64,
-    sustain_low_vol_ext_ms: u64,
-    phantom_revert_fraction: f64,
-    phantom_check_ms: u64,
+    min_magnitude_pct: f64,
+    momentum_ratio_min: f64,
 
     // ── ATR state ─────────────────────────────────────────────────────
-    /// Fast 1-minute EMA of absolute mid-price deltas.
+    /// EMA of absolute mid-price deltas.
     ema_atr: f64,
-    /// Slow ~5-minute fallback EMA (alpha ≈ 0.002).
-    ema_atr_slow: f64,
-    /// Very slow daily-average proxy (alpha ≈ 0.0001), used for low-vol detection.
-    daily_avg_atr: f64,
-    /// Number of samples seen; determines when fast ATR is reliable.
+    /// Number of samples seen; gates spike emission during warmup.
     sample_count: usize,
     /// Previous depth snapshot's mid-price.
     prev_mid: Option<f64>,
@@ -65,13 +49,17 @@ pub struct SpikeDetector {
     /// Signed peak delta during the spike window.
     spike_peak_delta: f64,
 
-    // ── Pending (post-sustain) confirmation ───────────────────────────
-    /// Spike that passed sustain, now in the phantom-check window.
-    pub(super) pending: Option<PendingSpike>,
-
     // ── Stale-event telemetry ─────────────────────────────────────────
     stale_count: u64,
     last_stale_log_ms: u64,
+
+    // ── Diagnostic counters (cumulative, logged periodically) ──────
+    diag_candidates_started: u64,
+    diag_expired_window: u64,
+    diag_fading_momentum: u64,
+    diag_below_magnitude: u64,
+    diag_confirmed: u64,
+    last_diag_log_ms: u64,
 }
 
 impl SpikeDetector {
@@ -81,12 +69,9 @@ impl SpikeDetector {
             atr_alpha: config.atr_alpha,
             window_ms: config.window_ms,
             sustain_ms: config.sustain_ms,
-            sustain_low_vol_ext_ms: config.sustain_low_vol_ext_ms,
-            phantom_revert_fraction: config.phantom_revert_fraction,
-            phantom_check_ms: config.phantom_check_ms,
+            min_magnitude_pct: config.min_magnitude_pct,
+            momentum_ratio_min: config.momentum_ratio_min,
             ema_atr: 0.0,
-            ema_atr_slow: 0.0,
-            daily_avg_atr: 0.0,
             sample_count: 0,
             prev_mid: None,
             prev_ts_ms: 0,
@@ -94,9 +79,14 @@ impl SpikeDetector {
             spike_direction: None,
             spike_origin_mid: 0.0,
             spike_peak_delta: 0.0,
-            pending: None,
             stale_count: 0,
             last_stale_log_ms: 0,
+            diag_candidates_started: 0,
+            diag_expired_window: 0,
+            diag_fading_momentum: 0,
+            diag_below_magnitude: 0,
+            diag_confirmed: 0,
+            last_diag_log_ms: 0,
         }
     }
 
@@ -115,67 +105,39 @@ impl SpikeDetector {
         let delta = mid - prev_mid;
         let abs_delta = delta.abs();
 
-        // ── Update ATR estimates ───────────────────────────────────────
+        // ── Update ATR ────────────────────────────────────────────────
         self.sample_count += 1;
         if self.sample_count == 1 {
             self.ema_atr = abs_delta;
-            self.ema_atr_slow = abs_delta;
-            self.daily_avg_atr = abs_delta;
         } else {
             self.ema_atr = self.atr_alpha * abs_delta + (1.0 - self.atr_alpha) * self.ema_atr;
-            self.ema_atr_slow = 0.002 * abs_delta + (1.0 - 0.002) * self.ema_atr_slow;
-            self.daily_avg_atr = 0.0001 * abs_delta + (1.0 - 0.0001) * self.daily_avg_atr;
         }
 
-        // Effective ATR: use slow fallback until we have enough fast samples.
-        let atr = if self.sample_count < MIN_ATR_SAMPLES {
-            self.ema_atr_slow.max(1e-10)
-        } else {
-            self.ema_atr.max(1e-10)
-        };
-
-        // ── Phantom reversion check (must run before spike candidate logic) ──
-        if let Some(ref pending) = self.pending {
-            let time_since_sustain = now_ms.saturating_sub(pending.sustain_confirmed_ms);
-
-            if time_since_sustain <= self.phantom_check_ms {
-                // Still within phantom-check window — check for reversion.
-                let revert_delta = (mid - pending.sustain_mid).abs();
-                let spike_delta = pending.info.magnitude.to_f64().unwrap_or(0.0) * prev_mid.abs();
-                let revert_fraction = if spike_delta > 1e-12 {
-                    revert_delta / spike_delta
-                } else {
-                    0.0
-                };
-
-                if revert_fraction > self.phantom_revert_fraction {
-                    debug!(
-                        revert_fraction,
-                        "phantom spike discarded (>{:.0}% reversion in 100ms)",
-                        self.phantom_revert_fraction * 100.0
-                    );
-                    self.pending = None;
-                    // Spike is gone — fall through to normal candidate logic.
-                } else {
-                    // Still holding — wait for phantom window to close.
-                    self.prev_mid = Some(mid);
-                    self.prev_ts_ms = now_ms;
-                    return None;
-                }
-            } else {
-                // Phantom check window elapsed without reversion — emit spike.
-                let confirmed_spike = self.pending.take().unwrap().info;
-                debug!(
-                    direction = ?confirmed_spike.direction,
-                    magnitude_pct = %(confirmed_spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                    sustained_ms = confirmed_spike.sustained_ms,
-                    "spike confirmed — phantom window elapsed without reversion"
-                );
-                self.prev_mid = Some(mid);
-                self.prev_ts_ms = now_ms;
-                return Some(confirmed_spike);
-            }
+        // ── Periodic diagnostic log (every 60s) ─────────────────────
+        if now_ms.saturating_sub(self.last_diag_log_ms) >= 60_000 {
+            info!(
+                atr = format!("{:.2}", self.ema_atr),
+                threshold = format!("{:.2}", self.multiplier * self.ema_atr.max(1e-10)),
+                mid = format!("{:.2}", mid),
+                candidates = self.diag_candidates_started,
+                rej_window = self.diag_expired_window,
+                rej_momentum = self.diag_fading_momentum,
+                rej_magnitude = self.diag_below_magnitude,
+                confirmed = self.diag_confirmed,
+                "spike 60s"
+            );
+            self.last_diag_log_ms = now_ms;
         }
+
+        // ── ATR warmup gate ───────────────────────────────────────────
+        // Hold off spike detection until the EMA has enough samples to be reliable.
+        if self.sample_count < MIN_ATR_SAMPLES {
+            self.prev_mid = Some(mid);
+            self.prev_ts_ms = now_ms;
+            return None;
+        }
+
+        let atr = self.ema_atr.max(1e-10);
 
         // ── Spike candidate detection ──────────────────────────────────
         let threshold = self.multiplier * atr;
@@ -191,7 +153,14 @@ impl SpikeDetector {
 
             if elapsed > self.window_ms {
                 // Candidate timed out without reaching sustain threshold.
-                debug!(elapsed, "spike candidate expired (window exceeded)");
+                self.diag_expired_window += 1;
+                debug!(
+                    elapsed,
+                    window_ms = self.window_ms,
+                    displacement = format!("{:.2}", abs_displacement),
+                    threshold = format!("{:.2}", threshold),
+                    "spike REJECTED: window expired before sustain"
+                );
                 self.reset_candidate();
             } else if abs_displacement > threshold {
                 // Price is still significantly displaced from origin — spike holds.
@@ -200,42 +169,60 @@ impl SpikeDetector {
                     self.spike_peak_delta = displacement;
                 }
 
-                // Check sustain: dynamic window based on volatility.
-                let sustain_window = if atr < self.daily_avg_atr {
-                    self.sustain_ms + self.sustain_low_vol_ext_ms // low-vol: slower build
-                } else {
-                    self.sustain_ms
-                };
-
-                if elapsed >= sustain_window {
-                    // Spike has sustained long enough — move to phantom check.
-                    let magnitude = if self.spike_origin_mid.abs() > 1e-12 {
-                        (self.spike_peak_delta.abs() / self.spike_origin_mid.abs())
-                            .clamp(0.0, 1.0)
+                if elapsed >= self.sustain_ms {
+                    // Momentum check: current displacement must be ≥ momentum_ratio_min of peak.
+                    // Filters fading spikes that retrace most of the move during sustain.
+                    let peak_abs = self.spike_peak_delta.abs().max(1e-12);
+                    let momentum_ratio = abs_displacement / peak_abs;
+                    if momentum_ratio < self.momentum_ratio_min {
+                        self.diag_fading_momentum += 1;
+                        debug!(
+                            momentum_ratio = format!("{:.3}", momentum_ratio),
+                            min = self.momentum_ratio_min,
+                            displacement = format!("{:.2}", abs_displacement),
+                            peak = format!("{:.2}", peak_abs),
+                            "spike REJECTED: fading momentum"
+                        );
+                        self.reset_candidate();
                     } else {
-                        0.0
-                    };
+                        // Use sustain-time displacement (not peak) for honest magnitude.
+                        let magnitude = if self.spike_origin_mid.abs() > 1e-12 {
+                            (abs_displacement / self.spike_origin_mid.abs()).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
 
-                    let spike_info = SpikeInfo {
-                        direction: self.spike_direction.unwrap_or(Direction::Up),
-                        magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
-                        sustained_ms: elapsed,
-                        timestamp_ms: spike_start,
-                    };
-
-                    debug!(
-                        elapsed_ms = elapsed,
-                        sustain_window_ms = sustain_window,
-                        magnitude_pct = %(magnitude * 100.0),
-                        "spike sustained — entering phantom check"
-                    );
-
-                    self.pending = Some(PendingSpike {
-                        info: spike_info,
-                        sustain_mid: mid,
-                        sustain_confirmed_ms: now_ms,
-                    });
-                    self.reset_candidate();
+                        // Minimum magnitude gate.
+                        let min_mag = self.min_magnitude_pct / 100.0;
+                        if magnitude < min_mag {
+                            self.diag_below_magnitude += 1;
+                            debug!(
+                                magnitude_pct = format!("{:.4}", magnitude * 100.0),
+                                min_pct = self.min_magnitude_pct,
+                                "spike REJECTED: below min magnitude"
+                            );
+                            self.reset_candidate();
+                        } else {
+                            // All gates passed — emit spike immediately.
+                            self.diag_confirmed += 1;
+                            let spike_info = SpikeInfo {
+                                direction: self.spike_direction.unwrap_or(Direction::Up),
+                                magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
+                                sustained_ms: elapsed,
+                                timestamp_ms: spike_start,
+                            };
+                            info!(
+                                direction = ?spike_info.direction,
+                                magnitude_pct = %(magnitude * 100.0),
+                                sustained_ms = elapsed,
+                                "spike CONFIRMED — all gates passed"
+                            );
+                            self.reset_candidate();
+                            self.prev_mid = Some(mid);
+                            self.prev_ts_ms = now_ms;
+                            return Some(spike_info);
+                        }
+                    }
                 }
             }
             // else: displacement below threshold but within window — allow brief dips.
@@ -251,12 +238,14 @@ impl SpikeDetector {
             self.spike_direction = Some(candidate_dir);
             self.spike_origin_mid = prev_mid;
             self.spike_peak_delta = delta;
+            self.diag_candidates_started += 1;
             debug!(
                 direction = ?candidate_dir,
-                abs_delta,
-                atr,
-                threshold,
-                "spike candidate started"
+                abs_delta = format!("{:.2}", abs_delta),
+                atr = format!("{:.2}", atr),
+                threshold = format!("{:.2}", threshold),
+                mid = format!("{:.2}", mid),
+                "spike candidate STARTED"
             );
         }
 
@@ -300,9 +289,8 @@ mod tests {
             atr_alpha: 0.1,
             window_ms: 400,
             sustain_ms: 200,
-            sustain_low_vol_ext_ms: 300,
-            phantom_revert_fraction: 0.5,
-            phantom_check_ms: 100,
+            min_magnitude_pct: 0.0, // no min filter in tests (test-specific)
+            momentum_ratio_min: 0.5,
         }
     }
 
@@ -312,20 +300,21 @@ mod tests {
         let base = 52000.0_f64;
         let mut ts = 1_700_000_000_000_u64;
 
-        // Feed 40 small-delta samples to establish ATR.
+        // Feed 40 alternating samples: deltas are always ±0.3.
+        // ATR converges to ~0.3, threshold = 1.5 × 0.3 = 0.45.
+        // All deltas (0.3) are below threshold — no candidates start.
         for i in 0..40 {
-            // Tiny oscillation — well below 1.5x ATR threshold.
-            let price = base + (i as f64 % 3.0) * 0.3;
+            let price = base + ((i % 2) as f64) * 0.3;
             let result = det.update(price, ts);
             ts += 100;
             assert!(result.is_none(), "noise tick {i} should not trigger spike");
         }
 
-        // A modest move that is still within 1.5× ATR.
-        let result = det.update(base + 5.0, ts);
+        // A single large tick starts a candidate but cannot confirm (no sustain yet).
+        let result = det.update(base + 500.0, ts);
         assert!(
             result.is_none(),
-            "sub-threshold move should not trigger spike"
+            "single large tick without sustain should not confirm"
         );
     }
 
@@ -336,7 +325,7 @@ mod tests {
         let base = 52000.0_f64;
         let mut ts = 1_700_000_000_000_u64;
 
-        // Warm ATR with small stable moves.
+        // Warm ATR with small stable moves (must exceed MIN_ATR_SAMPLES=10).
         for i in 0..30 {
             det.update(base + (i as f64 % 2.0) * 1.0, ts);
             ts += 100;
@@ -348,57 +337,20 @@ mod tests {
         // Tick 1: starts the spike candidate.
         det.update(spike_price, ts);
         ts += 100;
-        // Tick 2: continues.
+        // Tick 2: continues — 100ms elapsed, below sustain_ms=200ms.
         det.update(spike_price + 10.0, ts);
         ts += 100;
-        // Tick 3: > 200ms elapsed → sustain check passes, pending spike created.
-        det.update(spike_price + 10.0, ts);
-        ts += 100;
-        // Tick 4: within 100ms phantom window — no reversion.
-        det.update(spike_price + 8.0, ts);
-        ts += 110; // now past phantom window (>100ms since sustain)
-        // Tick 5: phantom window elapsed → spike should be confirmed here.
-        let confirmed = det.update(spike_price + 8.0, ts);
+        // Tick 3: 200ms elapsed — sustain passes, momentum+magnitude pass → spike confirmed immediately.
+        let confirmed = det.update(spike_price + 10.0, ts);
 
         assert!(
             confirmed.is_some(),
-            "spike should be confirmed after sustain + no phantom reversion"
+            "spike should be confirmed immediately after sustain"
         );
         let spike = confirmed.unwrap();
         assert_eq!(spike.direction, Direction::Up);
         assert!(spike.magnitude > Decimal::ZERO);
         assert!(spike.sustained_ms >= cfg.sustain_ms);
-    }
-
-    #[test]
-    fn test_spike_detector_phantom_rejected() {
-        let mut det = SpikeDetector::new(&test_spike_config());
-        let base = 52000.0_f64;
-        let mut ts = 1_700_000_000_000_u64;
-
-        // Warm ATR.
-        for i in 0..30 {
-            det.update(base + (i as f64 % 2.0) * 1.0, ts);
-            ts += 100;
-        }
-
-        let spike_price = base + 500.0;
-        // Start spike candidate.
-        det.update(spike_price, ts);
-        ts += 100;
-        det.update(spike_price, ts);
-        ts += 100;
-        // Sustain check fires (200ms elapsed).
-        det.update(spike_price, ts);
-        ts += 50; // 50ms after sustain — still within phantom window
-
-        // Revert > 50% of the spike delta.
-        let revert_price = base + 80.0; // reverts ~84% of the 500-pt spike
-        let result = det.update(revert_price, ts);
-        assert!(
-            result.is_none(),
-            "phantom reversion should discard the spike"
-        );
     }
 
     #[test]

@@ -8,14 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use crossbeam_channel::Sender;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 use super::tls_helpers::http_post;
 use super::{
-    CLOB_BASE_URL, HEARTBEAT_FAIL_ALERT_THRESHOLD, HEARTBEAT_INTERVAL_MS, MATCHING_ENGINE_RESTART_ET_SECS,
-    MONDAY, PRE_CANCEL_ET_START_SECS,
+    CLOB_BASE_URL, HEARTBEAT_FAIL_ALERT_THRESHOLD, HEARTBEAT_INTERVAL_MS,
+    MATCHING_ENGINE_RESTART_ET_SECS, MONDAY, PRE_CANCEL_ET_START_SECS,
 };
+use crate::types::IngestorEvent;
 
 /// Send `POST /heartbeat` every 5 seconds to the CLOB.
 ///
@@ -27,7 +29,11 @@ use super::{
 /// - Skipped in simulation mode.
 ///
 /// This method is intended to run as a standalone `tokio::spawn`-ed task.
-pub(super) async fn run_heartbeat(shutdown: Arc<AtomicBool>, sim_mode: bool) -> Result<()> {
+pub(super) async fn run_heartbeat(
+    shutdown: Arc<AtomicBool>,
+    sim_mode: bool,
+    tx: Sender<IngestorEvent>,
+) -> Result<()> {
     if sim_mode {
         info!("simulation mode — heartbeat loop skipped");
         std::future::pending::<()>().await;
@@ -58,8 +64,10 @@ pub(super) async fn run_heartbeat(shutdown: Arc<AtomicBool>, sim_mode: bool) -> 
                 heartbeat_id = new_id;
                 consecutive_failures = 0;
 
-                // HeartbeatStatus is informational — log at debug level.
-                // The executor layer listens for this to track CLOB session health.
+                let _ = tx.try_send(IngestorEvent::HeartbeatStatus {
+                    success: true,
+                    latency_ms,
+                });
             }
             Err(e) => {
                 consecutive_failures += 1;
@@ -68,6 +76,11 @@ pub(super) async fn run_heartbeat(shutdown: Arc<AtomicBool>, sim_mode: bool) -> 
                     consecutive_failures,
                     "heartbeat failed"
                 );
+
+                let _ = tx.try_send(IngestorEvent::HeartbeatStatus {
+                    success: false,
+                    latency_ms: 0,
+                });
 
                 if consecutive_failures >= HEARTBEAT_FAIL_ALERT_THRESHOLD {
                     error!(

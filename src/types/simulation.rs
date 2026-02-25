@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::market::Direction;
-use super::order::{ProfitTier, Side};
+use super::order::{ExitReason, ProfitTier, Side};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Data Structs
@@ -54,7 +54,8 @@ impl SimFill {
     ///
     /// Pure function — no side effects.
     pub fn compute_taker_fee(price: Decimal, size: Decimal) -> Decimal {
-        // fee = size * 0.25 * (price * (1 - price))^2
+        // Polymarket 15-min crypto: fee = C × feeRate × (p × (1 - p))^2
+        // where C = shares, feeRate = 0.25, exponent = 2
         let one = Decimal::ONE;
         let factor = Decimal::new(25, 2); // 0.25
         let inner = price * (one - price);
@@ -89,6 +90,14 @@ pub struct SimPosition {
     pub bot_contested: bool,
     /// Whether Leg 2 was triggered by adverse Binance price movement.
     pub adverse_movement_hedge: bool,
+    /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
+    pub favorable_taker: bool,
+    /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
+    pub emergency_maker: bool,
+    /// Why the trade exited. `None` for normal erosion fills.
+    pub exit_reason: Option<ExitReason>,
+    /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
+    pub spike_magnitude: Decimal,
 }
 
 // ─── Simulated Trade (closed) ────────────────────────────────────────────────
@@ -115,15 +124,15 @@ pub struct SimTrade {
     pub alloc_amount: Decimal,
 
     // ── PnL ──────────────────────────────────────────────────────────────
-    /// `leg1.price + leg2.price` (or just `leg1.price` if unhedged).
+    /// `leg1.price + leg2.price` per share (or just `leg1.price` if unhedged).
     pub pair_cost: Decimal,
-    /// `1.0 - pair_cost` for hedged trades. Negative if pair cost > 1.0.
+    /// `(1.0 - pair_cost) * size` in USDC. Negative if pair cost > 1.0.
     pub gross_profit: Decimal,
-    /// Taker fee paid on Leg 2 (0 in normal flow; non-zero only for emergency taker).
+    /// Taker fee paid on Leg 2 in USDC (0 in normal flow; non-zero only for emergency taker).
     pub taker_fee: Decimal,
-    /// `gross_profit - taker_fee`.
+    /// `gross_profit - taker_fee` in USDC.
     pub net_profit: Decimal,
-    /// `net_profit / pair_cost * 100` (percentage).
+    /// `net_profit / (pair_cost * size) * 100` — return on capital deployed.
     pub profit_pct: Decimal,
 
     // ── Resolution ───────────────────────────────────────────────────────
@@ -141,6 +150,14 @@ pub struct SimTrade {
     pub adverse_movement_hedge: bool,
     /// Whether a competitor depth wall was detected during this trade.
     pub bot_contested: bool,
+    /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
+    pub favorable_taker: bool,
+    /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
+    pub emergency_maker: bool,
+    /// Why the trade exited. `None` for normal erosion fills.
+    pub exit_reason: Option<ExitReason>,
+    /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
+    pub spike_magnitude: Decimal,
 
     // ── Timestamps ───────────────────────────────────────────────────────
     /// Epoch ms when the trade was opened (Leg 1 fill).
@@ -170,11 +187,16 @@ pub struct MarketSummary {
     /// Successfully hedged trades.
     pub trades_hedged: u32,
     /// Total trades (filled Leg 1, whether or not hedged).
+    #[allow(dead_code)] // set for Telegram reporting
     pub total_trades: u32,
     /// Smart outbidding events in this market.
     pub walls_outbid: u32,
     /// Emergency taker fills in this market.
     pub emergency_taker_fills: u32,
+    /// Emergency post-only maker fills in this market (zero fee).
+    pub emergency_maker_fills: u32,
+    /// Favorable taker fills in this market (ask < posted bid).
+    pub favorable_taker_fills: u32,
     /// All closed trades in this market (for detail lines).
     pub trades: Vec<SimTrade>,
     /// Total USDC allocated this market.
@@ -215,6 +237,10 @@ pub struct SessionSummary {
     pub timer_deadline_fok: u32,
     /// Total emergency taker fills.
     pub emergency_taker_fills: u32,
+    /// Emergency post-only maker fills (zero fee).
+    pub emergency_maker_fills: u32,
+    /// Favorable taker fills (ask < posted bid).
+    pub favorable_taker_fills: u32,
 
     // ── Confidence tier breakdown ─────────────────────────────────────────
     pub high_conf_trades: u32,
@@ -281,8 +307,16 @@ pub struct SimulationState {
     pub trades_hedged: u32,
     /// Trades hedged via adverse movement protocol (emergency taker).
     pub trades_adverse_hedged: u32,
+    /// Trades hedged via break-even breach FOK.
+    pub trades_break_even_fok: u32,
+    /// Trades hedged via deadline FOK.
+    pub trades_deadline_fok: u32,
     /// Total Leg 2 fills that executed as taker (any emergency reason).
     pub trades_emergency_taker: u32,
+    /// Emergency Leg 2 fills that rested as post-only maker (zero fee).
+    pub emergency_maker_fills: u32,
+    /// Favorable taker fills (ask < posted bid — market-take at better price).
+    pub favorable_taker_fills: u32,
     /// Smart outbidding events (depth walls detected and outbid).
     pub walls_outbid: u32,
 
@@ -305,6 +339,12 @@ pub struct SimulationState {
     pub locked_in_resolution: Decimal,
     /// USDC allocated in the current market window.
     pub cumulative_used: Decimal,
+
+    // ── Per-market counters (reset on rotation) ───────────────────────────
+    /// Leg 1 signals received for the current market window only (resets on rotation).
+    pub current_market_signals: u32,
+    /// Depth walls outbid in the current market window only (resets on rotation).
+    pub current_market_walls: u32,
 
     // ── Session metadata ─────────────────────────────────────────────────
     /// Number of 15-min markets observed this session.
@@ -330,7 +370,11 @@ impl SimulationState {
             leg1_fills: 0,
             trades_hedged: 0,
             trades_adverse_hedged: 0,
+            trades_break_even_fok: 0,
+            trades_deadline_fok: 0,
             trades_emergency_taker: 0,
+            emergency_maker_fills: 0,
+            favorable_taker_fills: 0,
             walls_outbid: 0,
             unfilled_post_only: 0,
             unfilled_liquidity: 0,
@@ -340,18 +384,12 @@ impl SimulationState {
             total_maker_rebates_earned: Decimal::ZERO,
             locked_in_resolution: Decimal::ZERO,
             cumulative_used: Decimal::ZERO,
+            current_market_signals: 0,
+            current_market_walls: 0,
             markets_observed: 0,
             session_start: now_ms,
             starting_balance,
         }
-    }
-
-    /// Leg 1 fill rate as a percentage (0–100).
-    pub fn fill_rate_pct(&self) -> Decimal {
-        if self.signals_detected == 0 {
-            return Decimal::ZERO;
-        }
-        Decimal::from(self.leg1_fills) / Decimal::from(self.signals_detected) * Decimal::ONE_HUNDRED
     }
 
     /// Win rate: fraction of hedged trades that were profitable (percentage 0–100).
@@ -371,6 +409,8 @@ impl SimulationState {
     /// Reset per-market counters on market rotation.
     pub fn on_market_rotation(&mut self) {
         self.cumulative_used = Decimal::ZERO;
+        self.current_market_signals = 0;
+        self.current_market_walls = 0;
         self.markets_observed += 1;
     }
 }
@@ -382,22 +422,26 @@ impl SimulationState {
 
 impl SimulationState {
     /// Increment the signals_detected counter. Called by SimulationExecutor
-    /// for every TradeSignal received from the Engine.
+    /// for Leg 1 TradeSignals only (not Leg 2 erosion signals).
     pub fn record_signal(&mut self) {
         self.signals_detected += 1;
+        self.current_market_signals += 1;
     }
 
     /// Record an unfilled signal (post-only bid not matched — zero cost).
+    #[allow(dead_code)] // used in tests + future executor wiring
     pub fn record_unfilled_post_only(&mut self) {
         self.unfilled_post_only += 1;
     }
 
     /// Record a signal aborted due to insufficient liquidity.
+    #[allow(dead_code)] // used in tests + future executor wiring
     pub fn record_unfilled_liquidity(&mut self) {
         self.unfilled_liquidity += 1;
     }
 
     /// Record a signal aborted due to spread too wide.
+    #[allow(dead_code)] // used in tests + future executor wiring
     pub fn record_unfilled_spread_wide(&mut self) {
         self.unfilled_spread_wide += 1;
     }
@@ -405,6 +449,7 @@ impl SimulationState {
     /// Record a smart outbidding event (depth wall detected and outbid by 1 tick).
     pub fn record_wall_outbid(&mut self) {
         self.walls_outbid += 1;
+        self.current_market_walls += 1;
     }
 
     /// Increment the erosion step counter for an open position.
@@ -416,9 +461,24 @@ impl SimulationState {
     }
 
     /// Mark a position as bot_contested (depth wall was detected during this trade).
+    #[allow(dead_code)] // used in tests + future executor wiring
     pub fn mark_bot_contested(&mut self, position_idx: usize) {
         if let Some(pos) = self.open_positions.get_mut(position_idx) {
             pos.bot_contested = true;
+        }
+    }
+
+    /// Set the spike magnitude on an open position (for QuestDB outcome correlation).
+    pub fn set_spike_magnitude(&mut self, position_idx: usize, magnitude: Decimal) {
+        if let Some(pos) = self.open_positions.get_mut(position_idx) {
+            pos.spike_magnitude = magnitude;
+        }
+    }
+
+    /// Set the exit reason on an open position (for QuestDB loss attribution).
+    pub fn set_exit_reason(&mut self, position_idx: usize, reason: ExitReason) {
+        if let Some(pos) = self.open_positions.get_mut(position_idx) {
+            pos.exit_reason = Some(reason);
         }
     }
 }
@@ -463,6 +523,10 @@ impl SimulationState {
             erosion_steps: 0,
             bot_contested: false,
             adverse_movement_hedge: false,
+            favorable_taker: false,
+            emergency_maker: false,
+            exit_reason: None,
+            spike_magnitude: Decimal::ZERO,
         };
 
         self.open_positions.push(position);
@@ -513,6 +577,46 @@ impl SimulationState {
         }
     }
 
+    /// Record an emergency Leg 2 fill that rested as post-only maker (zero fee).
+    ///
+    /// This happens when the emergency post-only order was accepted by the CLOB
+    /// (did not cross the spread). The position is hedged with zero taker fee.
+    pub fn record_emergency_maker(
+        &mut self,
+        position_idx: usize,
+        fill: SimFill,
+        exit_reason: &ExitReason,
+    ) {
+        if let Some(pos) = self.open_positions.get_mut(position_idx) {
+            pos.emergency_maker = true;
+            pos.leg2 = Some(fill);
+            pos.status = PositionStatus::Hedged;
+            self.trades_hedged += 1;
+            self.emergency_maker_fills += 1;
+            match exit_reason {
+                ExitReason::AdverseMovement => pos.adverse_movement_hedge = true,
+                ExitReason::FavorableTaker => pos.favorable_taker = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// Record a favorable taker Leg 2 fill (opposing ask < posted bid).
+    ///
+    /// Updates the position at `position_idx`, sets status to `Hedged`,
+    /// increments `trades_hedged` and `favorable_taker_fills`, and
+    /// accumulates `total_taker_fees_paid`.
+    pub fn record_favorable_taker(&mut self, position_idx: usize, fill: SimFill) {
+        if let Some(pos) = self.open_positions.get_mut(position_idx) {
+            pos.favorable_taker = true;
+            self.total_taker_fees_paid += fill.taker_fee;
+            pos.leg2 = Some(fill);
+            pos.status = PositionStatus::Hedged;
+            self.trades_hedged += 1;
+            self.favorable_taker_fills += 1;
+        }
+    }
+
     /// Close the position at `position_idx`: remove it from `open_positions`,
     /// compute PnL, push to `closed_trades`, and return the resulting `SimTrade`.
     ///
@@ -532,32 +636,41 @@ impl SimulationState {
         let one = Decimal::ONE;
         let hundred = Decimal::ONE_HUNDRED;
 
+        let size = pos.leg1.size;
+
         let (pair_cost, gross_profit, taker_fee, net_profit, profit_pct, leg2_was_taker) =
             if let Some(ref leg2) = pos.leg2 {
+                // pair_cost: per-share price paid for the full YES+NO pair.
                 let pc = pos.leg1.price + leg2.price;
-                let gp = one - pc;
+                // total USDC deployed on this pair trade.
+                let total_cost = pc * size;
+                // gross profit in USDC: spread captured × number of shares.
+                let gp = (one - pc) * size;
+                // taker_fee is already denominated in USDC.
                 let tf = leg2.taker_fee;
+                // net profit in USDC.
                 let np = gp - tf;
-                let pct = if pc.is_zero() {
+                // % return on capital deployed.
+                let pct = if total_cost.is_zero() {
                     Decimal::ZERO
                 } else {
-                    np / pc * hundred
+                    np / total_cost * hundred
                 };
                 (pc, gp, tf, np, pct, leg2.was_taker)
             } else {
                 // Unhedged: PnL determined by resolution outcome later.
-                // Pessimistic: treat as full loss of leg1 cost.
-                let pc = pos.leg1.price;
-                let gp = -pc;
+                // Pessimistic: treat as full loss of leg1 cost in USDC.
+                let pc = pos.leg1.price; // per-share for reference
+                let gp = -(pos.leg1.price * size); // total USDC spent, as negative
                 (pc, gp, Decimal::ZERO, gp, Decimal::ZERO, false)
             };
 
-        // Update running session PnL.
+        // Update running session PnL (USDC).
         self.total_pnl += net_profit;
 
-        // Return the cost basis to virtual_balance (net of profit/loss).
-        let leg1_cost = pos.leg1.price * pos.leg1.size;
-        self.virtual_balance += leg1_cost + net_profit * pos.leg1.size;
+        // Return the cost basis to virtual_balance (net_profit is already in USDC).
+        let leg1_cost = pos.leg1.price * size;
+        self.virtual_balance += leg1_cost + net_profit;
 
         let trade = SimTrade {
             market_id: pos.market_id,
@@ -578,47 +691,16 @@ impl SimulationState {
             leg2_was_taker,
             adverse_movement_hedge: pos.adverse_movement_hedge,
             bot_contested: pos.bot_contested,
+            favorable_taker: pos.favorable_taker,
+            emergency_maker: pos.emergency_maker,
+            exit_reason: pos.exit_reason,
+            spike_magnitude: pos.spike_magnitude,
             open_timestamp_ms: pos.leg1.timestamp_ms,
             close_timestamp_ms,
         };
 
         self.closed_trades.push(trade.clone());
         Some(trade)
-    }
-
-    /// Record a UMA market resolution event.
-    ///
-    /// Finds all positions (open or closed) with the given `market_id`,
-    /// updates their resolution fields, transitions `AwaitingResolution` positions
-    /// to `Resolved`, and releases `locked_in_resolution` capital.
-    pub fn record_resolution(&mut self, market_id: &str, outcome: &str, timestamp_ms: u64) {
-        // Update any open positions still AwaitingResolution for this market.
-        for pos in &mut self.open_positions {
-            if pos.market_id == market_id && pos.status == PositionStatus::AwaitingResolution {
-                pos.status = PositionStatus::Resolved;
-                // Release the locked capital (leg1 cost).
-                let locked = pos.leg1.price * pos.leg1.size;
-                self.locked_in_resolution = (self.locked_in_resolution - locked).max(Decimal::ZERO);
-                // Compute resolution PnL: winning side returns $1/share.
-                let won = outcome == "YES" && pos.direction == Direction::Up
-                    || outcome == "NO" && pos.direction == Direction::Down;
-                let resolved_profit = if won {
-                    (Decimal::ONE - pos.leg1.price) * pos.leg1.size
-                } else {
-                    -pos.leg1.price * pos.leg1.size
-                };
-                self.virtual_balance += pos.leg1.price * pos.leg1.size + resolved_profit;
-                self.total_pnl += resolved_profit;
-            }
-        }
-
-        // Update any matching closed trades (hedge was already done but resolution outstanding).
-        for trade in &mut self.closed_trades {
-            if trade.market_id == market_id && trade.resolution.is_none() {
-                trade.resolution = Some(outcome.to_owned());
-                trade.resolution_timestamp_ms = Some(timestamp_ms);
-            }
-        }
     }
 
     /// Lock capital for a position awaiting UMA resolution (unhedged at market expiry).
@@ -743,14 +825,12 @@ impl SimulationState {
             trades_hedged: self.trades_hedged,
             total_trades,
             walls_outbid: self.walls_outbid,
-            // Emergency taker breakdown — we have total and adverse.
-            // Break-even and timer deadline are derived from the remainder.
             adverse_movement_fok: self.trades_adverse_hedged,
-            break_even_fok: 0, // tracked separately when implemented in executor
-            timer_deadline_fok: self
-                .trades_emergency_taker
-                .saturating_sub(self.trades_adverse_hedged),
+            break_even_fok: self.trades_break_even_fok,
+            timer_deadline_fok: self.trades_deadline_fok,
             emergency_taker_fills: self.trades_emergency_taker,
+            emergency_maker_fills: self.emergency_maker_fills,
+            favorable_taker_fills: self.favorable_taker_fills,
             high_conf_trades: high_count,
             high_conf_avg_alloc,
             med_conf_trades: med_count,
@@ -798,11 +878,13 @@ impl SimulationState {
             .cloned()
             .collect();
 
-        let signals_detected = self.signals_detected; // simplification: all belong to current market
+        let signals_detected = self.current_market_signals;
         let leg1_fills = trades.len() as u32;
         let trades_hedged = trades.iter().filter(|t| t.leg2.is_some()).count() as u32;
         let emergency_taker_fills = trades.iter().filter(|t| t.leg2_was_taker).count() as u32;
-        let walls_outbid = self.walls_outbid; // scoped to current market by executor
+        let emergency_maker_fills = trades.iter().filter(|t| t.emergency_maker).count() as u32;
+        let favorable_taker_fills = trades.iter().filter(|t| t.favorable_taker).count() as u32;
+        let walls_outbid = self.current_market_walls;
 
         let mut allocation_used = Decimal::ZERO;
         let mut taker_fees_paid = Decimal::ZERO;
@@ -847,6 +929,8 @@ impl SimulationState {
             total_trades: leg1_fills,
             walls_outbid,
             emergency_taker_fills,
+            emergency_maker_fills,
+            favorable_taker_fills,
             trades,
             allocation_used,
             allocation_cap,

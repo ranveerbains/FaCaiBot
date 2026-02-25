@@ -9,17 +9,19 @@ mod utils;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::{Config, Mode};
 use crate::engine::strategy::StrategyEngine;
+use crate::executor::live::LiveExecutor;
 use crate::executor::simulation::SimulationExecutor;
 use crate::gateway::binance::BinanceGateway;
 use crate::gateway::polymarket::PolymarketGateway;
 use crate::gateway::polymarket::PolymarketWsGateway;
 use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
-use crate::storage::hot::HotStorage;
+use crate::types::market::OrderState;
+use crate::types::order::ExecutorFeedback;
 use crate::types::{ExecutorCommand, IngestorEvent};
 
 /// Channel capacity between layers. Sized to absorb burst without back-pressure.
@@ -45,7 +47,7 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     info!(
         mode = ?config.mode,
-        fixed_alloc = %config.fixed_alloc,
+        max_alloc_per_trade = %config.max_alloc_per_trade,
         spike_multiplier = config.bot.spike_detection.multiplier,
         max_spread_pct = config.bot.entry_guards.max_spread_pct,
         stale_book_ms = config.bot.entry_guards.stale_book_ms,
@@ -57,6 +59,9 @@ async fn main() -> Result<()> {
     let (ingestor_tx, ingestor_rx): (Sender<IngestorEvent>, Receiver<IngestorEvent>) =
         bounded(CHANNEL_CAP);
     let (executor_tx, executor_rx): (Sender<ExecutorCommand>, Receiver<ExecutorCommand>) =
+        bounded(CHANNEL_CAP);
+    // Reverse channel: live executor → engine (for CLOB order ID feedback).
+    let (feedback_tx, feedback_rx): (Sender<ExecutorFeedback>, Receiver<ExecutorFeedback>) =
         bounded(CHANNEL_CAP);
 
     // ── Layer 1: Ingestor (The Ear) ─────────────────────────────────
@@ -101,6 +106,8 @@ async fn main() -> Result<()> {
 
             let tx_binance = ingestor_tx_binance;
             let tx_poly_ws = ingestor_tx_poly.clone();
+            let tx_user_ws = ingestor_tx_poly.clone();
+            let tx_heartbeat = ingestor_tx_poly.clone();
             let tx_rotation = ingestor_tx_poly;
             let stale_threshold = ingestor_config.stale_event_threshold_ms;
 
@@ -108,9 +115,8 @@ async fn main() -> Result<()> {
             let (token_tx, token_rx) = tokio::sync::watch::channel(Vec::<String>::new());
 
             // Run all ingestor streams concurrently.
-            // Market rotation discovers 15-min markets via Gamma API and emits
-            // MarketRotation events; the market WS subscribes to live orderbook
-            // data for the active token IDs.
+            // In sim mode, run_user_ws and run_heartbeat park indefinitely
+            // (std::future::pending) without consuming resources.
             tokio::select! {
                 res = binance.run(tx_binance, stale_threshold) => {
                     if let Err(e) = res { error!(error = %e, "binance stream crashed"); }
@@ -120,6 +126,12 @@ async fn main() -> Result<()> {
                 }
                 res = poly_ws.run_market_rotation(tx_rotation, token_tx) => {
                     if let Err(e) = res { error!(error = %e, "polymarket market rotation crashed"); }
+                }
+                res = poly_ws.run_user_ws(tx_user_ws) => {
+                    if let Err(e) = res { error!(error = %e, "polymarket user WS crashed"); }
+                }
+                res = poly_ws.run_heartbeat(tx_heartbeat) => {
+                    if let Err(e) = res { error!(error = %e, "polymarket heartbeat crashed"); }
                 }
             }
         });
@@ -131,7 +143,35 @@ async fn main() -> Result<()> {
     let engine_handle = tokio::spawn(async move {
         let mut engine = StrategyEngine::new(&engine_config);
 
+        // QuestDB analytics — fire-and-forget, not on the execution path.
+        let mut cold = match ColdStorage::new(&engine_config.questdb_url) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                error!(error = %e, "failed to init QuestDB for engine analytics — recording disabled");
+                None
+            }
+        };
+        let mut last_book_snapshot_ms: u64 = 0;
+
         while let Ok(event) = ingestor_rx.recv() {
+            // Drain executor feedback (non-blocking). In live mode, the executor
+            // sends CLOB order IDs back so the engine can match User WS fills.
+            while let Ok(fb) = feedback_rx.try_recv() {
+                match fb {
+                    ExecutorFeedback::OrderPosted {
+                        is_leg2,
+                        order_id,
+                        price,
+                        size,
+                    } => {
+                        engine.on_order_posted(is_leg2, order_id, price, size);
+                    }
+                    ExecutorFeedback::OrderFailed { is_leg2 } => {
+                        engine.on_order_failed(is_leg2);
+                    }
+                }
+            }
+
             // Detect market rotation to notify executor.
             let rotation_condition_id = if let IngestorEvent::MarketRotation {
                 ref condition_id,
@@ -143,7 +183,70 @@ async fn main() -> Result<()> {
                 None
             };
 
+            // Record Binance ticks to QuestDB (fire-and-forget analytics).
+            if let IngestorEvent::BinanceTick(ref tick) = event {
+                if let Some(ref mut c) = cold {
+                    if let Err(e) = c.record_tick(tick) {
+                        debug!(error = %e, "failed to record tick to QuestDB");
+                    }
+                }
+            }
+
             engine.on_event(event);
+
+            // Record Polymarket book snapshots every 5 seconds.
+            let now_ms = epoch_ms();
+            if now_ms.saturating_sub(last_book_snapshot_ms) >= 5_000 {
+                if let Some(ref mut c) = cold {
+                    // Snapshot YES book.
+                    if let Some(ref book) = engine.state().poly_yes_book {
+                        let best_bid = book.best_bid().map(|l| l.price).unwrap_or_default();
+                        let best_ask = book.best_ask().map(|l| l.price).unwrap_or_default();
+                        let bid_depth = book.total_bid_depth();
+                        let ask_depth = book.total_ask_depth();
+                        let spread = best_ask - best_bid;
+                        if let Err(e) = c.record_book_snapshot(
+                            &book.asset_id,
+                            best_bid,
+                            best_ask,
+                            bid_depth,
+                            ask_depth,
+                            spread,
+                        ) {
+                            debug!(error = %e, "failed to record YES book snapshot");
+                        }
+                    }
+                    // Snapshot NO book.
+                    if let Some(ref book) = engine.state().poly_no_book {
+                        let best_bid = book.best_bid().map(|l| l.price).unwrap_or_default();
+                        let best_ask = book.best_ask().map(|l| l.price).unwrap_or_default();
+                        let bid_depth = book.total_bid_depth();
+                        let ask_depth = book.total_ask_depth();
+                        let spread = best_ask - best_bid;
+                        if let Err(e) = c.record_book_snapshot(
+                            &book.asset_id,
+                            best_bid,
+                            best_ask,
+                            bid_depth,
+                            ask_depth,
+                            spread,
+                        ) {
+                            debug!(error = %e, "failed to record NO book snapshot");
+                        }
+                    }
+                }
+                last_book_snapshot_ms = now_ms;
+            }
+
+            // Drain rotation emergency signals (Leg 2 FOK for open positions)
+            // BEFORE sending MarketRotation so the executor hedges the old
+            // position before cleaning up the old market's state.
+            for emergency_signal in engine.take_rotation_emergencies() {
+                if let Err(e) = executor_tx.send(ExecutorCommand::Signal(emergency_signal)) {
+                    error!(error = %e, "failed to send rotation emergency to executor");
+                    break;
+                }
+            }
 
             // Notify executor of market rotation (before evaluating signals,
             // so the executor can close positions before receiving new ones).
@@ -156,15 +259,23 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Send cutoff command once when entering the 3-min window.
+            if let Some((cond_id, market_end_ms)) = engine.take_cutoff_trigger() {
+                if let Err(e) = executor_tx.send(ExecutorCommand::MarketCutoff {
+                    condition_id: cond_id,
+                    market_end_ms,
+                }) {
+                    error!(error = %e, "failed to send MarketCutoff to executor");
+                }
+            }
+
             // In simulation mode, advance the fill state machine before
             // evaluating new signals. This simulates Leg 1/2 fills and
             // resets state after trade completion.
             if engine_mode == Mode::Simulation {
-                if let Some(sim_signal) = engine.advance_simulation() {
-                    if let Err(e) =
-                        executor_tx.send(ExecutorCommand::Signal(sim_signal))
-                    {
-                        error!(error = %e, "failed to send Leg 2 sim fill to executor");
+                for sim_signal in engine.advance_simulation() {
+                    if let Err(e) = executor_tx.send(ExecutorCommand::Signal(sim_signal)) {
+                        error!(error = %e, "failed to send sim fill to executor");
                         break;
                     }
                 }
@@ -180,10 +291,35 @@ async fn main() -> Result<()> {
 
             // Evaluate Leg 2 signals (erosion cascade, emergency hedge).
             if let Some(signal) = engine.evaluate_leg2() {
-                if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
-                    error!(error = %e, "failed to send Leg 2 signal to executor");
-                    break;
+                let should_send = if engine_mode == Mode::Simulation {
+                    // Sim: only erosion steps. Emergencies handled by advance_simulation().
+                    signal.exit_reason.is_none()
+                } else {
+                    // Live: ALL signals (including emergency FOK) must reach executor.
+                    true
+                };
+                if should_send {
+                    if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
+                        error!(error = %e, "failed to send Leg 2 signal to executor");
+                        break;
+                    }
                 }
+            }
+
+            // In live mode, detect trade completion (both legs filled via User WS).
+            if engine_mode == Mode::Live
+                && matches!(engine.state().leg1_state, OrderState::Filled { .. })
+                && matches!(engine.state().leg2_state, OrderState::Filled { .. })
+            {
+                engine.on_trade_complete();
+            }
+
+            engine.check_diagnostic();
+        }
+        // Flush any remaining buffered ticks before exiting.
+        if let Some(ref mut c) = cold {
+            if let Err(e) = c.flush() {
+                error!(error = %e, "failed to flush QuestDB on engine shutdown");
             }
         }
         info!("engine loop exited");
@@ -212,8 +348,12 @@ async fn main() -> Result<()> {
                 };
 
                 let now_ms = epoch_ms();
-                let sim_executor =
-                    SimulationExecutor::new(reporter, cold, executor_config.fixed_alloc, now_ms);
+                let sim_executor = SimulationExecutor::new(
+                    reporter,
+                    cold,
+                    executor_config.max_alloc_per_trade,
+                    now_ms,
+                );
 
                 if let Err(e) = sim_executor.run(executor_rx).await {
                     error!(error = %e, "simulation executor crashed");
@@ -223,78 +363,23 @@ async fn main() -> Result<()> {
                 info!("starting live executor");
 
                 let poly = PolymarketGateway::new(executor_config.clone());
-                let _hot = match HotStorage::new(&executor_config.redis_url) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        error!(error = %e, "failed to init Redis");
-                        return;
-                    }
-                };
-                let mut cold = match ColdStorage::new(&executor_config.questdb_url) {
+                let cold = match ColdStorage::new(&executor_config.questdb_url) {
                     Ok(c) => c,
                     Err(e) => {
                         error!(error = %e, "failed to init QuestDB");
                         return;
                     }
                 };
+                let reporter = TelegramReporter::new(
+                    executor_config.telegram_bot_token.clone(),
+                    executor_config.telegram_chat_id.clone(),
+                );
 
-                while let Ok(cmd) = executor_rx.recv() {
-                    let signal = match cmd {
-                        ExecutorCommand::Signal(s) => s,
-                        ExecutorCommand::MarketRotation { .. } => continue,
-                    };
+                let live_executor = LiveExecutor::new(poly, feedback_tx, reporter, cold);
 
-                    info!(
-                        side = ?signal.side,
-                        token = %signal.token_id,
-                        price = %signal.price,
-                        size = %signal.size,
-                        is_leg2 = signal.is_leg2,
-                        confidence = %signal.confidence,
-                        tier = signal.profit_target_tier.label(),
-                        "executing trade signal"
-                    );
-
-                    let order = crate::types::OrderRequest::post_only_gtc(
-                        signal.token_id.clone(),
-                        signal.side,
-                        signal.price,
-                        signal.size,
-                    );
-
-                    match poly.place_order(&order).await {
-                        Ok(resp) => {
-                            info!(
-                                order_id = %resp.order_id,
-                                status = ?resp.status,
-                                "order placed"
-                            );
-                        }
-                        Err(e) => {
-                            error!(error = %e, "order placement failed");
-                        }
-                    }
-
-                    // Record signal to QuestDB.
-                    let direction_str = match signal.direction {
-                        crate::types::market::Direction::Up => "YES",
-                        crate::types::market::Direction::Down => "NO",
-                    };
-                    if let Err(e) = cold.record_signal(
-                        &signal.token_id,
-                        direction_str,
-                        signal.confidence,
-                        signal.spike_info.magnitude,
-                        rust_decimal::Decimal::ZERO, // ATR from engine state
-                        rust_decimal::Decimal::ZERO, // book depth
-                        0,                           // time remaining
-                        signal.alloc_amount,
-                        "submitted",
-                    ) {
-                        warn!(error = %e, "failed to record signal to QuestDB");
-                    }
+                if let Err(e) = live_executor.run(executor_rx).await {
+                    error!(error = %e, "live executor crashed");
                 }
-                info!("live executor loop exited");
             }
         }
     });

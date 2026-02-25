@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use crate::types::BinanceTick;
+use crate::types::order::ExitReason;
 use crate::types::simulation::SimTrade;
 
 // ─── Flush Thresholds ─────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ const DEFAULT_ILP_PORT: u16 = 9009;
 // ─── All QuestDB Tables ───────────────────────────────────────────────────────
 
 /// All tables that the bot writes to — used by the automated pruning task.
+#[allow(dead_code)] // used by prune_old_partitions (wired when tokio-postgres is added)
 const ALL_TABLES: &[&str] = &[
     "binance_ticks",
     "poly_book_snapshots",
@@ -243,6 +245,7 @@ impl ColdStorage {
     ///
     /// Flushes immediately — trades are rare, durability matters more than throughput.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // live mode trade recording
     pub fn record_trade(
         &mut self,
         market_id: &str,
@@ -357,6 +360,13 @@ impl ColdStorage {
             .symbol("direction", &direction_str)?
             .symbol("profit_tier", profit_tier_label)?
             .symbol("resolution", resolution_str)?
+            .symbol("exit_reason", match trade.exit_reason {
+                Some(ExitReason::AdverseMovement) => "AdverseMovement",
+                Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+                Some(ExitReason::MarketExpiry) => "MarketExpiry",
+                Some(ExitReason::FavorableTaker) => "FavorableTaker",
+                None => "NormalErosion",
+            })?
             .column_f64("leg1_price", trade.leg1.price.try_into().unwrap_or(0.0))?
             .column_f64("leg2_price", leg2_price)?
             .column_f64("leg1_size", trade.leg1.size.try_into().unwrap_or(0.0))?
@@ -375,6 +385,9 @@ impl ColdStorage {
             .column_bool("bot_contested", trade.bot_contested)?
             .column_bool("leg1_was_partial", trade.leg1.was_partial)?
             .column_bool("leg2_was_partial", leg2_was_partial)?
+            .column_bool("favorable_taker", trade.favorable_taker)?
+            .column_bool("emergency_maker", trade.emergency_maker)?
+            .column_f64("spike_magnitude", trade.spike_magnitude.try_into().unwrap_or(0.0))?
             .column_i64("open_ts_ms", trade.open_timestamp_ms as i64)?
             .column_i64("close_ts_ms", trade.close_timestamp_ms as i64)?
             .at_now()?;
@@ -409,11 +422,11 @@ impl Drop for ColdStorage {
 
 // ─── Automated Partition Pruning ──────────────────────────────────────────────
 
-/// Drop QuestDB partitions older than 24 hours across all tables.
+/// Drop QuestDB partitions older than 7 days across all tables.
 ///
 /// Connects to QuestDB via the **Postgres wire protocol** (port 8812) and runs:
 /// ```sql
-/// ALTER TABLE {table} DROP PARTITION WHERE timestamp < dateadd('h', -24, now())
+/// ALTER TABLE {table} DROP PARTITION WHERE timestamp < dateadd('d', -7, now())
 /// ```
 /// for each table in `ALL_TABLES`.
 ///
@@ -438,6 +451,7 @@ impl Drop for ColdStorage {
 ///
 /// Until `tokio-postgres` is added to `Cargo.toml`, this function is a
 /// **TODO stub** that logs the intent without executing any SQL.
+#[allow(dead_code)] // stub — wired when tokio-postgres is added
 pub async fn prune_old_partitions(questdb_pg_url: &str) -> Result<()> {
     // TODO: Uncomment and use once `tokio-postgres` is added to Cargo.toml:
     //
@@ -457,7 +471,7 @@ pub async fn prune_old_partitions(questdb_pg_url: &str) -> Result<()> {
     //
     // for table in ALL_TABLES {
     //     let sql = format!(
-    //         "ALTER TABLE {} DROP PARTITION WHERE timestamp < dateadd('h', -24, now())",
+    //         "ALTER TABLE {} DROP PARTITION WHERE timestamp < dateadd('d', -7, now())",
     //         table
     //     );
     //     match client.execute(sql.as_str(), &[]).await {
@@ -476,7 +490,7 @@ pub async fn prune_old_partitions(questdb_pg_url: &str) -> Result<()> {
         url = questdb_pg_url,
         tables = ?ALL_TABLES,
         "STUB: prune_old_partitions called — add tokio-postgres to Cargo.toml to enable \
-         ALTER TABLE ... DROP PARTITION WHERE timestamp < dateadd('h', -24, now())"
+         ALTER TABLE ... DROP PARTITION WHERE timestamp < dateadd('d', -7, now())"
     );
     Ok(())
 }

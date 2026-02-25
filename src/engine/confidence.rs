@@ -1,39 +1,31 @@
 //! Confidence scoring for trade signals.
 //!
-//! Computes a 4-factor confidence score in [0.0, 1.0] from spike magnitude,
-//! sustain duration, book depth, and time remaining.
+//! Computes a confidence score in [0.0, 0.8] from three factors.
+//! Sustain is excluded — all confirmed spikes already passed the sustain gate,
+//! so it adds a constant offset with no discriminative value.
 
 use rust_decimal::Decimal;
 
-/// Compute the 4-factor confidence score in [0.0, 1.0].
+/// Compute the 3-factor confidence score in [0.0, 0.8].
 ///
 /// ```text
-/// confidence = 0.4 * min(spike_magnitude / ATR, 1.0)
-///            + 0.2 * min(sustained_ms / SUSTAIN_WINDOW_MS, 1.0)
+/// confidence = 0.4 * min(spike_magnitude / ATR, 1.0)   [spike quality vs recent volatility]
 ///            + 0.2 * min(poly_book_depth / avg_book_depth, 1.0)
 ///            + 0.2 * (time_remaining_secs / 900.0)
 /// ```
+///
+/// Thresholds: HIGH >= 0.6 | MED >= 0.3 | LOW < 0.3
 pub fn compute_confidence(
     spike_magnitude: Decimal,
     atr: Decimal,
-    sustained_ms: u64,
     poly_book_depth: Decimal,
     avg_book_depth: Decimal,
     time_remaining_secs: u64,
-    sustain_window_ms: u64,
 ) -> Decimal {
     let f1 = if atr.is_zero() {
         Decimal::ONE
     } else {
         (spike_magnitude / atr).min(Decimal::ONE)
-    };
-    let f2 = {
-        let w = Decimal::from(sustain_window_ms);
-        if w.is_zero() {
-            Decimal::ONE
-        } else {
-            (Decimal::from(sustained_ms) / w).min(Decimal::ONE)
-        }
     };
     let f3 = if avg_book_depth.is_zero() {
         Decimal::ONE
@@ -42,10 +34,7 @@ pub fn compute_confidence(
     };
     let f4 = (Decimal::from(time_remaining_secs) / Decimal::from(900u64)).min(Decimal::ONE);
 
-    (Decimal::new(4, 1) * f1
-        + Decimal::new(2, 1) * f2
-        + Decimal::new(2, 1) * f3
-        + Decimal::new(2, 1) * f4)
+    (Decimal::new(4, 1) * f1 + Decimal::new(2, 1) * f3 + Decimal::new(2, 1) * f4)
         .min(Decimal::ONE)
         .max(Decimal::ZERO)
 }
@@ -67,43 +56,34 @@ mod tests {
     #[test]
     fn test_confidence_all_max() {
         let c = compute_confidence(
-            Decimal::new(1, 0),  // spike = 1
-            Decimal::new(1, 0),  // atr = 1 → factor = 1.0
-            1000,                // sustained = 1000ms
+            Decimal::new(1, 0), // spike = 1
+            Decimal::new(1, 0), // atr = 1 → f1 = 1.0
             Decimal::new(100, 0),
             Decimal::new(100, 0),
-            900,                 // full 15 min
-            1000,
+            900, // full 15 min
         );
-        assert_eq!(c, Decimal::ONE);
+        // f1=1.0, f3=1.0, f4=1.0 → 0.4 + 0.2 + 0.2 = 0.8
+        assert_eq!(c, Decimal::new(8, 1));
     }
 
     #[test]
     fn test_confidence_all_zero() {
-        let c = compute_confidence(
-            Decimal::ZERO,
-            Decimal::ONE,
-            0,
-            Decimal::ZERO,
-            Decimal::ONE,
-            0,
-            1000,
-        );
+        let c = compute_confidence(Decimal::ZERO, Decimal::ONE, Decimal::ZERO, Decimal::ONE, 0);
+        // f1=0, f3=0, f4=0 → 0.0
         assert_eq!(c, Decimal::ZERO);
     }
 
     #[test]
     fn test_confidence_clamped() {
         let c = compute_confidence(
-            Decimal::new(10, 0), // 10x the ATR
+            Decimal::new(10, 0), // 10x the ATR → f1 clamped to 1.0
             Decimal::ONE,
-            5000,
             Decimal::new(500, 0),
             Decimal::new(100, 0),
             1800,
-            1000,
         );
-        assert_eq!(c, Decimal::ONE);
+        // f1=1.0, f3=1.0 (capped), f4=1.0 (capped) → 0.4 + 0.2 + 0.2 = 0.8
+        assert_eq!(c, Decimal::new(8, 1));
     }
 
     #[test]

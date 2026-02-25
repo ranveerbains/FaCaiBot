@@ -25,10 +25,7 @@ crossbeam-channel = "0.5"
 # Zero-copy serialization for internal messaging
 rkyv = { version = "0.8", features = ["alloc"] }
 
-# Hot storage — Redis with async tokio support
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
-
-# Cold storage — QuestDB time-series ingestion
+# Cold storage — QuestDB time-series ingestion (analytics only, not on execution path)
 questdb-rs = "4.0"
 
 # Fixed-point arithmetic (no floats)

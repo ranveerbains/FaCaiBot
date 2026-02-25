@@ -43,14 +43,17 @@ use sha2::Sha256;
 /// CTF Exchange contract — standard (non-negative-risk) markets.
 ///
 /// Source: Polymarket documentation / on-chain deployment.
+#[allow(dead_code)] // live mode EIP-712 order signing
 pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 
 /// Neg-Risk CTF Exchange contract — binary markets with negative risk.
 ///
 /// Used for most binary prediction markets including BTC/ETH 15-min markets.
+#[allow(dead_code)] // live mode EIP-712 order signing
 pub const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
 
 /// Polygon mainnet chain ID.
+#[allow(dead_code)] // live mode EIP-712 order signing
 pub const CHAIN_ID: u64 = 137;
 
 // ─── Signer construction ──────────────────────────────────────────────────────
