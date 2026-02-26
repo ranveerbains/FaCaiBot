@@ -2,7 +2,7 @@
 //!
 //! This module is split into focused sub-modules:
 //!
-//! - [`rest`] — CLOB REST gateway: EIP-712 signing, order placement, book queries.
+//! - [`rest`] — CLOB REST gateway: SDK-based order placement/cancel, public book queries.
 //! - [`market_ws`] — Public Market WebSocket: book, price, tick events.
 //! - [`user_ws`] — Authenticated User WebSocket: trade fills, order events.
 //! - [`heartbeat`] — `POST /heartbeat` loop (every 5 seconds).

@@ -108,7 +108,7 @@ impl OrderBook {
 
 // ─── Binance Structs ─────────────────────────────────────────────────────────
 
-/// A ticker snapshot from Binance `@ticker` stream.
+/// A best bid/ask snapshot from Binance SBE `@bestBidAsk` stream (real-time).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceTick {
     pub symbol: String,
@@ -126,7 +126,7 @@ impl BinanceTick {
     }
 }
 
-/// Top-20 depth snapshot from Binance `@depth20@100ms` stream.
+/// Top-20 depth snapshot from Binance SBE `@depth20` stream (50ms cadence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceDepth {
     pub symbol: String,
@@ -344,14 +344,22 @@ pub enum IngestorEvent {
     },
 
     // ── Binance ──────────────────────────────────────────────────────────
-    /// Ticker update from `@ticker` stream.
+    /// Best bid/ask update from SBE `@bestBidAsk` stream (real-time).
     BinanceTick(BinanceTick),
 
-    /// Depth snapshot from `@depth20@100ms` stream.
+    /// Depth snapshot from SBE `@depth20` stream (50ms cadence).
     BinanceDepth(BinanceDepth),
 
-    /// Confirmed spike from the Binance spike detector (all 6 gates passed).
+    /// Spike candidate from the Binance spike detector (ATR + magnitude passed).
+    /// Emitted immediately on the initial big tick — triggers speculative Leg 1 posting.
+    SpikeCandidate(SpikeInfo),
+
+    /// Spike confirmed after sustain + momentum check passed.
+    /// Gates sim Leg 1 fills; live mode no-op (fills come from User WS).
     SpikeConfirmed(SpikeInfo),
+
+    /// Spike candidate failed momentum/sustain check — cancel speculative Leg 1.
+    SpikeFailed { timestamp_ms: u64 },
 
     // ── Lifecycle ────────────────────────────────────────────────────────
     /// Emitted when the active 15-min market rotates (anticipatory loading complete).

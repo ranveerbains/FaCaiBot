@@ -1,0 +1,870 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" type="device" version="24.0.0">
+  <!-- PAGE 1: Main Trading Flow -->
+  <diagram id="main-trading-flow" name="Main Trading Flow">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title1" value="&lt;b&gt;FaCaiBot — Main Trading Flow&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=20;" vertex="1" parent="1">
+          <mxGeometry x="560" y="20" width="380" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle1" value="Happy-path trade lifecycle from spike detection to trade completion" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="490" y="55" width="430" height="25" as="geometry"/>
+        </mxCell>
+
+        <!-- Swimlane headers -->
+        <mxCell id="swim_ingestor" value="&lt;b&gt;INGESTOR&lt;/b&gt;&lt;br&gt;(Dedicated OS Thread)" style="shape=mxgraph.basic.rect;fillColor=#E8F5E9;strokeColor=#4CAF50;fontStyle=1;fontSize=11;verticalAlign=middle;align=center;rounded=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="80" y="95" width="200" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="swim_engine" value="&lt;b&gt;ENGINE&lt;/b&gt;&lt;br&gt;(Tokio Task)" style="shape=mxgraph.basic.rect;fillColor=#E3F2FD;strokeColor=#2196F3;fontStyle=1;fontSize=11;verticalAlign=middle;align=center;rounded=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="380" y="95" width="200" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="swim_executor" value="&lt;b&gt;EXECUTOR&lt;/b&gt;&lt;br&gt;(Tokio Task)" style="shape=mxgraph.basic.rect;fillColor=#F3E5F5;strokeColor=#9C27B0;fontStyle=1;fontSize=11;verticalAlign=middle;align=center;rounded=1;arcSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="95" width="200" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== INGESTOR LAYER ===== -->
+
+        <!-- Binance WS -->
+        <mxCell id="binance_ws" value="&lt;b&gt;Binance WS&lt;/b&gt;&lt;br&gt;@depth20@100ms + @ticker" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#4CAF50;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="90" y="170" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Spike Detector -->
+        <mxCell id="spike_detector" value="&lt;b&gt;Spike Detector&lt;/b&gt;&lt;br&gt;6-gate pipeline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#4CAF50;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="90" y="250" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- 6 gates detail -->
+        <mxCell id="gates_detail" value="1. ATR warmup (10 ticks)&lt;br&gt;2. |delta| &gt; 2× ATR&lt;br&gt;3. Window timeout (350ms)&lt;br&gt;4. Sustain (300ms)&lt;br&gt;5. Momentum ratio ≥ 50%&lt;br&gt;6. Magnitude ≥ 1 bp" style="text;html=1;align=left;verticalAlign=top;resizable=0;points=[];autosize=1;strokeColor=#BDBDBD;fillColor=#F5F5F5;fontSize=9;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="10" y="320" width="160" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- SpikeConfirmed event -->
+        <mxCell id="spike_confirmed" value="&lt;b&gt;SpikeConfirmed&lt;/b&gt;&lt;br&gt;direction, magnitude" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;size=15;" vertex="1" parent="1">
+          <mxGeometry x="100" y="445" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Polymarket WS -->
+        <mxCell id="poly_ws" value="&lt;b&gt;Polymarket WS&lt;/b&gt;&lt;br&gt;Books + Prices" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#4CAF50;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="90" y="530" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows in ingestor -->
+        <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="binance_ws" target="spike_detector" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a2" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="spike_detector" target="spike_confirmed" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a2_label" value="Confirmed" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a2">
+          <mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Reject from spike -->
+        <mxCell id="spike_reject" value="Rejected&lt;br&gt;(most ticks)" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontColor=#F44336;" vertex="1" parent="1">
+          <mxGeometry x="270" y="258" width="80" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_reject" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#F44336;dashed=1;" edge="1" source="spike_detector" target="spike_reject" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== ENGINE LAYER ===== -->
+
+        <!-- Evaluate (Leg 1) -->
+        <mxCell id="evaluate" value="&lt;b&gt;evaluate()&lt;/b&gt;&lt;br&gt;10 entry guards" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="395" y="170" width="170" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Guard fail -->
+        <mxCell id="guard_fail" value="Guard fail&lt;br&gt;(spike cleared)" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontColor=#F44336;" vertex="1" parent="1">
+          <mxGeometry x="570" y="195" width="90" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_guard_fail" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#F44336;dashed=1;" edge="1" source="evaluate" target="guard_fail" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Confidence scoring -->
+        <mxCell id="confidence" value="&lt;b&gt;Confidence Scoring&lt;/b&gt;&lt;br&gt;HIGH ≥0.6 / MED ≥0.3 / LOW" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="300" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Leg 1 Signal -->
+        <mxCell id="leg1_signal" value="&lt;b&gt;Leg 1 Signal&lt;/b&gt;&lt;br&gt;Buy YES/NO, post-only GTC" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;fontColor=#1B5E20;" vertex="1" parent="1">
+          <mxGeometry x="400" y="380" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Spike to evaluate -->
+        <mxCell id="a3" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="spike_confirmed" target="evaluate" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="300" y="470"/>
+              <mxPoint x="300" y="220"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a3_label" value="via crossbeam" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#888888;" vertex="1" connectable="0" parent="a3">
+          <mxGeometry x="-0.4" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="evaluate" target="confidence" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a4_label" value="Guards pass" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#4CAF50;" vertex="1" connectable="0" parent="a4">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+        <mxCell id="a5" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="confidence" target="leg1_signal" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== EXECUTOR LAYER — Sim vs Live split ===== -->
+
+        <!-- SIM path -->
+        <mxCell id="sim_leg1" value="&lt;b&gt;[SIM] advance_simulation()&lt;/b&gt;&lt;br&gt;Post-only valid + depth → fill" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="690" y="170" width="190" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- LIVE path -->
+        <mxCell id="live_leg1" value="&lt;b&gt;[LIVE] CLOB Post-Only GTC&lt;/b&gt;&lt;br&gt;→ OrderPosted feedback&lt;br&gt;→ User WS fill notification" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="690" y="250" width="190" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Leg 1 signal to executor -->
+        <mxCell id="a6_sim" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;dashed=1;" edge="1" source="leg1_signal" target="sim_leg1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="405"/>
+              <mxPoint x="620" y="195"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a6_live" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#7B1FA2;" edge="1" source="leg1_signal" target="live_leg1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="640" y="405"/>
+              <mxPoint x="640" y="280"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Leg 1 Filled -->
+        <mxCell id="leg1_filled" value="&lt;b&gt;Leg 1 Filled&lt;/b&gt;&lt;br&gt;init_erosion()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=11;fontColor=#1B5E20;" vertex="1" parent="1">
+          <mxGeometry x="400" y="470" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="a7_sim" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;dashed=1;" edge="1" source="sim_leg1" target="leg1_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="900" y="195"/>
+              <mxPoint x="900" y="440"/>
+              <mxPoint x="480" y="440"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a7_live" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#7B1FA2;" edge="1" source="live_leg1" target="leg1_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="920" y="280"/>
+              <mxPoint x="920" y="450"/>
+              <mxPoint x="480" y="450"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Feedback arrow (live only) -->
+        <mxCell id="feedback_arrow" value="ExecutorFeedback&lt;br&gt;(order IDs)" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#7B1FA2;dashed=1;dashPattern=5 5;fontSize=9;" edge="1" source="live_leg1" target="leg1_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="660" y="310"/>
+              <mxPoint x="660" y="495"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Erosion Cascade -->
+        <mxCell id="erosion" value="&lt;b&gt;evaluate_leg2()&lt;/b&gt;&lt;br&gt;Erosion Cascade&lt;br&gt;5 steps, ~6.8s to break-even" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="400" y="560" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="a8" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="leg1_filled" target="erosion" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Emergency branch -->
+        <mxCell id="emergency_branch" value="&lt;b&gt;Emergency Exit?&lt;/b&gt;&lt;br&gt;Adverse / BE Breach /&lt;br&gt;Exhausted / Expiry" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="620" y="545" width="160" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_emerg" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#E65100;" edge="1" source="erosion" target="emergency_branch" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_emerg_label" value="Triggered" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#E65100;" vertex="1" connectable="0" parent="a_emerg">
+          <mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Emergency executor -->
+        <mxCell id="emergency_exec" value="&lt;b&gt;Post-Only First&lt;/b&gt;&lt;br&gt;→ FOK Fallback&lt;br&gt;(after 3 attempts)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="830" y="555" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_emerg2" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="emergency_branch" target="emergency_exec" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_emerg2_label" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_emerg2">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Erosion signal to executor -->
+        <mxCell id="erosion_signal" value="&lt;b&gt;Leg 2 Signal&lt;/b&gt;&lt;br&gt;Cancel-replace at eroded price" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;fontColor=#1B5E20;" vertex="1" parent="1">
+          <mxGeometry x="400" y="670" width="160" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a9" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="erosion" target="erosion_signal" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a9_label" value="Normal erosion" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#4CAF50;" vertex="1" connectable="0" parent="a9">
+          <mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- SIM Leg 2 fill -->
+        <mxCell id="sim_leg2" value="&lt;b&gt;[SIM] advance_simulation()&lt;/b&gt;&lt;br&gt;ask ≤ posted → fill" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="690" y="660" width="190" height="45" as="geometry"/>
+        </mxCell>
+        <!-- LIVE Leg 2 fill -->
+        <mxCell id="live_leg2" value="&lt;b&gt;[LIVE] CLOB Cancel-Replace&lt;/b&gt;&lt;br&gt;→ User WS fill" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="690" y="720" width="190" height="45" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="a10_sim" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;dashed=1;" edge="1" source="erosion_signal" target="sim_leg2" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a10_live" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#7B1FA2;" edge="1" source="erosion_signal" target="live_leg2" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Leg 2 Filled -->
+        <mxCell id="leg2_filled" value="&lt;b&gt;Leg 2 Filled&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=12;fontColor=#1B5E20;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="420" y="790" width="120" height="40" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="a11_sim" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#1565C0;dashed=1;" edge="1" source="sim_leg2" target="leg2_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="940" y="683"/>
+              <mxPoint x="940" y="810"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a11_live" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#7B1FA2;" edge="1" source="live_leg2" target="leg2_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="960" y="743"/>
+              <mxPoint x="960" y="810"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Emergency fills also lead to Leg 2 Filled -->
+        <mxCell id="a_emerg_fill" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;dashed=1;" edge="1" source="emergency_exec" target="leg2_filled" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="980" y="585"/>
+              <mxPoint x="980" y="810"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a_emerg_fill_label" value="Fill" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_emerg_fill">
+          <mxGeometry x="0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Trade Complete -->
+        <mxCell id="trade_complete" value="&lt;b&gt;Trade Complete&lt;/b&gt;&lt;br&gt;PnL computed, state reset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=11;fontColor=#1B5E20;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="390" y="870" width="180" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a12" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="leg2_filled" target="trade_complete" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Loop back -->
+        <mxCell id="ready" value="&lt;b&gt;Ready for Next Spike&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="400" y="960" width="160" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="a13" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="trade_complete" target="ready" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Polymarket WS feeds to engine -->
+        <mxCell id="a_poly" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#4CAF50;" edge="1" source="poly_ws" target="erosion" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="300" y="555"/>
+              <mxPoint x="300" y="590"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a_poly_label" value="Book updates&lt;br&gt;(MarketState)" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#888888;" vertex="1" connectable="0" parent="a_poly">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="legend_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#E0E0E0;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="100" width="210" height="200" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="105" width="60" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_green" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="135" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_green_t" value="Happy path (normal fill)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="130" width="150" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_orange" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="160" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_orange_t" value="Emergency exits" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="155" width="110" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_blue" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="185" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_blue_t" value="Simulation path (dashed)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="180" width="150" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_purple" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#7B1FA2;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="210" width="20" height="15" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_purple_t" value="Live path (solid)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="205" width="120" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_diamond" value="◆" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="230" width="30" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_diamond_t" value="Decision point" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="230" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_hex" value="⬡" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1065" y="255" width="30" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="leg_hex_t" value="Event / message" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="255" width="110" height="25" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <!-- PAGE 2: Emergency Exits & Edge Cases -->
+  <diagram id="emergency-exits" name="Emergency Exits &amp; Edge Cases">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title2" value="&lt;b&gt;Emergency Exits &amp; Edge Cases&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=20;" vertex="1" parent="1">
+          <mxGeometry x="520" y="20" width="360" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle2" value="Decision tree from evaluate_leg2() — all paths from erosion evaluation" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="450" y="55" width="430" height="25" as="geometry"/>
+        </mxCell>
+
+        <!-- Entry point -->
+        <mxCell id="entry" value="&lt;b&gt;evaluate_leg2() called&lt;/b&gt;&lt;br&gt;Leg 1 is Filled, erosion active" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="580" y="100" width="220" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Decision 1: Emergency already submitted? -->
+        <mxCell id="d1" value="&lt;b&gt;Emergency&lt;br&gt;already submitted?&lt;/b&gt;" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="600" y="190" width="180" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="entry" target="d1" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Repost loop -->
+        <mxCell id="repost_loop" value="&lt;b&gt;Emergency Repost Loop&lt;/b&gt;&lt;br&gt;Every 500ms at current best_ask - tick" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="180" width="220" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e1_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="d1" target="repost_loop" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e1_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_e1_yes">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Repost count check -->
+        <mxCell id="d_repost" value="&lt;b&gt;Attempts ≥ 3?&lt;/b&gt;" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="920" y="265" width="140" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_repost1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="repost_loop" target="d_repost" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="postonly_repost" value="&lt;b&gt;Post-Only Repost&lt;/b&gt;&lt;br&gt;best_ask - 1 tick&lt;br&gt;(zero fee)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="200" width="160" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_repost_no" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#4CAF50;" edge="1" source="d_repost" target="postonly_repost" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1080" y="300"/>
+              <mxPoint x="1080" y="225"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a_repost_no_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#4CAF50;" vertex="1" connectable="0" parent="a_repost_no">
+          <mxGeometry x="-0.5" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <mxCell id="fok_fallback" value="&lt;b&gt;FOK at best_ask&lt;/b&gt;&lt;br&gt;Crosses spread&lt;br&gt;Guaranteed fill (taker fee)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="280" width="160" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_repost_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="d_repost" target="fok_fallback" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1080" y="300"/>
+              <mxPoint x="1080" y="308"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="a_repost_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_repost_yes">
+          <mxGeometry x="-0.5" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Decision 2: Adverse movement? -->
+        <mxCell id="d2" value="&lt;b&gt;Adverse movement?&lt;/b&gt;&lt;br&gt;Binance reversal &gt; 0.1%&lt;br&gt;from price at Leg 1 fill" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E65100;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="575" y="320" width="230" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e2" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="d1" target="d2" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e2_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a_e2">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Adverse emergency -->
+        <mxCell id="adverse_emerg" value="&lt;b&gt;ADVERSE MOVEMENT&lt;/b&gt;&lt;br&gt;emergency_submitted = true&lt;br&gt;exit_reason = AdverseMovement&lt;br&gt;&lt;br&gt;Post-only at best_ask - tick&lt;br&gt;Zero grace period" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="100" y="325" width="220" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d2_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="d2" target="adverse_emerg" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d2_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_d2_yes">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Decision 3: Break-even breach? -->
+        <mxCell id="d3" value="&lt;b&gt;Break-even breach?&lt;/b&gt;&lt;br&gt;steps ≥ 1 AND&lt;br&gt;ask worsened &gt; 2 ticks AND&lt;br&gt;pair cost ≥ $1.00" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E65100;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="565" y="470" width="250" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e3" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="d2" target="d3" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e3_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a_e3">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- BE breach emergency -->
+        <mxCell id="be_emerg" value="&lt;b&gt;BREAK-EVEN BREACH&lt;/b&gt;&lt;br&gt;emergency_submitted = true&lt;br&gt;exit_reason = BreakEvenBreach&lt;br&gt;&lt;br&gt;Post-only at best_ask - tick&lt;br&gt;Gated behind steps ≥ 1 (~3.5s)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="100" y="475" width="230" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d3_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="d3" target="be_emerg" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d3_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_d3_yes">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Decision 4: Erosion exhausted? -->
+        <mxCell id="d4" value="&lt;b&gt;Erosion exhausted?&lt;/b&gt;&lt;br&gt;steps ≥ 5 (MAX)" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#E65100;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="600" y="620" width="180" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="d3" target="d4" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e4_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a_e4">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Exhaustion emergency -->
+        <mxCell id="exhaust_emerg" value="&lt;b&gt;EROSION EXHAUSTED&lt;/b&gt;&lt;br&gt;All 5 steps applied, profit = 0&lt;br&gt;exit_reason = BreakEvenBreach&lt;br&gt;&lt;br&gt;Post-only at best_ask - tick" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="100" y="615" width="230" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d4_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#C62828;" edge="1" source="d4" target="exhaust_emerg" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_d4_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#C62828;" vertex="1" connectable="0" parent="a_d4_yes">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Decision 5: Interval gate -->
+        <mxCell id="d5" value="&lt;b&gt;Interval elapsed?&lt;/b&gt;&lt;br&gt;Time since last signal&lt;br&gt;&gt; erosion interval" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="590" y="750" width="200" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e5" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="d4" target="d5" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e5_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a_e5">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <mxCell id="wait" value="Wait&lt;br&gt;(return None)" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;fontColor=#9E9E9E;" vertex="1" parent="1">
+          <mxGeometry x="480" y="773" width="80" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_wait" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#BDBDBD;dashed=1;" edge="1" source="d5" target="wait" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_wait_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#9E9E9E;" vertex="1" connectable="0" parent="a_wait">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Normal erosion step -->
+        <mxCell id="normal_erosion" value="&lt;b&gt;Normal Erosion Step&lt;/b&gt;&lt;br&gt;Advance step, compute eroded price&lt;br&gt;Apply constraints (ask cap, BE floor, outbid)&lt;br&gt;&lt;br&gt;Skip guard: if posted ≤ target → keep order" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="560" y="880" width="260" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e6" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#4CAF50;" edge="1" source="d5" target="normal_erosion" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_e6_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#4CAF50;" vertex="1" connectable="0" parent="a_e6">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- Favorable taker (from normal erosion path) -->
+        <mxCell id="d_fav" value="&lt;b&gt;Favorable taker?&lt;/b&gt;&lt;br&gt;ask &lt; posted bid" style="shape=rhombus;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="580" y="1000" width="220" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_fav1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="normal_erosion" target="d_fav" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="fav_exit" value="&lt;b&gt;FAVORABLE TAKER&lt;/b&gt;&lt;br&gt;Take at ask (FOK)&lt;br&gt;exit_reason = FavorableTaker&lt;br&gt;&lt;br&gt;[SIM] fill at ask price&lt;br&gt;[LIVE] post-only first, FOK fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="100" y="980" width="230" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_fav_yes" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#2E7D32;" edge="1" source="d_fav" target="fav_exit" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_fav_yes_l" value="Yes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;fontColor=#2E7D32;" vertex="1" connectable="0" parent="a_fav_yes">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <mxCell id="emit_erosion" value="&lt;b&gt;Emit Erosion Signal&lt;/b&gt;&lt;br&gt;Cancel-replace at eroded price" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="890" y="1005" width="200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_fav_no" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#4CAF50;" edge="1" source="d_fav" target="emit_erosion" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a_fav_no_l" value="No" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=9;" vertex="1" connectable="0" parent="a_fav_no">
+          <mxGeometry x="-0.3" relative="1" as="geometry"><mxPoint as="offset"/></mxGeometry>
+        </mxCell>
+
+        <!-- ===== EDGE CASES SECTION ===== -->
+
+        <!-- Separator -->
+        <mxCell id="sep" value="" style="line;strokeWidth=2;strokeColor=#E0E0E0;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1110" width="1240" height="10" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_title" value="&lt;b&gt;Additional Edge Cases&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="560" y="1120" width="200" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Market Rotation Emergency -->
+        <mxCell id="rot_emerg" value="&lt;b&gt;Rotation Emergency&lt;/b&gt;&lt;br&gt;&lt;br&gt;MarketRotation arrives while&lt;br&gt;Leg 1 = Filled, Leg 2 ≠ Filled&lt;br&gt;&lt;br&gt;1. Build FOK with OLD market's&lt;br&gt;   token IDs + books&lt;br&gt;2. Drain buffer → send FOK&lt;br&gt;3. Send MarketRotation → reset&lt;br&gt;&lt;br&gt;exit_reason = MarketExpiry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=10;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1170" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- Leg 1 Staleness Timeout -->
+        <mxCell id="leg1_timeout" value="&lt;b&gt;Leg 1 Staleness Timeout&lt;/b&gt;&lt;br&gt;&lt;br&gt;Posted Leg 1 not filled within&lt;br&gt;leg1_timeout_ms (5000ms)&lt;br&gt;&lt;br&gt;→ Cancel order, free slot&lt;br&gt;→ leg1_state = None&lt;br&gt;→ Ready for next spike&lt;br&gt;&lt;br&gt;[SIM] In advance_simulation()&lt;br&gt;[LIVE] CancelLeg1 command" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=10;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="380" y="1170" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- Cutoff Window -->
+        <mxCell id="cutoff" value="&lt;b&gt;Cutoff Window&lt;/b&gt;&lt;br&gt;&lt;br&gt;T-300s before expiry:&lt;br&gt;&lt;br&gt;✗ New Leg 1 entries BLOCKED&lt;br&gt;✓ Existing Leg 2 erosion continues&lt;br&gt;✓ Emergency exits continue&lt;br&gt;✓ Market summary sent&lt;br&gt;&lt;br&gt;Open positions ride until&lt;br&gt;rotation (no forced close)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=10;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="1170" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+        <!-- User WS Delay -->
+        <mxCell id="ws_delay" value="&lt;b&gt;User WS Fill Delay (Live)&lt;/b&gt;&lt;br&gt;&lt;br&gt;CLOB fill → User WS: 200-500ms&lt;br&gt;REST feedback → Engine: 50-100ms&lt;br&gt;&lt;br&gt;Safety: feedback channel drained&lt;br&gt;BEFORE on_event() each loop.&lt;br&gt;Order IDs always set before&lt;br&gt;fill notifications arrive." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;align=left;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="980" y="1170" width="240" height="170" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <!-- PAGE 3: State Machines -->
+  <diagram id="state-machines" name="State Machines">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- Title -->
+        <mxCell id="title3" value="&lt;b&gt;State Machines &amp; Transitions&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=20;" vertex="1" parent="1">
+          <mxGeometry x="540" y="20" width="340" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== OrderState ===== -->
+        <mxCell id="os_title" value="&lt;b&gt;OrderState&lt;/b&gt; (applies to both Leg 1 and Leg 2)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="80" y="80" width="340" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- None state -->
+        <mxCell id="os_none" value="&lt;b&gt;None&lt;/b&gt;&lt;br&gt;(idle)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E0E0E0;strokeColor=#616161;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="100" y="130" width="120" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Posted state -->
+        <mxCell id="os_posted" value="&lt;b&gt;Posted&lt;/b&gt;&lt;br&gt;order_id, price, size" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="340" y="130" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Filled state -->
+        <mxCell id="os_filled" value="&lt;b&gt;Filled&lt;/b&gt;&lt;br&gt;price, size, timestamp" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="620" y="130" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- None → Posted -->
+        <mxCell id="os_a1" value="evaluate() emits signal&lt;br&gt;executor posts order" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="os_none" target="os_posted" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Posted → Filled -->
+        <mxCell id="os_a2" value="[LIVE] User WS fill&lt;br&gt;[SIM] advance_simulation()" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="os_posted" target="os_filled" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Posted → None (failure) -->
+        <mxCell id="os_a3" value="OrderFailed (CLOB reject)&lt;br&gt;OR Leg 1 timeout (5s)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#F44336;fontColor=#C62828;" edge="1" source="os_posted" target="os_none" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="420" y="220"/>
+              <mxPoint x="160" y="220"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Filled → None (completion) -->
+        <mxCell id="os_a4" value="on_trade_complete()&lt;br&gt;OR MarketRotation" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#1976D2;fontColor=#1565C0;" edge="1" source="os_filled" target="os_none" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="700" y="240"/>
+              <mxPoint x="160" y="240"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===== ErosionState ===== -->
+        <mxCell id="es_title" value="&lt;b&gt;ErosionState&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="80" y="290" width="120" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- None -->
+        <mxCell id="es_none" value="&lt;b&gt;None&lt;/b&gt;" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E0E0E0;strokeColor=#616161;fontSize=11;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="100" y="340" width="100" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Active -->
+        <mxCell id="es_active" value="&lt;b&gt;Active&lt;/b&gt;&lt;br&gt;steps=0..5&lt;br&gt;emergency=false" style="ellipse;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="320" y="330" width="160" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Emergency -->
+        <mxCell id="es_emergency" value="&lt;b&gt;Emergency&lt;/b&gt;&lt;br&gt;emergency=true&lt;br&gt;exit_reason set&lt;br&gt;repost_count: 0→3" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFCDD2;strokeColor=#C62828;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="600" y="330" width="180" height="70" as="geometry"/>
+        </mxCell>
+
+        <!-- Complete -->
+        <mxCell id="es_complete" value="&lt;b&gt;Complete&lt;/b&gt;&lt;br&gt;erosion = None" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="880" y="340" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- None → Active -->
+        <mxCell id="es_a1" value="init_erosion()&lt;br&gt;(Leg 1 fills)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="es_none" target="es_active" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Active → Active (erosion step) -->
+        <mxCell id="es_a2" value="erosion step&lt;br&gt;(steps++)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#1976D2;curved=1;" edge="1" source="es_active" target="es_active" parent="1">
+          <mxGeometry x="0.3" y="20" relative="1" as="geometry">
+            <mxPoint as="offset"/>
+            <Array as="points">
+              <mxPoint x="400" y="310"/>
+              <mxPoint x="430" y="310"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Active → Emergency -->
+        <mxCell id="es_a3" value="Adverse / BE breach /&lt;br&gt;Exhausted" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#C62828;fontColor=#C62828;" edge="1" source="es_active" target="es_emergency" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Emergency → Complete (fill) -->
+        <mxCell id="es_a4" value="Leg 2 fill" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#2E7D32;fontColor=#2E7D32;" edge="1" source="es_emergency" target="es_complete" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Active → Complete (normal fill) -->
+        <mxCell id="es_a5" value="Leg 2 fill&lt;br&gt;(normal)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#2E7D32;fontColor=#2E7D32;" edge="1" source="es_active" target="es_complete" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="400" y="430"/>
+              <mxPoint x="950" y="430"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Complete → None -->
+        <mxCell id="es_a6" value="on_trade_complete()&lt;br&gt;OR rotation" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#616161;" edge="1" source="es_complete" target="es_none" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="950" y="450"/>
+              <mxPoint x="150" y="450"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ===== SimPosition ===== -->
+        <mxCell id="sp_title" value="&lt;b&gt;SimPosition Status&lt;/b&gt; (simulation only)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="80" y="500" width="290" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- None -->
+        <mxCell id="sp_none" value="&lt;b&gt;None&lt;/b&gt;&lt;br&gt;(no position)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E0E0E0;strokeColor=#616161;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="100" y="550" width="120" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- Open -->
+        <mxCell id="sp_open" value="&lt;b&gt;Open&lt;/b&gt;&lt;br&gt;Leg 1 filled, Leg 2 pending" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="340" y="545" width="180" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- Hedged -->
+        <mxCell id="sp_hedged" value="&lt;b&gt;Hedged&lt;/b&gt;&lt;br&gt;Both legs filled" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="640" y="550" width="150" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- AwaitingResolution -->
+        <mxCell id="sp_await" value="&lt;b&gt;AwaitingResolution&lt;/b&gt;&lt;br&gt;Locked for UMA oracle" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="340" y="650" width="180" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ClosedTrades -->
+        <mxCell id="sp_closed" value="&lt;b&gt;[closed_trades]&lt;/b&gt;&lt;br&gt;Final PnL recorded" style="ellipse;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#9E9E9E;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="640" y="650" width="150" height="50" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="sp_a1" value="record_leg1_fill()" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="sp_none" target="sp_open" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="sp_a2" value="record_leg2_fill() /&lt;br&gt;record_emergency_*()" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="sp_open" target="sp_hedged" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="sp_a3" value="lock_for_resolution()&lt;br&gt;(rotation, no hedge)" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;strokeColor=#F44336;fontColor=#C62828;" edge="1" source="sp_open" target="sp_await" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="sp_a4" value="close_trade()" style="edgeStyle=orthogonalEdgeStyle;html=1;fontSize=9;" edge="1" source="sp_hedged" target="sp_closed" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== Full Trade Lifecycle ===== -->
+        <mxCell id="tl_title" value="&lt;b&gt;Full Trade Lifecycle&lt;/b&gt; (numbered steps)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="80" y="740" width="290" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 1 -->
+        <mxCell id="tl1" value="&lt;b&gt;1. SpikeConfirmed&lt;/b&gt;&lt;br&gt;spike_detected = true" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="80" y="790" width="160" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 2 -->
+        <mxCell id="tl2" value="&lt;b&gt;2. evaluate()&lt;/b&gt;&lt;br&gt;10 guards → Leg 1 signal&lt;br&gt;leg1_state = Posted" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="280" y="785" width="160" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 3 -->
+        <mxCell id="tl3" value="&lt;b&gt;3. Leg 1 Fill&lt;/b&gt;&lt;br&gt;leg1_state = Filled&lt;br&gt;init_erosion()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="480" y="785" width="160" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 4 -->
+        <mxCell id="tl4" value="&lt;b&gt;4. evaluate_leg2()&lt;/b&gt;&lt;br&gt;Erosion cascade&lt;br&gt;OR emergency path" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#BBDEFB;strokeColor=#1976D2;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="680" y="785" width="160" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 5 -->
+        <mxCell id="tl5" value="&lt;b&gt;5. Leg 2 Fill&lt;/b&gt;&lt;br&gt;leg2_state = Filled" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="880" y="790" width="160" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Step 6 -->
+        <mxCell id="tl6" value="&lt;b&gt;6. State Reset&lt;/b&gt;&lt;br&gt;→ Ready for next spike" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#4CAF50;fontSize=10;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="790" width="160" height="45" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrows -->
+        <mxCell id="tl_a1" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="tl1" target="tl2" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_a2" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="tl2" target="tl3" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_a3" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="tl3" target="tl4" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_a4" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="tl4" target="tl5" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_a5" style="edgeStyle=orthogonalEdgeStyle;" edge="1" source="tl5" target="tl6" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Failure paths from lifecycle -->
+        <mxCell id="tl_fail1" value="Guard fail&lt;br&gt;(spike cleared)" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontColor=#F44336;" vertex="1" parent="1">
+          <mxGeometry x="305" y="860" width="80" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_fa1" style="strokeColor=#F44336;dashed=1;" edge="1" source="tl2" target="tl_fail1" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="tl_fail2" value="Timeout / reject&lt;br&gt;→ None" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontColor=#F44336;" vertex="1" parent="1">
+          <mxGeometry x="505" y="860" width="100" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl_fa2" style="strokeColor=#F44336;dashed=1;" edge="1" source="tl3" target="tl_fail2" parent="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Sim vs Live annotations on step 3 -->
+        <mxCell id="tl3_sim" value="[SIM] advance_sim()" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=8;fontColor=#1565C0;" vertex="1" parent="1">
+          <mxGeometry x="490" y="770" width="120" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="tl3_live" value="[LIVE] User WS fill" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=8;fontColor=#7B1FA2;" vertex="1" parent="1">
+          <mxGeometry x="490" y="845" width="110" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- Key timing info -->
+        <mxCell id="timing_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#E0E0E0;" vertex="1" parent="1">
+          <mxGeometry x="80" y="920" width="500" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="timing_title" value="&lt;b&gt;Key Timing&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="90" y="925" width="90" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="timing_content" value="• Spike detection: ~300ms (sustain) after initial displacement&lt;br&gt;• Leg 1 fill (sim): next event loop (~100ms). Live: CLOB RTT (~50-100ms)&lt;br&gt;• Erosion cascade: 5 steps over ~6.8s (3.5s → 1.75s → 0.875s → 0.437s → 0.218s)&lt;br&gt;• Emergency repost: every 500ms, FOK fallback after 3 attempts (1.5s)&lt;br&gt;• Leg 1 staleness timeout: 5000ms&lt;br&gt;• Cutoff window: 300s before market expiry&lt;br&gt;• Pre-warm rotation: 180s before expiry" style="text;html=1;align=left;verticalAlign=top;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="90" y="950" width="480" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Exit reasons summary -->
+        <mxCell id="exit_bg" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAFAFA;strokeColor=#E0E0E0;" vertex="1" parent="1">
+          <mxGeometry x="620" y="920" width="420" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="exit_title" value="&lt;b&gt;Exit Reasons&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="630" y="925" width="100" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="exit_content" value="• &lt;b&gt;NormalErosion&lt;/b&gt; — Leg 2 filled during erosion cascade (happy path)&lt;br&gt;• &lt;b&gt;AdverseMovement&lt;/b&gt; — Binance reversal &gt; 0.1%&lt;br&gt;• &lt;b&gt;BreakEvenBreach&lt;/b&gt; — Opposing ask worsened or cascade exhausted&lt;br&gt;• &lt;b&gt;MarketExpiry&lt;/b&gt; — Rotation arrived with open position&lt;br&gt;• &lt;b&gt;FavorableTaker&lt;/b&gt; — Opposing ask dropped below posted bid" style="text;html=1;align=left;verticalAlign=top;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="630" y="950" width="400" height="90" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

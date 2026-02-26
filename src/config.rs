@@ -21,8 +21,6 @@ pub struct SpikeDetectionConfig {
     pub multiplier: f64,
     /// EMA smoothing alpha for ATR. No spikes emitted for first MIN_ATR_SAMPLES ticks (warmup).
     pub atr_alpha: f64,
-    /// Time window (ms) within which price delta must exceed threshold.
-    pub window_ms: u64,
     /// Minimum sustain duration (ms) before spike confirmation.
     pub sustain_ms: u64,
     /// Minimum spike magnitude (%) to emit a signal. Below this → discard.
@@ -36,7 +34,6 @@ impl Default for SpikeDetectionConfig {
         Self {
             multiplier: 2.0,
             atr_alpha: 0.002,
-            window_ms: 350,
             sustain_ms: 300,
             min_magnitude_pct: 0.01,
             momentum_ratio_min: 0.5,
@@ -47,8 +44,8 @@ impl Default for SpikeDetectionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EntryGuardsConfig {
-    /// Max bid-ask spread as fraction of mid price.
-    pub max_spread_pct: f64,
+    /// Max bid-ask spread in ticks (uniform regardless of mid price).
+    pub max_spread_ticks: u32,
     /// Min book depth as fraction of required depth.
     pub depth_min_pct: f64,
     /// No entries within this many seconds of market expiry.
@@ -57,16 +54,19 @@ pub struct EntryGuardsConfig {
     pub stale_book_ms: u64,
     /// Block entry if YES mid price exceeds this (or falls below 1 - this).
     pub max_price_skew: f64,
+    /// Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
+    pub leg1_timeout_ms: u64,
 }
 
 impl Default for EntryGuardsConfig {
     fn default() -> Self {
         Self {
-            max_spread_pct: 0.10,
+            max_spread_ticks: 2,
             depth_min_pct: 0.15,
-            entry_cutoff_secs: 300,
+            entry_cutoff_secs: 180,
             stale_book_ms: 1000,
             max_price_skew: 0.80,
+            leg1_timeout_ms: 5000,
         }
     }
 }
@@ -133,16 +133,10 @@ pub struct RiskConfig {
     pub erosion_interval_decay: f64,
     /// Depth level > X × avg = competitor wall.
     pub depth_wall_multiplier: f64,
-    /// Quick cancel threshold within 100ms of fill.
-    pub quick_reversal_threshold: f64,
-    /// Opposing ask must worsen by more than N ticks before triggering break-even FOK.
-    pub break_even_tolerance_ticks: u32,
-    /// Max ticks above initial opposing ask for break-even FOK. Beyond this, defer to erosion.
-    pub max_loss_ticks: u32,
-    /// Interval (ms) between emergency post-only reposts at top-of-book.
-    pub emergency_repost_interval_ms: u64,
-    /// Maximum post-only attempts before switching to FOK taker in emergency exits.
-    pub emergency_max_maker_attempts: u32,
+    /// Hard deadline (ms) from first emergency post to FOK taker fallback.
+    /// During this window, the engine only reposts when the book offers a strictly
+    /// better price (price-improvement chase). If no fill by deadline, FOK at best_ask.
+    pub emergency_deadline_ms: u64,
 }
 
 impl Default for RiskConfig {
@@ -152,11 +146,7 @@ impl Default for RiskConfig {
             erosion_base_interval_ms: 4000,
             erosion_interval_decay: 0.6,
             depth_wall_multiplier: 4.0,
-            quick_reversal_threshold: 0.0003,
-            break_even_tolerance_ticks: 2,
-            max_loss_ticks: 3,
-            emergency_repost_interval_ms: 500,
-            emergency_max_maker_attempts: 3,
+            emergency_deadline_ms: 2500,
         }
     }
 }
@@ -204,8 +194,11 @@ pub struct Config {
     // ── Infrastructure ────────────────────────────────────────────────
     pub questdb_url: String,
 
-    // ── Binance ───────────────────────────────────────────────────────
-    pub binance_ws_url: String,
+    // ── Binance SBE ────────────────────────────────────────────────────
+    /// Binance SBE WebSocket endpoint (binary market data streams).
+    pub binance_sbe_ws_url: String,
+    /// Binance Ed25519 API key string for SBE stream authentication.
+    pub binance_ed25519_api_key: String,
 
     // ── Telegram ──────────────────────────────────────────────────────
     pub telegram_bot_token: String,
@@ -331,8 +324,10 @@ impl Config {
             polymarket_passphrase,
             private_key,
             questdb_url: std::env::var("QUESTDB_URL").unwrap_or_else(|_| "127.0.0.1:9009".into()),
-            binance_ws_url: std::env::var("BINANCE_WS_URL")
-                .unwrap_or_else(|_| "wss://stream.binance.com:9443".into()),
+            binance_sbe_ws_url: std::env::var("BINANCE_SBE_WS_URL")
+                .unwrap_or_else(|_| "wss://stream-sbe.binance.com:9443".into()),
+            binance_ed25519_api_key: std::env::var("BINANCE_ED25519_API_KEY")
+                .context("BINANCE_ED25519_API_KEY not set (required for SBE market data)")?,
             telegram_bot_token,
             telegram_chat_id,
             bot,
@@ -384,7 +379,8 @@ impl Config {
             polymarket_passphrase: String::new(),
             private_key: String::new(),
             questdb_url: "127.0.0.1:9009".into(),
-            binance_ws_url: "wss://stream.binance.com:9443".into(),
+            binance_sbe_ws_url: "wss://stream-sbe.binance.com:9443".into(),
+            binance_ed25519_api_key: "test-key".into(),
             telegram_bot_token: "test-token".into(),
             telegram_chat_id: "test-chat".into(),
             bot,

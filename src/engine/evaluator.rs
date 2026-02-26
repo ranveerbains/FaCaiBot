@@ -53,7 +53,7 @@ pub(crate) enum Leg1RejectReason {
     StaleBook,
     /// YES mid-price outside the tradeable range (too skewed toward resolution).
     PriceSkewed,
-    /// Bid-ask spread exceeds `max_spread_pct`.
+    /// Bid-ask spread exceeds `max_spread_ticks`.
     SpreadWide,
     /// Book depth insufficient relative to required trade size.
     InsufficientDepth,
@@ -79,7 +79,7 @@ pub(crate) enum Leg1Outcome {
 /// Holds only the config fields required for Leg 1 guard checks and signal building.
 /// All reads are from borrowed `&MarketState`; no mutation occurs here.
 pub(crate) struct Leg1Evaluator {
-    pub spread_abort: Decimal,
+    pub max_spread_ticks: u32,
     pub entry_cutoff_secs: u64,
     pub depth_min_pct: Decimal,
     pub stale_book_ms: u64,
@@ -94,6 +94,7 @@ pub(crate) struct Leg1Evaluator {
     pub med_target_pct: Decimal,
     pub low_target_pct: Decimal,
     pub max_price_skew: Decimal,
+    pub leg1_timeout_ms: u64,
 }
 
 impl Leg1Evaluator {
@@ -234,14 +235,15 @@ impl Leg1Evaluator {
             }
         }
 
-        // Guard: spread too wide
-        let mid = (best_bid_price + best_ask_price) / Decimal::TWO;
-        if mid.is_zero() {
-            return Leg1Outcome::Rejected(Leg1RejectReason::NoBook);
-        }
-        let spread_pct = (best_ask_price - best_bid_price) / mid;
-        if spread_pct > self.spread_abort {
-            debug!(%spread_pct, "evaluate() BLOCKED: spread too wide");
+        // Guard: spread too wide (tick-based, uniform regardless of mid price)
+        let tick = state.tick_size;
+        let spread_ticks = if !tick.is_zero() {
+            (best_ask_price - best_bid_price) / tick
+        } else {
+            Decimal::ZERO
+        };
+        if spread_ticks > Decimal::from(self.max_spread_ticks) {
+            debug!(%spread_ticks, "evaluate() BLOCKED: spread too wide");
             return Leg1Outcome::Rejected(Leg1RejectReason::SpreadWide);
         }
 
@@ -308,7 +310,6 @@ impl Leg1Evaluator {
         };
 
         // Leg 1 bid price — post just above the current best bid of the direction book.
-        let tick = state.tick_size;
         let mut bid_price = round_to_tick(best_bid_price + tick, tick);
 
         // Cap at one tick below ask if bid would cross (post-only constraint).
@@ -390,6 +391,7 @@ impl Leg1Evaluator {
             market_end_timestamp_ms: state.market_end_timestamp_ms,
             tick_size: tick,
             fee_rate_bps: state.fee_rate_bps,
+            atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
             book_snapshot: match direction {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
@@ -405,7 +407,7 @@ impl Leg1Evaluator {
 
 /// Evaluates whether to emit a Leg 2 hedge signal after Leg 1 fills.
 ///
-/// Handles post-only erosion cascade, quick reversal, adverse movement,
+/// Handles post-only erosion cascade, adverse movement,
 /// and break-even breach emergency FOK fills.
 ///
 /// All reads are from borrowed `&MarketState` and `&ErosionSnap`; no mutation occurs here.
@@ -414,11 +416,7 @@ pub(crate) struct Leg2Evaluator {
     pub erosion_base_interval_ms: u64,
     pub erosion_interval_decay: f64,
     pub depth_wall_multiplier: Decimal,
-    pub quick_reversal_threshold: Decimal,
-    pub break_even_tolerance_ticks: u32,
-    pub max_loss_ticks: u32,
-    pub emergency_repost_interval_ms: u64,
-    pub emergency_max_maker_attempts: u32,
+    pub emergency_deadline_ms: u64,
 }
 
 impl Leg2Evaluator {
@@ -454,6 +452,7 @@ impl Leg2Evaluator {
         let tick = state.tick_size;
         let market_end_ms = state.market_end_timestamp_ms;
         let fee_rate_bps = state.fee_rate_bps;
+        let atr = state.atr.unwrap_or(Decimal::ZERO);
 
         // Pre-compute book data BEFORE the emergency check — needed for reposts.
         // Use the hedge book: the book for the token Leg 2 will buy (opposite of Leg 1).
@@ -482,66 +481,102 @@ impl Leg2Evaluator {
             Direction::Down => state.active_yes_token_id.as_ref()?.clone(),
         };
 
-        // ── Emergency repost: interval-gated re-evaluation at top-of-book ──
-        // After N post-only attempts, escalate to FOK taker at best_ask.
+        // ── Emergency price-improvement chase with hard deadline ────────
+        // Only repost when the book offers a strictly better price (preserves
+        // FIFO queue priority). After emergency_deadline_ms → FOK taker.
         if snap.emergency_submitted {
-            let time_since_last = now_ms.saturating_sub(last_erosion_ms);
-            if time_since_last < self.emergency_repost_interval_ms {
-                return None; // too soon, wait for interval
-            }
             let best_ask = hedge_book.best_ask().map(|a| a.price)?;
-            let fok_fallback =
-                snap.emergency_repost_count >= self.emergency_max_maker_attempts;
-            let repost_price = if fok_fallback {
-                // FOK taker — post at best_ask to cross the spread and guarantee fill.
-                best_ask
-            } else {
-                // Post-only at top of book.
-                round_to_tick(best_ask - tick, tick)
-            };
-            let leg1_size = match &state.leg1_state {
-                OrderState::Filled { size, .. } => *size,
-                _ => return None,
-            };
             let exit_reason = snap.exit_reason.unwrap_or(ExitReason::BreakEvenBreach);
-            let signal = make_leg2_signal(
-                &hedge_token_id,
-                state.active_condition_id.as_deref().unwrap_or(""),
-                repost_price,
-                leg1_size,
-                reference_price,
-                snap.confidence,
-                snap.tier,
-                Decimal::ZERO,
-                snap.direction,
-                snap.spike_info,
-                snap.leg1_fill_price,
-                now_ms,
-                market_end_ms,
-                tick,
-                fee_rate_bps,
-                false,
-                hedge_book_snapshot.clone(),
-                Some(exit_reason),
-            );
-            if fok_fallback {
-                warn!(%repost_price, %best_ask, ?exit_reason, reposts = snap.emergency_repost_count,
-                    "emergency FOK fallback — post-only attempts exhausted");
-            } else {
-                debug!(%repost_price, %best_ask, ?exit_reason, reposts = snap.emergency_repost_count,
-                    "emergency repost at top-of-book");
+
+            // 1. Hard deadline check — if elapsed >= deadline, FOK taker at best_ask.
+            let elapsed = snap
+                .emergency_first_post_ms
+                .map(|first| now_ms.saturating_sub(first))
+                .unwrap_or(0);
+
+            if elapsed >= self.emergency_deadline_ms {
+                let leg1_size = match &state.leg1_state {
+                    OrderState::Filled { size, .. } => *size,
+                    _ => return None,
+                };
+                warn!(%best_ask, ?exit_reason, elapsed_ms = elapsed,
+                    "emergency deadline reached — FOK taker fallback");
+                let mut signal = make_leg2_signal(
+                    &hedge_token_id,
+                    state.active_condition_id.as_deref().unwrap_or(""),
+                    best_ask,
+                    leg1_size,
+                    reference_price,
+                    snap.confidence,
+                    snap.tier,
+                    Decimal::ZERO,
+                    snap.direction,
+                    snap.spike_info,
+                    snap.leg1_fill_price,
+                    now_ms,
+                    market_end_ms,
+                    tick,
+                    fee_rate_bps,
+                    atr,
+                    false,
+                    hedge_book_snapshot.clone(),
+                    Some(exit_reason),
+                );
+                signal.sim_was_taker = true;
+                return Some(Leg2Decision::Emergency {
+                    signal,
+                    price: best_ask,
+                    size: leg1_size,
+                });
             }
-            return Some(Leg2Decision::Emergency {
-                signal,
-                price: repost_price,
-                size: leg1_size,
-            });
+
+            // 2. Price-improvement check — only repost if new top-of-book is strictly better.
+            let best_bid_we_can_post = round_to_tick(best_ask - tick, tick);
+            let current_posted = snap.emergency_posted_price.unwrap_or(Decimal::ZERO);
+
+            if best_bid_we_can_post > current_posted {
+                let leg1_size = match &state.leg1_state {
+                    OrderState::Filled { size, .. } => *size,
+                    _ => return None,
+                };
+                debug!(%best_bid_we_can_post, %current_posted, ?exit_reason,
+                    "emergency price chase — reposting at improved price");
+                let signal = make_leg2_signal(
+                    &hedge_token_id,
+                    state.active_condition_id.as_deref().unwrap_or(""),
+                    best_bid_we_can_post,
+                    leg1_size,
+                    reference_price,
+                    snap.confidence,
+                    snap.tier,
+                    Decimal::ZERO,
+                    snap.direction,
+                    snap.spike_info,
+                    snap.leg1_fill_price,
+                    now_ms,
+                    market_end_ms,
+                    tick,
+                    fee_rate_bps,
+                    atr,
+                    false,
+                    hedge_book_snapshot.clone(),
+                    Some(exit_reason),
+                );
+                return Some(Leg2Decision::Emergency {
+                    signal,
+                    price: best_bid_we_can_post,
+                    size: leg1_size,
+                });
+            }
+
+            // 3. No improvement and within deadline — keep current order, preserve queue priority.
+            return None;
         }
 
         // ── Adverse movement (immediate — ultimate safeguard, zero grace) ─
         // If Binance reverses > adverse_threshold at ANY point after Leg 1 fill,
         // the spike thesis is invalidated → emergency post-only at top-of-book.
-        // FOK fallback after emergency_max_maker_attempts via the repost block.
+        // FOK fallback after emergency_deadline_ms via the price-chase block.
         if let (Some(cur), Some(fill_p)) = (state.binance_price, snap.binance_at_fill) {
             if !fill_p.is_zero() {
                 let change = (cur - fill_p).abs() / fill_p;
@@ -573,6 +608,7 @@ impl Leg2Evaluator {
                         market_end_ms,
                         tick,
                         fee_rate_bps,
+                        atr,
                         false,
                         hedge_book_snapshot.clone(),
                         Some(ExitReason::AdverseMovement),
@@ -587,60 +623,47 @@ impl Leg2Evaluator {
         }
 
         // ── Break-even breach (after first erosion step) ─────────────────
-        // Only fire after at least one erosion step has completed (~4s).
+        // Only fire after at least one erosion step has completed (~3.5s).
         // This gives the Polymarket book time to react to spike momentum.
-        // Only triggers when the opposing ask has RISEN above its fill-time level.
-        // FOK price is capped at initial_ask + max_loss_ticks × tick to prevent
-        // catastrophic execution at gapped prices.
+        // Triggers when pair cost (leg1 + opposing ask) >= $1.00 — position is unprofitable.
+        // Uses post-only pricing (best_ask - tick), consistent with all other emergencies.
+        // FOK fallback after emergency_deadline_ms (via price-chase block).
         if snap.steps_applied >= 1 {
             if let Some(ask_price) = best_ask_price {
-                let tolerance = Decimal::from(self.break_even_tolerance_ticks) * tick;
-                let worsened = snap
-                    .opposing_ask_at_fill
-                    .map_or(false, |initial| ask_price > initial + tolerance);
-                if worsened && leg1_price + ask_price >= Decimal::ONE {
-                    let initial_ask = snap.opposing_ask_at_fill.unwrap_or(Decimal::ZERO);
-                    // Cap FOK price to limit catastrophic loss.
-                    let max_fok_price = snap
-                        .opposing_ask_at_fill
-                        .map(|initial| initial + Decimal::from(self.max_loss_ticks) * tick)
-                        .unwrap_or(ask_price);
-                    if ask_price > max_fok_price {
-                        debug!(%ask_price, %max_fok_price, %initial_ask,
-                            "break-even breach but ask beyond FOK cap — deferring to erosion");
-                    } else {
-                        let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
-                        if fok_size <= Decimal::ZERO {
-                            warn!(%leg1_price, %ask_price, %initial_ask, "break-even breach — no ask depth for FOK");
-                            return None;
-                        }
-                        warn!(%leg1_price, %ask_price, %initial_ask, %fok_size, "break-even breach FOK Leg 2");
-                        let signal = make_leg2_signal(
-                            &hedge_token_id,
-                            state.active_condition_id.as_deref().unwrap_or(""),
-                            ask_price,
-                            fok_size,
-                            reference_price,
-                            snap.confidence,
-                            snap.tier,
-                            Decimal::ZERO,
-                            snap.direction,
-                            snap.spike_info,
-                            leg1_price,
-                            now_ms,
-                            market_end_ms,
-                            tick,
-                            fee_rate_bps,
-                            false,
-                            hedge_book_snapshot.clone(),
-                            Some(ExitReason::BreakEvenBreach),
-                        );
-                        return Some(Leg2Decision::Emergency {
-                            signal,
-                            price: ask_price,
-                            size: fok_size,
-                        });
+                if leg1_price + ask_price >= Decimal::ONE {
+                    let price = round_to_tick(ask_price - tick, tick);
+                    let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
+                    if fok_size <= Decimal::ZERO {
+                        warn!(%leg1_price, %ask_price, "break-even breach — no ask depth for emergency");
+                        return None;
                     }
+                    warn!(%leg1_price, %ask_price, %fok_size, %price, "break-even breach emergency Leg 2");
+                    let signal = make_leg2_signal(
+                        &hedge_token_id,
+                        state.active_condition_id.as_deref().unwrap_or(""),
+                        price,
+                        fok_size,
+                        reference_price,
+                        snap.confidence,
+                        snap.tier,
+                        Decimal::ZERO,
+                        snap.direction,
+                        snap.spike_info,
+                        leg1_price,
+                        now_ms,
+                        market_end_ms,
+                        tick,
+                        fee_rate_bps,
+                        atr,
+                        false,
+                        hedge_book_snapshot.clone(),
+                        Some(ExitReason::BreakEvenBreach),
+                    );
+                    return Some(Leg2Decision::Emergency {
+                        signal,
+                        price,
+                        size: fok_size,
+                    });
                 }
             }
         }
@@ -679,6 +702,7 @@ impl Leg2Evaluator {
                     market_end_ms,
                     tick,
                     fee_rate_bps,
+                    atr,
                     false,
                     hedge_book_snapshot.clone(),
                     Some(ExitReason::BreakEvenBreach),
@@ -688,23 +712,6 @@ impl Leg2Evaluator {
                     price,
                     size: fok_size,
                 });
-            }
-        }
-
-        // ── Quick reversal (100ms window after fill) ──────────────────────
-        if now_ms.saturating_sub(snap.fill_ms) <= 100 {
-            if let (Some(cur), Some(fill_p)) = (state.binance_price, snap.binance_at_fill) {
-                if !fill_p.is_zero() {
-                    let change = (cur - fill_p) / fill_p;
-                    let reversal = match snap.direction {
-                        Direction::Up => change <= -self.quick_reversal_threshold,
-                        Direction::Down => change >= self.quick_reversal_threshold,
-                    };
-                    if reversal {
-                        debug!(%change, "quick reversal within 100ms — holding off Leg 2");
-                        return None;
-                    }
-                }
             }
         }
 
@@ -767,6 +774,17 @@ impl Leg2Evaluator {
             }
         }
 
+        // ── Skip guard: don't repost if current order is already at or better ──
+        if let OrderState::Posted { price: posted_price, .. } = &state.leg2_state {
+            if *posted_price <= target_price {
+                debug!(
+                    %posted_price, %target_price,
+                    "Leg 2 skip: posted price already at or better than erosion target"
+                );
+                return None;
+            }
+        }
+
         debug!(
             step = steps_now,
             %target_price,
@@ -791,6 +809,7 @@ impl Leg2Evaluator {
             market_end_ms,
             tick,
             fee_rate_bps,
+            atr,
             bot_contested,
             hedge_book_snapshot,
             None,
@@ -878,6 +897,7 @@ pub(crate) fn make_leg2_signal(
     market_end_ms: u64,
     tick_size: Decimal,
     fee_rate_bps: u16,
+    atr: Decimal,
     bot_contested: bool,
     book_snapshot: Option<OrderBook>,
     exit_reason: Option<ExitReason>,
@@ -902,6 +922,7 @@ pub(crate) fn make_leg2_signal(
         market_end_timestamp_ms: market_end_ms,
         tick_size,
         fee_rate_bps,
+        atr,
         bot_contested,
         book_snapshot,
         sim_confirmed_fill: false,
@@ -1067,6 +1088,7 @@ mod tests {
             2_000,
             Decimal::new(1, 2),
             0,
+            Decimal::ZERO,
             false,
             Some(book),
             None,
@@ -1132,7 +1154,6 @@ mod tests {
             initial_profit_target: Decimal::new(25, 3), // 2.5%
             direction: Direction::Up,
             binance_at_fill: Some(Decimal::new(50_000, 0)),
-            opposing_ask_at_fill: Some(Decimal::new(48, 2)),
             fill_ms: now_ms - 5_000,
             steps_applied: 2,
             tier: ProfitTier::High,
@@ -1145,7 +1166,8 @@ mod tests {
             },
             leg1_fill_price: Decimal::new(50, 2),
             exit_reason: Some(ExitReason::AdverseMovement),
-            emergency_repost_count: 0,
+            emergency_first_post_ms: Some(now_ms - 1_000),
+            emergency_posted_price: Some(Decimal::new(48, 2)),
         };
 
         let evaluator = Leg2Evaluator {
@@ -1153,102 +1175,76 @@ mod tests {
             erosion_base_interval_ms: 4000,
             erosion_interval_decay: 0.6,
             depth_wall_multiplier: Decimal::new(4, 0),
-            quick_reversal_threshold: Decimal::new(3, 3),
-            break_even_tolerance_ticks: 2,
-            max_loss_ticks: 3,
-            emergency_repost_interval_ms: 500,
-            emergency_max_maker_attempts: 3,
+            emergency_deadline_ms: 2500,
         };
 
         (state, snap, evaluator)
     }
 
     #[test]
-    fn test_emergency_repost_interval() {
+    fn test_emergency_no_repost_without_price_improvement() {
         let now_ms = 100_000;
+        // Posted at 0.48, ask at 0.49 → best_ask - tick = 0.48 == posted → no improvement.
         let (state, snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-
-        // Last erosion signal was 200ms ago → within 500ms interval → should suppress.
         let last_erosion_ms = now_ms - 200;
         let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
         assert!(
             result.is_none(),
-            "should suppress repost when interval has not elapsed"
-        );
-
-        // Last erosion signal was 600ms ago → past 500ms interval → should emit.
-        let last_erosion_ms_old = now_ms - 600;
-        let result2 = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms_old, now_ms);
-        assert!(
-            result2.is_some(),
-            "should emit repost when interval has elapsed"
-        );
-        assert!(
-            result2.as_ref().unwrap().is_emergency(),
-            "repost should be an Emergency decision"
+            "should not repost when price hasn't improved (preserves queue priority)"
         );
     }
 
     #[test]
-    fn test_emergency_repost_price_updates() {
+    fn test_emergency_price_chase_on_improvement() {
         let now_ms = 100_000;
-        let last_erosion_ms = now_ms - 600; // past interval
-
-        // Scenario 1: NO book ask at 0.49 → repost price = 0.49 - 0.01 = 0.48
-        let (state1, snap1, evaluator1) = make_emergency_test_setup("0.49", now_ms);
-        let decision1 = evaluator1
-            .evaluate_leg2(&state1, &snap1, last_erosion_ms, now_ms)
-            .expect("should emit repost");
-        assert_eq!(
-            decision1.price(),
-            Decimal::new(48, 2),
-            "repost should be best_ask(0.49) - tick(0.01) = 0.48"
-        );
-
-        // Scenario 2: NO book ask at 0.52 → repost price = 0.52 - 0.01 = 0.51
-        let (state2, snap2, evaluator2) = make_emergency_test_setup("0.52", now_ms);
-        let decision2 = evaluator2
-            .evaluate_leg2(&state2, &snap2, last_erosion_ms, now_ms)
-            .expect("should emit repost");
-        assert_eq!(
-            decision2.price(),
-            Decimal::new(51, 2),
-            "repost should be best_ask(0.52) - tick(0.01) = 0.51"
-        );
-
-        // Verify both carry the original exit reason.
-        let sig1 = decision1.into_signal();
-        assert_eq!(sig1.exit_reason, Some(ExitReason::AdverseMovement));
-    }
-
-    // ── FOK fallback after N maker attempts ───────────────────────────
-
-    #[test]
-    fn test_emergency_repost_fok_fallback_after_max_attempts() {
-        let now_ms = 100_000;
-        let last_erosion_ms = now_ms - 600; // past interval
-
-        // NO book ask at 0.49. With repost_count < max (3), should post-only: 0.49 - 0.01 = 0.48
-        let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        snap.emergency_repost_count = 2; // below max
+        // Posted at 0.48, ask at 0.52 → best_ask - tick = 0.51 > 0.48 → price improved.
+        let (state, snap, evaluator) = make_emergency_test_setup("0.52", now_ms);
+        let last_erosion_ms = now_ms - 200;
         let decision = evaluator
             .evaluate_leg2(&state, &snap, last_erosion_ms, now_ms)
-            .expect("should emit repost");
+            .expect("should emit price-chase repost");
+        assert!(decision.is_emergency());
         assert_eq!(
             decision.price(),
-            Decimal::new(48, 2),
-            "count < max → post-only at best_ask - tick"
+            Decimal::new(51, 2),
+            "should repost at best_ask(0.52) - tick(0.01) = 0.51"
         );
+        let sig = decision.into_signal();
+        assert_eq!(sig.exit_reason, Some(ExitReason::AdverseMovement));
+        assert!(!sig.sim_was_taker, "price-chase should be post-only (not taker)");
+    }
 
-        // With repost_count >= max (3), should FOK: price = best_ask = 0.49
-        snap.emergency_repost_count = 3;
-        let decision_fok = evaluator
+    #[test]
+    fn test_emergency_fok_at_deadline() {
+        let now_ms = 100_000;
+        let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
+        // Emergency started 3s ago → past 2.5s deadline.
+        snap.emergency_first_post_ms = Some(now_ms - 3_000);
+        let last_erosion_ms = now_ms - 200;
+        let decision = evaluator
             .evaluate_leg2(&state, &snap, last_erosion_ms, now_ms)
-            .expect("should emit FOK fallback");
+            .expect("should emit FOK at deadline");
+        assert!(decision.is_emergency());
         assert_eq!(
-            decision_fok.price(),
+            decision.price(),
             Decimal::new(49, 2),
-            "count >= max → FOK at best_ask"
+            "deadline FOK should be at best_ask (crosses spread)"
+        );
+        let sig = decision.into_signal();
+        assert!(sig.sim_was_taker, "deadline FOK should be marked as taker");
+    }
+
+    #[test]
+    fn test_emergency_no_fok_before_deadline() {
+        let now_ms = 100_000;
+        let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
+        // Emergency started 1s ago → within 2.5s deadline. Same price → no improvement.
+        snap.emergency_first_post_ms = Some(now_ms - 1_000);
+        let last_erosion_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
+        assert!(
+            result.is_none(),
+            "should not FOK before deadline when no price improvement"
         );
     }
 
@@ -1334,9 +1330,12 @@ mod tests {
         snap.steps_applied = 4;
         snap.exit_reason = None;
         snap.current_profit_target = Decimal::new(2, 3); // small residual
+        // Posted price must be WORSE (higher) than the erosion target so the
+        // skip guard doesn't suppress the signal.  Target will land at 0.48 after
+        // post-only clamping, so 0.49 > 0.48 → repost is needed.
         state.leg2_state = OrderState::Posted {
             order_id: "sim-leg2".into(),
-            price: Decimal::new(48, 2),
+            price: Decimal::new(49, 2),
             size: Decimal::new(100, 0),
             timestamp_ms: now_ms - 1_000,
         };

@@ -7,9 +7,13 @@ mod storage;
 mod types;
 mod utils;
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Mode};
 use crate::engine::strategy::StrategyEngine;
@@ -27,8 +31,13 @@ use crate::types::{ExecutorCommand, IngestorEvent};
 /// Channel capacity between layers. Sized to absorb burst without back-pressure.
 const CHANNEL_CAP: usize = 8192;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Minimum interval (ms) between recording Binance ticks to QuestDB.
+/// The engine processes every tick for real-time trading decisions, but QuestDB
+/// only needs periodic snapshots for analytics. 1 tick/sec keeps 7-day storage
+/// under ~600K rows (~30MB) instead of ~18-30M rows at full SBE rate.
+const TICK_RECORD_INTERVAL_MS: u64 = 1_000;
+
+fn main() -> Result<()> {
     // ── Bootstrap ────────────────────────────────────────────────────
     // Install the ring crypto provider process-wide before any TLS connections.
     rustls::crypto::ring::default_provider()
@@ -44,12 +53,36 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
+    // Build the main tokio runtime with 2 worker threads pinned to cores 1-2.
+    // Core 0 is reserved for the ingestor (dedicated OS thread).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .on_thread_start(|| {
+            let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+            if core_ids.len() >= 3 {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+                let id = THREAD_ID.fetch_add(1, Ordering::Relaxed);
+                let target_core = if id % 2 == 0 { 1 } else { 2 };
+                if let Some(core) = core_ids.get(target_core) {
+                    core_affinity::set_for_current(*core);
+                }
+            }
+        })
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let config = Config::load()?;
     info!(
         mode = ?config.mode,
         max_alloc_per_trade = %config.max_alloc_per_trade,
         spike_multiplier = config.bot.spike_detection.multiplier,
-        max_spread_pct = config.bot.entry_guards.max_spread_pct,
+        max_spread_ticks = config.bot.entry_guards.max_spread_ticks,
         stale_book_ms = config.bot.entry_guards.stale_book_ms,
         sustain_ms = config.bot.spike_detection.sustain_ms,
         "FaCaiBot starting"
@@ -87,7 +120,8 @@ async fn main() -> Result<()> {
         rt.block_on(async move {
             // Binance gateway — always active (both modes need price feeds).
             let binance = BinanceGateway::new(
-                ingestor_config.binance_ws_url.clone(),
+                ingestor_config.binance_sbe_ws_url.clone(),
+                ingestor_config.binance_ed25519_api_key.clone(),
                 ingestor_config.bot.spike_detection.clone(),
             );
 
@@ -152,6 +186,7 @@ async fn main() -> Result<()> {
             }
         };
         let mut last_book_snapshot_ms: u64 = 0;
+        let mut last_tick_record_ms: u64 = 0;
 
         while let Ok(event) = ingestor_rx.recv() {
             // Drain executor feedback (non-blocking). In live mode, the executor
@@ -184,11 +219,15 @@ async fn main() -> Result<()> {
             };
 
             // Record Binance ticks to QuestDB (fire-and-forget analytics).
+            // Downsampled: only record ~1 tick/sec to keep 7-day storage manageable.
             if let IngestorEvent::BinanceTick(ref tick) = event {
-                if let Some(ref mut c) = cold {
-                    if let Err(e) = c.record_tick(tick) {
-                        debug!(error = %e, "failed to record tick to QuestDB");
+                if tick.timestamp_ms.saturating_sub(last_tick_record_ms) >= TICK_RECORD_INTERVAL_MS {
+                    if let Some(ref mut c) = cold {
+                        if let Err(e) = c.record_tick(tick) {
+                            debug!(error = %e, "failed to record tick to QuestDB");
+                        }
                     }
+                    last_tick_record_ms = tick.timestamp_ms;
                 }
             }
 
@@ -281,6 +320,20 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Drain spike cancel (speculative Leg 1 cancelled after SpikeFailed).
+            if let Some(cancel_cmd) = engine.take_spike_cancel()
+                && let Err(e) = executor_tx.send(cancel_cmd)
+            {
+                error!(error = %e, "failed to send spike cancel to executor");
+            }
+
+            // Check for stale Leg 1 orders (applies in both sim and live modes).
+            if let Some(cancel_cmd) = engine.check_leg1_staleness() {
+                if let Err(e) = executor_tx.send(cancel_cmd) {
+                    error!(error = %e, "failed to send CancelLeg1 to executor");
+                }
+            }
+
             // Evaluate Leg 1 signals.
             if let Some(signal) = engine.evaluate() {
                 if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
@@ -311,6 +364,12 @@ async fn main() -> Result<()> {
                 && matches!(engine.state().leg1_state, OrderState::Filled { .. })
                 && matches!(engine.state().leg2_state, OrderState::Filled { .. })
             {
+                // Record to QuestDB before state reset.
+                if let Some(ref mut c) = cold
+                    && let Err(e) = engine.record_live_trade(c)
+                {
+                    warn!(error = %e, "failed to record live trade to QuestDB");
+                }
                 engine.on_trade_complete();
             }
 
@@ -362,7 +421,7 @@ async fn main() -> Result<()> {
             Mode::Live => {
                 info!("starting live executor");
 
-                let poly = PolymarketGateway::new(executor_config.clone());
+                let poly = PolymarketGateway::new(executor_config.clone()).await;
                 let cold = match ColdStorage::new(&executor_config.questdb_url) {
                     Ok(c) => c,
                     Err(e) => {

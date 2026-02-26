@@ -30,7 +30,7 @@ WHERE timestamp > dateadd('h', -24, now());
 -- Performance by confidence tier (last 24h)
 -- ============================================================
 SELECT
-    profit_target_tier,
+    profit_tier,
     count(*) AS trades,
     avg(confidence) AS avg_confidence,
     avg(profit_pct) AS avg_net_pct,
@@ -39,7 +39,7 @@ SELECT
     avg(alloc_amount) AS avg_alloc
 FROM simulated_trades
 WHERE timestamp > dateadd('h', -24, now())
-GROUP BY profit_target_tier;
+GROUP BY profit_tier;
 
 -- ============================================================
 -- Emergency taker fee impact by price range
@@ -91,11 +91,8 @@ SELECT
     symbol,
     max(mid) - min(mid) AS range,
     avg(mid) AS avg_mid
-FROM (
-    SELECT timestamp, symbol, (bid_price + ask_price) / 2 AS mid
-    FROM binance_ticks
-    WHERE timestamp > dateadd('h', -1, now())
-)
+FROM binance_ticks
+WHERE timestamp > dateadd('h', -1, now())
 SAMPLE BY 1m;
 
 -- ════════════════════════════════════════════════════════════
@@ -106,7 +103,7 @@ SAMPLE BY 1m;
 -- 8. Loss attribution by exit reason (last 24h)
 -- THE most important tuning query. Answers: "What is causing losses?"
 --   AdverseMovement  → tune risk.adverse_threshold
---   BreakEvenBreach  → tune risk.break_even_tolerance_ticks, risk.max_loss_ticks
+--   BreakEvenBreach  → tune entry timing (risk.erosion_base_interval_ms)
 --   MarketExpiry     → tune entry_guards.entry_cutoff_secs
 --   FavorableTaker   → usually a win (opportunistic take)
 --   NormalErosion    → happy path
@@ -213,7 +210,7 @@ ORDER BY entry_window;
 -- ============================================================
 -- 13. Emergency taker vs. maker exit comparison (last 24h)
 -- Answers: "How much are emergency fees eating profits?"
--- Tune: risk.emergency_repost_interval_ms (lower = more post-only attempts)
+-- Tune: risk.emergency_deadline_ms (lower = faster FOK fallback, fewer maker fills)
 -- ============================================================
 SELECT
     CASE

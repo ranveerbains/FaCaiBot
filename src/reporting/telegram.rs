@@ -118,9 +118,10 @@ impl TelegramReporter {
     }
 
     /// Tier 2 — market summary (sent at each 15-min market expiry).
+    /// Uses fire_critical() so summaries are never silently dropped by the rate limiter.
     pub fn send_market_summary(&self, summary: &MarketSummary) {
         let text = formatter::format_market_summary(summary);
-        self.fire_and_forget(text);
+        self.fire_critical(text);
     }
 
     /// Tier 3 — session summary (sent hourly and on graceful shutdown).
@@ -161,18 +162,22 @@ impl TelegramReporter {
         });
     }
 
-    /// Fire a message unconditionally (no rate limit). Use for trade completions
-    /// and session summaries that must never be dropped.
+    /// Fire a message unconditionally (never dropped). Spaces critical messages
+    /// at least 1.5s apart so they don't pile up on Telegram.
     fn fire_critical(&self, text: String) {
-        // Update last_send_ms so subsequent non-critical messages are still gated.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.inner.last_send_ms.store(now_ms, Ordering::Relaxed);
+        let last = self.inner.last_send_ms.swap(now_ms, Ordering::Relaxed);
+        let gap_ms = now_ms.saturating_sub(last);
 
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
+            // Space critical messages at least 1.5s apart so they don't pile up on Telegram.
+            if gap_ms < 1_500 {
+                tokio::time::sleep(std::time::Duration::from_millis(1_500 - gap_ms)).await;
+            }
             if let Err(e) = post_telegram_message(
                 &inner.tls_connector,
                 &inner.bot_token,

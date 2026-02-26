@@ -73,6 +73,7 @@ pub fn build_signer(private_key_hex: &str) -> Result<PrivateKeySigner> {
 
 // ─── L2 HMAC authentication headers ──────────────────────────────────────────
 
+#[allow(dead_code)] // retained for potential fallback; SDK handles auth for trading ops
 /// Generate the five L2 authentication headers for a Polymarket CLOB request.
 ///
 /// # Arguments
@@ -116,6 +117,7 @@ pub fn generate_api_headers(
     Ok(headers)
 }
 
+#[allow(dead_code)] // retained for potential fallback; SDK handles auth for trading ops
 /// Compute the HMAC-SHA256 signature for a CLOB API request.
 ///
 /// Message: `timestamp || method || path || body` (raw concatenation, no separator).
@@ -151,6 +153,7 @@ pub fn build_hmac_signature(
     Ok(hex::encode(result.into_bytes()))
 }
 
+#[allow(dead_code)] // retained for potential fallback; SDK handles auth for trading ops
 /// Return the current Unix timestamp in **seconds** as a string.
 ///
 /// Convenience helper for callers building auth headers without an explicit

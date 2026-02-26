@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::Decimal;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::gateway::polymarket::PolymarketGateway;
 use crate::reporting::telegram::TelegramReporter;
@@ -87,10 +87,25 @@ impl LiveExecutor {
                     condition_id,
                     market_end_ms,
                 } => {
-                    debug!(
+                    info!(
                         condition_id,
-                        market_end_ms, "LiveExecutor: market cutoff (no action needed)"
+                        market_end_ms, "LiveExecutor: market cutoff entered"
                     );
+                    let short_id = if condition_id.len() > 5 {
+                        &condition_id[condition_id.len() - 5..]
+                    } else {
+                        &condition_id
+                    };
+                    self.reporter.send_alert(&format!(
+                        "MARKET CUTOFF: #{} — no new entries allowed. Leg 2 erosion continues for open positions.",
+                        short_id,
+                    ));
+                }
+                ExecutorCommand::CancelLeg1 { order_id } => {
+                    info!(%order_id, "cancelling stale Leg 1 order");
+                    if let Err(e) = self.poly.cancel_order(&order_id).await {
+                        warn!(%order_id, error = %e, "failed to cancel stale Leg 1");
+                    }
                 }
             }
             self.check_diagnostic();
@@ -339,16 +354,10 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 2 emergency: post-only first, FOK fallback ────────────────
+    // ─── Leg 2 emergency: price-chase post-only or deadline FOK ─────────
 
     async fn handle_leg2_emergency(&mut self, signal: &TradeSignal) {
         let exit_reason = signal.exit_reason.unwrap();
-        warn!(
-            reason = ?exit_reason,
-            price = %signal.price,
-            size = %signal.size,
-            "Leg 2 EMERGENCY: trying aggressive post-only first"
-        );
 
         // Cancel any existing Leg 2 resting order first.
         if let Some(ref prev_order_id) = self.active_leg2_order_id {
@@ -359,50 +368,72 @@ impl LiveExecutor {
             self.orders_cancelled += 1;
         }
 
-        // Try aggressive post-only at best_ask - 1 tick (zero fee).
-        let post_only_price = round_to_tick(signal.price - signal.tick_size, signal.tick_size);
-        let order = OrderRequest::aggressive_post_only(
-            signal.token_id.clone(),
-            signal.side,
-            post_only_price,
-            signal.size,
-        );
+        if signal.sim_was_taker {
+            // Deadline expired — evaluator determined FOK taker at best_ask.
+            warn!(
+                reason = ?exit_reason,
+                price = %signal.price,
+                size = %signal.size,
+                "Leg 2 EMERGENCY: deadline expired — direct FOK taker"
+            );
+            self.emergency_fok_fallback(signal, exit_reason).await;
+        } else {
+            // Price-chase — aggressive post-only at evaluator-computed price (best_ask - tick).
+            warn!(
+                reason = ?exit_reason,
+                price = %signal.price,
+                size = %signal.size,
+                "Leg 2 EMERGENCY: price-chase post-only"
+            );
+            let order = OrderRequest::aggressive_post_only(
+                signal.token_id.clone(),
+                signal.side,
+                signal.price,
+                signal.size,
+            );
 
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                if resp.status == OrderStatus::Rejected {
-                    // Post-only would cross spread → FOK fallback.
-                    warn!(
-                        price = %post_only_price,
-                        "Leg 2 emergency: post-only REJECTED — falling back to FOK"
-                    );
-                    self.emergency_fok_fallback(signal, exit_reason).await;
-                } else {
-                    info!(
-                        order_id = %resp.order_id,
-                        price = %post_only_price,
-                        "Leg 2 emergency: aggressive post-only accepted"
-                    );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
-                    self.emergency_maker_posts += 1;
-                    self.orders_placed += 1;
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Rejected {
+                        // Post-only would cross spread → FOK fallback at best_ask.
+                        let fok_price = round_to_tick(
+                            signal.price + signal.tick_size,
+                            signal.tick_size,
+                        );
+                        warn!(
+                            price = %signal.price,
+                            fok_price = %fok_price,
+                            "Leg 2 emergency: post-only REJECTED — falling back to FOK"
+                        );
+                        self.emergency_fok_at_price(signal, exit_reason, fok_price)
+                            .await;
+                    } else {
+                        info!(
+                            order_id = %resp.order_id,
+                            price = %signal.price,
+                            "Leg 2 emergency: price-chase post-only accepted"
+                        );
+                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                        self.emergency_maker_posts += 1;
+                        self.orders_placed += 1;
 
-                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                        is_leg2: true,
-                        order_id: resp.order_id,
-                        price: post_only_price,
-                        size: signal.size,
-                    });
+                        let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                            is_leg2: true,
+                            order_id: resp.order_id,
+                            price: signal.price,
+                            size: signal.size,
+                        });
 
-                    self.reporter.send_alert(&format!(
-                        "EMERGENCY POST-ONLY: {:?} at {} for {} shares (zero fee)",
-                        exit_reason, post_only_price, signal.size,
-                    ));
+                        self.reporter.send_alert(&format!(
+                            "EMERGENCY POST-ONLY: {:?} at {} for {} shares (zero fee)",
+                            exit_reason, signal.price, signal.size,
+                        ));
+                    }
                 }
-            }
-            Err(e) => {
-                error!(error = %e, "Leg 2 emergency: post-only placement FAILED — trying FOK fallback");
-                self.emergency_fok_fallback(signal, exit_reason).await;
+                Err(e) => {
+                    error!(error = %e, "Leg 2 emergency: post-only placement FAILED — trying FOK fallback");
+                    self.emergency_fok_fallback(signal, exit_reason).await;
+                }
             }
         }
     }
@@ -460,6 +491,61 @@ impl LiveExecutor {
         }
     }
 
+    // ─── Emergency FOK at a specific price (CLOB rejection fallback) ────
+
+    async fn emergency_fok_at_price(
+        &mut self,
+        signal: &TradeSignal,
+        exit_reason: crate::types::order::ExitReason,
+        price: Decimal,
+    ) {
+        let order = OrderRequest::emergency_fok(
+            signal.token_id.clone(),
+            signal.side,
+            price,
+            signal.size,
+        );
+
+        match self.poly.place_order(&order).await {
+            Ok(resp) => {
+                info!(
+                    order_id = %resp.order_id,
+                    status = ?resp.status,
+                    %price,
+                    "Leg 2 emergency: FOK at price placed"
+                );
+                self.active_leg2_order_id = Some(resp.order_id.clone());
+                self.emergency_foks += 1;
+                self.orders_placed += 1;
+
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                    is_leg2: true,
+                    order_id: resp.order_id,
+                    price,
+                    size: signal.size,
+                });
+
+                self.reporter.send_alert(&format!(
+                    "EMERGENCY FOK FALLBACK: {:?} at {} for {} shares",
+                    exit_reason, price, signal.size,
+                ));
+            }
+            Err(e) => {
+                error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — POSITION EXPOSED");
+                self.orders_failed += 1;
+
+                let _ = self
+                    .feedback_tx
+                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+
+                self.reporter.send_alert(&format!(
+                    "CRITICAL: Emergency FOK FAILED: {} — position unhedged!",
+                    e
+                ));
+            }
+        }
+    }
+
     // ─── Market rotation ────────────────────────────────────────────────
 
     async fn on_market_rotation(&mut self, condition_id: &str) {
@@ -492,8 +578,8 @@ impl LiveExecutor {
             direction_str,
             signal.confidence,
             signal.spike_info.magnitude,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            signal.atr,
+            signal.book_snapshot.as_ref().map(|b| b.total_bid_depth()).unwrap_or(Decimal::ZERO),
             time_remaining_secs as i64,
             signal.alloc_amount,
             action,

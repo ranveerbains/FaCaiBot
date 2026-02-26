@@ -35,14 +35,13 @@ pub(crate) struct ErosionState {
     pub spike_info: SpikeInfo,
     pub confidence: Decimal,
     pub binance_at_fill: Option<Decimal>,
-    /// Opposing token's best ask at Leg 1 fill time. Used to detect whether
-    /// the hedge cost has *worsened* since entry (break-even breach).
-    pub opposing_ask_at_fill: Option<Decimal>,
     pub emergency_submitted: bool,
     /// Set when an emergency FOK is confirmed — carries the reason for executor categorization.
     pub exit_reason: Option<ExitReason>,
-    /// Number of emergency repost attempts (for FOK fallback after N maker attempts).
-    pub emergency_repost_count: u32,
+    /// Epoch ms when the first emergency order was posted (for hard deadline).
+    pub emergency_first_post_ms: Option<u64>,
+    /// Price of the currently resting emergency order (for price-chase comparison).
+    pub emergency_posted_price: Option<Decimal>,
 }
 
 impl ErosionState {
@@ -56,7 +55,6 @@ impl ErosionState {
         spike_info: SpikeInfo,
         confidence: Decimal,
         binance_at_fill: Option<Decimal>,
-        opposing_ask_at_fill: Option<Decimal>,
     ) -> Self {
         Self {
             leg1_fill_ms,
@@ -69,10 +67,10 @@ impl ErosionState {
             spike_info,
             confidence,
             binance_at_fill,
-            opposing_ask_at_fill,
             emergency_submitted: false,
             exit_reason: None,
-            emergency_repost_count: 0,
+            emergency_first_post_ms: None,
+            emergency_posted_price: None,
         }
     }
 
@@ -136,9 +134,6 @@ pub(crate) struct ErosionSnap {
     pub initial_profit_target: Decimal,
     pub direction: Direction,
     pub binance_at_fill: Option<Decimal>,
-    /// Opposing ask at Leg 1 fill time — break-even FOK only fires if current
-    /// opposing ask has *risen* above this baseline.
-    pub opposing_ask_at_fill: Option<Decimal>,
     pub fill_ms: u64,
     pub steps_applied: u32,
     pub tier: ProfitTier,
@@ -148,8 +143,10 @@ pub(crate) struct ErosionSnap {
     pub leg1_fill_price: Decimal,
     /// Exit reason from the erosion state — carried for emergency reposts.
     pub exit_reason: Option<ExitReason>,
-    /// Number of emergency repost attempts so far (for FOK fallback threshold).
-    pub emergency_repost_count: u32,
+    /// Epoch ms when the first emergency order was posted (for hard deadline).
+    pub emergency_first_post_ms: Option<u64>,
+    /// Price of the currently resting emergency order (for price-chase comparison).
+    pub emergency_posted_price: Option<Decimal>,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -173,7 +170,6 @@ mod tests {
                 timestamp_ms: 0,
             },
             Decimal::new(7, 1),
-            None,
             None,
         );
         e.steps_applied = steps;
@@ -210,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repost_count_initializes_to_zero() {
+    fn test_emergency_fields_initialize_to_none() {
         let e = ErosionState::new(
             0,
             Decimal::new(50, 2),
@@ -226,8 +222,8 @@ mod tests {
             },
             Decimal::new(7, 1),
             None,
-            None,
         );
-        assert_eq!(e.emergency_repost_count, 0);
+        assert!(e.emergency_first_post_ms.is_none());
+        assert!(e.emergency_posted_price.is_none());
     }
 }

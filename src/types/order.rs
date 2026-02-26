@@ -163,6 +163,8 @@ pub struct TradeSignal {
     pub fee_rate_bps: u16,
 
     // ── Analytics flags ──────────────────────────────────────────────────
+    /// Current ATR at signal time (for QuestDB analytics). `Decimal::ZERO` if ATR not yet warmed up.
+    pub atr: Decimal,
     /// Whether a competitor depth wall was detected during signal generation.
     pub bot_contested: bool,
 
@@ -199,6 +201,10 @@ pub enum ExecutorCommand {
         condition_id: String,
         /// Epoch ms when the market ends.
         market_end_ms: u64,
+    },
+    /// Cancel a stale Leg 1 order that wasn't filled in time.
+    CancelLeg1 {
+        order_id: String,
     },
 }
 

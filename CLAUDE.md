@@ -10,7 +10,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC/ETH 15-minute prediction ma
 cargo build              # Build (debug)
 cargo build --release    # Build (release — LTO, single codegen unit)
 cargo run                # Run the bot
-cargo test               # Run all tests (102 tests)
+cargo test               # Run all tests (136 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -26,26 +26,45 @@ docker-compose down      # Stop
 
 Copy `.env.example` → `.env` and fill credentials before running. Tuning params live in `config.toml`.
 
+## Production Deployment (AWS)
+
+```bash
+sudo bash deploy/setup.sh                                    # One-time server setup
+RUSTFLAGS="-C target-cpu=native" cargo build --release       # Build with native CPU opts
+bash deploy/deploy.sh                                        # Deploy/update
+```
+
+- **Instance**: `c7i.xlarge` in `eu-west-2` (London) — co-located with Polymarket CLOB
+- **OS**: Amazon Linux 2023
+- See `README.md` for full deployment guide and `deploy/` for scripts
+
 ## Architecture
 
 Three-layer lock-free pipeline connected by crossbeam SPSC channels:
 
 ```
 Ingestor (gateway/) ──▶ Engine (engine/) ──▶ Executor (executor/)
-  Binance WS              MarketState          MODE=live: CLOB API
+  Binance SBE WS          MarketState          MODE=live: CLOB API
   Polymarket WS            Spike→Signal         MODE=sim: Telegram+QuestDB
   Gamma API (REST)        Erosion cascade
 ```
 
 - **Ingestor**: Dedicated OS thread, CPU-pinned core 0, single-threaded tokio runtime
 - **Engine**: Evaluates arbitrage, emits TradeSignal. In sim mode also runs `advance_simulation()` fill state machine
-- **Executor**: Live mode signs+submits orders; sim mode reports via Telegram+QuestDB
+- **Executor**: Live mode submits orders via polymarket-client-sdk; sim mode reports via Telegram+QuestDB
 
 ## Source Files
 
 ```
+deploy/
+├── facaibot.service               # systemd unit (auto-restart, CPU affinity, security)
+├── sysctl.conf                    # Kernel network tuning for low-latency trading
+├── setup.sh                       # One-time EC2 server provisioning
+├── deploy.sh                      # Update deployment (git pull, build, restart)
+└── healthcheck.sh                 # Cron health check with Telegram alerts
+
 src/
-├── main.rs                        # Entry point, MODE-based dispatch, channel wiring
+├── main.rs                        # Entry point: jemalloc, manual tokio runtime (2 workers), channel wiring
 ├── config.rs                      # Hybrid config: config.toml (tuning) + .env (secrets)
 ├── engine/
 │   ├── strategy.rs                # StrategyEngine: event routing, state, simulation FSM
@@ -58,11 +77,11 @@ src/
 │   └── fill_engine.rs             # Utility helpers: compute_fill_size, opposite_side, epoch_ms
 ├── gateway/
 │   ├── binance/
-│   │   ├── ws.rs                  # BinanceGateway: fastwebsockets TLS, JSON parsing
+│   │   ├── ws.rs                  # BinanceGateway: fastwebsockets TLS, SBE binary decoding (50ms depth + real-time bestBidAsk)
 │   │   └── spike.rs               # SpikeDetector: EMA-ATR with sustain + momentum filter
 │   └── polymarket/
 │       ├── mod.rs                 # Facade, shared constants
-│       ├── rest.rs                # CLOB REST: EIP-712 signing, order placement
+│       ├── rest.rs                # CLOB REST: SDK-based order placement, cancel, public read endpoints
 │       ├── market_ws.rs           # Public Market WS: book, price, tick events
 │       ├── user_ws.rs             # Authenticated User WS: trade fills
 │       ├── heartbeat.rs           # POST /heartbeat every 5s (live only)
@@ -77,7 +96,7 @@ src/
 │   ├── order.rs                   # TradeSignal, ProfitTier, ExecutorCommand, ExecutorFeedback, Side
 │   └── simulation.rs              # SimulationState, SimPosition, SimTrade
 └── utils/
-    └── signing.rs                 # HMAC-SHA256 auth, EIP-712 signer, contract addresses
+    └── signing.rs                 # build_signer() helper; HMAC/contract constants retained as dead-code fallback
 ```
 
 ## Key Conventions
@@ -87,9 +106,11 @@ src/
 - **Hybrid config**: `config.toml` for tuning params (serde + `#[serde(default)]`), `.env` for secrets only. Override path with `CONFIG_FILE` env var
 - **Evaluator pattern**: `Leg1Evaluator`/`Leg2Evaluator` are pure (no state mutation) — caller applies mutations after receiving results
 - **Self-gating**: `evaluate(&mut self)` clears `spike_detected` on both success AND failure — each spike gets exactly 1 attempt
+- **Binance SBE**: Binary market data via `stream-sbe.binance.com` (Ed25519 API key required). `@depth20` at 50ms cadence + `@bestBidAsk` real-time. Zero-copy decode: `i64::from_le_bytes()` at known offsets → `Decimal::new(mantissa, -exponent)`. Schema `stream_1_0.xml`, templates 10001 (BestBidAsk) and 10002 (DepthSnapshot)
 - **Spike delivery**: Confirmed spikes delivered as `IngestorEvent::SpikeConfirmed(SpikeInfo)` — dedicated event variant, not encoded in BinanceTick fields
-- **Erosion model**: Triangle-weighted steps `[5,4,3,2,1]` (front-loaded) with exponential decay intervals (3.5s→1.75s→0.875s→0.437s→0.218s). ~6.8s to break-even. Capped at `MAX_EROSION_STEPS` (5) — exhaustion auto-triggers `BreakEvenBreach` emergency
-- **Emergency exits**: All use post-only first → FOK fallback after `emergency_max_maker_attempts` (3) reposts. Three triggers: (1) Adverse movement — Binance reversal >0.1%, zero grace; (2) Break-even breach — after first erosion step, FOK capped at initial+3 ticks; (3) Erosion exhausted — all 5 steps applied without fill
+- **Erosion model**: Triangle-weighted steps `[5,4,3,2,1]` (front-loaded) with exponential decay intervals (3s→1.5s→0.75s→0.375s→0.2s). ~5.8s to break-even. Capped at `MAX_EROSION_STEPS` (5) — exhaustion auto-triggers `BreakEvenBreach` emergency. **Skip guard**: if posted Leg 2 price is already at or better than the next erosion target, the repost is skipped (preserves favorable exits)
+- **Emergency exits**: Price-improvement chase with hard deadline. Post-only at `best_ask - 1 tick`, only repost when book offers strictly better price (preserves FIFO queue priority). After `emergency_deadline_ms` (2500ms) → FOK taker at `best_ask`. Three triggers: (1) Adverse movement — Binance reversal >0.1%, zero grace; (2) Break-even breach — after first erosion step; (3) Erosion exhausted — all 5 steps applied without fill
+- **Leg 1 staleness**: Unfilled Leg 1 post-only orders are cancelled after `leg1_timeout_ms` (default 5000ms) to free the slot for the next spike. `CancelLeg1` executor command in live mode; handled in `advance_simulation()` for sim
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
 
 ## Key Documents

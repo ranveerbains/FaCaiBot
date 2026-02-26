@@ -10,11 +10,33 @@ use tracing::{debug, info};
 use crate::config::SpikeDetectionConfig;
 use crate::types::market::{Direction, SpikeInfo};
 
+// ─── SpikeEvent ──────────────────────────────────────────────────────────────
+
+/// Result of feeding a tick to [`SpikeDetector::update`].
+///
+/// - `None` — normal tick, no action.
+/// - `Candidate` — ATR + magnitude passed, emit immediately for speculative Leg 1 posting.
+/// - `Confirmed` — sustain + momentum passed (informational, gates sim fills).
+/// - `Failed` — momentum check failed at sustain time → cancel speculative Leg 1.
+#[derive(Debug, Clone)]
+pub enum SpikeEvent {
+    /// Normal tick — no spike activity.
+    None,
+    /// ATR threshold + magnitude passed on the initial tick. Emitted immediately
+    /// so the engine can speculatively post a Leg 1 order before sustain confirms.
+    Candidate(SpikeInfo),
+    /// Sustain + momentum passed — spike is real. Gates sim Leg 1 fills.
+    Confirmed(SpikeInfo),
+    /// Spike candidate failed momentum check at sustain time.
+    /// Engine should cancel any speculative Leg 1 order.
+    Failed { timestamp_ms: u64 },
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// ATR warmup period: no spikes emitted until this many samples have been seen.
 /// Prevents false positives while the EMA initialises from a single data point.
-/// At 100ms/tick this is ~1 second.
+/// At 50ms/tick (SBE @depth20) this is ~0.5 seconds.
 const MIN_ATR_SAMPLES: usize = 10;
 
 // ─── SpikeDetector ────────────────────────────────────────────────────────────
@@ -24,7 +46,6 @@ pub struct SpikeDetector {
     // ── Config ────────────────────────────────────────────────────────
     multiplier: f64,
     atr_alpha: f64,
-    window_ms: u64,
     sustain_ms: u64,
     min_magnitude_pct: f64,
     momentum_ratio_min: f64,
@@ -55,7 +76,6 @@ pub struct SpikeDetector {
 
     // ── Diagnostic counters (cumulative, logged periodically) ──────
     diag_candidates_started: u64,
-    diag_expired_window: u64,
     diag_fading_momentum: u64,
     diag_below_magnitude: u64,
     diag_confirmed: u64,
@@ -67,7 +87,6 @@ impl SpikeDetector {
         Self {
             multiplier: config.multiplier,
             atr_alpha: config.atr_alpha,
-            window_ms: config.window_ms,
             sustain_ms: config.sustain_ms,
             min_magnitude_pct: config.min_magnitude_pct,
             momentum_ratio_min: config.momentum_ratio_min,
@@ -82,7 +101,6 @@ impl SpikeDetector {
             stale_count: 0,
             last_stale_log_ms: 0,
             diag_candidates_started: 0,
-            diag_expired_window: 0,
             diag_fading_momentum: 0,
             diag_below_magnitude: 0,
             diag_confirmed: 0,
@@ -92,14 +110,17 @@ impl SpikeDetector {
 
     /// Feed a new mid-price sample from a `@depth20` snapshot.
     ///
-    /// Returns `Some(SpikeInfo)` when a spike passes all filters and is ready
-    /// to emit. Returns `None` if no spike is confirmed yet.
-    pub fn update(&mut self, mid: f64, now_ms: u64) -> Option<SpikeInfo> {
+    /// Returns a [`SpikeEvent`]:
+    /// - `Candidate` — ATR + magnitude passed on the initial tick (speculative Leg 1).
+    /// - `Confirmed` — sustain + momentum passed at sustain_ms.
+    /// - `Failed` — momentum/magnitude failed at sustain_ms → cancel speculative order.
+    /// - `None` — normal tick, no action.
+    pub fn update(&mut self, mid: f64, now_ms: u64) -> SpikeEvent {
         // ── Initialise on first sample ─────────────────────────────────
         let Some(prev_mid) = self.prev_mid else {
             self.prev_mid = Some(mid);
             self.prev_ts_ms = now_ms;
-            return None;
+            return SpikeEvent::None;
         };
 
         let delta = mid - prev_mid;
@@ -120,7 +141,6 @@ impl SpikeDetector {
                 threshold = format!("{:.2}", self.multiplier * self.ema_atr.max(1e-10)),
                 mid = format!("{:.2}", mid),
                 candidates = self.diag_candidates_started,
-                rej_window = self.diag_expired_window,
                 rej_momentum = self.diag_fading_momentum,
                 rej_magnitude = self.diag_below_magnitude,
                 confirmed = self.diag_confirmed,
@@ -134,7 +154,7 @@ impl SpikeDetector {
         if self.sample_count < MIN_ATR_SAMPLES {
             self.prev_mid = Some(mid);
             self.prev_ts_ms = now_ms;
-            return None;
+            return SpikeEvent::None;
         }
 
         let atr = self.ema_atr.max(1e-10);
@@ -151,18 +171,7 @@ impl SpikeDetector {
             let abs_displacement = displacement.abs();
             let elapsed = now_ms.saturating_sub(spike_start);
 
-            if elapsed > self.window_ms {
-                // Candidate timed out without reaching sustain threshold.
-                self.diag_expired_window += 1;
-                debug!(
-                    elapsed,
-                    window_ms = self.window_ms,
-                    displacement = format!("{:.2}", abs_displacement),
-                    threshold = format!("{:.2}", threshold),
-                    "spike REJECTED: window expired before sustain"
-                );
-                self.reset_candidate();
-            } else if abs_displacement > threshold {
+            if abs_displacement > threshold {
                 // Price is still significantly displaced from origin — spike holds.
                 // Track the largest displacement as peak delta.
                 if abs_displacement > self.spike_peak_delta.abs() {
@@ -184,6 +193,9 @@ impl SpikeDetector {
                             "spike REJECTED: fading momentum"
                         );
                         self.reset_candidate();
+                        self.prev_mid = Some(mid);
+                        self.prev_ts_ms = now_ms;
+                        return SpikeEvent::Failed { timestamp_ms: now_ms };
                     } else {
                         // Use sustain-time displacement (not peak) for honest magnitude.
                         let magnitude = if self.spike_origin_mid.abs() > 1e-12 {
@@ -192,40 +204,43 @@ impl SpikeDetector {
                             0.0
                         };
 
-                        // Minimum magnitude gate.
-                        let min_mag = self.min_magnitude_pct / 100.0;
-                        if magnitude < min_mag {
-                            self.diag_below_magnitude += 1;
-                            debug!(
-                                magnitude_pct = format!("{:.4}", magnitude * 100.0),
-                                min_pct = self.min_magnitude_pct,
-                                "spike REJECTED: below min magnitude"
-                            );
-                            self.reset_candidate();
-                        } else {
-                            // All gates passed — emit spike immediately.
-                            self.diag_confirmed += 1;
-                            let spike_info = SpikeInfo {
-                                direction: self.spike_direction.unwrap_or(Direction::Up),
-                                magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
-                                sustained_ms: elapsed,
-                                timestamp_ms: spike_start,
-                            };
-                            info!(
-                                direction = ?spike_info.direction,
-                                magnitude_pct = %(magnitude * 100.0),
-                                sustained_ms = elapsed,
-                                "spike CONFIRMED — all gates passed"
-                            );
-                            self.reset_candidate();
-                            self.prev_mid = Some(mid);
-                            self.prev_ts_ms = now_ms;
-                            return Some(spike_info);
-                        }
+                        // All gates passed — emit Confirmed.
+                        // Magnitude was already validated at candidate start, but
+                        // we recompute here for the confirmed SpikeInfo using
+                        // sustain-time displacement (more honest than initial tick).
+                        self.diag_confirmed += 1;
+                        let spike_info = SpikeInfo {
+                            direction: self.spike_direction.unwrap_or(Direction::Up),
+                            magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
+                            sustained_ms: elapsed,
+                            timestamp_ms: spike_start,
+                        };
+                        info!(
+                            direction = ?spike_info.direction,
+                            magnitude_pct = %(magnitude * 100.0),
+                            sustained_ms = elapsed,
+                            "spike CONFIRMED — sustain + momentum passed"
+                        );
+                        self.reset_candidate();
+                        self.prev_mid = Some(mid);
+                        self.prev_ts_ms = now_ms;
+                        return SpikeEvent::Confirmed(spike_info);
                     }
                 }
+            } else if elapsed >= self.sustain_ms {
+                // Displacement fell below threshold at sustain time — spike faded.
+                self.diag_fading_momentum += 1;
+                debug!(
+                    displacement = format!("{:.2}", abs_displacement),
+                    threshold = format!("{:.2}", threshold),
+                    "spike FAILED: displacement below threshold at sustain"
+                );
+                self.reset_candidate();
+                self.prev_mid = Some(mid);
+                self.prev_ts_ms = now_ms;
+                return SpikeEvent::Failed { timestamp_ms: now_ms };
             }
-            // else: displacement below threshold but within window — allow brief dips.
+            // else: within sustain window, displacement may be below threshold — allow brief dips.
         } else if abs_delta > threshold {
             // No active candidate — start a new one from a large per-tick jump.
             let candidate_dir = if delta > 0.0 {
@@ -234,24 +249,55 @@ impl SpikeDetector {
                 Direction::Down
             };
 
+            // Magnitude check at candidate start: reject if the initial tick
+            // doesn't meet the minimum magnitude threshold.
+            let magnitude = if prev_mid.abs() > 1e-12 {
+                (abs_delta / prev_mid.abs()).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let min_mag = self.min_magnitude_pct / 100.0;
+            if magnitude < min_mag {
+                self.diag_below_magnitude += 1;
+                debug!(
+                    magnitude_pct = format!("{:.4}", magnitude * 100.0),
+                    min_pct = self.min_magnitude_pct,
+                    "spike candidate REJECTED: below min magnitude at start"
+                );
+                self.prev_mid = Some(mid);
+                self.prev_ts_ms = now_ms;
+                return SpikeEvent::None;
+            }
+
             self.spike_start_ms = Some(now_ms);
             self.spike_direction = Some(candidate_dir);
             self.spike_origin_mid = prev_mid;
             self.spike_peak_delta = delta;
             self.diag_candidates_started += 1;
+
+            let spike_info = SpikeInfo {
+                direction: candidate_dir,
+                magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
+                sustained_ms: 0,
+                timestamp_ms: now_ms,
+            };
             debug!(
                 direction = ?candidate_dir,
                 abs_delta = format!("{:.2}", abs_delta),
                 atr = format!("{:.2}", atr),
                 threshold = format!("{:.2}", threshold),
                 mid = format!("{:.2}", mid),
-                "spike candidate STARTED"
+                magnitude_pct = format!("{:.4}", magnitude * 100.0),
+                "spike candidate STARTED — emitting Candidate"
             );
+            self.prev_mid = Some(mid);
+            self.prev_ts_ms = now_ms;
+            return SpikeEvent::Candidate(spike_info);
         }
 
         self.prev_mid = Some(mid);
         self.prev_ts_ms = now_ms;
-        None
+        SpikeEvent::None
     }
 
     pub(super) fn reset_candidate(&mut self) {
@@ -287,7 +333,6 @@ mod tests {
         SpikeDetectionConfig {
             multiplier: 1.5,
             atr_alpha: 0.1,
-            window_ms: 400,
             sustain_ms: 200,
             min_magnitude_pct: 0.0, // no min filter in tests (test-specific)
             momentum_ratio_min: 0.5,
@@ -307,15 +352,11 @@ mod tests {
             let price = base + ((i % 2) as f64) * 0.3;
             let result = det.update(price, ts);
             ts += 100;
-            assert!(result.is_none(), "noise tick {i} should not trigger spike");
+            assert!(
+                matches!(result, SpikeEvent::None),
+                "noise tick {i} should not trigger spike"
+            );
         }
-
-        // A single large tick starts a candidate but cannot confirm (no sustain yet).
-        let result = det.update(base + 500.0, ts);
-        assert!(
-            result.is_none(),
-            "single large tick without sustain should not confirm"
-        );
     }
 
     #[test]
@@ -334,27 +375,35 @@ mod tests {
         // Large spike — far exceeds 1.5x ATR threshold.
         let spike_price = base + 600.0;
 
-        // Tick 1: starts the spike candidate.
-        det.update(spike_price, ts);
+        // Tick 1: starts the spike candidate → should return Candidate immediately.
+        let candidate = det.update(spike_price, ts);
+        assert!(
+            matches!(candidate, SpikeEvent::Candidate(_)),
+            "big tick should emit Candidate immediately"
+        );
         ts += 100;
         // Tick 2: continues — 100ms elapsed, below sustain_ms=200ms.
-        det.update(spike_price + 10.0, ts);
+        let mid = det.update(spike_price + 10.0, ts);
+        assert!(
+            matches!(mid, SpikeEvent::None),
+            "should be None before sustain elapsed"
+        );
         ts += 100;
-        // Tick 3: 200ms elapsed — sustain passes, momentum+magnitude pass → spike confirmed immediately.
+        // Tick 3: 200ms elapsed — sustain passes, momentum pass → Confirmed.
         let confirmed = det.update(spike_price + 10.0, ts);
 
-        assert!(
-            confirmed.is_some(),
-            "spike should be confirmed immediately after sustain"
-        );
-        let spike = confirmed.unwrap();
-        assert_eq!(spike.direction, Direction::Up);
-        assert!(spike.magnitude > Decimal::ZERO);
-        assert!(spike.sustained_ms >= cfg.sustain_ms);
+        match confirmed {
+            SpikeEvent::Confirmed(spike) => {
+                assert_eq!(spike.direction, Direction::Up);
+                assert!(spike.magnitude > Decimal::ZERO);
+                assert!(spike.sustained_ms >= cfg.sustain_ms);
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_spike_detector_candidate_times_out() {
+    fn test_spike_detector_candidate_fails_momentum() {
         let cfg = test_spike_config();
         let mut det = SpikeDetector::new(&cfg);
         let base = 52000.0_f64;
@@ -366,15 +415,71 @@ mod tests {
             ts += 100;
         }
 
-        // Single big spike tick — starts candidate.
-        det.update(base + 500.0, ts);
-        ts += cfg.window_ms + 50; // past the 400ms spike window
+        // Single big spike tick — starts candidate, emits Candidate.
+        let candidate = det.update(base + 500.0, ts);
+        assert!(matches!(candidate, SpikeEvent::Candidate(_)));
+        ts += cfg.sustain_ms + 50; // past sustain
 
-        // Price back to base — candidate should time out, no spike.
+        // Price back to base — displacement below threshold at sustain → Failed.
         let result = det.update(base, ts);
         assert!(
-            result.is_none(),
-            "spike candidate that timed out should not emit a spike"
+            matches!(result, SpikeEvent::Failed { .. }),
+            "spike candidate that faded should emit Failed"
+        );
+    }
+
+    #[test]
+    fn test_spike_candidate_emitted_immediately() {
+        let cfg = test_spike_config();
+        let mut det = SpikeDetector::new(&cfg);
+        let base = 52000.0_f64;
+        let mut ts = 1_700_000_000_000_u64;
+
+        // Warm ATR.
+        for i in 0..20 {
+            det.update(base + (i as f64 % 2.0), ts);
+            ts += 100;
+        }
+
+        // Big upward tick — should return Candidate with correct direction and magnitude.
+        let result = det.update(base + 600.0, ts);
+        match result {
+            SpikeEvent::Candidate(spike) => {
+                assert_eq!(spike.direction, Direction::Up);
+                assert!(spike.magnitude > Decimal::ZERO);
+                assert_eq!(spike.sustained_ms, 0);
+            }
+            other => panic!("expected Candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_spike_magnitude_filter_at_start() {
+        // Use a config with a high min_magnitude_pct so the tick exceeds ATR but
+        // fails magnitude.
+        let cfg = SpikeDetectionConfig {
+            multiplier: 1.5,
+            atr_alpha: 0.1,
+            sustain_ms: 200,
+            min_magnitude_pct: 5.0, // 5% — very high for this test
+            momentum_ratio_min: 0.5,
+        };
+        let mut det = SpikeDetector::new(&cfg);
+        let base = 52000.0_f64;
+        let mut ts = 1_700_000_000_000_u64;
+
+        // Warm ATR with small moves.
+        for i in 0..20 {
+            det.update(base + (i as f64 % 2.0), ts);
+            ts += 100;
+        }
+
+        // Tick exceeds ATR threshold (1.5 × ~1.0 ≈ 1.5) but magnitude is
+        // only ~10/52000 ≈ 0.019% — far below the 5% minimum.
+        let result = det.update(base + 10.0, ts);
+        assert!(
+            matches!(result, SpikeEvent::None),
+            "tick exceeding ATR but failing magnitude should return None"
         );
     }
 }

@@ -244,6 +244,9 @@ impl SimulationExecutor {
                     } => {
                         self.on_market_cutoff(&condition_id, market_end_ms);
                     }
+                    ExecutorCommand::CancelLeg1 { order_id } => {
+                        debug!(%order_id, "SimExecutor: Leg 1 cancel (handled by engine)");
+                    }
                 }
 
                 // 60-second session diagnostic (cumulative, same source as Telegram).
@@ -553,8 +556,7 @@ impl SimulationExecutor {
             .as_ref()
             .map(|b| b.total_bid_depth())
             .unwrap_or(Decimal::ZERO);
-        // ATR is not carried in TradeSignal; the engine tracks it in MarketState.
-        let atr = Decimal::ZERO;
+        let atr = signal.atr;
         let time_remaining_secs = signal
             .market_end_timestamp_ms
             .saturating_sub(signal.entry_timestamp_ms)
@@ -638,6 +640,7 @@ mod tests {
             market_end_timestamp_ms: 1_900_000,
             tick_size: d("0.01"),
             fee_rate_bps: 156,
+            atr: Decimal::ZERO,
             bot_contested: false,
             book_snapshot: None,
             sim_confirmed_fill: false,

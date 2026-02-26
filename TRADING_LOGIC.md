@@ -1,6 +1,6 @@
-# Trading Logic — Complete Reference
+# Trading Logic Reference
 
-This document covers every aspect of FaCaiBot's trading logic: signal detection, entry validation, execution, hedge management, emergency exits, and state machines — for both live and simulation modes.
+This document covers FaCaiBot's trading logic: signal detection, entry validation, execution, hedge management, emergency exits, and state machines — for both live and simulation modes.
 
 ---
 
@@ -13,7 +13,7 @@ This document covers every aspect of FaCaiBot's trading logic: signal detection,
 5. [Leg 1 Execution](#5-leg-1-execution)
 6. [Leg 2 Erosion Cascade](#6-leg-2-erosion-cascade)
 7. [Emergency Exits](#7-emergency-exits)
-8. [Post-Only First Strategy](#8-post-only-first-strategy)
+8. [Price-Improvement Chase Strategy](#8-price-improvement-chase-strategy)
 9. [Favorable Taker Exits](#9-favorable-taker-exits)
 10. [Trade Completion & State Reset](#10-trade-completion--state-reset)
 11. [Market Rotation](#11-market-rotation)
@@ -21,9 +21,8 @@ This document covers every aspect of FaCaiBot's trading logic: signal detection,
 13. [Capital Management](#13-capital-management)
 14. [State Machines & Transitions](#14-state-machines--transitions)
 15. [Edge Cases & Race Conditions](#15-edge-cases--race-conditions)
-16. [Diagnostic Logging](#16-diagnostic-logging)
-17. [Complete Trade Example](#17-complete-trade-example)
-18. [Simulation vs Live Differences](#18-simulation-vs-live-differences)
+16. [Complete Trade Example](#16-complete-trade-example)
+17. [Simulation vs Live Differences](#17-simulation-vs-live-differences)
 
 ---
 
@@ -41,8 +40,7 @@ Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
 
 **Key economics:**
 - Both legs target post-only execution (maker, zero fee)
-- Taker fees apply only to FOK emergency exits: `C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50
-- At p=0.50 and 50 shares: ~$0.78 taker fee per FOK fill
+- Taker fees apply only to FOK emergency exits — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
 - Unfilled post-only orders cost nothing — failed signals are free
 
 **One trade at a time.** The engine self-gates after emitting a Leg 1 signal: no new spikes are evaluated until the current trade completes or resets.
@@ -51,59 +49,55 @@ Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
 
 ## 2. Signal Detection Pipeline
 
-**Source file:** `src/gateway/binance/spike.rs`
+The spike detector runs on a dedicated OS thread (CPU-pinned core 0) processing Binance SBE `@depth20` (50ms cadence) and `@bestBidAsk` (real-time) binary WebSocket streams.
 
-The spike detector runs on a dedicated OS thread (CPU-pinned core 0) processing Binance `@depth20@100ms` and `@ticker` WebSocket streams via `fastwebsockets`.
+### Mid-price
 
-### Mid-price computation
-```
-mid = (best_bid + best_ask) / 2
-```
-Updated every ~100ms from `@depth20` orderbook snapshots.
+Computed as `(best_bid + best_ask) / 2` from SBE `@depth20` orderbook snapshots, updated every ~50ms.
 
 ### Rolling EMA-ATR
-```
-atr_alpha = 0.01 (~200-tick / ~20s memory)
-atr(t) = alpha * |delta| + (1 - alpha) * atr(t-1)
-```
 
-No spikes are emitted for the first 10 ticks (~1 second) while the ATR warms up. This prevents false positives during initialization when the ATR is unrepresentative.
+Uses `atr_alpha = 0.01` (~200-tick / ~10s memory at 50ms/tick). No spikes are emitted for the first 10 ticks (~0.5 seconds) while the ATR warms up, preventing false positives during initialization.
 
-### 6-Gate Spike Confirmation Pipeline
+### Speculative Spike Detection Pipeline
 
-Each gate is checked in sequence. A candidate is discarded the moment any gate fails:
+The detector uses a **"post then cancel if unconfirmed"** model. Leg 1 is posted speculatively on the initial ATR+magnitude trigger, ~300ms before sustain confirmation. This gains CLOB queue priority at zero cost (post-only orders can be cancelled for free).
 
-| # | Gate | Threshold | What it filters |
-|---|------|-----------|-----------------|
+**Phase 1 — Immediate candidate (T+0):**
+
+| # | Check | Threshold | What it filters |
+|---|-------|-----------|-----------------|
 | 1 | **ATR warmup** | 10 samples | Initialization noise |
-| 2 | **Per-tick threshold** | `\|delta\| > multiplier * ATR` (2x) | Normal volatility |
-| 3 | **Window timeout** | 350ms | Transient liquidity gaps (candidate dies if not sustained) |
-| 4 | **Sustain duration** | 300ms | Short-lived noise (must hold displacement for this long) |
-| 5 | **Momentum ratio** | displacement/peak >= 0.50 | Fading spikes (price already retracing) |
-| 6 | **Magnitude gate** | `displacement/origin_price >= min_magnitude_pct` (0.01 = 1%) | Marginal moves too small to trade |
+| 2 | **Per-tick threshold** | `|delta| > multiplier × ATR` (2x) | Normal volatility |
+| 3 | **Magnitude gate** | `displacement/origin_price >= 0.01%` (1 bp) | Marginal moves too small to trade |
 
-**Timing:** The "catch zone" is `window_ms - sustain_ms` = 50ms. This is the tolerance for network jitter between sustain confirmation and window expiry.
+If all pass → emit `SpikeCandidate` immediately → engine posts speculative Leg 1.
 
-**Magnitude uses sustain-time displacement**, not peak overshoot. This ensures we're measuring the sustained move, not a momentary spike that's already fading.
+**Phase 2 — Sustain confirmation (T+300ms):**
+
+| # | Check | Threshold | What it filters |
+|---|-------|-----------|-----------------|
+| 4 | **Sustain duration** | 300ms | Short-lived noise |
+| 5 | **Displacement held** | Price still above threshold | Spike already reverted |
+| 6 | **Momentum ratio** | displacement/peak >= 0.65 | Fading spikes |
+
+If all pass → emit `SpikeConfirmed` → sim fills unblocked. If any fail → emit `SpikeFailed` → speculative Leg 1 cancelled.
 
 ### Spike Delivery
-Confirmed spikes emit `IngestorEvent::SpikeConfirmed(SpikeInfo)` carrying:
-- `direction`: Up or Down
-- `magnitude`: as Decimal fraction (e.g., 0.005 = 0.5%)
-- `sustained_ms`: how long displacement held
-- `timestamp_ms`: when spike was first detected
 
-This is a dedicated event variant — normal `BinanceTick` events only update `binance_price` and never trigger spike evaluation.
+Three event variants carry spike lifecycle signals:
+
+- **`SpikeCandidate(SpikeInfo)`**: ATR + magnitude passed → triggers speculative Leg 1 posting. Engine sets `spike_detected = true`, `speculative_awaiting_sustain = true`
+- **`SpikeConfirmed(SpikeInfo)`**: Sustain + momentum passed → clears `speculative_awaiting_sustain` (sim fills allowed). Live mode: no-op (fills come from User WS)
+- **`SpikeFailed { timestamp_ms }`**: Spike faded → engine cancels speculative Leg 1 if `Posted`, resets spike state. If already `Filled`: no-op, Leg 2 proceeds normally
+
+Normal `BinanceTick` events only update `binance_price` and never trigger spike evaluation.
 
 ---
 
 ## 3. Entry Validation (Leg 1 Guards)
 
-**Source file:** `src/engine/evaluator.rs` — `Leg1Evaluator::evaluate()`
-
-When `spike_detected = true`, the evaluator checks every guard in sequence. **The ordering matters** — cheaper/faster checks run first, and the `ActiveTrade` check is deliberately placed after book/spread checks (see rationale below).
-
-### Guard ordering and rationale
+When `spike_detected = true`, the evaluator checks every guard in sequence. **The ordering matters** — cheaper/faster checks run first, and the `ActiveTrade` check is deliberately placed after book/spread checks.
 
 | # | Guard | Condition | Rejection | Why this order |
 |---|-------|-----------|-----------|----------------|
@@ -112,42 +106,30 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 3 | **Direction book** | Book for YES (Up) or NO (Down) token exists with bid+ask | `NoBook` | Can't price without book |
 | 4 | **Binance price** | `binance_price` exists | `NoBinance` | Reference price needed |
 | 5 | **Stale book** | `book_age_ms > stale_book_ms` (500ms) | `StaleBook` | Stale data = unreliable pricing |
-| 6 | **Price skew** | YES mid > `max_price_skew` (0.80) or < 0.20 | `PriceSkewed` | Near-certain markets have illiquid sides |
-| 7 | **Spread** | `(ask - bid) / mid > max_spread_pct` (0.02 = 2%) | `SpreadWide` | Book too thin for reliable entry |
-| 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book. Separates "good signal, executor busy" from "spike on bad book" |
-| 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (300s) | `Other` | Defence-in-depth (normally caught upstream) |
-| 10 | **Depth** | `book_bid_depth < required_depth * depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity to absorb our order |
+| 6 | **Price skew** | YES mid > 0.80 or < 0.20 | `PriceSkewed` | Near-certain markets have illiquid sides |
+| 7 | **Spread** | `(ask - bid) / tick > max_spread_ticks` (2 ticks) | `SpreadWide` | Book too thin for reliable entry |
+| 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
+| 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
+| 10 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
 
 ### Direction-aware book selection
 
-The evaluator uses the book for the token being bought:
-- **Spike Up** → buying YES → use `poly_yes_book` (fallback: `poly_book`)
-- **Spike Down** → buying NO → use `poly_no_book` (fallback: derive from YES complement)
-
-If the NO book is unavailable (common early in market lifecycle), NO prices are derived as complement of YES: `no_bid = 1 - yes_ask`, `no_ask = 1 - yes_bid`.
+- **Spike Up** → buying YES → use YES book (fallback: generic book)
+- **Spike Down** → buying NO → use NO book (fallback: derive from YES complement — `no_bid = 1 - yes_ask`, `no_ask = 1 - yes_bid`)
 
 ### Self-gating
 
-`spike_detected` is cleared on both `Signal` AND `Rejected` outcomes. Each spike gets exactly 1 evaluation attempt. This prevents:
-- Re-evaluating the same spike on every subsequent event
-- Signal flooding if multiple events arrive during a single spike
+`spike_detected` is cleared on both signal emission AND rejection. Each spike gets exactly 1 evaluation attempt, preventing re-evaluation on subsequent events and signal flooding.
 
 ---
 
 ## 4. Confidence Scoring & Allocation
 
-**Source file:** `src/engine/confidence.rs`
-
 ### Confidence formula
-```
-confidence = 0.4 * min(spike_magnitude / ATR, 1.0)    // spike quality vs recent volatility
-           + 0.2 * min(total_book_depth / avg_depth, 1.0)  // book quality
-           + 0.2 * (time_remaining_secs / 900.0)       // time value (900s = 15 min)
 
-Max possible: 0.8
-```
+`confidence = 0.4 × min(spike_magnitude / ATR, 1.0) + 0.2 × min(total_book_depth / avg_depth, 1.0) + 0.2 × (time_remaining_secs / 900.0)`
 
-**Why 3 factors, not 4:** The sustain factor was removed — all confirmed spikes already passed the sustain gate, so it contributed a constant offset with zero discriminative value.
+Max possible: **0.8**. The sustain factor was removed — all confirmed spikes already passed the sustain gate, so it contributed a constant offset with zero discriminative value.
 
 ### Tier thresholds
 
@@ -157,17 +139,11 @@ Max possible: 0.8
 | >= 0.3 | MED | 1.5% | 50% | $10 |
 | < 0.3 | LOW | 1.0% | 25% | $5 |
 
-### Allocation computation
-```
-alloc = max(round(max_alloc_per_trade * tier_pct), $1)
-```
-The `$1` floor ensures we always trade at least the minimum, even at the lowest tier.
+### Allocation
 
-### Entry sizing
-```
-entry_size = round_dp(alloc / bid_price, 2)  // Polymarket min precision: 0.01 shares
-```
-If `entry_size <= 0` after rounding, the signal is rejected.
+`alloc = max(round(max_alloc_per_trade × tier_pct), $1)`. The $1 floor ensures we always trade at least the minimum.
+
+Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 shares. If entry_size rounds to 0, the signal is rejected.
 
 ---
 
@@ -175,92 +151,36 @@ If `entry_size <= 0` after rounding, the signal is rejected.
 
 ### Pricing logic
 
-```
-bid_price = round_to_tick(best_bid + tick, tick)  // one tick above current best bid
-```
+1. **Base bid:** `round_to_tick(best_bid + tick, tick)` — one tick above current best bid
+2. **Post-only cap:** If `bid_price >= best_ask`, cap at `best_ask - tick` (must not cross spread)
+3. **Smart outbidding:** If a depth wall is detected (single level with > 4x average depth), outbid it by 1 tick. Only if the result stays within break-even and below the ask
+4. **Break-even cap:** Ensures `bid_price` won't cause pair cost > 1.0 even at the initial profit target. Estimated Leg 2 = `1.0 - target_pct - bid_price`; cap = `1.0 - est_leg2 - tick`
 
-**Capping:** If `bid_price >= best_ask`, cap at `best_ask - tick` (post-only constraint — must not cross spread).
+### Fill models
 
-**Smart outbidding:** If a depth wall is detected (single level with > `depth_wall_multiplier` (4x) the average depth of other levels), outbid it by 1 tick. This wins queue priority against competing bots. Only outbid if the resulting price stays within break-even and below the ask.
+**Speculative posting**: Leg 1 is posted on `SpikeCandidate` (before sustain confirmation), gaining ~300ms of CLOB queue priority. If `SpikeFailed` arrives before fill, the order is cancelled at zero cost (post-only). If `SpikeFailed` arrives after fill, the fill is valid and Leg 2 proceeds normally.
 
-**Break-even cap:** Final check ensures `bid_price` won't cause pair cost > 1.0 even at the initial profit target:
-```
-est_leg2 = 1.0 - target_pct - bid_price
-be_cap = 1.0 - est_leg2 - tick
-if bid_price > be_cap: bid_price = round_to_tick(be_cap, tick)
-```
+**Simulation:** The engine acts as the simulated CLOB. On each event loop iteration, it checks post-only validity (bid < ask) and near-ask depth within 2 ticks. If both pass, transitions `leg1_state` from `Posted` to `Filled`, initializes erosion, and emits a confirmed fill signal. **Speculative fill gate**: fills are blocked while `speculative_awaiting_sustain = true` (set on `SpikeCandidate`, cleared on `SpikeConfirmed`). This ensures sim fills only happen after the spike is confirmed (~300ms).
 
-### Simulation mode
+**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine. Fills arrive via the authenticated User WebSocket as `TradeStatusUpdate` events, matched by order ID. No fill gate needed — the CLOB decides fill timing.
 
-**Source:** `src/engine/strategy.rs` — `advance_simulation()`
+### Leg 1 staleness timeout
 
-The engine acts as the simulated CLOB. On each event loop iteration:
+If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms), the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
 
-```rust
-// Post-only validity check
-post_only_valid = best_ask > fill_price  // our bid is below the ask (no spread crossing)
-
-// Depth check within 2 ticks of our bid
-near_ask_depth = sum(asks where price <= fill_price + 2*tick)
-
-should_fill = post_only_valid && near_ask_depth > 0
-```
-
-If `should_fill`:
-1. Transition `leg1_state` from `Posted` to `Filled`
-2. Initialize erosion state
-3. Emit confirmed fill signal (`sim_confirmed_fill = true`) → `SimulationExecutor` records it
-
-The `SimulationExecutor` receives two types of Leg 1 signals:
-- `sim_confirmed_fill = false` (from `evaluate()`): Records signal detection only (counter, QuestDB)
-- `sim_confirmed_fill = true` (from `advance_simulation()`): Records confirmed fill, creates `SimPosition`, deducts from `virtual_balance`, sends Telegram opportunity alert
-
-### Live mode
-
-**Source:** `src/executor/live.rs` — `handle_leg1()`
-
-1. Build `OrderRequest::post_only_gtc(token_id, side, price, size)`
-2. Submit via `PolymarketGateway::place_order()`
-3. Handle response:
-   - **Rejected** (post-only would cross spread): Send `ExecutorFeedback::OrderFailed`, increment `orders_failed`
-   - **Placed**: Send `ExecutorFeedback::OrderPosted { order_id, price, size }`, increment `orders_placed`
-   - **API error**: Send `OrderFailed`, log to QuestDB as "failed"
-4. Log signal to QuestDB
-
-The engine receives feedback via the reverse channel and updates `leg1_state` with the real CLOB order ID. This is needed for matching User WS fill notifications later.
+In sim mode, this rarely fires (instant fills). In live mode, the engine checks staleness on each event loop iteration and sends a `CancelLeg1` command to the executor.
 
 ---
 
 ## 6. Leg 2 Erosion Cascade
 
-**Source files:** `src/engine/erosion.rs`, `src/engine/evaluator.rs` — `Leg2Evaluator::evaluate_leg2()`
-
 ### Erosion state initialization
 
-When Leg 1 fills, `init_erosion()` captures:
-```rust
-ErosionState {
-    leg1_fill_ms,                       // fill timestamp
-    leg1_fill_price,                    // entry price
-    leg1_fill_size,                     // shares
-    initial_profit_target,              // tier target (0.025/0.015/0.010)
-    steps_applied: 0,
-    tier,                               // HIGH/MED/LOW
-    direction,                          // Up/Down
-    spike_info,                         // original spike details
-    confidence,                         // original confidence score
-    binance_at_fill: Some(binance_mid), // Binance mid at Leg 1 fill time
-    opposing_ask_at_fill: Some(ask),    // hedge book best ask at fill time
-    emergency_submitted: false,
-    exit_reason: None,
-}
-```
-
-The `opposing_ask_at_fill` baseline is critical — break-even breach detection compares current opposing ask against this baseline to detect deterioration.
+When Leg 1 fills, the engine captures: fill timestamp, fill price, fill size, initial profit target (from tier), and the Binance mid at fill time (`binance_at_fill`).
 
 ### Step sizing — triangle weights
 
-Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15):
+Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15). Early steps give up more margin (higher chance of fill at a good price); later steps give up less:
 
 | Step | Weight | % of margin | HIGH (2.5%) | MED (1.5%) | LOW (1.0%) |
 |------|--------|-------------|-------------|------------|------------|
@@ -270,281 +190,150 @@ Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15):
 | 3 | 2/15 | 13.3% | 0.333% | 0.200% | 0.133% |
 | 4 | 1/15 | 6.7% | 0.167% | 0.100% | 0.067% |
 
-**Rationale:** Early steps give up more margin (higher chance of fill at a good price); later steps give up less and fire faster (urgency increases).
-
 After all 5 steps: 100% of margin eroded → price is at break-even.
 
 ### Interval timing — exponential decay
 
-```
-interval(step) = max(base_ms * decay^step, 200ms)
-```
-
-Default: `base=3500ms`, `decay=0.5`:
+`interval(step) = max(base_ms × decay^step, 200ms)`. Default: base=3000ms, decay=0.5:
 
 | Step | Interval | Cumulative |
 |------|----------|-----------|
-| 0 | 3500ms | 3.5s |
-| 1 | 1750ms | 5.25s |
-| 2 | 875ms | 6.125s |
-| 3 | 437ms | 6.562s |
-| 4 | 218ms | 6.780s |
+| 0 | 3000ms | 3.0s |
+| 1 | 1500ms | 4.5s |
+| 2 | 750ms | 5.25s |
+| 3 | 375ms | 5.625s |
+| 4 | 200ms | 5.825s |
 
-Early steps wait longer (market has time to fill at best price). Later steps fire rapidly (urgency).
-
-Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to a `BreakEvenBreach` emergency (see Section 7d).
+Early steps wait longer (market has time to fill). Later steps fire rapidly (urgency). Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to a `BreakEvenBreach` emergency.
 
 ### Erosion evaluation flow
 
-On every engine event, if `erosion` exists and `leg1_state == Filled`:
+On every engine event, if erosion exists and `leg1_state == Filled`:
 
-```
-1. Is emergency already submitted? → repost at interval (see Section 8)
-   After emergency_max_maker_attempts post-only reposts → FOK at best_ask
+1. Is emergency already submitted? → price-improvement chase (see Section 8). After `emergency_deadline_ms` → FOK at best_ask
 2. Compute hedge book data (direction-aware)
 3. Check adverse movement (Binance reversal) → emergency post-only
-4. Check break-even breach (opposing ask worsened)
+4. Check break-even breach (opposing ask worsened) → emergency post-only
 5. Check erosion exhausted (steps_applied >= 5) → emergency post-only
-6. Check quick reversal (within 100ms of fill)
-7. Check erosion interval gate (time since last signal)
-8. Determine whether to advance step (capped at MAX_EROSION_STEPS)
-9. Compute new target price
-10. Apply constraints (don't cross ask, break-even floor, smart outbid)
+6. Check erosion interval gate (time since last signal)
+7. Determine whether to advance step (capped at MAX_EROSION_STEPS)
+8. Compute new target price
+9. Apply constraints (don't cross ask, break-even floor, smart outbid)
+10. Skip guard: if posted Leg 2 price <= computed target, return None (keep existing order)
 11. Emit erosion signal
-```
 
 ### Target price computation
 
-```
-current_profit = initial_target - cumulative_erosion(steps)
-target_price = round_to_tick(1.0 - current_profit - leg1_price, tick)
-```
+`current_profit = initial_target - cumulative_erosion(steps)`, then `target_price = round_to_tick(1.0 - current_profit - leg1_price, tick)`.
 
 **Constraints applied in order:**
-1. **Don't cross ask:** If `target >= best_ask`, clamp to `best_ask - tick`
-2. **Break-even floor:** If `target > 1.0 - leg1_price`, clamp to break-even
-3. **Smart outbid:** If depth wall detected on the ask side and wall price <= our target, outbid by 1 tick (wall_price - tick)
+1. **Don't cross ask:** If target >= best_ask, clamp to `best_ask - tick`
+2. **Break-even floor:** If target > `1.0 - leg1_price`, clamp to break-even
+3. **Smart outbid:** If depth wall detected on the ask side and wall price <= our target, outbid by 1 tick
 
-### Quick reversal protection
+### Erosion skip guard
 
-Within the first 100ms after Leg 1 fill, if Binance reverses by more than `quick_reversal_threshold` (0.03%), the evaluator holds off on emitting any Leg 2 signal. This gives the market a moment to settle before committing to a hedge direction.
+After all price constraints, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new target. If so, it returns None — the cancel-and-repost is skipped, preserving a favorable position. This prevents erosion from overwriting a good price with a worse one.
+
+**Monotonically safe:** Erosion lowers the profit target over time, which raises `target_price`. If the posted price is already below the current target, it will be below all future targets too.
 
 ---
 
 ## 7. Emergency Exits
 
-All emergency exits set `erosion.emergency_submitted = true` and `erosion.exit_reason = Some(reason)`. Once set, the evaluator switches from erosion mode to emergency repost mode (see Section 8).
+All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from erosion mode to emergency repost mode (see Section 8).
 
 ### 7a. Adverse Movement
 
-**Trigger:** Binance reversal from `binance_at_fill` exceeds `adverse_threshold` (0.1% = 0.001)
+**Trigger:** Binance reversal from `binance_at_fill` exceeds `adverse_threshold` (0.1%). Checked on every evaluation with zero grace period. The spike thesis is invalidated by the source (Binance) itself.
 
-```rust
-change = |current_binance - binance_at_fill| / binance_at_fill
-adverse = match direction {
-    Up   => current < fill_price,  // price dropped
-    Down => current > fill_price,  // price rose
-};
-if adverse && change >= adverse_threshold → EMERGENCY
-```
-
-**Timing:** Checked on every evaluation, zero grace period. The spike thesis is invalidated by the source (Binance) itself.
-
-**Price:** First signal is **post-only** at `best_ask - 1 tick` (not taker). Subsequent reposts follow the standard emergency repost loop (Section 8) with FOK fallback after `emergency_max_maker_attempts` post-only attempts.
-
-**FOK size:** `min(leg1_size, ask_depth_within_2_ticks)` — cap at available liquidity to avoid reject.
-
-**Exit reason:** `ExitReason::AdverseMovement`
+- Direction-aware: Up spike → adverse if price dropped; Down spike → adverse if price rose
+- **Price:** First signal is post-only at `best_ask - 1 tick`. Subsequent reposts only on price improvement (Section 8), FOK fallback at `emergency_deadline_ms`
+- **FOK size:** `min(leg1_size, ask_depth_within_2_ticks)` — capped at available liquidity
+- **Exit reason:** `AdverseMovement`
 
 ### 7b. Break-Even Breach
 
-**Trigger:** Opposing ask has worsened beyond tolerance after first erosion step.
+**Trigger:** Pair cost has reached or exceeded $1.00 after first erosion step.
 
 **Gates (all must be true):**
-1. `steps_applied >= 1` (at least one erosion step completed, ~3.5s after fill)
-2. `current_opposing_ask > opposing_ask_at_fill + break_even_tolerance_ticks * tick` (2 ticks)
-3. `leg1_price + current_opposing_ask >= 1.0` (pair cost exceeds $1.00)
+1. `steps_applied >= 1` (at least one erosion step completed, ~3s after fill)
+2. `leg1_price + current_opposing_ask >= 1.0` (pair cost exceeds $1.00)
 
-**FOK price cap:** `opposing_ask_at_fill + max_loss_ticks * tick` (3 ticks). If the ask has gapped beyond this cap, defer to erosion — don't crystallize a catastrophic loss.
+**Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
 
-```rust
-max_fok_price = opposing_ask_at_fill + max_loss_ticks * tick
-if ask > max_fok_price → defer to erosion (log and continue)
-```
+**Exit reason:** `BreakEvenBreach`
 
-**Exit reason:** `ExitReason::BreakEvenBreach`
+### 7c. Rotation Emergency (Market Expiry)
 
-### 7c. Market Expiry
+**Trigger:** `MarketRotation` arrives while Leg 1 is Filled and Leg 2 is not Filled.
 
-**Trigger:** `MarketRotation` event arrives while `leg1_state == Filled` and `leg2_state != Filled`.
+Given the entry cutoff (`entry_cutoff_secs`), any Leg 1 fill has at least that time for the erosion cascade (~5.8s total), so this only fires when all other exit paths failed before rotation.
 
-This is handled specially in `on_event(MarketRotation)` — NOT in the evaluator:
+Handled in the MarketRotation event handler — the engine builds an emergency FOK signal using the OLD market's token IDs and books BEFORE resetting state. The main loop sends this emergency to the executor before the rotation command, ensuring the position is hedged (or best-effort attempted) before state wipe.
 
-```rust
-// Build emergency signal BEFORE state reset (using OLD market's token IDs)
-let signal = make_leg2_signal(
-    hedge_token_id,    // OLD market's opposing token
-    condition_id,      // OLD market's condition
-    best_ask,          // current opposing ask
-    leg1_size,
-    ...,
-    exit_reason: Some(ExitReason::MarketExpiry),
-);
-rotation_emergency_buffer.push(signal);
-```
-
-The main loop drains this buffer BEFORE sending `ExecutorCommand::MarketRotation` to the executor, ensuring the emergency FOK is attempted before the executor resets state.
-
-**Exit reason:** `ExitReason::MarketExpiry`
+**Exit reason:** `MarketExpiry`
 
 ### 7d. Erosion Exhausted
 
-**Trigger:** `steps_applied >= MAX_EROSION_STEPS (5)` — the full erosion cascade completed without filling. Profit target is zero (break-even).
+**Trigger:** `steps_applied >= MAX_EROSION_STEPS (5)` — the full cascade completed without filling. Profit target is zero (break-even).
 
-**Timing:** Checked after break-even breach, before quick reversal. Fires on the first evaluation after all 5 steps have been applied.
+Checked after break-even breach, before the erosion interval gate. Auto-escalates as a `BreakEvenBreach` emergency (semantically identical — the cascade reached break-even without filling).
 
-**Price:** Post-only at `best_ask - 1 tick`. FOK fallback after `emergency_max_maker_attempts` post-only attempts (via Section 8 repost loop).
-
-**Exit reason:** `ExitReason::BreakEvenBreach` (same as break-even breach — semantically identical: the cascade reached break-even without filling).
-
-**Step cap safety net:** In `strategy.rs`, `steps_applied` is also guarded against incrementing beyond `MAX_EROSION_STEPS`. In `evaluator.rs`, `advance_step` is gated with `steps_applied < MAX_EROSION_STEPS`. These are belt-and-suspenders — the exhaustion check fires before the step could overflow.
+**Exit reason:** `BreakEvenBreach`
 
 ---
 
-## 8. Post-Only First Strategy
+## 8. Price-Improvement Chase Strategy
 
-Emergency exits use a **post-only first, FOK fallback** strategy to minimize taker fees. After `emergency_max_maker_attempts` (default 3) post-only attempts without a fill, the engine escalates to a FOK taker at `best_ask` to guarantee execution.
+Emergency exits use a **price-improvement chase with hard deadline** strategy to minimize taker fees while preserving FIFO queue priority.
 
-### Engine-side: emergency repost loop
+### How it works
 
-**Source:** `src/engine/evaluator.rs` — the `emergency_submitted` branch
+Once `emergency_submitted = true`, the engine posts an aggressive post-only limit at `best_ask - 1 tick` and records `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). From that point, on each Polymarket book update:
 
-Once `emergency_submitted = true`, the evaluator switches from normal erosion to interval-gated repost mode:
+1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2500ms) → FOK at `best_ask` (guaranteed fill, taker fee)
+2. **Price improvement check**: If `best_ask - 1 tick > emergency_posted_price` → cancel and repost at the improved price (price-chase)
+3. **No change**: Hold current order — preserve FIFO queue priority (no blind reposts)
 
-```rust
-if snap.emergency_submitted {
-    // Rate-limit reposts
-    time_since_last = now_ms - last_erosion_ms;
-    if time_since_last < emergency_repost_interval_ms (500ms) {
-        return None;  // too soon
-    }
+**Key insight**: Binance tick events are irrelevant during emergency exit (only Polymarket book changes affect exit pricing). The engine skips evaluation on Binance events when in emergency mode, only re-evaluating on Polymarket book/price updates or when the deadline may have expired.
 
-    best_ask = hedge_book.best_ask();
-    fok_fallback = emergency_repost_count >= emergency_max_maker_attempts;
+### Example timeline
 
-    if fok_fallback {
-        // FOK taker — post at best_ask to cross the spread and guarantee fill
-        repost_price = best_ask;
-    } else {
-        // Post-only at top of book
-        repost_price = round_to_tick(best_ask - tick, tick);
-    }
+| Time | Book state | Action |
+|------|-----------|--------|
+| T+0 | ask=0.52 | Emergency trigger → post-only at 0.51 (`best_ask - tick`) |
+| T+800ms | ask=0.52 | Book update, no improvement → hold (preserve queue) |
+| T+1200ms | ask=0.54 | Book update, 0.53 > 0.51 → cancel and repost at 0.53 |
+| T+2000ms | ask=0.54 | Book update, no improvement → hold |
+| T+2500ms | — | Deadline expired → FOK at `best_ask` |
 
-    // Emit emergency signal with same exit_reason, updated price
-    return Emergency { signal, price: repost_price, size: leg1_size };
-}
-```
+### Live executor flow
 
-The `emergency_repost_count` is tracked in `ErosionState` and incremented in `strategy.rs` on each subsequent emergency decision (first emergency leaves count at 0). With `emergency_max_maker_attempts = 3`:
+The evaluator communicates intent via the `sim_was_taker` flag on `TradeSignal`:
 
-```
-Attempt 0: initial emergency → post-only (best_ask - tick)
-Attempt 1: first repost (500ms) → post-only
-Attempt 2: second repost (1000ms) → post-only
-Attempt 3: third repost (1500ms) → FOK at best_ask (crosses spread)
-```
+- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `best_ask`)
+- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick`
 
-This means the engine tries post-only for 1.5s, then guarantees fill with FOK. The executor handles each signal identically — cancel old + post new.
+### Simulation model
 
-### Live executor: two-step execution
-
-**Source:** `src/executor/live.rs` — `handle_leg2_emergency()`
-
-```
-1. Cancel existing resting Leg 2 order (if any)
-2. Compute aggressive post-only price: signal.price - tick
-3. Place OrderRequest::aggressive_post_only() at that price
-   ├─ CLOB accepts → Track as active_leg2_order_id
-   │                  Send OrderPosted feedback
-   │                  Send Telegram alert
-   │                  Increment emergency_maker_posts
-   │                  (Zero fee — maker)
-   │
-   ├─ CLOB rejects (would cross spread) → emergency_fok_fallback()
-   │   └─ Place OrderRequest::emergency_fok() at original signal.price
-   │      ├─ Accepted → Track, feedback, Telegram alert (emergency_foks++)
-   │      └─ Failed → OrderFailed feedback, CRITICAL Telegram alert
-   │                   "POSITION EXPOSED"
-   │
-   └─ API error → emergency_fok_fallback()
-```
-
-### Simulation model: book-based taker determination
-
-**Source:** `src/engine/strategy.rs` — `advance_simulation()` emergency branch
-
-```rust
-if is_emergency {
-    best_ask = opposing_book.best_ask();
-    if best_ask <= posted_price - tick {
-        // Would cross spread → FOK fallback (taker)
-        sim_was_taker = true;  // taker fee charged
-        fill_price = best_ask;
-    } else {
-        // Post-only rests at top of book → fills as maker
-        sim_was_taker = false;  // zero fee
-        fill_price = posted_price;
-    }
-}
-```
-
-The `sim_was_taker` flag propagates through `TradeSignal` to the `SimulationExecutor`, which uses it to determine fee treatment:
-- `sim_was_taker = true` → `is_taker = true` → taker fee computed and charged
-- `sim_was_taker = false` → `is_taker = false` → zero fee (recorded via `record_emergency_maker()`)
+Emergency fills wait the full deadline window. On each book update: if `best_ask <= posted_price` → maker fill (zero fee, market came to our bid). If deadline expires without fill → taker FOK at `best_ask` (taker fee applies). The `sim_was_taker` flag propagates to the executor for fee treatment.
 
 ### Fee savings
 
-At p=0.50 and 50 shares, the taker fee is ~$0.78. The post-only-first strategy avoids this fee entirely when the aggressive post-only is accepted (book hasn't crossed). Over many emergency exits, this saves significant capital.
+At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase avoids this fee entirely when the market moves to our posted price within the deadline. Queue priority preservation means our resting order is ahead of later arrivals at the same price level.
 
 ---
 
 ## 9. Favorable Taker Exits
 
-**Trigger:** During normal erosion, the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes.
+**Trigger:** During normal erosion, the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes at the ask — taker fee is acceptable insurance vs the risk of an open position.
 
-### Simulation detection
+**Simulation:** `advance_simulation()` detects `ask < posted_price` on each book update across all direction branches. Fills at the ask price with `ExitReason::FavorableTaker`.
 
-In `advance_simulation()`, the non-emergency Leg 2 fill check:
-```rust
-match best_ask {
-    Some(ask) if ask < posted_price => (true, true, ask, false)   // favorable taker at ask
-    Some(ask) if ask <= posted_price => (true, false, posted_price, false)  // normal maker
-    _ => (false, false, posted_price, false)  // no fill
-}
-```
+**Live:** When the CLOB rejects a post-only erosion order (price would cross), the executor calls `attempt_favorable_exit()` — first tries aggressive post-only at `best_ask - 1 tick`, then FOK fallback if rejected. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement.
 
-When `is_favorable_taker = true`:
-- `exit_reason` set to `FavorableTaker`
-- Fee treatment depends on whether post-only would have been rejected (always taker in non-emergency context since ask < bid)
-
-### Live detection
-
-In `handle_leg2_erosion()`, when the CLOB returns `Rejected` for a post-only order:
-```
-Post-only rejected → ask is below our bid → attempt_favorable_exit()
-  ├─ Try aggressive post-only (best_ask - tick)
-  │   ├─ Accepted → emergency_maker_posts++ (maker fill)
-  │   └─ Rejected → favorable_exit_fok_fallback()
-  │       └─ FOK at eroded price (automatic price improvement from CLOB)
-  └─ API error → favorable_exit_fok_fallback()
-```
-
-The CLOB fills FOK orders at the actual best ask (which is below our limit), giving automatic price improvement.
-
-### Tracking
-
-- `favorable_taker_fills` counter in `SimulationState`, `MarketSummary`, `SessionSummary`, `LiveExecutor`
-- `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]` tags in Telegram trade completions
+**Tracking:** `favorable_taker_fills` counter across all reporting contexts. Telegram tags: `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]`.
 
 ---
 
@@ -552,49 +341,20 @@ The CLOB fills FOK orders at the actual best ask (which is below our limit), giv
 
 ### Detection
 
-**Simulation:** `advance_simulation()` checks after Leg 2 fill:
-```rust
-if leg1_state == Filled && leg2_state == Filled {
-    // Reset everything
-}
-```
+**Simulation:** `advance_simulation()` detects both legs Filled after Leg 2 fill.
 
-**Live:** The main engine loop checks after processing each event:
-```rust
-if leg1_filled && leg2_filled {
-    engine.on_trade_complete();
-}
-```
+**Live:** The main engine loop checks after processing each event — if both `leg1_state` and `leg2_state` are Filled, calls `on_trade_complete()`.
 
 ### State reset
 
-```rust
-leg1_state = None;
-leg2_state = None;
-erosion = None;
-last_erosion_signal_ms = 0;
-leg1_direction = None;
-pending_leg1_signal = None;
-// cumulative_used is NOT reset — capital stays allocated within this market
-```
-
-After reset, the engine can immediately accept a new spike signal.
+On completion: `leg1_state`, `leg2_state`, and `erosion` all reset to None. `cumulative_used` persists (capital stays allocated within this market). After reset, the engine can immediately accept a new spike signal.
 
 ### PnL computation (simulation)
 
-```rust
-pair_cost = leg1.price + leg2.price;           // per-share
-gross_profit = (1.0 - pair_cost) * size;       // USDC
-taker_fee = leg2.taker_fee;                     // USDC (0 for maker)
-net_profit = gross_profit - taker_fee;          // USDC
-profit_pct = net_profit / (pair_cost * size) * 100;
-```
-
-Virtual balance update:
-```rust
-// On Leg 1 fill: virtual_balance -= leg1.price * size
-// On close: virtual_balance += leg1.price * size + net_profit
-```
+- **Pair cost** = leg1_price + leg2_price (per share)
+- **Gross profit** = (1.0 - pair_cost) × size
+- **Net profit** = gross_profit - taker_fee (zero for maker fills)
+- **Profit %** = net_profit / (pair_cost × size) × 100
 
 ---
 
@@ -603,7 +363,7 @@ Virtual balance update:
 ### Timeline
 
 ```
-T-300s   Cutoff window: no new Leg 1 entries (spikes dropped)
+T-180s   Cutoff window: no new Leg 1 entries (spikes dropped)
 T-180s   Pre-warm: discover Market B via Gamma API, fetch books
 T-0      Instant switch: emit pre-warmed MarketRotation + books
          Market WS resubscribes to new token IDs in parallel
@@ -611,108 +371,50 @@ T-0      Instant switch: emit pre-warmed MarketRotation + books
 
 ### Market discovery
 
-**Source:** `src/gateway/polymarket/rotation.rs`
+Gamma API `GET /events?tag_id=102467&active=true&closed=false&limit=10`. Tag 102467 = "15M" markets. Filter by slug prefix `btc-updown-15m-` or `eth-updown-15m-`. Note: `clobTokenIds` is a JSON-encoded string (not an array) — index 0 = YES, index 1 = NO.
 
-Gamma API: `GET /events?tag_id=102467&active=true&closed=false&limit=10`
-- Tag 102467 = "15M" markets
-- Filter by slug prefix `btc-updown-15m-` or `eth-updown-15m-`
-- `clobTokenIds` is a JSON-encoded string (not a JSON array): index 0 = YES, index 1 = NO
+Pre-warming at T-180s: query for markets ending after the current one, skipping Market A to find Market B. Pre-fetch both YES and NO books via REST.
 
-Pre-warming at T-180s: `discover_market_after(current_end_ms)` queries for markets ending after the current one, skipping Market A to find Market B. Pre-fetches both YES and NO books via REST.
+**Fallback:** If pre-warming failed, falls back to immediate Gamma poll within 5s of expiry.
+
+**Delivery:** `MarketRotation` uses blocking `send()` to guarantee delivery. Book events use `try_send()` (expendable — WS will provide updates).
 
 ### Rotation emergency protection
 
-If Leg 1 is filled but Leg 2 incomplete when rotation arrives:
+If Leg 1 is Filled but Leg 2 incomplete when rotation arrives, the engine builds an emergency FOK signal using the OLD market's token IDs and books BEFORE resetting state. The main loop drains this buffer before sending the rotation command to the executor.
 
-```rust
-// BEFORE state reset:
-if leg1_filled && !leg2_filled {
-    // Build emergency using OLD market's token IDs/books
-    signal = make_leg2_signal(
-        old_hedge_token_id,
-        old_condition_id,
-        current_opposing_ask,
-        leg1_fill_size,
-        ExitReason::MarketExpiry,
-    );
-    rotation_emergency_buffer.push(signal);
-}
-```
-
-**Main loop drainage order:**
+**Drainage order:**
 1. Drain `rotation_emergency_buffer` → send emergency signals to executor
-2. Send `ExecutorCommand::MarketRotation` → executor resets
-
-This guarantees the emergency FOK is attempted before the executor wipes state.
+2. Send `MarketRotation` → executor resets
 
 ### Engine state reset on rotation
 
-```rust
-active_condition_id = new_id;
-active_yes_token_id = new_yes;
-active_no_token_id = new_no;
-market_end_timestamp_ms = new_end;
-poly_book = None;           // old books cleared
-poly_yes_book = None;
-poly_no_book = None;
-spike_detected = false;
-last_spike = None;
-leg1_state = None;
-leg2_state = None;
-cumulative_used = 0;        // RESET for new market
-erosion = None;
-last_erosion_signal_ms = 0;
-leg1_direction = None;
-in_cutoff_window = false;   // RESET for new market
-```
+All market-specific state resets: active token IDs updated, books cleared, spike state cleared, leg states cleared, `cumulative_used` reset to 0, `in_cutoff_window` reset to false.
 
 ### Executor cleanup
 
-**Live:** `cancel_all()` all open CLOB orders, reset `active_leg2_order_id`
+**Live:** `cancel_all()` open CLOB orders, reset active order tracking.
 
-**Simulation:** `on_market_rotation()`:
-1. Force-close any open positions (`status == Open`) — record as full loss
-2. Lock `AwaitingResolution` positions for UMA resolution tracking
-3. Reset per-market counters (`cumulative_used`, `current_market_signals`, `current_market_walls`)
-4. Increment `markets_observed`
+**Simulation:** Force-close any open positions (record as full loss), lock `AwaitingResolution` positions for UMA resolution tracking, reset per-market counters, increment `markets_observed`.
 
 ---
 
 ## 12. Cutoff Window
 
-**Source:** `src/engine/strategy.rs` — checked on every event
-
 ### Detection
 
-```rust
-if !in_cutoff_window && active_condition_id.is_some() {
-    time_remaining_secs = (market_end_ms - now_ms) / 1000;
-    if time_remaining_secs < entry_cutoff_secs (300) {
-        in_cutoff_window = true;
-        cutoff_trigger_pending = true;
-        cutoff_market_end_ms = market_end_ms;
-    }
-}
-```
-
-**Runs on every event**, not just spikes. This ensures the cutoff is detected promptly regardless of event type.
+Checked on every event (not just spikes) — the cutoff is detected promptly regardless of event type. When `time_remaining_secs < entry_cutoff_secs` (`entry_cutoff_secs`), the engine sets `in_cutoff_window = true`.
 
 ### Effects
 
 | Action | During cutoff? |
 |--------|---------------|
-| New Leg 1 entries | **Blocked** — spikes dropped, `diag_spikes_dropped_cutoff++` |
-| Existing Leg 2 erosion | **Continues** — no cutoff check in `evaluate_leg2()` |
+| New Leg 1 entries | **Blocked** — spikes dropped |
+| Existing Leg 2 erosion | **Continues** — no cutoff check in Leg 2 evaluation |
 | Emergency exits | **Continue** — adverse, break-even, favorable all active |
-| Market summary | **Sent** — `ExecutorCommand::MarketCutoff` triggers Telegram summary (sim) |
+| Market summary | **Sent** — `MarketCutoff` triggers Telegram summary (sim) |
 
-### Cutoff alert (sim)
-
-When first entering cutoff with an open position:
-```
-"open position detected at cutoff — Leg 2 will continue until rotation"
-```
-This is informational only — no special action is taken.
+When first entering cutoff with an open position, a log notes "Leg 2 will continue until rotation" — informational only, no special action taken.
 
 ---
 
@@ -720,15 +422,11 @@ This is informational only — no special action is taken.
 
 ### Per-trade allocation
 
-```
-alloc = max(round(max_alloc_per_trade * tier_pct), $1)
-```
-
-`max_alloc_per_trade` is the sole capital control. The wallet balance is the real constraint in live trading.
+`alloc = max(round(max_alloc_per_trade × tier_pct), $1)`. `max_alloc_per_trade` is the sole capital control.
 
 ### Per-market budget
 
-`cumulative_used` tracks total USDC allocated in the current 15-minute market. Reset to 0 on rotation. There is no explicit per-market cap guard — the single-trade-at-a-time constraint plus `max_alloc_per_trade` naturally bound exposure.
+`cumulative_used` tracks total USDC allocated in the current 15-minute market. Reset to 0 on rotation. No explicit per-market cap guard — the single-trade-at-a-time constraint plus `max_alloc_per_trade` naturally bound exposure.
 
 ### Session tracking (simulation only)
 
@@ -738,11 +436,10 @@ alloc = max(round(max_alloc_per_trade * tier_pct), $1)
 | `locked_in_resolution` | +cost when position locked for UMA |
 | `total_pnl` | +net_profit on each trade close |
 | `total_taker_fees_paid` | +fee on each taker fill |
-| `total_maker_rebates_earned` | estimated 20% of taker fees as maker rebate |
 
 ### Live capital
 
-In live mode, the wallet USDC.e balance is the real constraint. No virtual balance tracking — the CLOB itself rejects orders that exceed available funds.
+In live mode, the wallet USDC.e balance is the real constraint. No virtual balance tracking — the CLOB rejects orders that exceed available funds.
 
 ---
 
@@ -762,10 +459,10 @@ None ──────────────► Posted ───────�
 ```
 
 **Triggers:**
-- `None → Posted`: Engine emits signal, executor posts order
-- `Posted → Filled`: User WS `TradeStatusUpdate::Confirmed` (live) or `advance_simulation()` (sim)
-- `Posted → None`: `ExecutorFeedback::OrderFailed` (CLOB rejected/error)
-- `Filled → None`: `on_trade_complete()` (both legs done) or `MarketRotation`
+- `None → Posted`: Engine emits signal on `SpikeCandidate`, executor posts order (speculative)
+- `Posted → Filled`: User WS fill (live) or `advance_simulation()` after `SpikeConfirmed` (sim)
+- `Posted → None`: CLOB rejection/error OR Leg 1 staleness timeout OR `SpikeFailed` cancel
+- `Filled → None`: Trade completion (both legs done) or MarketRotation
 
 ### ErosionState
 
@@ -804,35 +501,32 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 ### Full trade lifecycle
 
 ```
-1. SpikeConfirmed ─► spike_detected = true
+1. SpikeCandidate → spike_detected = true, speculative_awaiting_sustain = true
 
-2. evaluate() passes all guards ─► Leg 1 signal emitted
-   spike_detected = false
-   leg1_state = Posted
-   pending_leg1_signal stored (sim)
+2. evaluate() passes all guards → Leg 1 signal emitted (speculative)
+   spike_detected = false, leg1_state = Posted
 
-3a. [SIM] advance_simulation() Leg 1 check passes ─► leg1_state = Filled
-    init_erosion()
-    emit confirmed fill signal → SimulationExecutor records
+3. SpikeConfirmed (T+300ms) → speculative_awaiting_sustain = false
+   OR SpikeFailed → cancel Leg 1 if Posted, reset state → STOP
 
-3b. [LIVE] Executor places post-only GTC
-    ExecutorFeedback::OrderPosted → engine stores order_id
-    User WS TradeStatusUpdate::Confirmed → leg1_state = Filled
-    init_erosion()
+4a. [SIM] advance_simulation() fill check passes (gate cleared) → leg1_state = Filled
+    init_erosion(), emit confirmed fill signal
 
-4. evaluate_leg2() runs on each event:
+4b. [LIVE] Executor places post-only GTC (at T+0, gains ~300ms queue priority)
+    OrderPosted feedback → engine stores order_id
+    User WS fill → leg1_state = Filled, init_erosion()
+
+5. evaluate_leg2() runs on each event:
    - Normal: emit erosion signal → executor cancel+repost
-   - Emergency: set emergency_submitted → executor attempts post-only first
+   - Emergency: set emergency_submitted → post-only first, FOK fallback
 
-5a. [SIM] advance_simulation() Leg 2 fill detected
-    leg2_state = Filled
-    emit confirmed fill signal → SimulationExecutor records, closes trade
+6a. [SIM] advance_simulation() Leg 2 fill detected
+    leg2_state = Filled, emit confirmed fill signal
 
-5b. [LIVE] User WS TradeStatusUpdate::Confirmed for Leg 2
-    leg2_state = Filled
-    Main loop detects both filled → on_trade_complete()
+6b. [LIVE] User WS fill for Leg 2
+    leg2_state = Filled, main loop detects both filled → on_trade_complete()
 
-6. State reset → ready for next spike
+7. State reset → ready for next spike
 ```
 
 ---
@@ -841,9 +535,9 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 ### Rotation while Leg 2 is posting
 
-**Scenario:** `MarketRotation` arrives while `leg1_state = Filled`, `leg2_state = Posted`.
+**Scenario:** MarketRotation arrives while Leg 1 is Filled and Leg 2 is Posted.
 
-**Handle:** The engine builds an emergency FOK signal using the OLD market's token IDs and books BEFORE resetting state. The main loop sends this emergency to the executor before the `MarketRotation` command.
+**Handle:** The engine builds an emergency FOK using the OLD market's token IDs and books BEFORE resetting state. The main loop sends this emergency before the rotation command.
 
 **Guarantee:** Open position is hedged (or best-effort FOK attempted) before state wipe.
 
@@ -851,282 +545,136 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 **Scenario:** CLOB fills an order, but the User WS notification arrives 200-500ms later.
 
-**Handle:** The feedback channel sends the real CLOB order ID back to the engine in ~50-100ms (REST round-trip). The engine stores this ID immediately. When the User WS notification arrives later, the engine can match it.
-
-**Sequence:**
-1. Executor places order → CLOB accepts → executor sends `OrderPosted` feedback (~50ms)
-2. Engine receives feedback → stores order_id in `leg_state`
-3. User WS notifies fill (~200-500ms) → engine matches order_id → updates to `Filled`
+**Handle:** The feedback channel sends the real CLOB order ID back in ~50-100ms (REST round-trip). The engine stores this ID immediately. When the User WS notification arrives later, the engine matches it.
 
 **Safety:** Feedback channel is drained BEFORE `on_event()` in each main loop iteration.
 
 ### Stale events
 
-Events older than `stale_event_threshold_ms` (from `stale_book_ms` config, default 500ms) are not explicitly discarded at the ingestor level, but the evaluator's stale book check rejects signals based on old data.
+The evaluator's stale book check (500ms threshold) rejects signals based on old data.
 
 ### Adverse movement false positives
 
-The `adverse_threshold` (0.1%) is designed to filter normal market noise. At BTC $65K, this requires a $65 reversal — well above normal tick-to-tick noise but catching genuine spike reversals.
-
-### Break-even breach at extreme prices
-
-When the opposing ask has gapped beyond `max_loss_ticks` (3 ticks) above the baseline, the break-even FOK is suppressed:
-```
-if ask > opposing_ask_at_fill + max_loss_ticks * tick:
-    defer to erosion (don't crystallize catastrophic loss)
-```
-This prevents the bot from panic-buying the hedge at a terrible price during a liquidity gap.
+The `adverse_threshold` (0.1%) is designed to filter normal market noise. At BTC $65K, this requires a $65 reversal — well above tick-to-tick noise but catching genuine spike reversals.
 
 ### Leg 2 with zero ask depth
 
-If the hedge book has no ask depth within 2 ticks, the emergency FOK size is capped to zero:
-```rust
-fok_size = min(leg1_size, ask_depth_2tick).round_dp(2)
-if fok_size <= 0 → return None (log warning, wait for depth to appear)
-```
-The evaluator returns `None` and will re-evaluate on the next event.
+If the hedge book has no ask depth within 2 ticks, the emergency FOK size caps to zero. The evaluator returns None and will re-evaluate on the next event.
 
 ### Double emergency submission
 
-Once `emergency_submitted = true`, the evaluator switches to repost mode (not re-triggering adverses). The `exit_reason` is preserved from the original trigger, so even though the evaluator reposts at 500ms intervals, the reason stays consistent.
+Once `emergency_submitted = true`, the evaluator switches to price-improvement chase mode (not re-triggering). The `exit_reason` is preserved from the original trigger. Reposts only happen on Polymarket book price improvement; otherwise the order holds its FIFO queue position.
 
-### Book bootstrapping
+### SpikeFailed races with fill (live)
 
-If no full orderbook has been received yet but a `BestBidAsk` event arrives, the engine bootstraps a synthetic book:
-```rust
-poly_book = OrderBook {
-    bids: [PriceLevel { price: best_bid, size: 500 }],
-    asks: [PriceLevel { price: best_ask, size: 500 }],
-}
-```
-This allows evaluation to proceed before the first full book snapshot arrives.
+**Scenario:** CLOB fills the speculative Leg 1 order before `SpikeFailed` arrives (~300ms later).
+
+**Handle:** `SpikeFailed` checks `leg1_state`. If `Filled` → no-op, Leg 2 proceeds normally. The fill is valid because the initial ATR+magnitude signal was genuine; only the sustain check failed. If `Posted` → cancel order, reset state.
+
+**Safety:** Same race semantics as existing Leg 1 staleness timeout. User WS fill overrides state regardless.
 
 ### Spike during existing trade
 
-The `ActiveTrade` guard rejects the spike, incrementing `diag_rej_busy`. The spike is consumed (cleared) and cannot be re-evaluated. This is by design — the engine only runs one trade at a time. The diagnostic counter tracks how many valid-book spikes were lost to executor busyness, informing parameter tuning.
+The `ActiveTrade` guard rejects the spike, incrementing `rej_busy`. The spike is consumed (cleared) and cannot be re-evaluated. The diagnostic counter tracks how many valid-book spikes were lost to executor busyness, informing parameter tuning.
 
-### Decimal precision
+### New spike during speculative window
 
-All pricing uses `rust_decimal::Decimal` — never `f32`/`f64`. This prevents floating-point rounding errors in pair cost calculations where $0.001 differences matter. The `round_to_tick()` function ensures all prices are exact multiples of the tick size (typically 0.01).
+**Scenario:** A second spike arrives while the first is in the speculative window (Posted, awaiting sustain).
 
----
-
-## 16. Diagnostic Logging
-
-### Engine diagnostics (every 60s, cumulative from app start)
-
-```
-"engine 60s" {
-    markets_rotated,
-    spikes_received,
-    spikes_dropped_cutoff,
-    rej_busy,           // ActiveTrade: valid spike, executor occupied
-    rej_no_book,        // NoBook / NoBinance
-    rej_stale,          // StaleBook
-    rej_skew,           // PriceSkewed
-    rej_spread,         // SpreadWide
-    rej_depth,          // InsufficientDepth
-    rej_other,          // Catchall (no market, bid cap, zero size)
-    leg1_signals,       // Signals emitted
-    leg1_fills,         // Fills confirmed
-    leg2_erosion_steps, // Erosion steps emitted
-    leg2_fills,         // Leg 2 fills confirmed
-    emergencies,        // Emergency signals emitted
-}
-```
-
-### Spike detector diagnostics (every 60s)
-
-```
-"spike 60s" {
-    atr,                    // Current ATR value
-    threshold,              // multiplier * ATR
-    mid,                    // Current Binance mid
-    candidates_started,     // Spike candidates initiated
-    expired_window,         // Timed out before sustain
-    fading_momentum,        // Failed momentum ratio
-    below_magnitude,        // Below min magnitude
-    confirmed,              // Successfully emitted
-}
-```
-
-### Simulation executor diagnostics (every 60s)
-
-```
-"session 60s" {
-    uptime_min,
-    markets,
-    signals,
-    leg1_fills,
-    hedged,
-    emergency,
-    emergency_maker,    // Post-only emergency fills (zero fee)
-    adverse_fok,
-    be_fok,
-    pnl,
-    win_rate,
-    open,               // Currently open positions
-}
-```
-
-### Live executor diagnostics (every 60s)
-
-```
-"live executor 60s" {
-    placed,
-    cancelled,
-    failed,
-    emergency_fok,          // FOK fallbacks
-    emergency_maker,        // Post-only emergency fills (zero fee)
-    favorable_taker,        // Favorable exit fills
-}
-```
+**Handle:** The `ActiveTrade` guard blocks it — `leg1_state == Posted`. After `SpikeFailed` cancels and resets state to `None`, the next spike is accepted normally.
 
 ---
 
-## 17. Complete Trade Example
+## 16. Complete Trade Example
 
 **Scenario:** BTC spikes up $400 (0.77% at $52,000). 15-minute market has 10 minutes remaining.
 
-### Step 1: Spike Detection (T+0ms)
+### Step 1: Spike Candidate (T+0ms)
 
-```
-Binance @depth20: mid jumps from $51,800 to $52,200
-ATR = $12.50, threshold = 2 * $12.50 = $25.00
-|delta| = $400 >> $25 → candidate started
-```
+Binance mid jumps from $51,800 to $52,200. ATR = $12.50, threshold = 2 × $12.50 = $25.00. |delta| = $400 >> $25 → ATR check passed. Magnitude: 400/52000 = 0.0077 >= 0.0001 → magnitude check passed.
 
-### Step 2: Spike Confirmation (T+300ms)
+Result: `SpikeCandidate { direction: Up, magnitude: 0.0077, sustained_ms: 0 }` — emitted immediately.
 
-```
-Sustain: displacement held for 300ms ✓
-Momentum: 380/400 = 0.95 ≥ 0.50 ✓
-Magnitude: 400/52000 = 0.0077 ≥ 0.01 ✓
-→ SpikeConfirmed { direction: Up, magnitude: 0.0077, sustained_ms: 300 }
-```
+### Step 2: Leg 1 Evaluation (T+1ms, speculative)
 
-### Step 3: Leg 1 Evaluation (T+301ms)
+Guards pass: no active trade, Binance price present, YES book bid=0.495/ask=0.505, book age 50ms, YES mid=0.50 (no skew), spread = 1 tick, 200 shares depth.
 
-```
-Guards:
-  Active trade? None ✓
-  Binance price? $52,200 ✓
-  YES book? bid=0.49, ask=0.51 ✓
-  Stale? 50ms old ✓
-  Skew? YES mid=0.50 ✓
-  Spread? (0.51-0.49)/0.50 = 4% > 2% → REJECTED (SpreadWide)
-```
+Confidence = 0.4×1.0 + 0.2×1.0 + 0.2×0.667 = 0.733 → **HIGH** tier.
 
-**Wait** — in this example the spread is too wide. The spike is consumed and no trade is placed. Let's retry with a tighter book:
+Allocation = round(20 × 1.0) = $20. Bid = round_to_tick(0.495 + 0.01) = $0.50. Size = round_dp(20 / 0.50) = 40 shares.
 
-```
-YES book? bid=0.495, ask=0.505 ✓
-Spread? (0.505-0.495)/0.50 = 2.0% ≤ 2% ✓
-Depth? 200 shares on bid ✓
+**Signal:** Buy YES @ $0.50 × 40 shares = $20.00 (speculative — posted before sustain confirmation)
 
-Confidence = 0.4*min(0.0077/0.001,1) + 0.2*min(200/150,1) + 0.2*(600/900)
-           = 0.4*1.0 + 0.2*1.0 + 0.2*0.667
-           = 0.4 + 0.2 + 0.133 = 0.733 → HIGH tier
+### Step 3: Spike Confirmation (T+300ms)
 
-Alloc = round(20 * 1.0) = $20
-Bid = round_to_tick(0.495 + 0.01, 0.01) = $0.50
-Cap: 0.50 < 0.505 ✓ (post-only valid)
-Size = round_dp(20 / 0.50, 2) = 40 shares
+- Sustain: displacement held 300ms
+- Momentum: 380/400 = 0.95 >= 0.65
+- Magnitude reconfirmed: 0.0077 >= 0.0001
 
-→ Leg 1 signal: Buy YES @ $0.50 × 40sh = $20.00
-```
+Result: `SpikeConfirmed` — sim fill gate cleared, order has been resting on CLOB for ~300ms already.
 
 ### Step 4: Leg 1 Fill (T+350ms)
 
-**Sim:** `advance_simulation()` checks: ask=0.505 > bid=0.50 ✓, near depth > 0 ✓ → fill
-**Live:** CLOB accepts post-only GTC, rests on book. User WS notifies fill.
+Sim: gate cleared by SpikeConfirmed, ask=0.505 > bid=0.50, near depth > 0 → fill. Live: CLOB accepts post-only GTC at T+0 (300ms queue priority), User WS notifies fill.
 
-```
-leg1_state = Filled { price: 0.50, size: 40 }
-init_erosion(0.50, 40, now_ms)
-  opposing_ask_at_fill = 0.505 (NO book best ask)
-  binance_at_fill = 52200
-  initial_profit_target = 0.025 (HIGH)
-```
+Result: `leg1_state = Filled`, erosion initialized. `binance_at_fill` = 52200, `initial_profit_target` = 0.025 (HIGH).
 
-### Step 5: Erosion Step 0 (T+3850ms, 3.5s later)
+### Step 5: Erosion Step 0 (T+3350ms)
 
-```
-current_profit = 0.025 - 0 = 0.025 (no erosion yet)
-target = 1.0 - 0.025 - 0.50 = 0.475
-Leg 2 target: Buy NO @ $0.475
+current_profit = 0.025, target = 1.0 - 0.025 - 0.50 = **$0.475**. Emit erosion signal: Buy NO @ $0.475.
 
-→ Emit erosion signal
-```
+### Step 6: Erosion Step 1 (T+4850ms)
 
-### Step 6: Erosion Step 1 (T+5600ms, 1.75s later)
+Erosion = 0.025 × 5/15 = 0.00833. current_profit = 0.01667. target = 1.0 - 0.01667 - 0.50 = 0.48333 → round to **$0.48**. Emit erosion signal: Buy NO @ $0.48.
 
-```
-erosion = 0.025 * 5/15 = 0.00833
-current_profit = 0.025 - 0.00833 = 0.01667
-target = 1.0 - 0.01667 - 0.50 = 0.48333 → round to 0.48
-→ Emit erosion signal: Buy NO @ $0.48
-```
+### Step 7: Leg 2 Fill (T+5000ms)
 
-### Step 7: Leg 2 Fill (T+5800ms)
+NO book best_ask = 0.48 <= posted 0.48 → fill as maker.
 
-**Sim:** NO book best_ask = 0.48 ≤ posted 0.48 → fill as maker
-**Live:** CLOB fills post-only at 0.48
-
-```
-Trade complete:
-  Leg 1: YES @ $0.50 × 40sh = $20.00
-  Leg 2: NO  @ $0.48 × 40sh = $19.20
-  Pair cost: $0.98/sh
-  Gross profit: (1.0 - 0.98) × 40 = $0.80
-  Taker fee: $0 (both legs maker)
-  Net profit: $0.80 (4.0% return on $20 deployed)
-```
+| | Price | Shares | Cost |
+|---|-------|--------|------|
+| Leg 1 (YES) | $0.50 | 40 | $20.00 |
+| Leg 2 (NO) | $0.48 | 40 | $19.20 |
+| **Pair cost** | $0.98/sh | | |
+| **Gross profit** | | | $0.80 |
+| **Taker fee** | | | $0.00 |
+| **Net profit** | | | **$0.80 (4.0%)** |
 
 ### Alternative: Emergency adverse movement (T+5000ms)
 
-If instead BTC reverses at T+5000ms (1.5s after fill):
-```
-Binance drops to $51,950
-Change = |51950 - 52200| / 52200 = 0.00479 ≥ 0.001 → ADVERSE MOVEMENT
+If BTC reverses to $51,950 at T+5s: change = |51950-52200|/52200 = 0.48% >= 0.1% → **ADVERSE MOVEMENT**.
 
-Emergency signal: Buy NO @ best_ask (0.51)
-emergency_submitted = true
-exit_reason = AdverseMovement
-
-Post-only first: place at 0.51 - 0.01 = 0.50
-[SIM] best_ask=0.51 > 0.50 → post-only rests → maker fill, zero fee
-[LIVE] CLOB accepts post-only → zero fee; if rejected → FOK at 0.51 (taker fee)
-
-Pair: 0.50 + 0.50 = 1.00 → $0.00 gross profit (break-even, but no fee)
-      OR if FOK: 0.50 + 0.51 = 1.01 → -$0.40 gross - ~$0.63 fee = -$1.03 net
-```
+Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero fee, pair = $1.00 (break-even). If rejected → FOK at $0.51 → pair = $1.01, loss = $0.40 gross + ~$0.63 fee = -$1.03 net.
 
 ---
 
-## 18. Simulation vs Live Differences
+## 17. Simulation vs Live Differences
 
 | Aspect | Simulation | Live |
 |--------|-----------|------|
 | **Fill authority** | Engine (`advance_simulation()`) | CLOB (User WS fills) |
-| **Leg 1 fill model** | Post-only check: bid < ask AND near depth > 0 | Real CLOB matching engine |
-| **Leg 2 fill model** | Book-based: ask ≤ posted → fill | Real CLOB matching engine |
-| **Emergency fill model** | Book-based taker determination (`sim_was_taker`) | Post-only first, FOK fallback on CLOB rejection |
-| **Feedback channel** | Not used (engine is fill authority) | `ExecutorFeedback` carries order IDs back |
-| **Fill latency** | Instant (on next event loop) | CLOB matching + network RTT (~50-100ms) |
-| **Order tracking** | Synthetic IDs (`sim-leg1-{ts}`) | Real CLOB order IDs |
-| **Capital** | Virtual balance (starts at `max_alloc_per_trade`) | Real wallet USDC.e balance |
-| **Telegram** | Full reporting: opportunity, completion, market, session | Alerts only (emergencies, critical) |
+| **Speculative fill gate** | Blocked until `SpikeConfirmed` clears `speculative_awaiting_sustain` | No gate — CLOB decides fill timing |
+| **Leg 1 fill model** | Post-only check: bid < ask AND near depth > 0 (after gate clears) | Real CLOB matching engine |
+| **Leg 2 fill model** | Book-based: ask <= posted → fill | Real CLOB matching engine |
+| **Emergency fill model** | Deadline-aware: maker if ask <= posted, taker FOK at deadline | Price-improvement chase, FOK at deadline or CLOB rejection |
+| **Feedback channel** | Not used (engine is fill authority) | Executor → engine order IDs |
+| **Spike cancel** | `SpikeFailed` cancels Posted Leg 1 (no fill ever) | `CancelLeg1` sent to executor; if already filled, no-op |
+| **Fill latency** | After sustain confirmation (~300ms + next event loop) | CLOB + network RTT (order posted ~300ms earlier than old model) |
+| **Order tracking** | Synthetic IDs | Real CLOB order IDs |
+| **Capital** | Virtual balance | Real wallet USDC.e |
+| **Telegram** | Full: opportunity, completion, market, session | Alerts: emergencies, critical only |
 | **QuestDB** | `simulated_trades` table | `executed_trades` table |
-| **Heartbeat** | Not needed | 5s POST to `/heartbeat` (keep API session alive) |
-| **MarketRotation** | Force-close open positions, lock for resolution | `cancel_all()` CLOB orders |
-| **Trade detection** | `advance_simulation()` sees both filled | Main loop checks both `leg_state == Filled` |
+| **Heartbeat** | Not needed | 5s POST to `/heartbeat` |
+| **MarketRotation** | Force-close open, lock for resolution | `cancel_all()` CLOB orders |
+| **Trade detection** | `advance_simulation()` sees both filled | Main loop checks both legs Filled |
+| **Leg 1 timeout** | In `advance_simulation()` (rarely fires) | `CancelLeg1` command via CLOB cancel |
+| **Order signing** | N/A (no real orders) | SDK handles EIP-712 signing, fee rate caching, L2 HMAC auth |
 
 ### Key simulation simplifications
 
-1. **Instant fills:** No fill latency. If the book supports the order, it fills on the next event. This over-estimates fill rates vs live.
-2. **Full depth available:** Sim assumes our entire order fills at posted price. In reality, partial fills may occur.
-3. **No queue position:** Sim doesn't model time priority in the CLOB queue. Real-world fill probability depends on queue position.
-4. **Deterministic emergency fees:** Sim uses book state to determine maker vs taker. Live depends on actual CLOB acceptance/rejection.
+1. **Fills after sustain:** Sim fills only happen after `SpikeConfirmed` (~300ms); live mode may fill earlier since the order is on the CLOB from T+0
+2. **Full depth available:** Assumes entire order fills at posted price; real CLOB may partially fill
+3. **No queue position:** Doesn't model time priority in the CLOB queue
+4. **Deterministic emergency fees:** Uses book state for maker/taker; live depends on actual CLOB acceptance
 
 These simplifications mean simulation PnL is an optimistic estimate. Live trading will likely see lower fill rates, occasional partial fills, and more FOK fallbacks.

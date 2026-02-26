@@ -1,0 +1,37 @@
+[Unit]
+Description=FaCaiBot Polymarket Arbitrage
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/facaibot
+EnvironmentFile=/opt/facaibot/.env
+ExecStart=/opt/facaibot/facaibot
+Restart=always
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65535
+LimitMEMLOCK=infinity
+
+# Pin the main process to cores 0-2 (core 3 for QuestDB/system)
+# The ingestor self-pins to core 0, tokio workers to cores 1-2
+CPUAffinity=0 1 2
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/facaibot
+PrivateTmp=yes
+
+# Logging to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=facaibot
+
+[Install]
+WantedBy=multi-user.target

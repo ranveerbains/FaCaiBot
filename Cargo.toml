@@ -8,12 +8,15 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 
 # Polymarket CLOB client (market reads, orders, WebSocket streaming)
-polymarket-client-sdk = "0.4"
+polymarket-client-sdk = { version = "0.4", features = ["clob"] }
+
+# UUID parsing for API key
+uuid = { version = "1", features = ["serde"] }
 
 # EVM / Polygon interactions, EIP-712 signing
 alloy = { version = "1.7", features = ["signers", "signer-local", "eip712"] }
 
-# Binance WebSocket streams (@depth, @ticker)
+# Binance WebSocket streams (SBE @depth20, @bestBidAsk)
 binance = "0.21"
 
 # Low-latency SIMD-accelerated WebSocket client
@@ -73,6 +76,9 @@ http-body-util = "0.1"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [profile.release]
 opt-level = 3

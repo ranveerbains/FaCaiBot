@@ -2,10 +2,9 @@
 //!
 //! Wraps every Polymarket CLOB HTTP endpoint needed by the Executor layer:
 //!
-//! - [`PolymarketGateway::place_order`] — EIP-712 signed single-order POST to `/order`.
-//! - [`PolymarketGateway::place_orders`] — Batch POST to `/orders` (max 15 per request).
-//! - [`PolymarketGateway::cancel_order`] — DELETE `/order` by ID.
-//! - [`PolymarketGateway::cancel_all`] — DELETE `/orders` (cancel all open orders).
+//! - [`PolymarketGateway::place_order`] — SDK-signed order POST to `/order`.
+//! - [`PolymarketGateway::cancel_order`] — Cancel by ID via SDK.
+//! - [`PolymarketGateway::cancel_all`] — Cancel all open orders via SDK.
 //! - [`PolymarketGateway::get_orderbook`] — GET `/book?token_id={id}`.
 //! - [`PolymarketGateway::get_midpoint`] — GET `/midpoint?token_id={id}`.
 //! - [`PolymarketGateway::get_price`] — GET `/price?token_id={id}`.
@@ -15,142 +14,55 @@
 //!
 //! # Authentication
 //!
-//! All trading endpoints require **L2 headers** (HMAC-SHA256 over API credentials).
-//! The order *payload* itself must also carry an EIP-712 signature produced by the
-//! bot's Polygon private key.  Both are handled inside this module.
+//! Order placement uses the official `polymarket-client-sdk` for correct EIP-712
+//! signing, automatic fee rate fetching, and tick size validation. Cancel operations
+//! also go through the SDK's authenticated client.
 //!
-//! The signed order structure follows the Polymarket CLOB wire format:
-//! ```json
-//! {
-//!   "order": {
-//!     "salt": 12345,
-//!     "maker": "0x...",
-//!     "signer": "0x...",
-//!     "taker": "0x0000000000000000000000000000000000000000",
-//!     "tokenId": "TOKEN_ID",
-//!     "makerAmount": "50000",   // USDC micro-units (6 decimals)
-//!     "takerAmount": "100000",  // outcome token units (scaled)
-//!     "expiration": "0",
-//!     "nonce": "0",
-//!     "feeRateBps": "0",
-//!     "side": 0,               // 0 = BUY, 1 = SELL
-//!     "signatureType": 0,      // 0 = EOA
-//!     "signature": "0x..."
-//!   },
-//!   "owner": "0x...",
-//!   "orderType": "GTC",
-//!   "postOnly": true
-//! }
-//! ```
+//! Public read endpoints (orderbook, midpoint, etc.) use a lightweight `reqwest`
+//! client directly — no auth required.
 //!
 //! # Thread safety
 //!
-//! `PolymarketGateway` is `Send + Sync`.  The internal `reqwest::Client` pools
-//! connections and is cheaply cloneable.  The `PrivateKeySigner` does not mutate
-//! shared state during signing.
+//! `PolymarketGateway` is `Send + Sync`.  The SDK client uses `Arc` internally
+//! and is cheaply cloneable.
 //!
 //! # File ownership
 //! Owned by the **Executor Developer**.  Do NOT merge with the WS sub-modules.
 
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::signers::SignerSync;
+use alloy::primitives::U256;
+use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::{Credentials, Normal};
+use polymarket_client_sdk::clob::types::response::PostOrderResponse;
+use polymarket_client_sdk::clob::types::{
+    OrderStatusType, OrderType as SdkOrderType, Side as SdkSide,
+};
+use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::types::order::{OrderType, Side};
 use crate::types::{
     IngestorEvent, OrderBook, OrderRequest, OrderResponse, OrderStatus, PriceLevel,
 };
-use crate::utils::signing::{build_signer, current_timestamp_secs, generate_api_headers};
+use crate::utils::signing::build_signer;
 
 // ─── CLOB API constants ───────────────────────────────────────────────────────
 
-/// Base URL for the Polymarket CLOB REST API.
+/// Base URL for the Polymarket CLOB REST API (used for public GET endpoints).
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 
-/// Zero-address used as the `taker` field in all orders (open taker).
-const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
-
-/// EOA signature type (type 0 — wallet signs its own orders, pays its own gas).
-const SIGNATURE_TYPE_EOA: u8 = 0;
-
-// ─── Wire format types ────────────────────────────────────────────────────────
-
-/// Raw signed order object sent inside the POST `/order` body.
-///
-/// All numeric fields that Polymarket requires as strings are `String` here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SignedOrderPayload {
-    /// Random salt — prevents replay of identical orders.
-    salt: u64,
-    /// Maker (funder) address — the wallet posting the order.
-    maker: String,
-    /// Signer address — same as maker for EOA (type 0).
-    signer: String,
-    /// Taker address — zero-address = open taker.
-    taker: String,
-    /// Token ID of the outcome being traded.
-    token_id: String,
-    /// Maker amount: USDC micro-units (6 decimals) for a BUY,
-    /// or outcome token units (also 6 decimals) for a SELL.
-    maker_amount: String,
-    /// Taker amount: outcome token units for a BUY, USDC for a SELL.
-    taker_amount: String,
-    /// GTD expiration timestamp (epoch seconds).  `"0"` = never.
-    expiration: String,
-    /// Anti-replay nonce.  `"0"` = ignore.
-    nonce: String,
-    /// Fee rate in basis points (included in the signed payload).
-    fee_rate_bps: String,
-    /// Side: `0` = BUY, `1` = SELL.
-    side: u8,
-    /// Signature type: `0` = EOA.
-    signature_type: u8,
-    /// EIP-712 signature bytes, hex-encoded with `0x` prefix.
-    signature: String,
-}
-
-/// Top-level body for `POST /order`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PostOrderBody {
-    order: SignedOrderPayload,
-    /// Polygon address of the order owner (same as maker for EOA).
-    owner: String,
-    /// Time-in-force string: `"GTC"`, `"GTD"`, `"FOK"`, `"FAK"`.
-    order_type: String,
-    /// If `true`, reject the order instead of executing if it would cross the spread.
-    post_only: bool,
-}
-
-/// Cancel-by-ID request body for `DELETE /order`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelOrderBody {
-    order_id: String,
-}
-
-/// Raw JSON response from `POST /order`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ClobOrderResponse {
-    #[serde(default)]
-    order_id: String,
-    /// One of: "matched", "live", "delayed", "unmatched", or error codes.
-    #[serde(default)]
-    status: String,
-    /// Present when `status` is an error message.
-    #[serde(default)]
-    error_msg: String,
-}
+// ─── Wire format types (public GET endpoints only) ───────────────────────────
 
 /// Raw order book response from `GET /book`.
 #[allow(dead_code)] // used by REST accessors (live mode market param fetching)
@@ -194,44 +106,40 @@ struct ClobScalarResponse {
 
 /// Production Polymarket CLOB gateway (REST).
 ///
-/// Holds a persistent `reqwest::Client` (connection-pooled) and an optional
-/// `PrivateKeySigner` for EIP-712 order payload signing.  The signer is
-/// `None` when no valid private key is configured (simulation mode).
+/// Uses the official `polymarket-client-sdk` for authenticated operations
+/// (order placement, signing, cancellation) and a lightweight `reqwest::Client`
+/// for public read endpoints.
 ///
 /// `Send + Sync` — safe to share across tokio tasks via `Arc<PolymarketGateway>`.
 pub struct PolymarketGateway {
-    /// Persistent HTTP client with connection pooling.
+    /// Persistent HTTP client for public (unauthenticated) GET endpoints.
     http: reqwest::Client,
-    /// EIP-712 signer — the bot's Polygon private key.
-    /// `None` in simulation mode (private key not configured or invalid).
+    /// EIP-712 signer with chain_id=137 (Polygon) set. Used for SDK `sign()` calls.
+    /// `None` when no valid private key is configured (simulation mode).
     signer: Option<PrivateKeySigner>,
     /// Checksummed EIP-55 address string of the signer (cached at construction).
     /// Empty string when `signer` is `None`.
+    #[allow(dead_code)] // used for logging
     address: String,
-    /// L2 API key UUID.
-    api_key: String,
-    /// L2 API secret (base64-encoded raw HMAC key).
-    secret: String,
-    /// L2 API passphrase.
-    passphrase: String,
+    /// Authenticated SDK CLOB client. Handles EIP-712 signing, fee rate caching,
+    /// tick size validation, and L2 HMAC auth internally.
+    /// `None` when credentials are not configured (simulation mode).
+    sdk_client: Option<SdkClient<Authenticated<Normal>>>,
 }
 
 impl PolymarketGateway {
     /// Construct a new gateway from bot config.
     ///
-    /// Takes `Config` by value (matching the call sites in `main.rs`).
-    /// Parses the private key and derives the signing address; logs a warning
-    /// but does **not** panic if the private key is absent or invalid —
-    /// in that case the gateway operates in read-only mode (no order signing).
-    ///
-    /// A persistent, connection-pooled `reqwest::Client` is constructed here
-    /// and reused for all subsequent requests.
-    pub fn new(config: Config) -> Self {
+    /// **Async** — initializes the SDK CLOB client with pre-existing L2 credentials.
+    /// If the private key or API credentials are invalid/missing, the gateway
+    /// operates in read-only mode (no order signing or placement).
+    pub async fn new(config: Config) -> Self {
+        // Build signer with chain_id for Polygon mainnet.
         let (signer, address) = match build_signer(&config.private_key) {
             Ok(s) => {
                 let addr = format!("{:?}", s.address());
                 info!(address = %addr, "PolymarketGateway: signer initialised");
-                (Some(s), addr)
+                (Some(s.with_chain_id(Some(POLYGON))), addr)
             }
             Err(e) => {
                 warn!(
@@ -243,12 +151,31 @@ impl PolymarketGateway {
             }
         };
 
+        // Initialize SDK CLOB client (only if signer + credentials are available).
+        let sdk_client = if let Some(ref signer) = signer {
+            match init_sdk_client(signer, &config).await {
+                Ok(client) => {
+                    info!("PolymarketGateway: SDK CLOB client authenticated");
+                    Some(client)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "PolymarketGateway: SDK CLOB client init failed — \
+                         order placement disabled (read-only mode)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let http = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|e| {
-                // This should never fail in practice; panic is acceptable here.
                 panic!("failed to build reqwest::Client: {e}");
             });
 
@@ -256,9 +183,7 @@ impl PolymarketGateway {
             http,
             signer,
             address,
-            api_key: config.polymarket_api_key,
-            secret: config.polymarket_secret,
-            passphrase: config.polymarket_passphrase,
+            sdk_client,
         }
     }
 
@@ -266,8 +191,11 @@ impl PolymarketGateway {
 
     /// Place a single order on the CLOB.
     ///
-    /// Builds an EIP-712 signed payload, attaches L2 auth headers, and
-    /// POSTs to `/order`.  Returns an [`OrderResponse`] on success.
+    /// Uses the SDK to build, sign, and post the order. The SDK handles:
+    /// - EIP-712 typed data signing (correct domain separator for CTF/NegRisk exchange)
+    /// - Automatic fee rate fetching and caching per token
+    /// - Tick size and lot size validation
+    /// - Maker/taker amount calculation
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
         info!(
             token_id = %order.token_id,
@@ -276,50 +204,76 @@ impl PolymarketGateway {
             size = %order.size,
             order_type = ?order.order_type,
             post_only = order.post_only,
-            "placing order"
+            "placing order via SDK"
         );
 
-        let fee_rate_bps: u16 = 0; // Fetched dynamically in production; 0 for post-only makers.
-        let payload = self.build_signed_order(order, fee_rate_bps)?;
-        let order_type_str = order_type_to_str(order.order_type);
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("SDK client not initialized — order placement unavailable"))?;
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("no private key configured — order signing unavailable"))?;
 
-        let body = PostOrderBody {
-            owner: self.address.clone(),
-            order_type: order_type_str.to_string(),
-            post_only: order.post_only,
-            order: payload,
-        };
+        // Parse token_id as U256 (large decimal string → U256).
+        let token_id = U256::from_str(&order.token_id)
+            .with_context(|| format!("failed to parse token_id '{}' as U256", order.token_id))?;
 
-        let body_json =
-            serde_json::to_string(&body).context("failed to serialise PostOrderBody")?;
-        let path = "/order";
-        let ts = current_timestamp_secs();
-        let headers = generate_api_headers(
-            &self.api_key,
-            &self.secret,
-            &self.passphrase,
-            &self.address,
-            &ts,
-            "POST",
-            path,
-            &body_json,
-        )?;
+        let sdk_side = to_sdk_side(order.side);
+        let sdk_order_type = to_sdk_order_type(order.order_type);
 
-        let url = format!("{CLOB_BASE_URL}{path}");
-        let resp_bytes = self.authenticated_post(&url, &body_json, &headers).await?;
+        // Build: fetches fee_rate_bps + tick_size from CLOB (cached after first call per token).
+        let mut builder = sdk
+            .limit_order()
+            .token_id(token_id)
+            .side(sdk_side)
+            .price(order.price)
+            .size(order.size)
+            .order_type(sdk_order_type)
+            .post_only(order.post_only);
 
-        let resp: ClobOrderResponse =
-            serde_json::from_slice(&resp_bytes).context("failed to parse POST /order response")?;
+        // Set expiration for GTD orders.
+        if let Some(exp_ms) = order.expiration {
+            if let Some(dt) = polymarket_client_sdk::types::DateTime::from_timestamp((exp_ms / 1000) as i64, 0) {
+                builder = builder.expiration(dt);
+            }
+        }
+
+        let signable = builder
+            .build()
+            .await
+            .map_err(|e| anyhow!("SDK order build failed: {e}"))?;
+
+        // Sign: EIP-712 typed data with correct domain separator (auto-detects neg_risk).
+        let signed = sdk
+            .sign(signer, signable)
+            .await
+            .map_err(|e| anyhow!("SDK order signing failed: {e}"))?;
+
+        // Post: sends authenticated request to CLOB with L2 HMAC headers.
+        let resp: PostOrderResponse = sdk
+            .post_order(signed)
+            .await
+            .map_err(|e| anyhow!("SDK post_order failed: {e}"))?;
 
         debug!(
             order_id = %resp.order_id,
-            status = %resp.status,
+            status = ?resp.status,
+            success = resp.success,
             "POST /order response"
         );
 
-        let status = parse_insert_status(&resp.status);
-        if !resp.error_msg.is_empty() {
-            warn!(error_msg = %resp.error_msg, "CLOB returned error_msg on order placement");
+        let status = if !resp.success {
+            OrderStatus::Rejected
+        } else {
+            map_sdk_status(&resp.status)
+        };
+
+        if let Some(ref msg) = resp.error_msg {
+            if !msg.is_empty() {
+                warn!(error_msg = %msg, "CLOB returned error_msg on order placement");
+            }
         }
 
         Ok(OrderResponse {
@@ -331,58 +285,41 @@ impl PolymarketGateway {
 
     /// Cancel an open order by its ID.
     ///
-    /// Sends `DELETE /order` with `{"orderID": "<id>"}` and L2 headers.
+    /// Uses the SDK's authenticated `cancel_order` method (DELETE `/order`).
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        info!(order_id, "cancelling order");
+        info!(order_id, "cancelling order via SDK");
 
-        let body = CancelOrderBody {
-            order_id: order_id.to_string(),
-        };
-        let body_json =
-            serde_json::to_string(&body).context("failed to serialise CancelOrderBody")?;
-        let path = "/order";
-        let ts = current_timestamp_secs();
-        let headers = generate_api_headers(
-            &self.api_key,
-            &self.secret,
-            &self.passphrase,
-            &self.address,
-            &ts,
-            "DELETE",
-            path,
-            &body_json,
-        )?;
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("SDK client not initialized — cancel unavailable"))?;
 
-        let url = format!("{CLOB_BASE_URL}{path}");
-        self.authenticated_delete(&url, &body_json, &headers)
-            .await?;
-        debug!(order_id, "cancel_order: DELETE /order sent");
+        let resp = sdk
+            .cancel_order(order_id)
+            .await
+            .map_err(|e| anyhow!("cancel_order failed: {e}"))?;
+
+        debug!(order_id, ?resp.canceled, "cancel_order response");
         Ok(())
     }
 
     /// Cancel all open orders.
     ///
-    /// Sends `DELETE /orders` (no body) with L2 headers.
-    /// Used before the Monday matching-engine restart window.
+    /// Uses the SDK's authenticated `cancel_all_orders` method (DELETE `/cancel-all`).
     pub async fn cancel_all(&self) -> Result<()> {
-        info!("cancelling ALL open orders");
+        info!("cancelling ALL open orders via SDK");
 
-        let path = "/orders";
-        let ts = current_timestamp_secs();
-        let headers = generate_api_headers(
-            &self.api_key,
-            &self.secret,
-            &self.passphrase,
-            &self.address,
-            &ts,
-            "DELETE",
-            path,
-            "",
-        )?;
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("SDK client not initialized — cancel unavailable"))?;
 
-        let url = format!("{CLOB_BASE_URL}{path}");
-        self.authenticated_delete(&url, "", &headers).await?;
-        debug!("cancel_all: DELETE /orders sent");
+        let resp = sdk
+            .cancel_all_orders()
+            .await
+            .map_err(|e| anyhow!("cancel_all_orders failed: {e}"))?;
+
+        debug!(?resp.canceled, "cancel_all response");
         Ok(())
     }
 
@@ -465,13 +402,11 @@ impl PolymarketGateway {
 
     /// Get the current market price for a token.
     ///
-    /// `GET /price?token_id={token_id}&side=BUY` — public endpoint.
-    /// Returns the best ask for BUY and best bid for SELL queries.
+    /// `GET /price?token_id={id}&side=BUY` — public endpoint.
     #[allow(dead_code)] // live mode market param fetching
     pub async fn get_price(&self, token_id: &str) -> Result<Decimal> {
         debug!(token_id, "fetching price from CLOB");
 
-        // Default to BUY side (best ask).
         let url = format!("{CLOB_BASE_URL}/price?token_id={token_id}&side=BUY");
         let bytes = self.public_get(&url).await?;
 
@@ -492,8 +427,6 @@ impl PolymarketGateway {
     /// Fetch the tick size for a token.
     ///
     /// `GET /tick-size?token_id={token_id}` — public endpoint.
-    /// The tick size is cached once per market rotation and updated on
-    /// `tick_size_change` WS events.
     #[allow(dead_code)] // live mode market param fetching
     pub async fn get_tick_size(&self, token_id: &str) -> Result<Decimal> {
         debug!(token_id, "fetching tick size from CLOB");
@@ -518,8 +451,6 @@ impl PolymarketGateway {
     /// Fetch the taker fee rate for a token (in basis points).
     ///
     /// `GET /fee-rate?token_id={token_id}` — public endpoint.
-    /// The fee rate must be included in the signed order payload;
-    /// always fetch dynamically — never hardcode.
     #[allow(dead_code)] // live mode market param fetching
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<u16> {
         debug!(token_id, "fetching fee rate from CLOB");
@@ -544,9 +475,7 @@ impl PolymarketGateway {
 
     /// WebSocket order-book streaming — stub.
     ///
-    /// Real WebSocket streaming is implemented in `market_ws.rs` (Ingestor
-    /// layer).  This method exists only for interface completeness and logs a
-    /// warning to flag any accidental caller.
+    /// Real WebSocket streaming is implemented in `market_ws.rs` (Ingestor layer).
     #[allow(dead_code)] // interface completeness — real streaming in market_ws.rs
     pub async fn stream_orderbook(&self, token_id: &str, tx: Sender<IngestorEvent>) -> Result<()> {
         warn!(
@@ -554,119 +483,8 @@ impl PolymarketGateway {
             "stream_orderbook called on PolymarketGateway — \
              use PolymarketWsGateway (polymarket_ws.rs) for WS streaming"
         );
-        let _ = tx; // Silence unused-variable warning.
+        let _ = tx;
         Ok(())
-    }
-
-    // ─── EIP-712 order signing ────────────────────────────────────────────────
-
-    /// Build and EIP-712-sign a `SignedOrderPayload` from an [`OrderRequest`].
-    ///
-    /// Computes `makerAmount` and `takerAmount` from `price` and `size`:
-    ///
-    /// **BUY** (buying outcome tokens with USDC):
-    /// - `makerAmount` = `price * size` (USDC cost, 6-decimal micro-units)
-    /// - `takerAmount` = `size` (outcome tokens received, 6-decimal units)
-    ///
-    /// **SELL** (selling outcome tokens for USDC):
-    /// - `makerAmount` = `size` (outcome tokens given, 6-decimal units)
-    /// - `takerAmount` = `price * size` (USDC received, 6-decimal micro-units)
-    ///
-    /// Amounts are scaled by `1_000_000` (6 decimal places, matching USDC and
-    /// the on-chain exchange contract).
-    ///
-    /// The EIP-712 digest is constructed over the canonical Polymarket order
-    /// struct and signed synchronously using the `PrivateKeySigner`.
-    fn build_signed_order(
-        &self,
-        order: &OrderRequest,
-        fee_rate_bps: u16,
-    ) -> Result<SignedOrderPayload> {
-        let scale = Decimal::new(1_000_000, 0); // 1e6
-        let side_num: u8 = match order.side {
-            Side::Buy => 0,
-            Side::Sell => 1,
-        };
-
-        // Compute maker/taker amounts (scaled to 6 decimals, rounded to integer).
-        let cost = (order.price * order.size * scale)
-            .round()
-            .to_string()
-            .split('.')
-            .next()
-            .unwrap_or("0")
-            .to_string();
-        let tokens = (order.size * scale)
-            .round()
-            .to_string()
-            .split('.')
-            .next()
-            .unwrap_or("0")
-            .to_string();
-
-        let (maker_amount, taker_amount) = match order.side {
-            Side::Buy => (cost, tokens),
-            Side::Sell => (tokens, cost),
-        };
-
-        let expiration = order
-            .expiration
-            .map(|ts_ms| (ts_ms / 1000).to_string()) // ms → seconds
-            .unwrap_or_else(|| "0".to_string());
-
-        let salt: u64 = generate_salt();
-
-        // Build the EIP-712 message bytes.
-        // The Polymarket exchange contract uses a simplified struct hash:
-        //   keccak256(abi.encode(TYPE_HASH, salt, maker, signer, taker,
-        //             tokenId, makerAmount, takerAmount, expiration,
-        //             nonce, feeRateBps, side, signatureType))
-        // For production use the full EIP-712 domain + struct hash; here we
-        // produce a deterministic message bytes suitable for personal_sign
-        // (which alloy PrivateKeySigner supports via sign_message_sync).
-        //
-        // NOTE: A fully spec-compliant EIP-712 implementation requires the
-        // on-chain domain separator, type-hash, and abi-encoding. The
-        // integration layer (polymarket-client-sdk) handles this when it
-        // derives orders via `createOrder`. Here we produce a placeholder
-        // hash that is correctly structured for the signing pipeline; the
-        // Integration Developer wires the SDK-provided order builder when
-        // `polymarket-client-sdk` v0.4 types are available.
-        let message = build_order_message_bytes(
-            salt,
-            &self.address,
-            &order.token_id,
-            &maker_amount,
-            &taker_amount,
-            &expiration,
-            fee_rate_bps,
-            side_num,
-        );
-
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| anyhow!("no private key configured — order signing unavailable"))?;
-        let signature = signer
-            .sign_message_sync(&message)
-            .context("EIP-712 order signing failed")?;
-        let sig_hex = format!("0x{}", hex::encode(signature.as_bytes()));
-
-        Ok(SignedOrderPayload {
-            salt,
-            maker: self.address.clone(),
-            signer: self.address.clone(),
-            taker: ZERO_ADDRESS.to_string(),
-            token_id: order.token_id.clone(),
-            maker_amount,
-            taker_amount,
-            expiration,
-            nonce: "0".to_string(),
-            fee_rate_bps: fee_rate_bps.to_string(),
-            side: side_num,
-            signature_type: SIGNATURE_TYPE_EOA,
-            signature: sig_hex,
-        })
     }
 
     // ─── HTTP helpers ─────────────────────────────────────────────────────────
@@ -697,126 +515,68 @@ impl PolymarketGateway {
             .with_context(|| format!("reading body from GET {url}"))?
             .to_vec())
     }
+}
 
-    /// POST to an authenticated CLOB endpoint and return the raw body bytes.
-    async fn authenticated_post(
-        &self,
-        url: &str,
-        body_json: &str,
-        auth_headers: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<u8>> {
-        let mut header_map = HeaderMap::new();
-        header_map.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        for (k, v) in auth_headers {
-            let name: HeaderName = k
-                .parse()
-                .with_context(|| format!("invalid header name: {k}"))?;
-            let value = HeaderValue::from_str(v)
-                .with_context(|| format!("invalid header value for {k}"))?;
-            header_map.insert(name, value);
-        }
+// ─── SDK client initialization ───────────────────────────────────────────────
 
-        let resp = self
-            .http
-            .post(url)
-            .headers(header_map)
-            .body(body_json.to_string())
-            .send()
-            .await
-            .with_context(|| format!("POST {url} failed"))?;
+/// Initialize an authenticated SDK CLOB client using pre-existing L2 credentials.
+///
+/// Skips the `create_or_derive_api_key` network call by passing credentials directly.
+async fn init_sdk_client(
+    signer: &PrivateKeySigner,
+    config: &Config,
+) -> Result<SdkClient<Authenticated<Normal>>> {
+    let uuid: Uuid = config
+        .polymarket_api_key
+        .parse()
+        .context("POLYMARKET_API_KEY must be a valid UUID")?;
 
-        let status = resp.status();
-        if status.as_u16() == 425 {
-            warn!(url, "HTTP 425 — matching engine restarting");
-        } else if !status.is_success() {
-            warn!(url, %status, "authenticated POST returned non-2xx");
-        }
+    let creds = Credentials::new(
+        uuid,
+        config.polymarket_secret.clone(),
+        config.polymarket_passphrase.clone(),
+    );
 
-        Ok(resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading body from POST {url}"))?
-            .to_vec())
-    }
+    let client = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
+        .map_err(|e| anyhow!("failed to create SDK client: {e}"))?
+        .authentication_builder(signer)
+        .credentials(creds)
+        .authenticate()
+        .await
+        .map_err(|e| anyhow!("SDK authentication failed: {e}"))?;
 
-    /// DELETE on an authenticated CLOB endpoint and return the raw body bytes.
-    async fn authenticated_delete(
-        &self,
-        url: &str,
-        body_json: &str,
-        auth_headers: &std::collections::HashMap<String, String>,
-    ) -> Result<Vec<u8>> {
-        let mut header_map = HeaderMap::new();
-        header_map.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        for (k, v) in auth_headers {
-            let name: HeaderName = k
-                .parse()
-                .with_context(|| format!("invalid header name: {k}"))?;
-            let value = HeaderValue::from_str(v)
-                .with_context(|| format!("invalid header value for {k}"))?;
-            header_map.insert(name, value);
-        }
-
-        let req = self.http.delete(url).headers(header_map);
-
-        // reqwest DELETE with body (some CLOB cancel endpoints require it).
-        let req = if body_json.is_empty() {
-            req
-        } else {
-            req.body(body_json.to_string())
-        };
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("DELETE {url} failed"))?;
-
-        let status = resp.status();
-        if status.as_u16() == 425 {
-            warn!(url, "HTTP 425 — matching engine restarting");
-        } else if !status.is_success() {
-            warn!(url, %status, "authenticated DELETE returned non-2xx");
-        }
-
-        Ok(resp
-            .bytes()
-            .await
-            .with_context(|| format!("reading body from DELETE {url}"))?
-            .to_vec())
-    }
+    Ok(client)
 }
 
 // ─── Pure helper functions ────────────────────────────────────────────────────
 
-/// Map our `OrderType` enum to the CLOB wire string.
-fn order_type_to_str(ot: OrderType) -> &'static str {
-    match ot {
-        OrderType::Gtc => "GTC",
-        OrderType::Gtd => "GTD",
-        OrderType::Fok => "FOK",
-        OrderType::Fak => "FAK",
+/// Map our `Side` enum to the SDK's `Side`.
+fn to_sdk_side(side: Side) -> SdkSide {
+    match side {
+        Side::Buy => SdkSide::Buy,
+        Side::Sell => SdkSide::Sell,
     }
 }
 
-/// Map a CLOB insert-status string to our [`OrderStatus`] enum.
-///
-/// CLOB insert statuses: "matched", "live", "delayed", "unmatched".
-/// We also handle error-like strings defensively.
-fn parse_insert_status(s: &str) -> OrderStatus {
-    match s.to_lowercase().as_str() {
-        "matched" => OrderStatus::Filled,
-        "live" => OrderStatus::Placed,
-        "delayed" => OrderStatus::Placed, // Marketable but delayed — still accepted.
-        "unmatched" => OrderStatus::Placed, // Marketable but queued as resting.
-        "cancelled" | "canceled" => OrderStatus::Cancelled,
-        "rejected" | "invalid" | "error" => OrderStatus::Rejected,
-        _ => OrderStatus::Placed, // Default to Placed for unknown success statuses.
+/// Map our `OrderType` enum to the SDK's `OrderType`.
+fn to_sdk_order_type(ot: OrderType) -> SdkOrderType {
+    match ot {
+        OrderType::Gtc => SdkOrderType::GTC,
+        OrderType::Gtd => SdkOrderType::GTD,
+        OrderType::Fok => SdkOrderType::FOK,
+        OrderType::Fak => SdkOrderType::FAK,
+    }
+}
+
+/// Map SDK `OrderStatusType` to our `OrderStatus`.
+fn map_sdk_status(s: &OrderStatusType) -> OrderStatus {
+    match s {
+        OrderStatusType::Matched => OrderStatus::Filled,
+        OrderStatusType::Live => OrderStatus::Placed,
+        OrderStatusType::Delayed => OrderStatus::Placed,
+        OrderStatusType::Unmatched => OrderStatus::Placed,
+        OrderStatusType::Canceled => OrderStatus::Cancelled,
+        OrderStatusType::Unknown(_) | _ => OrderStatus::Placed,
     }
 }
 
@@ -836,52 +596,6 @@ fn parse_timestamp_value(val: &serde_json::Value) -> u64 {
     }
 }
 
-/// Build deterministic message bytes for EIP-712 order signing.
-///
-/// Produces a canonical byte string: `keccak256` is applied over the packed
-/// fields so that the message is unique per order and deterministic.
-///
-/// The full EIP-712 domain-separator + struct-hash derivation requires the
-/// on-chain contract's domain data; the `polymarket-client-sdk` SDK provides
-/// `createOrder()` which handles this correctly.  This function produces a
-/// structurally consistent message for the signing pipeline and can be
-/// replaced by SDK-derived bytes when the Integration layer wires the SDK.
-fn build_order_message_bytes(
-    salt: u64,
-    maker: &str,
-    token_id: &str,
-    maker_amount: &str,
-    taker_amount: &str,
-    expiration: &str,
-    fee_rate_bps: u16,
-    side: u8,
-) -> Vec<u8> {
-    // Pack fields into a canonical string and take its bytes.
-    // This mirrors the pre-image used in the Polymarket TypeScript SDK's
-    // `buildOrder` function before EIP-712 domain hashing.
-    let pre_image = format!(
-        "{salt}{maker}{token_id}{maker_amount}{taker_amount}{expiration}{fee_rate_bps}{side}"
-    );
-    pre_image.into_bytes()
-}
-
-/// Generate a random 64-bit salt for order replay protection.
-///
-/// Uses the current nanosecond timestamp as entropy.  The salt is included
-/// in the EIP-712 message to ensure each order has a unique hash even if
-/// all other fields are identical.
-fn generate_salt() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64
-        | (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            << 32)
-}
-
 /// Current wall-clock time as epoch milliseconds.
 #[inline]
 fn now_ms() -> u64 {
@@ -897,51 +611,55 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    // ── order_type_to_str ──────────────────────────────────────────────────────
+    // ── map_sdk_status ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_order_type_to_str_all_variants() {
-        assert_eq!(order_type_to_str(OrderType::Gtc), "GTC");
-        assert_eq!(order_type_to_str(OrderType::Gtd), "GTD");
-        assert_eq!(order_type_to_str(OrderType::Fok), "FOK");
-        assert_eq!(order_type_to_str(OrderType::Fak), "FAK");
-    }
-
-    // ── parse_insert_status ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_insert_status_matched_is_filled() {
-        assert_eq!(parse_insert_status("matched"), OrderStatus::Filled);
+    fn test_map_sdk_status_matched_is_filled() {
+        assert_eq!(map_sdk_status(&OrderStatusType::Matched), OrderStatus::Filled);
     }
 
     #[test]
-    fn test_parse_insert_status_live_is_placed() {
-        assert_eq!(parse_insert_status("live"), OrderStatus::Placed);
+    fn test_map_sdk_status_live_is_placed() {
+        assert_eq!(map_sdk_status(&OrderStatusType::Live), OrderStatus::Placed);
     }
 
     #[test]
-    fn test_parse_insert_status_delayed_is_placed() {
-        assert_eq!(parse_insert_status("delayed"), OrderStatus::Placed);
+    fn test_map_sdk_status_delayed_is_placed() {
+        assert_eq!(map_sdk_status(&OrderStatusType::Delayed), OrderStatus::Placed);
     }
 
     #[test]
-    fn test_parse_insert_status_rejected() {
-        assert_eq!(parse_insert_status("rejected"), OrderStatus::Rejected);
-        assert_eq!(parse_insert_status("invalid"), OrderStatus::Rejected);
+    fn test_map_sdk_status_canceled_is_cancelled() {
+        assert_eq!(map_sdk_status(&OrderStatusType::Canceled), OrderStatus::Cancelled);
     }
 
     #[test]
-    fn test_parse_insert_status_cancelled() {
-        assert_eq!(parse_insert_status("cancelled"), OrderStatus::Cancelled);
-        assert_eq!(parse_insert_status("canceled"), OrderStatus::Cancelled);
+    fn test_map_sdk_status_unknown_defaults_to_placed() {
+        assert_eq!(
+            map_sdk_status(&OrderStatusType::Unknown("new_status".to_string())),
+            OrderStatus::Placed
+        );
     }
+
+    // ── to_sdk_side ──────────────────────────────────────────────────────────
 
     #[test]
-    fn test_parse_insert_status_unknown_defaults_to_placed() {
-        assert_eq!(parse_insert_status("some_new_status"), OrderStatus::Placed);
+    fn test_to_sdk_side() {
+        assert!(matches!(to_sdk_side(Side::Buy), SdkSide::Buy));
+        assert!(matches!(to_sdk_side(Side::Sell), SdkSide::Sell));
     }
 
-    // ── parse_timestamp_value ──────────────────────────────────────────────────
+    // ── to_sdk_order_type ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_sdk_order_type() {
+        assert!(matches!(to_sdk_order_type(OrderType::Gtc), SdkOrderType::GTC));
+        assert!(matches!(to_sdk_order_type(OrderType::Gtd), SdkOrderType::GTD));
+        assert!(matches!(to_sdk_order_type(OrderType::Fok), SdkOrderType::FOK));
+        assert!(matches!(to_sdk_order_type(OrderType::Fak), SdkOrderType::FAK));
+    }
+
+    // ── parse_timestamp_value ────────────────────────────────────────────────
 
     #[test]
     fn test_parse_timestamp_epoch_secs_converted_to_ms() {
@@ -968,29 +686,10 @@ mod tests {
     fn test_parse_timestamp_null_falls_back_to_now() {
         let val = serde_json::Value::Null;
         let ts = parse_timestamp_value(&val);
-        // Must be a plausible epoch ms (after 2024-01-01).
         assert!(ts > 1_700_000_000_000, "fallback timestamp must be recent");
     }
 
-    // ── build_order_message_bytes ──────────────────────────────────────────────
-
-    #[test]
-    fn test_build_order_message_bytes_is_deterministic() {
-        let bytes1 =
-            build_order_message_bytes(12345, "0xmaker", "token123", "50000", "100000", "0", 0, 0);
-        let bytes2 =
-            build_order_message_bytes(12345, "0xmaker", "token123", "50000", "100000", "0", 0, 0);
-        assert_eq!(bytes1, bytes2, "message bytes must be deterministic");
-    }
-
-    #[test]
-    fn test_build_order_message_bytes_changes_with_salt() {
-        let b1 = build_order_message_bytes(1, "0xm", "t", "50000", "100000", "0", 0, 0);
-        let b2 = build_order_message_bytes(2, "0xm", "t", "50000", "100000", "0", 0, 0);
-        assert_ne!(b1, b2, "different salt must produce different bytes");
-    }
-
-    // ── maker/taker amount calculation ────────────────────────────────────────
+    // ── maker/taker amount calculation ───────────────────────────────────────
 
     /// Verify that the BUY amount formula produces the correct USDC cost.
     ///
@@ -1024,63 +723,7 @@ mod tests {
         let cost = (price * size * scale).round();
         let tokens = (size * scale).round();
 
-        // For SELL: maker=tokens, taker=cost.
         assert_eq!(tokens.to_string(), "50000000");
         assert_eq!(cost.to_string(), "24000000");
-    }
-
-    // ── PostOrderBody serialisation ────────────────────────────────────────────
-
-    #[test]
-    fn test_post_order_body_serialises_to_camel_case() {
-        let payload = SignedOrderPayload {
-            salt: 99,
-            maker: "0xmaker".to_string(),
-            signer: "0xmaker".to_string(),
-            taker: ZERO_ADDRESS.to_string(),
-            token_id: "tok1".to_string(),
-            maker_amount: "50000".to_string(),
-            taker_amount: "100000".to_string(),
-            expiration: "0".to_string(),
-            nonce: "0".to_string(),
-            fee_rate_bps: "0".to_string(),
-            side: 0,
-            signature_type: 0,
-            signature: "0xsig".to_string(),
-        };
-        let body = PostOrderBody {
-            order: payload,
-            owner: "0xmaker".to_string(),
-            order_type: "GTC".to_string(),
-            post_only: true,
-        };
-
-        let json_str = serde_json::to_string(&body).expect("serialise failed");
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("re-parse failed");
-
-        // Top-level keys should be camelCase.
-        assert!(parsed.get("orderType").is_some(), "expected 'orderType'");
-        assert!(parsed.get("postOnly").is_some(), "expected 'postOnly'");
-        assert!(parsed.get("owner").is_some(), "expected 'owner'");
-        assert!(parsed.get("order").is_some(), "expected 'order'");
-
-        // Nested order keys should also be camelCase.
-        let order = &parsed["order"];
-        assert!(order.get("tokenId").is_some(), "expected 'tokenId'");
-        assert!(order.get("makerAmount").is_some(), "expected 'makerAmount'");
-        assert!(order.get("takerAmount").is_some(), "expected 'takerAmount'");
-        assert!(order.get("feeRateBps").is_some(), "expected 'feeRateBps'");
-        assert!(
-            order.get("signatureType").is_some(),
-            "expected 'signatureType'"
-        );
-    }
-
-    // ── generate_salt ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_generate_salt_is_nonzero() {
-        let salt = generate_salt();
-        assert!(salt > 0, "salt must be nonzero");
     }
 }

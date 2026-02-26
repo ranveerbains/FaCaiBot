@@ -4,14 +4,20 @@ use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use crate::types::BinanceTick;
+use crate::types::market::Direction;
 use crate::types::order::ExitReason;
 use crate::types::simulation::SimTrade;
 
 // ─── Flush Thresholds ─────────────────────────────────────────────────────────
 
 /// Batch size before auto-flushing the `binance_ticks` buffer.
-/// Low-latency ticks are the high-volume table — batch them to reduce TCP overhead.
+/// With 1/sec downsampling, ~1000 ticks ≈ ~17 minutes of data.
 const TICK_FLUSH_THRESHOLD: usize = 1000;
+
+/// Time-based flush interval (ms) — ensures buffered ticks are persisted
+/// even at low ingestion rates. 60s is a good balance between durability
+/// and TCP overhead.
+const TICK_FLUSH_INTERVAL_MS: u64 = 60_000;
 
 /// All other tables (book snapshots, signals, trades) flush immediately because
 /// they are rare events and timeliness matters more than throughput.
@@ -48,6 +54,8 @@ pub struct ColdStorage {
     buffer: Buffer,
     /// Number of rows in the buffer that belong to `binance_ticks`.
     tick_count: usize,
+    /// Epoch ms of last tick buffer flush — for time-based flushing.
+    last_flush_ms: u64,
 }
 
 impl ColdStorage {
@@ -59,11 +67,16 @@ impl ColdStorage {
         let sender = SenderBuilder::new(Protocol::Tcp, host, port)
             .build()
             .context("failed to connect to QuestDB")?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         info!(url = questdb_url, "QuestDB sender created");
         Ok(Self {
             sender,
             buffer: Buffer::new(),
             tick_count: 0,
+            last_flush_ms: now_ms,
         })
     }
 
@@ -98,7 +111,13 @@ impl ColdStorage {
 
         self.tick_count += 1;
 
-        if self.tick_count >= TICK_FLUSH_THRESHOLD {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let time_since_flush = now_ms.saturating_sub(self.last_flush_ms);
+
+        if self.tick_count >= TICK_FLUSH_THRESHOLD || time_since_flush >= TICK_FLUSH_INTERVAL_MS {
             self.flush_ticks()?;
         }
         Ok(())
@@ -118,6 +137,10 @@ impl ColdStorage {
             .context("QuestDB flush (binance_ticks) failed")?;
         info!(count = self.tick_count, "flushed binance_ticks to QuestDB");
         self.tick_count = 0;
+        self.last_flush_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Ok(())
     }
 
@@ -245,7 +268,6 @@ impl ColdStorage {
     ///
     /// Flushes immediately — trades are rare, durability matters more than throughput.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // live mode trade recording
     pub fn record_trade(
         &mut self,
         market_id: &str,
@@ -333,7 +355,10 @@ impl ColdStorage {
     ///
     /// Flushes immediately.
     pub fn record_simulated_trade(&mut self, trade: &SimTrade) -> Result<()> {
-        let direction_str = format!("{:?}", trade.direction); // "Up" or "Down"
+        let direction_str = match trade.direction {
+            Direction::Up => "YES",
+            Direction::Down => "NO",
+        };
         let profit_tier_label = trade.profit_target_tier.label();
 
         let leg2_price: f64 = trade
