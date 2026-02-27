@@ -29,7 +29,8 @@ Three-layer lock-free pipeline connected by crossbeam SPSC bounded(8192) channel
 Ingestor (gateway/)        Engine (engine/)           Executor (executor/)
 ─────────────────          ──────────────             ─────────────────────
 Dedicated OS thread        tokio task                 tokio task
-CPU-pinned core 0          Main runtime               Main runtime
+CPU-pinned core 0          Manual runtime (2 workers)  Manual runtime (2 workers)
+                           Pinned cores 1-2            Pinned cores 1-2
 
 Binance SBE WS ──┐
   @depth20 (50ms)│
@@ -439,7 +440,7 @@ PolymarketGateway {
 ```
 OrderRequest
   → sdk.limit_order().token_id().side().price().size().order_type().post_only().build().await
-    (auto-fetches fee_rate_bps + tick_size per token — DashMap cache, one CLOB call then cached)
+    (SDK fetches tick_size per token internally — DashMap cache, one CLOB call then cached)
   → sdk.sign(signer, signable).await
     (EIP-712 typed data — auto-detects neg_risk for correct exchange contract domain separator)
   → sdk.post_order(signed).await
@@ -451,7 +452,7 @@ OrderRequest
 - `cancel_order(id)` → `sdk.cancel_order(id).await` → `DELETE /order`
 - `cancel_all()` → `sdk.cancel_all_orders().await` → `DELETE /cancel-all`
 
-**Public read endpoints** (`get_orderbook`, `get_midpoint`, `get_price`, `get_tick_size`, `get_fee_rate`) use the lightweight `reqwest::Client` directly — no SDK or auth needed.
+**Public read endpoints** (`get_orderbook`, `get_midpoint`, `get_price`, `get_tick_size`) use the lightweight `reqwest::Client` directly — no SDK or auth needed.
 
 **Dead code in `signing.rs`**: `generate_api_headers()`, `build_hmac_signature()`, `current_timestamp_secs()`, and contract address constants are `#[allow(dead_code)]` — only `build_signer()` is called.
 
@@ -459,21 +460,67 @@ OrderRequest
 
 ## 12. Deployment
 
+### Runtime Optimizations
+
+- **jemalloc**: Global allocator (`tikv-jemallocator`) eliminates glibc malloc latency spikes. Conditional on `cfg(not(target_env = "msvc"))` — active on both macOS (local dev) and Linux (production)
+- **Manual tokio runtime**: 2 worker threads pinned to cores 1-2 via `on_thread_start` + `core_affinity`. Replaces `#[tokio::main]` for explicit core control. Core 0 reserved for ingestor (dedicated OS thread)
+- **Release profile**: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip=true`. Production builds add `RUSTFLAGS="-C target-cpu=native"` for AVX-512 on c7i
+
 ### Stage 1: Local Simulation
 ```bash
 docker-compose up -d
 cp .env.example .env  # Set MODE=simulation, Telegram creds
-cargo build --release && cargo run
+cargo build && cargo run
 ```
 Verify: WS connections, spike detection, simulated trades, Telegram alerts.
 
-### Stage 2: Server Simulation
-Deploy to AWS `us-east-1` or Hetzner Ashburn. Run 48+ hours, validate latency (<350ms P99).
+### Stage 2: AWS Production
+
+**Infrastructure**: `c7i.xlarge` in `eu-west-2` (London) — co-located with Polymarket CLOB servers. Amazon Linux 2023. QuestDB on same instance (Docker, pinned to core 3).
+
+**Core allocation**: core 0 = ingestor, cores 1-2 = engine+executor (tokio), core 3 = QuestDB + system processes
+
+```bash
+# One-time setup (installs Rust, Docker, QuestDB, kernel tuning, systemd service)
+sudo bash deploy/setup.sh
+
+# Build with native CPU optimizations
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Deploy
+cp target/release/facaibot /opt/facaibot/
+cp config.toml /opt/facaibot/
+# Create /opt/facaibot/.env with production secrets (chmod 600)
+sudo systemctl enable --now facaibot
+```
+
+**OS-level tuning** (applied by `setup.sh`):
+- TCP low-latency mode, increased socket buffers, TCP fast open
+- ENA NIC: ring buffers 4096, interrupt coalescing disabled
+- Transparent Huge Pages disabled (prevents compaction latency spikes)
+- IRQ affinity: network interrupts moved to cores 2-3
+- CPU frequency locked to max (`performance` governor)
+- Clock sync: Amazon Time Sync Service (sub-microsecond via Nitro hypervisor)
+
+**Optional kernel boot parameters** (maximum latency reduction):
+```
+isolcpus=0,1 nohz_full=0,1 rcu_nocbs=0,1 intel_pstate=disable processor.max_cstate=1 idle=poll
+```
+
+See `README.md` for step-by-step instructions and `deploy/` for all scripts.
 
 ### Stage 3: Live Trading
-Set `MODE=live`, fill CLOB credentials, fund EOA wallet (USDC.e + POL). Start with reduced allocation. Approve Exchange contract for spending.
+Set `MODE=live`, fill CLOB credentials, fund EOA wallet (USDC.e + POL). Start with reduced allocation (`max_alloc_per_trade=$1`). Approve Exchange contract for spending.
 
 **Go-live gate**: Leg 1 fill rate >25%, win rate >80% over 200+ trades, average net >1.0%, emergency taker <15% of Leg 2 fills.
+
+### Monitoring
+
+- **Logs**: `journalctl -u facaibot -f` (live), `--since "1 hour ago"` (history)
+- **Telegram**: trade signals, fills, emergencies, market summaries (built-in)
+- **Health check**: `deploy/healthcheck.sh` via cron (Telegram alert if service down)
+- **QuestDB**: `http://<ip>:9000` for analytics dashboard (restrict to your IP)
+- **Updates**: `bash deploy/deploy.sh` (git pull, build, restart)
 
 ---
 
@@ -481,7 +528,7 @@ Set `MODE=live`, fill CLOB credentials, fund EOA wallet (USDC.e + POL). Start wi
 
 | Metric | Target |
 |--------|--------|
-| Signal-to-MATCHED (P99) | <350ms |
+| Spike-to-CLOB (internal, eu-west-2) | <50ms |
 | Leg 1 fill rate | 30-50% of signals |
 | Win rate (hedged trades) | 85-95% |
 | Avg net profit per trade | >1.0% |

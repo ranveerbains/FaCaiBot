@@ -111,6 +111,14 @@ impl ErosionState {
     }
 }
 
+impl ErosionSnap {
+    /// Returns `true` when all erosion steps have been applied and the
+    /// cascade is exhausted (profit target is at or below zero).
+    pub fn is_exhausted(&self) -> bool {
+        self.steps_applied >= MAX_EROSION_STEPS
+    }
+}
+
 // ─── Connectivity State ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]

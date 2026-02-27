@@ -147,14 +147,36 @@ The setup script handles:
 - Clock sync verified (Amazon Time Sync Service, sub-microsecond accuracy)
 - systemd service installed
 
-### Step 3: Build
+### Step 3: On-Chain Approvals (One-Time)
+
+Before the bot can trade, your EOA wallet needs 3 on-chain approvals. This is a **one-time** operation — never needs to be repeated.
+
+**Prerequisites:**
+- [Foundry](https://getfoundry.sh/) installed: `curl -L https://foundry.paradigm.xyz | bash && foundryup`
+- USDC.e in your wallet on Polygon (your trading capital)
+- ~0.01 POL for gas (3 small transactions)
+
+```bash
+# Dry run first — checks balances and existing approvals, sends nothing
+PRIVATE_KEY=0x... DRY_RUN=1 ./examples/approve_contracts.sh
+
+# Execute approvals (idempotent — skips any already set)
+PRIVATE_KEY=0x... ./examples/approve_contracts.sh
+```
+
+This approves:
+1. **USDC.e → CTF contract** — so CTF can split your USDC.e into outcome tokens
+2. **CTF tokens → CTF Exchange** — so the exchange can settle standard trades
+3. **CTF tokens → Neg Risk CTF Exchange** — for neg-risk markets (BTC/ETH 15-min)
+
+### Step 4: Build
 
 ```bash
 # Build with native CPU optimizations (AVX-512 on Ice Lake)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### Step 4: Deploy
+### Step 5: Deploy
 
 ```bash
 # Copy binary and config to install directory
@@ -170,7 +192,7 @@ chmod 600 /opt/facaibot/.env
 sudo systemctl enable --now facaibot
 ```
 
-### Step 5: Verify
+### Step 6: Verify
 
 ```bash
 # Check service status
@@ -184,6 +206,50 @@ journalctl -u facaibot --since "1 hour ago"
 ```
 
 Also verify Telegram alerts are arriving (startup message, spike diagnostics every 60s).
+
+#### Clock Sync Check (Critical)
+
+The bot compares Binance SBE event timestamps and Polymarket book timestamps against wall-clock time. If the system clock drifts, events are discarded as stale even when the feed is healthy — silently blocking all entries.
+
+**Check chrony is locked to the AWS Time Sync Service:**
+
+```bash
+chronyc tracking
+```
+
+Expected output (healthy):
+
+```
+Reference ID    : A9FEA97B (169.254.169.123)   ← AWS Time Sync (on-metal)
+System time     : 0.000000123 seconds fast of NTP time
+Last offset     : +0.000000089 seconds
+RMS offset      : 0.000000112 seconds
+Frequency       : 12.345 ppm fast
+Stratum         : 3
+```
+
+Key fields:
+- **Reference ID** must be `169.254.169.123` (AWS Time Sync). If it shows a public NTP server, latency is higher.
+- **System time / Last offset** must be `< 1ms`. Anything above 10ms will cause `stale_book_ms` breaches; above 50ms will cause `binance_stale_event_ms` breaches.
+
+If chrony is not running:
+
+```bash
+sudo systemctl enable --now chronyd
+chronyc tracking   # verify it locks within ~30s
+```
+
+**Verify no stale events are being discarded after startup:**
+
+```bash
+# Binance SBE — check `stale` field in the "spike 60s" log (should be 0 or near-zero)
+journalctl -u facaibot | grep "spike 60s"
+
+# Polymarket book — stale book blocks entry, counted as `rej_stale` in "engine 60s" log
+journalctl -u facaibot | grep "engine 60s"
+```
+
+In the `spike 60s` log, the `stale` field is a cumulative count of Binance SBE events discarded because their timestamp exceeded `binance_stale_event_ms` (100ms). On a correctly synced c7i.xlarge in eu-west-2, SBE round-trip should be <10ms and `stale` should not grow. In the `engine 60s` log, `rej_stale` counts spikes that were blocked because the Polymarket book snapshot was older than `stale_book_ms` (150ms). Raise these thresholds only after ruling out a clock drift issue with `chronyc tracking`.
 
 ### Updating
 

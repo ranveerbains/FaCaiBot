@@ -144,6 +144,7 @@ async fn async_main() -> Result<()> {
             let tx_heartbeat = ingestor_tx_poly.clone();
             let tx_rotation = ingestor_tx_poly;
             let stale_threshold = ingestor_config.stale_event_threshold_ms;
+            let prewarm_lead_ms = ingestor_config.bot.rotation.prewarm_lead_secs * 1_000;
 
             // Watch channel: rotation manager pushes token IDs → Market WS subscribes.
             let (token_tx, token_rx) = tokio::sync::watch::channel(Vec::<String>::new());
@@ -158,7 +159,7 @@ async fn async_main() -> Result<()> {
                 res = poly_ws.run_market_ws(token_rx, tx_poly_ws) => {
                     if let Err(e) = res { error!(error = %e, "polymarket market WS crashed"); }
                 }
-                res = poly_ws.run_market_rotation(tx_rotation, token_tx) => {
+                res = poly_ws.run_market_rotation(tx_rotation, token_tx, prewarm_lead_ms) => {
                     if let Err(e) = res { error!(error = %e, "polymarket market rotation crashed"); }
                 }
                 res = poly_ws.run_user_ws(tx_user_ws) => {
@@ -397,12 +398,12 @@ async fn async_main() -> Result<()> {
                     executor_config.telegram_chat_id.clone(),
                 );
 
-                // Build QuestDB cold storage.
+                // Build QuestDB cold storage (optional — executor runs without it).
                 let cold = match ColdStorage::new(&executor_config.questdb_url) {
-                    Ok(c) => c,
+                    Ok(c) => Some(c),
                     Err(e) => {
-                        error!(error = %e, "failed to init QuestDB for simulation");
-                        return;
+                        warn!(error = %e, "QuestDB unavailable for simulation — analytics recording disabled");
+                        None
                     }
                 };
 
@@ -423,10 +424,10 @@ async fn async_main() -> Result<()> {
 
                 let poly = PolymarketGateway::new(executor_config.clone()).await;
                 let cold = match ColdStorage::new(&executor_config.questdb_url) {
-                    Ok(c) => c,
+                    Ok(c) => Some(c),
                     Err(e) => {
-                        error!(error = %e, "failed to init QuestDB");
-                        return;
+                        warn!(error = %e, "QuestDB unavailable for live executor — analytics recording disabled");
+                        None
                     }
                 };
                 let reporter = TelegramReporter::new(

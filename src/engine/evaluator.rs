@@ -19,7 +19,7 @@ use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeI
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::{compute_confidence, round_to_tick};
-use super::erosion::{ErosionSnap, ErosionState, MAX_EROSION_STEPS};
+use super::erosion::{ErosionSnap, ErosionState};
 
 /// Triangle weights for erosion steps — mirrors `erosion.rs` constants.
 const EROSION_WEIGHTS: [u32; 5] = [5, 4, 3, 2, 1];
@@ -390,7 +390,6 @@ impl Leg1Evaluator {
             entry_timestamp_ms: now_ms,
             market_end_timestamp_ms: state.market_end_timestamp_ms,
             tick_size: tick,
-            fee_rate_bps: state.fee_rate_bps,
             atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
             book_snapshot: match direction {
@@ -451,7 +450,6 @@ impl Leg2Evaluator {
         let reference_price = state.binance_price?;
         let tick = state.tick_size;
         let market_end_ms = state.market_end_timestamp_ms;
-        let fee_rate_bps = state.fee_rate_bps;
         let atr = state.atr.unwrap_or(Decimal::ZERO);
 
         // Pre-compute book data BEFORE the emergency check — needed for reposts.
@@ -516,7 +514,6 @@ impl Leg2Evaluator {
                     now_ms,
                     market_end_ms,
                     tick,
-                    fee_rate_bps,
                     atr,
                     false,
                     hedge_book_snapshot.clone(),
@@ -556,7 +553,6 @@ impl Leg2Evaluator {
                     now_ms,
                     market_end_ms,
                     tick,
-                    fee_rate_bps,
                     atr,
                     false,
                     hedge_book_snapshot.clone(),
@@ -607,7 +603,6 @@ impl Leg2Evaluator {
                         now_ms,
                         market_end_ms,
                         tick,
-                        fee_rate_bps,
                         atr,
                         false,
                         hedge_book_snapshot.clone(),
@@ -653,7 +648,6 @@ impl Leg2Evaluator {
                         now_ms,
                         market_end_ms,
                         tick,
-                        fee_rate_bps,
                         atr,
                         false,
                         hedge_book_snapshot.clone(),
@@ -671,7 +665,7 @@ impl Leg2Evaluator {
         // ── Erosion exhausted (all 5 steps applied, profit target = 0) ──
         // The cascade reached break-even without filling. Escalate to emergency
         // post-only at top of book. FOK fallback after N reposts (via repost block).
-        if snap.steps_applied >= MAX_EROSION_STEPS {
+        if snap.is_exhausted() {
             if let Some(ask_price) = best_ask_price {
                 let price = round_to_tick(ask_price - tick, tick);
                 let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
@@ -701,7 +695,6 @@ impl Leg2Evaluator {
                     now_ms,
                     market_end_ms,
                     tick,
-                    fee_rate_bps,
                     atr,
                     false,
                     hedge_book_snapshot.clone(),
@@ -729,7 +722,7 @@ impl Leg2Evaluator {
         // ── Determine whether to advance erosion step ─────────────────────
         let advance_step = last_erosion_ms > 0
             && now_ms.saturating_sub(last_erosion_ms) >= current_interval
-            && snap.steps_applied < MAX_EROSION_STEPS;
+            && !snap.is_exhausted();
 
         let current_profit = snap.current_profit_target;
         let steps_now = snap.steps_applied + if advance_step { 1 } else { 0 };
@@ -808,7 +801,6 @@ impl Leg2Evaluator {
             now_ms,
             market_end_ms,
             tick,
-            fee_rate_bps,
             atr,
             bot_contested,
             hedge_book_snapshot,
@@ -896,7 +888,6 @@ pub(crate) fn make_leg2_signal(
     now_ms: u64,
     market_end_ms: u64,
     tick_size: Decimal,
-    fee_rate_bps: u16,
     atr: Decimal,
     bot_contested: bool,
     book_snapshot: Option<OrderBook>,
@@ -921,7 +912,6 @@ pub(crate) fn make_leg2_signal(
         entry_timestamp_ms: now_ms,
         market_end_timestamp_ms: market_end_ms,
         tick_size,
-        fee_rate_bps,
         atr,
         bot_contested,
         book_snapshot,
@@ -1087,7 +1077,6 @@ mod tests {
             1_000,
             2_000,
             Decimal::new(1, 2),
-            0,
             Decimal::ZERO,
             false,
             Some(book),
@@ -1130,7 +1119,6 @@ mod tests {
             active_yes_token_id: Some("yes".to_string()),
             active_no_token_id: Some("no".to_string()),
             tick_size: tick,
-            fee_rate_bps: 0,
             market_end_timestamp_ms: now_ms + 600_000,
             leg1_state: OrderState::Filled {
                 order_id: "sim-leg1".into(),

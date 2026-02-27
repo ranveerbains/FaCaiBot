@@ -31,7 +31,9 @@ pub struct LiveExecutor {
     poly: PolymarketGateway,
     feedback_tx: Sender<ExecutorFeedback>,
     reporter: TelegramReporter,
-    cold: ColdStorage,
+    /// QuestDB cold storage. `None` if QuestDB is unavailable — the executor
+    /// still runs without analytics.
+    cold: Option<ColdStorage>,
 
     // ── Position tracking ───────────────────────────────────────────
     /// Current active Leg 2 order ID on the CLOB. `None` if no Leg 2 posted.
@@ -52,7 +54,7 @@ impl LiveExecutor {
         poly: PolymarketGateway,
         feedback_tx: Sender<ExecutorFeedback>,
         reporter: TelegramReporter,
-        cold: ColdStorage,
+        cold: Option<ColdStorage>,
     ) -> Self {
         Self {
             poly,
@@ -573,18 +575,21 @@ impl LiveExecutor {
             .saturating_sub(signal.entry_timestamp_ms)
             / 1000;
 
-        if let Err(e) = self.cold.record_signal(
-            &signal.token_id,
-            direction_str,
-            signal.confidence,
-            signal.spike_info.magnitude,
-            signal.atr,
-            signal.book_snapshot.as_ref().map(|b| b.total_bid_depth()).unwrap_or(Decimal::ZERO),
-            time_remaining_secs as i64,
-            signal.alloc_amount,
-            action,
-        ) {
-            warn!(error = %e, "failed to record signal to QuestDB");
+        if let Some(ref mut c) = self.cold {
+            if let Err(e) = c.record_signal(
+                &signal.token_id,
+                direction_str,
+                signal.confidence,
+                signal.spike_info.magnitude,
+                signal.atr,
+                signal.book_snapshot.as_ref().map(|b| b.total_bid_depth()).unwrap_or(Decimal::ZERO),
+                time_remaining_secs as i64,
+                signal.alloc_amount,
+                action,
+                signal.spike_info.timestamp_ms,
+            ) {
+                warn!(error = %e, "failed to record signal to QuestDB");
+            }
         }
     }
 

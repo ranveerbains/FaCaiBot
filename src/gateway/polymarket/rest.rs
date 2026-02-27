@@ -9,7 +9,6 @@
 //! - [`PolymarketGateway::get_midpoint`] — GET `/midpoint?token_id={id}`.
 //! - [`PolymarketGateway::get_price`] — GET `/price?token_id={id}`.
 //! - [`PolymarketGateway::get_tick_size`] — GET `/tick-size?token_id={id}`.
-//! - [`PolymarketGateway::get_fee_rate`] — GET `/fee-rate?token_id={id}`.
 //! - [`PolymarketGateway::stream_orderbook`] — Stub; real WS is in `market_ws.rs`.
 //!
 //! # Authentication
@@ -85,7 +84,7 @@ struct ClobPriceLevel {
     size: String,
 }
 
-/// Response from scalar price endpoints (`/midpoint`, `/price`, `/tick-size`, `/fee-rate`).
+/// Response from scalar price endpoints (`/midpoint`, `/price`, `/tick-size`).
 #[allow(dead_code)] // used by REST accessors (live mode market param fetching)
 #[derive(Debug, Clone, Deserialize)]
 struct ClobScalarResponse {
@@ -98,8 +97,6 @@ struct ClobScalarResponse {
     minimum_tick_size: Option<String>,
     #[serde(default)]
     tick_size: Option<String>,
-    #[serde(default)]
-    fee_rate_bps: Option<serde_json::Value>,
 }
 
 // ─── Gateway struct ───────────────────────────────────────────────────────────
@@ -223,7 +220,7 @@ impl PolymarketGateway {
         let sdk_side = to_sdk_side(order.side);
         let sdk_order_type = to_sdk_order_type(order.order_type);
 
-        // Build: fetches fee_rate_bps + tick_size from CLOB (cached after first call per token).
+        // Build: SDK fetches tick_size (and fee rate internally) from CLOB, cached per token.
         let mut builder = sdk
             .limit_order()
             .token_id(token_id)
@@ -446,31 +443,6 @@ impl PolymarketGateway {
         tick_str
             .parse::<Decimal>()
             .with_context(|| format!("GET /tick-size: cannot parse '{tick_str}' as Decimal"))
-    }
-
-    /// Fetch the taker fee rate for a token (in basis points).
-    ///
-    /// `GET /fee-rate?token_id={token_id}` — public endpoint.
-    #[allow(dead_code)] // live mode market param fetching
-    pub async fn get_fee_rate(&self, token_id: &str) -> Result<u16> {
-        debug!(token_id, "fetching fee rate from CLOB");
-
-        let url = format!("{CLOB_BASE_URL}/fee-rate?token_id={token_id}");
-        let bytes = self.public_get(&url).await?;
-
-        let raw: ClobScalarResponse =
-            serde_json::from_slice(&bytes).context("failed to parse GET /fee-rate response")?;
-
-        match &raw.fee_rate_bps {
-            Some(serde_json::Value::Number(n)) => {
-                let bps = n.as_u64().unwrap_or(0);
-                Ok(bps as u16)
-            }
-            Some(serde_json::Value::String(s)) => s
-                .parse::<u16>()
-                .with_context(|| format!("GET /fee-rate: cannot parse '{s}' as u16")),
-            _ => Ok(0), // Fee-free market.
-        }
     }
 
     /// WebSocket order-book streaming — stub.

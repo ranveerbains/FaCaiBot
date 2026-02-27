@@ -35,7 +35,8 @@ pub struct SimulationExecutor {
     /// Telegram reporter (fire-and-forget sends).
     reporter: TelegramReporter,
     /// QuestDB cold storage (write simulated trade records + signals).
-    cold: ColdStorage,
+    /// `None` if QuestDB is unavailable — the executor still runs without analytics.
+    cold: Option<ColdStorage>,
     /// Latest Polymarket orderbook snapshot (updated by caller or Engine snapshot).
     current_book: Option<OrderBook>,
     /// Latest Binance mid price for reference in signal records.
@@ -58,7 +59,7 @@ impl SimulationExecutor {
     /// used as the simulation session start time.
     pub fn new(
         reporter: TelegramReporter,
-        cold: ColdStorage,
+        cold: Option<ColdStorage>,
         fixed_alloc: Decimal,
         now_ms: u64,
     ) -> Self {
@@ -139,8 +140,10 @@ impl SimulationExecutor {
                         "simulation: position force-closed at rotation — no Leg 2 fill"
                     );
                     self.reporter.send_trade_completed(&trade);
-                    if let Err(e) = self.cold.record_simulated_trade(&trade) {
-                        error!(error = %e, "failed to write force-closed trade to QuestDB");
+                    if let Some(ref mut c) = self.cold {
+                        if let Err(e) = c.record_simulated_trade(&trade) {
+                            error!(error = %e, "failed to write force-closed trade to QuestDB");
+                        }
                     }
                 }
             } else {
@@ -537,8 +540,10 @@ impl SimulationExecutor {
                 "Leg 2: trade closed"
             );
             self.reporter.send_trade_completed(&trade);
-            if let Err(e) = self.cold.record_simulated_trade(&trade) {
-                error!(error = %e, "failed to write simulated trade to QuestDB");
+            if let Some(ref mut c) = self.cold {
+                if let Err(e) = c.record_simulated_trade(&trade) {
+                    error!(error = %e, "failed to write simulated trade to QuestDB");
+                }
             }
         }
     }
@@ -562,18 +567,21 @@ impl SimulationExecutor {
             .saturating_sub(signal.entry_timestamp_ms)
             / 1000;
 
-        if let Err(e) = self.cold.record_signal(
-            &signal.token_id,
-            direction_str,
-            signal.confidence,
-            signal.spike_info.magnitude,
-            atr,
-            book_depth,
-            time_remaining_secs as i64,
-            signal.alloc_amount,
-            action,
-        ) {
-            error!(error = %e, "failed to log signal to QuestDB");
+        if let Some(ref mut c) = self.cold {
+            if let Err(e) = c.record_signal(
+                &signal.token_id,
+                direction_str,
+                signal.confidence,
+                signal.spike_info.magnitude,
+                atr,
+                book_depth,
+                time_remaining_secs as i64,
+                signal.alloc_amount,
+                action,
+                signal.spike_info.timestamp_ms,
+            ) {
+                error!(error = %e, "failed to log signal to QuestDB");
+            }
         }
     }
 }
@@ -639,7 +647,6 @@ mod tests {
             entry_timestamp_ms: 1_000_000,
             market_end_timestamp_ms: 1_900_000,
             tick_size: d("0.01"),
-            fee_rate_bps: 156,
             atr: Decimal::ZERO,
             bot_contested: false,
             book_snapshot: None,

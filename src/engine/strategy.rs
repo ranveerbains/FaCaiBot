@@ -30,7 +30,7 @@ use crate::types::market::{
 use crate::types::order::{ExecutorCommand, ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::compute_confidence;
-use super::erosion::{ConnectivityState, ErosionSnap, ErosionState, MAX_EROSION_STEPS};
+use super::erosion::{ConnectivityState, ErosionSnap, ErosionState};
 use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
 };
@@ -412,6 +412,7 @@ impl StrategyEngine {
                 info!(
                     direction = ?spike.direction,
                     magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
+                    spike_detected_ms = spike.timestamp_ms,
                     "spike candidate received — speculative Leg 1"
                 );
                 self.state.spike_detected = true;
@@ -428,6 +429,7 @@ impl StrategyEngine {
                     direction = ?spike.direction,
                     magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
                     sustained_ms = spike.sustained_ms,
+                    spike_detected_ms = spike.timestamp_ms,
                     "spike sustained — sim fill gate open"
                 );
             }
@@ -812,7 +814,7 @@ impl StrategyEngine {
                 // tick size (e.g. MED tier's 2% margin over 5 steps < $0.01 tick).
                 // Without this, steps_applied never reaches MAX_EROSION_STEPS and the
                 // erosion-exhausted emergency never fires.
-                if last_erosion_ms > 0 && snap.steps_applied < MAX_EROSION_STEPS {
+                if last_erosion_ms > 0 && !snap.is_exhausted() {
                     let interval = ErosionState::interval_for_step(
                         snap.steps_applied,
                         self.leg2.erosion_base_interval_ms,
@@ -860,7 +862,7 @@ impl StrategyEngine {
             if let Leg2Decision::Erosion { advance_step, .. } = &decision {
                 if *advance_step {
                     if let Some(e) = self.erosion.as_mut() {
-                        if e.steps_applied < MAX_EROSION_STEPS {
+                        if !e.is_exhausted() {
                             e.steps_applied += 1;
                         }
                     }
@@ -1071,18 +1073,9 @@ impl StrategyEngine {
         let leg2_was_taker = exit_reason.is_some();
         let adverse_movement = exit_reason == Some(ExitReason::AdverseMovement);
 
-        // Estimate taker fee: emergency exits likely crossed the spread.
-        let taker_fee = if leg2_was_taker {
-            // fee_rate_bps from pending signal (e.g., 20 bps = 0.002)
-            let fee_bps = self.pending_leg1_signal
-                .as_ref()
-                .map(|s| s.fee_rate_bps)
-                .unwrap_or(0);
-            let fee_rate = Decimal::new(i64::from(fee_bps), 4); // bps → decimal
-            l2_price * l2_size * fee_rate
-        } else {
-            Decimal::ZERO // post-only maker = zero fee
-        };
+        // Taker fee: CLOB deducts fees automatically; the REST response and User WS
+        // do not return the actual amount charged. Recorded as zero in QuestDB.
+        let taker_fee = Decimal::ZERO;
 
         let net_profit = gross_profit - taker_fee;
         let profit_pct = if pair_cost > Decimal::ZERO && l1_size > Decimal::ZERO {
@@ -1158,9 +1151,8 @@ impl StrategyEngine {
     }
 
     #[allow(dead_code)] // test helper + live mode
-    pub fn set_market_params(&mut self, tick_size: Decimal, fee_rate_bps: u16) {
+    pub fn set_market_params(&mut self, tick_size: Decimal) {
         self.state.tick_size = tick_size;
-        self.state.fee_rate_bps = fee_rate_bps;
     }
 
     #[allow(dead_code)] // test helper + live mode
@@ -1519,7 +1511,6 @@ impl StrategyEngine {
             now_ms,
             self.state.market_end_timestamp_ms,
             self.state.tick_size,
-            self.state.fee_rate_bps,
             self.state.atr.unwrap_or(Decimal::ZERO),
             false,
             hedge_book,
@@ -1550,6 +1541,7 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::erosion::MAX_EROSION_STEPS;
     use crate::types::market::{BinanceTick, OrderBook, PriceLevel, SpikeInfo};
 
     const TEST_FIXED_ALLOC: Decimal = Decimal::from_parts(100, 0, 0, false, 0);

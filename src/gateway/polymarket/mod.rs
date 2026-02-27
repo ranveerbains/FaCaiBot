@@ -54,15 +54,12 @@ pub(super) const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
 /// Returns up to 10 active, non-closed events; we filter client-side
 /// for BTC/ETH by slug prefix (`btc-updown-15m-` / `eth-updown-15m-`).
 pub(super) const GAMMA_EVENTS_PATH: &str =
-    "/events?tag_id=102467&active=true&closed=false&limit=10";
+    "/events?tag_id=102467&closed=false&limit=10";
 
 // ─── Timing constants ─────────────────────────────────────────────────────────
 
 /// Heartbeat interval (ms). PRD: 5 000 ms (Section 5.4).
 pub(super) const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
-
-/// Gamma API polling interval (ms). PRD: 10 minutes (Section 5.3).
-pub(super) const GAMMA_POLL_INTERVAL_MS: u64 = 600_000;
 
 /// Reconnection backoff: initial delay (ms).
 pub(super) const BACKOFF_INITIAL_MS: u64 = 1_000;
@@ -205,15 +202,15 @@ impl PolymarketWsGateway {
     /// Long-running market rotation manager.
     ///
     /// - Polls Gamma API every 10 minutes for the next market.
-    /// - At T-180s (3 min before expiry), discovers the next market and
-    ///   pre-warms its order books. Instant switch when the current market expires.
+    /// - Pre-warms the next market before expiry (lead time configurable).
     /// - Falls back to immediate Gamma poll if pre-warming was not possible.
     /// - Emits `IngestorEvent::MarketRotation` once per market transition.
     pub async fn run_market_rotation(
         &self,
         tx: Sender<IngestorEvent>,
         token_tx: tokio::sync::watch::Sender<Vec<String>>,
+        prewarm_lead_ms: u64,
     ) -> Result<()> {
-        rotation::run_market_rotation(self.shutdown.clone(), tx, token_tx).await
+        rotation::run_market_rotation(self.shutdown.clone(), tx, token_tx, prewarm_lead_ms).await
     }
 }

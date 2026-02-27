@@ -1,5 +1,16 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ROTATION
+# Market rotation manager: discovery and pre-warming of upcoming 15-min markets.
+# ─────────────────────────────────────────────────────────────────────────────
+[rotation]
+
+# How many seconds before the current market expires we discover and pre-warm
+# the next market. Lower = less wasted API calls; higher = more buffer.
+# 30 = start looking 30s before expiry.
+prewarm_lead_secs = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SPIKE DETECTION
 # Detects sudden BTC price movements on Binance that create a repricing lag on Polymarket.
 # Pipeline: single-tick trigger → sustain → momentum → magnitude → confirmed spike.
@@ -9,14 +20,14 @@
 # At ATR=$0.61 (observed): 2.5 needs a $1.53 tick, 2.0 needed a $1.22 tick.
 multiplier = 2.5
 
-# All ATR EMAs below use the same tick interval: 50ms per tick (SBE @depth20).
+# All ATR EMAs below use the same tick interval: 50ms per tick (SBE @depth20. (we are not using @BestBidAsk).
 
 # EMA smoothing factor for the ATR (~10s memory at 50ms ticks).
 # Lower = smoother/slower ATR adaptation (ATR stays stable longer after a spike).
 # Higher = ATR reacts faster to recent volatility (threshold rises quickly after a spike).
-# 0.005 gives ~200 ticks (~10s at 50ms/tick).
+# 0.01 gives 10seconds of smoothing. at 50ms/tick --> 20 tick/s. 0.02 gives 5 seconds of smoothing 
 # NOTE: No spikes are emitted for the first 10 ticks (~0.5s) after startup while the ATR warms up.
-atr_alpha = 0.01
+atr_alpha = 0.02
 
 # How long (ms) the price must stay displaced above threshold before confirmation
 # This is about the MARKET, not your latency — confirms the spike is real and not a momentary liquidity gap. The spike must hold for this duration.
@@ -29,7 +40,7 @@ sustain_ms = 300
 # 0.005 = 0.5 bps = ~$3.24 at BTC $65K.  (old value)
 # 0.015 = 1.5 bps = ~$9.70 at BTC $65K.  (new value — filters marginal moves)
 # 0.030 = 3.0 bps = ~$19.5 at BTC $65K.
-min_magnitude_pct = 0.015
+min_magnitude_pct = 0.01
 
 # At sustain time, current displacement must be >= this fraction of peak displacement.
 # Filters "fading spikes" where the price spiked but is already retracing.
@@ -61,9 +72,14 @@ depth_min_pct = 0.20
 # time for the erosion cascade + hedge to complete.
 entry_cutoff_secs = 180
 
+# Maximum age (ms) of a Binance SBE event before it is discarded.
+# SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
+# Events older than this indicate network congestion or clock skew — discard to avoid
+# acting on stale price data.
+binance_stale_event_ms = 100
+
 # Maximum age (ms) of the Polymarket orderbook snapshot before blocking entry.
 # If the book data is older than this, it's considered stale and unreliable.
-# 1000 = reject if book hasn't updated in 1 second.
 stale_book_ms = 150
 
 # Maximum YES mid price before blocking entry (mirrors minimum as 1 - max_price_skew).

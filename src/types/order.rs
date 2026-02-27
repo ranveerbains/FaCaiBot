@@ -158,9 +158,6 @@ pub struct TradeSignal {
     pub market_end_timestamp_ms: u64,
     /// Tick size for price rounding.
     pub tick_size: Decimal,
-    /// Taker fee rate in basis points (for emergency taker fee calculations).
-    #[allow(dead_code)] // carried for live mode fee computation
-    pub fee_rate_bps: u16,
 
     // ── Analytics flags ──────────────────────────────────────────────────
     /// Current ATR at signal time (for QuestDB analytics). `Decimal::ZERO` if ATR not yet warmed up.

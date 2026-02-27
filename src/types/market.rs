@@ -204,8 +204,6 @@ pub struct MarketState {
     /// Tick size for the current market token (dynamic, cached once per rotation).
     /// Updated on rare `tick_size_change` WS events.
     pub tick_size: Decimal,
-    /// Taker fee rate in basis points (used only for emergency taker fee calculations).
-    pub fee_rate_bps: u16,
     /// Epoch ms when the current 15-min market expires.
     pub market_end_timestamp_ms: u64,
 
@@ -251,7 +249,6 @@ impl MarketState {
             active_yes_token_id: None,
             active_no_token_id: None,
             tick_size: Decimal::new(1, 2), // 0.01 default; overwritten at rotation
-            fee_rate_bps: 0,
             market_end_timestamp_ms: 0,
             leg1_state: OrderState::None,
             leg2_state: OrderState::None,

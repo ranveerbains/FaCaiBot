@@ -72,7 +72,6 @@ pub struct SpikeDetector {
 
     // ── Stale-event telemetry ─────────────────────────────────────────
     stale_count: u64,
-    last_stale_log_ms: u64,
 
     // ── Diagnostic counters (cumulative, logged periodically) ──────
     diag_candidates_started: u64,
@@ -99,7 +98,6 @@ impl SpikeDetector {
             spike_origin_mid: 0.0,
             spike_peak_delta: 0.0,
             stale_count: 0,
-            last_stale_log_ms: 0,
             diag_candidates_started: 0,
             diag_fading_momentum: 0,
             diag_below_magnitude: 0,
@@ -144,6 +142,7 @@ impl SpikeDetector {
                 rej_momentum = self.diag_fading_momentum,
                 rej_magnitude = self.diag_below_magnitude,
                 confirmed = self.diag_confirmed,
+                stale = self.stale_count,
                 "spike 60s"
             );
             self.last_diag_log_ms = now_ms;
@@ -307,19 +306,9 @@ impl SpikeDetector {
         self.spike_peak_delta = 0.0;
     }
 
-    /// Record a discarded stale event; log a summary every 60 seconds.
-    pub(super) fn record_stale(&mut self, now_ms: u64) {
+    /// Record a discarded stale event. Count is included in the next "spike 60s" log.
+    pub(super) fn record_stale(&mut self, _now_ms: u64) {
         self.stale_count += 1;
-        if now_ms.saturating_sub(self.last_stale_log_ms) >= 60_000 {
-            if self.stale_count > 0 {
-                info!(
-                    stale_count = self.stale_count,
-                    "stale Binance events discarded in the last 60s"
-                );
-            }
-            self.stale_count = 0;
-            self.last_stale_log_ms = now_ms;
-        }
     }
 }
 

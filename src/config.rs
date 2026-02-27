@@ -50,6 +50,8 @@ pub struct EntryGuardsConfig {
     pub depth_min_pct: f64,
     /// No entries within this many seconds of market expiry.
     pub entry_cutoff_secs: u64,
+    /// Max age (ms) of a Binance SBE event before it is discarded.
+    pub binance_stale_event_ms: u64,
     /// Max book age (ms) before blocking entry.
     pub stale_book_ms: u64,
     /// Block entry if YES mid price exceeds this (or falls below 1 - this).
@@ -64,6 +66,7 @@ impl Default for EntryGuardsConfig {
             max_spread_ticks: 2,
             depth_min_pct: 0.15,
             entry_cutoff_secs: 180,
+            binance_stale_event_ms: 50,
             stale_book_ms: 1000,
             max_price_skew: 0.80,
             leg1_timeout_ms: 5000,
@@ -151,11 +154,27 @@ impl Default for RiskConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RotationConfig {
+    /// How many seconds before current market expiry to discover and pre-warm the next market.
+    pub prewarm_lead_secs: u64,
+}
+
+impl Default for RotationConfig {
+    fn default() -> Self {
+        Self {
+            prewarm_lead_secs: 30,
+        }
+    }
+}
+
 // ─── Top-level TOML config ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BotConfig {
+    pub rotation: RotationConfig,
     pub spike_detection: SpikeDetectionConfig,
     pub entry_guards: EntryGuardsConfig,
     pub capital: CapitalConfig,
@@ -166,6 +185,7 @@ pub struct BotConfig {
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
+            rotation: RotationConfig::default(),
             spike_detection: SpikeDetectionConfig::default(),
             entry_guards: EntryGuardsConfig::default(),
             capital: CapitalConfig::default(),
@@ -309,7 +329,7 @@ impl Config {
             .context("capital.low_alloc_pct: invalid decimal")?;
         let adverse_threshold = Decimal::try_from(bot.risk.adverse_threshold)
             .context("risk.adverse_threshold: invalid decimal")?;
-        let stale_event_threshold_ms = bot.entry_guards.stale_book_ms;
+        let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct)
             .context("confidence.high_target_pct: invalid decimal")?;
         let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct)
@@ -367,7 +387,7 @@ impl Config {
         let med_alloc_pct = Decimal::try_from(bot.capital.med_alloc_pct).unwrap();
         let low_alloc_pct = Decimal::try_from(bot.capital.low_alloc_pct).unwrap();
         let adverse_threshold = Decimal::try_from(bot.risk.adverse_threshold).unwrap();
-        let stale_event_threshold_ms = bot.entry_guards.stale_book_ms;
+        let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct).unwrap();
         let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct).unwrap();
         let low_target_pct = Decimal::try_from(bot.confidence.low_target_pct).unwrap();

@@ -218,6 +218,7 @@ impl ColdStorage {
         time_remaining_secs: i64,
         alloc_amount: Decimal,
         action: &str,
+        spike_detected_ms: u64,
     ) -> Result<()> {
         self.buffer
             .table("trade_signals")?
@@ -230,6 +231,7 @@ impl ColdStorage {
             .column_f64("book_depth", book_depth.try_into().unwrap_or(0.0))?
             .column_i64("time_remaining", time_remaining_secs)?
             .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
+            .column_i64("spike_detected_ms", spike_detected_ms as i64)?
             .at_now()?;
 
         // Flush immediately — signals are rare, we want them durable right away.

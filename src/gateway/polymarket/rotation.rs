@@ -1,11 +1,10 @@
 //! Market rotation manager — Gamma API discovery and market lifecycle management.
 //!
-//! Polls the Gamma API every 10 minutes for upcoming BTC/ETH 15-minute markets.
-//! At T-180s (3 minutes before the current market expires), anticipatorily
-//! discovers the next market and pre-fetches its order books via REST.
-//! When the current market expires, the pre-warmed rotation is emitted
-//! instantly (zero gap). Falls back to immediate Gamma poll if pre-warming
-//! was not possible.
+//! Single 5s timer drives all rotation logic:
+//! - **Prewarm** at T-180s: discovers the next market and pre-fetches order books.
+//! - **Instant switch** at T-0: emits the pre-warmed rotation with zero gap.
+//! - **Aggressive retry**: when marketless (startup, post-expiry fallback failure,
+//!   any gap), retries Gamma discovery every 5s until a market is found.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +20,7 @@ use crate::types::market::OrderBook;
 
 use super::market_ws::{parse_price_levels, parse_timestamp_field};
 use super::tls_helpers::http_get;
-use super::{CLOB_BASE_URL, GAMMA_BASE_URL, GAMMA_EVENTS_PATH, GAMMA_POLL_INTERVAL_MS};
+use super::{CLOB_BASE_URL, GAMMA_BASE_URL, GAMMA_EVENTS_PATH};
 
 /// Information about a discovered upcoming 15-minute market.
 #[derive(Debug, Clone)]
@@ -36,18 +35,13 @@ pub struct MarketInfo {
     pub end_timestamp_ms: u64,
 }
 
-/// How far before the current market expires we discover and pre-warm the next
-/// market (3 minutes). At this point we query Gamma for a market ending AFTER
-/// the current one, fetch its order books, and cache them for instant switch.
-const PREWARM_LEAD_MS: u64 = 180_000;
-
 /// Long-running market rotation manager.
 ///
-/// - Polls Gamma API every 10 minutes for the next market.
-/// - At T-180s (3 minutes before expiry), discovers the NEXT market and
-///   pre-warms its order books via REST. When the current market expires,
-///   the pre-warmed rotation is emitted instantly (zero gap).
-/// - Falls back to immediate Gamma poll if pre-warming failed.
+/// - Pre-warms the NEXT market before expiry (lead time configurable).
+///   Retries every 5s on failure until the prewarm window closes.
+/// - At T-0, emits the pre-warmed rotation instantly (zero gap).
+/// - When marketless (startup, post-expiry failure, any gap), retries
+///   Gamma discovery every 5s until a market is found.
 /// - Emits `IngestorEvent::MarketRotation` once per market transition.
 ///
 /// The caller (`main.rs` / integration layer) is responsible for:
@@ -59,29 +53,22 @@ pub(super) async fn run_market_rotation(
     shutdown: Arc<AtomicBool>,
     tx: Sender<IngestorEvent>,
     token_tx: tokio::sync::watch::Sender<Vec<String>>,
+    prewarm_lead_ms: u64,
 ) -> Result<()> {
-    let mut poll_interval = tokio::time::interval(Duration::from_millis(GAMMA_POLL_INTERVAL_MS));
     let mut last_emitted_condition_id: Option<String> = None;
     let mut current_market: Option<MarketInfo> = None;
-    // Check lifecycle every 5s (pre-warm window + expiry detection).
+    // Single 5s timer drives all rotation logic: prewarm at T-180s, expiry
+    // detection, and aggressive retry when marketless.
     let mut rotation_check = tokio::time::interval(Duration::from_secs(5));
-    // Set when expiry is detected without a pre-warmed market — triggers immediate Gamma poll.
-    let mut needs_immediate_poll = false;
 
     // ── Anticipatory pre-warming state ────────────────────────────────────
     let mut next_market: Option<MarketInfo> = None;
     let mut prewarmed_books: Vec<OrderBook> = Vec::new();
     let mut prewarm_attempted = false;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         tokio::select! {
-            _ = poll_interval.tick() => {
-                poll_gamma_and_emit(
-                    &tx, &token_tx,
-                    &mut last_emitted_condition_id,
-                    &mut current_market,
-                ).await;
-            }
             _ = rotation_check.tick() => {
                 if shutdown.load(Ordering::Relaxed) {
                     info!("market rotation manager shutdown — exiting");
@@ -93,18 +80,18 @@ pub(super) async fn run_market_rotation(
                 if let Some(ref market) = current_market {
                     let remaining_ms = market.end_timestamp_ms.saturating_sub(now_ms);
 
-                    // ── Pre-warm at T-180s ────────────────────────────────
+                    // ── Pre-warm before expiry ───────────────────────────
                     // Discover the NEXT market (ending after current) and
                     // pre-fetch its order books so the switch is instant.
                     if remaining_ms > 0
-                        && remaining_ms <= PREWARM_LEAD_MS
+                        && remaining_ms <= prewarm_lead_ms
                         && !prewarm_attempted
                     {
-                        prewarm_attempted = true;
                         info!(
                             remaining_secs = remaining_ms / 1000,
+                            prewarm_lead_secs = prewarm_lead_ms / 1000,
                             current_condition_id = %market.condition_id,
-                            "T-180s: pre-warming next market"
+                            "pre-warming next market"
                         );
 
                         match discover_market_after(market.end_timestamp_ms).await {
@@ -144,12 +131,14 @@ pub(super) async fn run_market_rotation(
                                 }
                                 prewarmed_books = books;
                                 next_market = Some(info);
+                                prewarm_attempted = true;
                             }
                             Err(e) => {
-                                warn!(
+                                // Pre-warm failures are expected retries (market may
+                                // not be listed yet). Keep at debug to avoid log noise.
+                                debug!(
                                     error = %e,
-                                    "failed to discover next market for pre-warming \
-                                     — will poll Gamma on expiry"
+                                    "pre-warm discovery failed — will retry next tick"
                                 );
                             }
                         }
@@ -180,18 +169,31 @@ pub(super) async fn run_market_rotation(
                             current_market = None;
                             prewarmed_books.clear();
                             prewarm_attempted = false;
-                            needs_immediate_poll = true;
                         }
                     }
                 }
 
-                if needs_immediate_poll {
-                    needs_immediate_poll = false;
+                // Aggressive 5s retry when marketless (startup failure, post-expiry
+                // fallback failure, any gap). Self-terminates when poll succeeds.
+                // Safe: poll_gamma_and_emit deduplicates by last_emitted_condition_id.
+                if current_market.is_none() {
+                    debug!("no active market — retrying Gamma discovery");
                     poll_gamma_and_emit(
                         &tx, &token_tx,
                         &mut last_emitted_condition_id,
                         &mut current_market,
                     ).await;
+
+                    if current_market.is_some() {
+                        consecutive_failures = 0;
+                    } else {
+                        consecutive_failures += 1;
+                        if consecutive_failures == 1 {
+                            warn!("Gamma discovery failed — no market found (will retry every 5s)");
+                        } else {
+                            debug!(consecutive_failures, "Gamma discovery still failing");
+                        }
+                    }
                 }
             }
         }
@@ -410,6 +412,9 @@ struct GammaEventMarket {
     clob_token_ids: String,
 
     /// Whether the market is currently accepting orders.
+    /// Not used for discovery filtering (engine guards handle readiness),
+    /// but deserialized for diagnostics.
+    #[allow(dead_code)]
     #[serde(rename = "acceptingOrders", default)]
     accepting_orders: bool,
 }
@@ -417,7 +422,7 @@ struct GammaEventMarket {
 /// Parse the Gamma API `/events?tag_id=102467` response into a `MarketInfo`.
 ///
 /// Filters for BTC/ETH 15-minute markets by slug prefix, selects the
-/// soonest non-expired event that is accepting orders.
+/// soonest non-expired event with valid token IDs.
 pub(super) fn parse_gamma_events_response(body: &str) -> Result<MarketInfo> {
     parse_gamma_events_response_after(body, now_epoch_ms())
 }
@@ -456,8 +461,11 @@ fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<
         }
 
         // Extract the first market with valid tokens.
+        // Note: acceptingOrders is NOT checked — we only need token IDs for
+        // discovery. The engine's guards (spread, depth, stale book) prevent
+        // trading before the market is ready.
         for m in &event.markets {
-            if m.condition_id.is_empty() || !m.accepting_orders {
+            if m.condition_id.is_empty() {
                 continue;
             }
 
@@ -493,6 +501,36 @@ fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<
                 }
             }
         }
+    }
+
+    if best.is_none() {
+        // Diagnostic: log what we got from Gamma so we can tell whether the
+        // market exists but is being filtered, or doesn't exist at all.
+        let target_count = events
+            .iter()
+            .filter(|e| {
+                TARGET_SLUG_PREFIXES
+                    .iter()
+                    .any(|p| e.slug.starts_with(p))
+            })
+            .count();
+        let future_count = events
+            .iter()
+            .filter(|e| {
+                TARGET_SLUG_PREFIXES
+                    .iter()
+                    .any(|p| e.slug.starts_with(p))
+                    && !e.end_date.is_empty()
+                    && parse_iso8601_to_epoch_ms(&e.end_date).unwrap_or(0) > skip_before_ms
+            })
+            .count();
+        warn!(
+            total_events = events.len(),
+            target_events = target_count,
+            future_target_events = future_count,
+            skip_before_ms,
+            "Gamma discovery failed — diagnostic"
+        );
     }
 
     best.map(|(_, info)| info)
@@ -739,9 +777,26 @@ mod tests {
         );
     }
 
+    /// Market with `acceptingOrders=false` should still be discovered.
+    /// We only need token IDs for discovery; engine guards prevent premature trading.
+    const GAMMA_EVENTS_NOT_ACCEPTING: &str = r#"[
+        {
+            "slug": "btc-updown-15m-9999999900",
+            "endDate": "2099-01-01T00:00:00Z",
+            "markets": [{
+                "conditionId": "0xnotyet",
+                "clobTokenIds": "[\"0xyesNew\", \"0xnoNew\"]",
+                "acceptingOrders": false
+            }]
+        }
+    ]"#;
+
     #[test]
-    fn test_prewarm_lead_constant() {
-        // Sanity check: PREWARM_LEAD_MS is 3 minutes (180 000 ms).
-        assert_eq!(PREWARM_LEAD_MS, 180_000);
+    fn test_accepting_orders_false_still_discovered() {
+        let info = parse_gamma_events_response(GAMMA_EVENTS_NOT_ACCEPTING)
+            .expect("should discover market even with acceptingOrders=false");
+        assert_eq!(info.condition_id, "0xnotyet");
+        assert_eq!(info.yes_token_id, "0xyesNew");
+        assert_eq!(info.no_token_id, "0xnoNew");
     }
 }
