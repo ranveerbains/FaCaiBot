@@ -17,12 +17,8 @@ pub enum PositionStatus {
     Open,
     /// Both legs filled — paired position locked in.
     Hedged,
-    /// Market expired before Leg 2 could fill.
-    Expired,
     /// Market expired; position awaiting UMA resolution (~2h challenge period).
     AwaitingResolution,
-    /// UMA resolution confirmed; PnL finalized.
-    Resolved,
 }
 
 // ─── Simulated Fill ──────────────────────────────────────────────────────────
@@ -428,24 +424,6 @@ impl SimulationState {
         self.current_market_signals += 1;
     }
 
-    /// Record an unfilled signal (post-only bid not matched — zero cost).
-    #[allow(dead_code)] // used in tests + future executor wiring
-    pub fn record_unfilled_post_only(&mut self) {
-        self.unfilled_post_only += 1;
-    }
-
-    /// Record a signal aborted due to insufficient liquidity.
-    #[allow(dead_code)] // used in tests + future executor wiring
-    pub fn record_unfilled_liquidity(&mut self) {
-        self.unfilled_liquidity += 1;
-    }
-
-    /// Record a signal aborted due to spread too wide.
-    #[allow(dead_code)] // used in tests + future executor wiring
-    pub fn record_unfilled_spread_wide(&mut self) {
-        self.unfilled_spread_wide += 1;
-    }
-
     /// Record a smart outbidding event (depth wall detected and outbid by 1 tick).
     pub fn record_wall_outbid(&mut self) {
         self.walls_outbid += 1;
@@ -457,14 +435,6 @@ impl SimulationState {
     pub fn record_erosion_step(&mut self, position_idx: usize) {
         if let Some(pos) = self.open_positions.get_mut(position_idx) {
             pos.erosion_steps += 1;
-        }
-    }
-
-    /// Mark a position as bot_contested (depth wall was detected during this trade).
-    #[allow(dead_code)] // used in tests + future executor wiring
-    pub fn mark_bot_contested(&mut self, position_idx: usize) {
-        if let Some(pos) = self.open_positions.get_mut(position_idx) {
-            pos.bot_contested = true;
         }
     }
 

@@ -10,7 +10,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC/ETH 15-minute prediction ma
 cargo build              # Build (debug)
 cargo build --release    # Build (release — LTO, single codegen unit)
 cargo run                # Run the bot
-cargo test               # Run all tests (136 tests)
+cargo test               # Run all tests (124 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -74,14 +74,14 @@ src/
 ├── executor/
 │   ├── live.rs                    # LiveExecutor: CLOB order placement, cancel/repost, FOK emergency
 │   ├── simulation.rs              # SimulationExecutor: simulated fills, Telegram reporting
-│   └── fill_engine.rs             # Utility helpers: compute_fill_size, opposite_side, epoch_ms
+│   └── fill_engine.rs             # Utility helpers: compute_fill_size, opposite_side
 ├── gateway/
 │   ├── binance/
 │   │   ├── ws.rs                  # BinanceGateway: fastwebsockets TLS, SBE binary decoding (50ms depth + real-time bestBidAsk)
 │   │   └── spike.rs               # SpikeDetector: EMA-ATR with sustain + momentum filter
 │   └── polymarket/
 │       ├── mod.rs                 # Facade, shared constants
-│       ├── rest.rs                # CLOB REST: SDK-based order placement, cancel, public read endpoints
+│       ├── rest.rs                # CLOB REST: SDK-based order placement and cancellation
 │       ├── market_ws.rs           # Public Market WS: book, price, tick events
 │       ├── user_ws.rs             # Authenticated User WS: trade fills
 │       ├── heartbeat.rs           # POST /heartbeat every 5s (live only)
@@ -96,7 +96,8 @@ src/
 │   ├── order.rs                   # TradeSignal, ProfitTier, ExecutorCommand, ExecutorFeedback, Side
 │   └── simulation.rs              # SimulationState, SimPosition, SimTrade
 └── utils/
-    └── signing.rs                 # build_signer() helper; HMAC/contract constants retained as dead-code fallback
+    ├── signing.rs                 # build_signer() helper (hex private key → PrivateKeySigner)
+    └── time.rs                    # epoch_ms() — single source of truth for millisecond timestamps
 ```
 
 ## Key Conventions
@@ -113,6 +114,8 @@ src/
 - **Erosion model**: Triangle-weighted steps `[5,4,3,2,1]` (front-loaded) with exponential decay intervals (3s→1.5s→0.75s→0.375s→0.2s). ~5.8s to break-even. Capped at `MAX_EROSION_STEPS` (5) — exhaustion auto-triggers `BreakEvenBreach` emergency. **Skip guard**: if posted Leg 2 price is already at or better than the next erosion target, the repost is skipped (preserves favorable exits)
 - **Emergency exits**: Price-improvement chase with hard deadline. Post-only at `best_ask - 1 tick`, only repost when book offers strictly better price (preserves FIFO queue priority). After `emergency_deadline_ms` (2500ms) → FOK taker at `best_ask`. Three triggers: (1) Adverse movement — Binance reversal >0.1%, zero grace; (2) Break-even breach — after first erosion step; (3) Erosion exhausted — all 5 steps applied without fill
 - **Leg 1 staleness**: Unfilled Leg 1 post-only orders are cancelled after `leg1_timeout_ms` (default 5000ms) to free the slot for the next spike. `CancelLeg1` executor command in live mode; handled in `advance_simulation()` for sim
+- **SDK cache pre-population**: On market rotation, `LiveExecutor` pre-populates the SDK's per-token caches (`tick_size`, `fee_rate_bps=0`, `neg_risk=true`) using token IDs from the `MarketRotation` command. Eliminates the first-order CLOB round-trip per token
+- **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
 
 ## Key Documents

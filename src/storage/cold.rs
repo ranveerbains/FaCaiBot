@@ -27,18 +27,6 @@ const TICK_FLUSH_INTERVAL_MS: u64 = 60_000;
 /// QuestDB ILP TCP port (ingestion).
 const DEFAULT_ILP_PORT: u16 = 9009;
 
-// ─── All QuestDB Tables ───────────────────────────────────────────────────────
-
-/// All tables that the bot writes to — used by the automated pruning task.
-#[allow(dead_code)] // used by prune_old_partitions (wired when tokio-postgres is added)
-const ALL_TABLES: &[&str] = &[
-    "binance_ticks",
-    "poly_book_snapshots",
-    "trade_signals",
-    "executed_trades",
-    "simulated_trades",
-];
-
 // ─── ColdStorage ──────────────────────────────────────────────────────────────
 
 /// QuestDB-backed cold storage for millisecond-level time-series data.
@@ -387,13 +375,16 @@ impl ColdStorage {
             .symbol("direction", &direction_str)?
             .symbol("profit_tier", profit_tier_label)?
             .symbol("resolution", resolution_str)?
-            .symbol("exit_reason", match trade.exit_reason {
-                Some(ExitReason::AdverseMovement) => "AdverseMovement",
-                Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
-                Some(ExitReason::MarketExpiry) => "MarketExpiry",
-                Some(ExitReason::FavorableTaker) => "FavorableTaker",
-                None => "NormalErosion",
-            })?
+            .symbol(
+                "exit_reason",
+                match trade.exit_reason {
+                    Some(ExitReason::AdverseMovement) => "AdverseMovement",
+                    Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+                    Some(ExitReason::MarketExpiry) => "MarketExpiry",
+                    Some(ExitReason::FavorableTaker) => "FavorableTaker",
+                    None => "NormalErosion",
+                },
+            )?
             .column_f64("leg1_price", trade.leg1.price.try_into().unwrap_or(0.0))?
             .column_f64("leg2_price", leg2_price)?
             .column_f64("leg1_size", trade.leg1.size.try_into().unwrap_or(0.0))?
@@ -414,7 +405,10 @@ impl ColdStorage {
             .column_bool("leg2_was_partial", leg2_was_partial)?
             .column_bool("favorable_taker", trade.favorable_taker)?
             .column_bool("emergency_maker", trade.emergency_maker)?
-            .column_f64("spike_magnitude", trade.spike_magnitude.try_into().unwrap_or(0.0))?
+            .column_f64(
+                "spike_magnitude",
+                trade.spike_magnitude.try_into().unwrap_or(0.0),
+            )?
             .column_i64("open_ts_ms", trade.open_timestamp_ms as i64)?
             .column_i64("close_ts_ms", trade.close_timestamp_ms as i64)?
             .at_now()?;
@@ -445,81 +439,6 @@ impl Drop for ColdStorage {
             }
         }
     }
-}
-
-// ─── Automated Partition Pruning ──────────────────────────────────────────────
-
-/// Drop QuestDB partitions older than 7 days across all tables.
-///
-/// Connects to QuestDB via the **Postgres wire protocol** (port 8812) and runs:
-/// ```sql
-/// ALTER TABLE {table} DROP PARTITION WHERE timestamp < dateadd('d', -7, now())
-/// ```
-/// for each table in `ALL_TABLES`.
-///
-/// This function is designed to be called from a `tokio::interval` task in
-/// `main.rs` (e.g., every hour):
-/// ```rust
-/// let mut interval = tokio::time::interval(Duration::from_secs(3600));
-/// loop {
-///     interval.tick().await;
-///     if let Err(e) = ColdStorage::prune_old_partitions(&questdb_pg_url).await {
-///         tracing::warn!(error = %e, "partition pruning failed");
-///     }
-/// }
-/// ```
-///
-/// # Dependency Note
-///
-/// This function requires the `tokio-postgres` crate. Add to `Cargo.toml`:
-/// ```toml
-/// tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
-/// ```
-///
-/// Until `tokio-postgres` is added to `Cargo.toml`, this function is a
-/// **TODO stub** that logs the intent without executing any SQL.
-#[allow(dead_code)] // stub — wired when tokio-postgres is added
-pub async fn prune_old_partitions(questdb_pg_url: &str) -> Result<()> {
-    // TODO: Uncomment and use once `tokio-postgres` is added to Cargo.toml:
-    //
-    // ```rust
-    // use tokio_postgres::NoTls;
-    //
-    // let (client, connection) = tokio_postgres::connect(questdb_pg_url, NoTls)
-    //     .await
-    //     .context("failed to connect to QuestDB Postgres wire (port 8812)")?;
-    //
-    // // Drive the connection in a background task.
-    // tokio::spawn(async move {
-    //     if let Err(e) = connection.await {
-    //         tracing::warn!(error = %e, "QuestDB Postgres connection error during pruning");
-    //     }
-    // });
-    //
-    // for table in ALL_TABLES {
-    //     let sql = format!(
-    //         "ALTER TABLE {} DROP PARTITION WHERE timestamp < dateadd('d', -7, now())",
-    //         table
-    //     );
-    //     match client.execute(sql.as_str(), &[]).await {
-    //         Ok(n) => info!(table, partitions_dropped = n, "pruned old partitions"),
-    //         Err(e) => warn!(table, error = %e, "failed to prune partitions for table"),
-    //     }
-    // }
-    // ```
-    //
-    // Required Cargo.toml addition:
-    //   tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
-    //   QuestDB Postgres wire endpoint: postgresql://admin:quest@127.0.0.1:8812/qdb
-
-    // Stub implementation — logs intent without executing SQL.
-    info!(
-        url = questdb_pg_url,
-        tables = ?ALL_TABLES,
-        "STUB: prune_old_partitions called — add tokio-postgres to Cargo.toml to enable \
-         ALTER TABLE ... DROP PARTITION WHERE timestamp < dateadd('d', -7, now())"
-    );
-    Ok(())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

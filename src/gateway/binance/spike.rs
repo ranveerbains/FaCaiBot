@@ -185,16 +185,18 @@ impl SpikeDetector {
                     if momentum_ratio < self.momentum_ratio_min {
                         self.diag_fading_momentum += 1;
                         debug!(
-                            momentum_ratio = format!("{:.3}", momentum_ratio),
+                            %momentum_ratio,
                             min = self.momentum_ratio_min,
-                            displacement = format!("{:.2}", abs_displacement),
-                            peak = format!("{:.2}", peak_abs),
+                            %abs_displacement,
+                            %peak_abs,
                             "spike REJECTED: fading momentum"
                         );
                         self.reset_candidate();
                         self.prev_mid = Some(mid);
                         self.prev_ts_ms = now_ms;
-                        return SpikeEvent::Failed { timestamp_ms: now_ms };
+                        return SpikeEvent::Failed {
+                            timestamp_ms: now_ms,
+                        };
                     } else {
                         // Use sustain-time displacement (not peak) for honest magnitude.
                         let magnitude = if self.spike_origin_mid.abs() > 1e-12 {
@@ -230,14 +232,16 @@ impl SpikeDetector {
                 // Displacement fell below threshold at sustain time — spike faded.
                 self.diag_fading_momentum += 1;
                 debug!(
-                    displacement = format!("{:.2}", abs_displacement),
-                    threshold = format!("{:.2}", threshold),
+                    %abs_displacement,
+                    %threshold,
                     "spike FAILED: displacement below threshold at sustain"
                 );
                 self.reset_candidate();
                 self.prev_mid = Some(mid);
                 self.prev_ts_ms = now_ms;
-                return SpikeEvent::Failed { timestamp_ms: now_ms };
+                return SpikeEvent::Failed {
+                    timestamp_ms: now_ms,
+                };
             }
             // else: within sustain window, displacement may be below threshold — allow brief dips.
         } else if abs_delta > threshold {
@@ -259,7 +263,7 @@ impl SpikeDetector {
             if magnitude < min_mag {
                 self.diag_below_magnitude += 1;
                 debug!(
-                    magnitude_pct = format!("{:.4}", magnitude * 100.0),
+                    magnitude_pct = %(magnitude * 100.0),
                     min_pct = self.min_magnitude_pct,
                     "spike candidate REJECTED: below min magnitude at start"
                 );
@@ -282,11 +286,11 @@ impl SpikeDetector {
             };
             debug!(
                 direction = ?candidate_dir,
-                abs_delta = format!("{:.2}", abs_delta),
-                atr = format!("{:.2}", atr),
-                threshold = format!("{:.2}", threshold),
-                mid = format!("{:.2}", mid),
-                magnitude_pct = format!("{:.4}", magnitude * 100.0),
+                %abs_delta,
+                %atr,
+                %threshold,
+                %mid,
+                magnitude_pct = %(magnitude * 100.0),
                 "spike candidate STARTED — emitting Candidate"
             );
             self.prev_mid = Some(mid);

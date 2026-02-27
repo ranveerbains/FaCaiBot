@@ -36,14 +36,7 @@ pub(crate) fn round_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     (price / tick).round() * tick
 }
 
-/// Current epoch time in milliseconds.
-pub(crate) fn epoch_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+pub(crate) use crate::utils::time::epoch_ms;
 
 // ─── Unit Tests ───────────────────────────────────────────────────────────────
 

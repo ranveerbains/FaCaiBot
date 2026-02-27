@@ -25,7 +25,7 @@
 //! < 50 ms from Binance WS push to crossbeam channel emit (P99).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
@@ -300,8 +300,14 @@ fn handle_sbe_message(
                         }
                     }
                     SpikeEvent::Failed { timestamp_ms } => {
-                        debug!(timestamp_ms, "Binance spike failed — cancelling speculative Leg 1");
-                        if tx.try_send(IngestorEvent::SpikeFailed { timestamp_ms }).is_err() {
+                        debug!(
+                            timestamp_ms,
+                            "Binance spike failed — cancelling speculative Leg 1"
+                        );
+                        if tx
+                            .try_send(IngestorEvent::SpikeFailed { timestamp_ms })
+                            .is_err()
+                        {
                             warn!("ingestor channel full — SpikeFailed dropped");
                         }
                     }
@@ -407,7 +413,7 @@ fn parse_sbe_depth(body: &[u8], block_length: usize) -> Result<BinanceDepth> {
         .context("SBE asks group parse error")?;
 
     Ok(BinanceDepth {
-        symbol: "btcusdt".to_string(),
+        symbol: "BTCUSDT",
         bids,
         asks,
         timestamp_ms,
@@ -474,7 +480,7 @@ fn parse_sbe_best_bid_ask(body: &[u8], block_length: usize) -> Result<BinanceTic
     let timestamp_ms = (event_time_us / 1000) as u64;
 
     Ok(BinanceTick {
-        symbol: "BTCUSDT".to_string(),
+        symbol: "BTCUSDT",
         bid_price: sbe_to_decimal(bid_price, price_exp),
         bid_qty: sbe_to_decimal(bid_qty, qty_exp),
         ask_price: sbe_to_decimal(ask_price, price_exp),
@@ -501,14 +507,7 @@ pub(super) fn is_stale(event_ts_ms: u64, now_ms: u64, threshold_ms: u64) -> bool
     now_ms.saturating_sub(event_ts_ms) > threshold_ms
 }
 
-/// Current wall-clock time as epoch milliseconds.
-#[inline]
-pub(super) fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub(super) use crate::utils::time::epoch_ms as now_epoch_ms;
 
 // ─── fastwebsockets executor adapter ─────────────────────────────────────────
 
@@ -648,7 +647,7 @@ mod tests {
 
         let depth = parse_sbe_depth(&body, 18).unwrap();
 
-        assert_eq!(depth.symbol, "btcusdt");
+        assert_eq!(depth.symbol, "BTCUSDT");
         assert_eq!(depth.timestamp_ms, 1_700_000_000_000);
         assert_eq!(depth.bids.len(), 2);
         assert_eq!(depth.asks.len(), 2);

@@ -6,6 +6,11 @@
 
 use rust_decimal::Decimal;
 
+const WEIGHT_SPIKE: Decimal = Decimal::from_parts(4, 0, 0, false, 1); // 0.4
+const WEIGHT_DEPTH: Decimal = Decimal::from_parts(2, 0, 0, false, 1); // 0.2
+const WEIGHT_TIME: Decimal = Decimal::from_parts(2, 0, 0, false, 1); // 0.2
+const MARKET_DURATION: Decimal = Decimal::from_parts(900, 0, 0, false, 0); // 900
+
 /// Compute the 3-factor confidence score in [0.0, 0.8].
 ///
 /// ```text
@@ -32,9 +37,9 @@ pub fn compute_confidence(
     } else {
         (poly_book_depth / avg_book_depth).min(Decimal::ONE)
     };
-    let f4 = (Decimal::from(time_remaining_secs) / Decimal::from(900u64)).min(Decimal::ONE);
+    let f4 = (Decimal::from(time_remaining_secs) / MARKET_DURATION).min(Decimal::ONE);
 
-    (Decimal::new(4, 1) * f1 + Decimal::new(2, 1) * f3 + Decimal::new(2, 1) * f4)
+    (WEIGHT_SPIKE * f1 + WEIGHT_DEPTH * f3 + WEIGHT_TIME * f4)
         .min(Decimal::ONE)
         .max(Decimal::ZERO)
 }

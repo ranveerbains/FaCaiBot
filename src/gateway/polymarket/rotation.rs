@@ -410,13 +410,6 @@ struct GammaEventMarket {
     /// e.g. `"[\"YES_ID\", \"NO_ID\"]"`, not a native JSON array.
     #[serde(rename = "clobTokenIds", default)]
     clob_token_ids: String,
-
-    /// Whether the market is currently accepting orders.
-    /// Not used for discovery filtering (engine guards handle readiness),
-    /// but deserialized for diagnostics.
-    #[allow(dead_code)]
-    #[serde(rename = "acceptingOrders", default)]
-    accepting_orders: bool,
 }
 
 /// Parse the Gamma API `/events?tag_id=102467` response into a `MarketInfo`.
@@ -508,18 +501,12 @@ fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<
         // market exists but is being filtered, or doesn't exist at all.
         let target_count = events
             .iter()
-            .filter(|e| {
-                TARGET_SLUG_PREFIXES
-                    .iter()
-                    .any(|p| e.slug.starts_with(p))
-            })
+            .filter(|e| TARGET_SLUG_PREFIXES.iter().any(|p| e.slug.starts_with(p)))
             .count();
         let future_count = events
             .iter()
             .filter(|e| {
-                TARGET_SLUG_PREFIXES
-                    .iter()
-                    .any(|p| e.slug.starts_with(p))
+                TARGET_SLUG_PREFIXES.iter().any(|p| e.slug.starts_with(p))
                     && !e.end_date.is_empty()
                     && parse_iso8601_to_epoch_ms(&e.end_date).unwrap_or(0) > skip_before_ms
             })
@@ -581,15 +568,7 @@ pub(super) fn parse_iso8601_to_epoch_ms(s: &str) -> Result<u64> {
     Ok(epoch_secs * 1_000)
 }
 
-/// Current wall-clock time as epoch milliseconds.
-#[inline]
-pub(super) fn now_epoch_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub(super) use crate::utils::time::epoch_ms as now_epoch_ms;
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 

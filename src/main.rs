@@ -127,15 +127,11 @@ async fn async_main() -> Result<()> {
 
             // Polymarket WS gateway — live mode passes creds, sim mode passes None.
             let poly_ws = if ingestor_config.mode == Mode::Live {
-                PolymarketWsGateway::new(
-                    Some(ingestor_config.polymarket_api_key.clone()),
-                    Some(ingestor_config.polymarket_secret.clone()),
-                    Some(ingestor_config.polymarket_passphrase.clone()),
-                )
+                PolymarketWsGateway::new(Some(ingestor_config.polymarket_api_key.clone()))
             } else {
                 // Simulation: no User WS or heartbeat, but Market WS still runs
                 // for live orderbook data.
-                PolymarketWsGateway::new(None, None, None)
+                PolymarketWsGateway::new(None)
             };
 
             let tx_binance = ingestor_tx_binance;
@@ -209,12 +205,18 @@ async fn async_main() -> Result<()> {
             }
 
             // Detect market rotation to notify executor.
-            let rotation_condition_id = if let IngestorEvent::MarketRotation {
+            let rotation_info = if let IngestorEvent::MarketRotation {
                 ref condition_id,
+                ref yes_token_id,
+                ref no_token_id,
                 ..
             } = event
             {
-                Some(condition_id.clone())
+                Some((
+                    condition_id.clone(),
+                    yes_token_id.clone(),
+                    no_token_id.clone(),
+                ))
             } else {
                 None
             };
@@ -222,7 +224,8 @@ async fn async_main() -> Result<()> {
             // Record Binance ticks to QuestDB (fire-and-forget analytics).
             // Downsampled: only record ~1 tick/sec to keep 7-day storage manageable.
             if let IngestorEvent::BinanceTick(ref tick) = event {
-                if tick.timestamp_ms.saturating_sub(last_tick_record_ms) >= TICK_RECORD_INTERVAL_MS {
+                if tick.timestamp_ms.saturating_sub(last_tick_record_ms) >= TICK_RECORD_INTERVAL_MS
+                {
                     if let Some(ref mut c) = cold {
                         if let Err(e) = c.record_tick(tick) {
                             debug!(error = %e, "failed to record tick to QuestDB");
@@ -290,9 +293,12 @@ async fn async_main() -> Result<()> {
 
             // Notify executor of market rotation (before evaluating signals,
             // so the executor can close positions before receiving new ones).
-            if let Some(cond_id) = rotation_condition_id {
+            if let Some((cond_id, yes_id, no_id)) = rotation_info {
                 if let Err(e) = executor_tx.send(ExecutorCommand::MarketRotation {
                     condition_id: cond_id,
+                    yes_token_id: yes_id,
+                    no_token_id: no_id,
+                    tick_size: engine.state().tick_size,
                 }) {
                     error!(error = %e, "failed to send MarketRotation to executor");
                     break;
@@ -455,9 +461,4 @@ async fn async_main() -> Result<()> {
 }
 
 /// Current epoch milliseconds.
-fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::utils::time::epoch_ms;

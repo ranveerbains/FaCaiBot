@@ -9,12 +9,12 @@
 //! Sends `ExecutorFeedback` back to the engine so it can update `OrderState`
 //! with the real CLOB order IDs (needed for User WS fill matching).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::Decimal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::gateway::polymarket::PolymarketGateway;
 use crate::reporting::telegram::TelegramReporter;
@@ -82,8 +82,14 @@ impl LiveExecutor {
                 ExecutorCommand::Signal(signal) => {
                     self.handle_signal(signal).await;
                 }
-                ExecutorCommand::MarketRotation { condition_id } => {
-                    self.on_market_rotation(&condition_id).await;
+                ExecutorCommand::MarketRotation {
+                    condition_id,
+                    yes_token_id,
+                    no_token_id,
+                    tick_size,
+                } => {
+                    self.on_market_rotation(&condition_id, &yes_token_id, &no_token_id, tick_size)
+                        .await;
                 }
                 ExecutorCommand::MarketCutoff {
                     condition_id,
@@ -398,10 +404,8 @@ impl LiveExecutor {
                 Ok(resp) => {
                     if resp.status == OrderStatus::Rejected {
                         // Post-only would cross spread → FOK fallback at best_ask.
-                        let fok_price = round_to_tick(
-                            signal.price + signal.tick_size,
-                            signal.tick_size,
-                        );
+                        let fok_price =
+                            round_to_tick(signal.price + signal.tick_size, signal.tick_size);
                         warn!(
                             price = %signal.price,
                             fok_price = %fok_price,
@@ -501,12 +505,8 @@ impl LiveExecutor {
         exit_reason: crate::types::order::ExitReason,
         price: Decimal,
     ) {
-        let order = OrderRequest::emergency_fok(
-            signal.token_id.clone(),
-            signal.side,
-            price,
-            signal.size,
-        );
+        let order =
+            OrderRequest::emergency_fok(signal.token_id.clone(), signal.side, price, signal.size);
 
         match self.poly.place_order(&order).await {
             Ok(resp) => {
@@ -550,7 +550,13 @@ impl LiveExecutor {
 
     // ─── Market rotation ────────────────────────────────────────────────
 
-    async fn on_market_rotation(&mut self, condition_id: &str) {
+    async fn on_market_rotation(
+        &mut self,
+        condition_id: &str,
+        yes_token_id: &str,
+        no_token_id: &str,
+        tick_size: rust_decimal::Decimal,
+    ) {
         info!(
             condition_id,
             "LiveExecutor: market rotation — cancelling all orders"
@@ -561,6 +567,20 @@ impl LiveExecutor {
         }
 
         self.active_leg2_order_id = None;
+
+        // Pre-populate SDK caches for the new market's tokens.
+        if let Some(sdk) = self.poly.sdk_client() {
+            if let Some(sdk_tick) = decimal_to_tick_size(tick_size) {
+                for token_id_str in [yes_token_id, no_token_id] {
+                    if let Ok(id) = alloy::primitives::U256::from_str(token_id_str) {
+                        sdk.set_tick_size(id, sdk_tick);
+                        sdk.set_fee_rate_bps(id, 0); // maker fee = 0
+                        sdk.set_neg_risk(id, true); // all 15-min markets are neg_risk
+                    }
+                }
+                debug!("SDK caches pre-populated for new market tokens");
+            }
+        }
     }
 
     // ─── Cold storage logging ───────────────────────────────────────────
@@ -582,7 +602,11 @@ impl LiveExecutor {
                 signal.confidence,
                 signal.spike_info.magnitude,
                 signal.atr,
-                signal.book_snapshot.as_ref().map(|b| b.total_bid_depth()).unwrap_or(Decimal::ZERO),
+                signal
+                    .book_snapshot
+                    .as_ref()
+                    .map(|b| b.total_bid_depth())
+                    .unwrap_or(Decimal::ZERO),
                 time_remaining_secs as i64,
                 signal.alloc_amount,
                 action,
@@ -617,9 +641,20 @@ impl LiveExecutor {
     }
 }
 
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+use crate::utils::time::epoch_ms as now_epoch_ms;
+
+/// Convert a `Decimal` tick_size to the SDK's `TickSize` enum.
+fn decimal_to_tick_size(d: Decimal) -> Option<polymarket_client_sdk::clob::types::TickSize> {
+    use polymarket_client_sdk::clob::types::TickSize;
+    if d == Decimal::new(1, 1) {
+        Some(TickSize::Tenth)
+    } else if d == Decimal::new(1, 2) {
+        Some(TickSize::Hundredth)
+    } else if d == Decimal::new(1, 3) {
+        Some(TickSize::Thousandth)
+    } else if d == Decimal::new(1, 4) {
+        Some(TickSize::TenThousandth)
+    } else {
+        None
+    }
 }

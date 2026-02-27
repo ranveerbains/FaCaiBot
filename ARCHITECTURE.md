@@ -425,7 +425,6 @@ Order placement, signing, and cancellation use the official Rust SDK (v0.4, `clo
 **Gateway struct** (`PolymarketGateway` in `rest.rs`):
 ```
 PolymarketGateway {
-    http: reqwest::Client,                                // Public read endpoints (no auth)
     signer: Option<PrivateKeySigner>,                     // Built via build_signer(), chain_id=137
     sdk_client: Option<SdkClient<Authenticated<Normal>>>, // Authenticated CLOB client (None in sim)
 }
@@ -452,9 +451,9 @@ OrderRequest
 - `cancel_order(id)` → `sdk.cancel_order(id).await` → `DELETE /order`
 - `cancel_all()` → `sdk.cancel_all_orders().await` → `DELETE /cancel-all`
 
-**Public read endpoints** (`get_orderbook`, `get_midpoint`, `get_price`, `get_tick_size`) use the lightweight `reqwest::Client` directly — no SDK or auth needed.
+**SDK cache pre-population**: On market rotation, `LiveExecutor` pre-populates the SDK's per-token `DashMap` caches (`tick_size`, `fee_rate_bps=0`, `neg_risk=true`) using token IDs from the `MarketRotation` command. This eliminates the first-order CLOB round-trip per token that the SDK would otherwise make to fetch tick size.
 
-**Dead code in `signing.rs`**: `generate_api_headers()`, `build_hmac_signature()`, `current_timestamp_secs()`, and contract address constants are `#[allow(dead_code)]` — only `build_signer()` is called.
+`signing.rs` contains only `build_signer()` — hex private key parsing to `PrivateKeySigner`.
 
 ---
 

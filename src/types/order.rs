@@ -191,6 +191,12 @@ pub enum ExecutorCommand {
     MarketRotation {
         /// Condition ID of the market that just rotated.
         condition_id: String,
+        /// YES token ID for the new market.
+        yes_token_id: String,
+        /// NO token ID for the new market.
+        no_token_id: String,
+        /// Tick size for the new market.
+        tick_size: Decimal,
     },
     /// x-minute entry cutoff window entered — executor should send market summary.
     MarketCutoff {
@@ -200,9 +206,7 @@ pub enum ExecutorCommand {
         market_end_ms: u64,
     },
     /// Cancel a stale Leg 1 order that wasn't filled in time.
-    CancelLeg1 {
-        order_id: String,
-    },
+    CancelLeg1 { order_id: String },
 }
 
 // ─── Order Request ───────────────────────────────────────────────────────────
@@ -291,8 +295,6 @@ pub enum OrderStatus {
     Placed,
     /// Order fully filled.
     Filled,
-    /// Order partially filled (some size remains on book).
-    PartiallyFilled,
     /// Order cancelled (by user or system).
     Cancelled,
     /// Order rejected by the CLOB (e.g., post-only would cross spread, tick size violation).

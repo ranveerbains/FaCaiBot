@@ -15,8 +15,7 @@
 //! runtime.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use crossbeam_channel::Sender;
@@ -32,7 +31,6 @@ pub mod user_ws;
 
 // Re-export key public types.
 pub use rest::PolymarketGateway;
-pub use rotation::MarketInfo;
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
@@ -53,8 +51,7 @@ pub(super) const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
 /// Uses tag_id=102467 ("15M") to find all 15-minute prediction markets.
 /// Returns up to 10 active, non-closed events; we filter client-side
 /// for BTC/ETH by slug prefix (`btc-updown-15m-` / `eth-updown-15m-`).
-pub(super) const GAMMA_EVENTS_PATH: &str =
-    "/events?tag_id=102467&closed=false&limit=10";
+pub(super) const GAMMA_EVENTS_PATH: &str = "/events?tag_id=102467&closed=false&limit=10";
 
 // ─── Timing constants ─────────────────────────────────────────────────────────
 
@@ -82,14 +79,7 @@ pub(super) const MATCHING_ENGINE_RESTART_ET_SECS: u32 = 20 * 3600; // 72 000
 
 // ─── Shared utility ───────────────────────────────────────────────────────────
 
-/// Current wall-clock time as epoch milliseconds.
-#[inline]
-pub(super) fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub(super) use crate::utils::time::epoch_ms as now_epoch_ms;
 
 // ─── Gateway facade ───────────────────────────────────────────────────────────
 
@@ -100,12 +90,6 @@ pub(super) fn now_epoch_ms() -> u64 {
 pub struct PolymarketWsGateway {
     /// CLOB API key (L2 HMAC credential). `None` in simulation mode.
     api_key: Option<String>,
-    /// CLOB API secret (L2 HMAC credential). `None` in simulation mode.
-    #[allow(dead_code)]
-    secret: Option<String>,
-    /// CLOB API passphrase (L2 HMAC credential). `None` in simulation mode.
-    #[allow(dead_code)]
-    passphrase: Option<String>,
     /// `true` = simulation mode — User WS and heartbeat loop are skipped.
     sim_mode: bool,
     /// Shared flag allowing callers to signal a graceful shutdown.
@@ -118,25 +102,13 @@ impl PolymarketWsGateway {
     ///
     /// - Pass `api_key / secret / passphrase` as `Some(...)` in live mode.
     /// - Pass all as `None` in simulation mode — User WS and heartbeat will be skipped.
-    pub fn new(
-        api_key: Option<String>,
-        secret: Option<String>,
-        passphrase: Option<String>,
-    ) -> Self {
+    pub fn new(api_key: Option<String>) -> Self {
         let sim_mode = api_key.is_none();
         Self {
             api_key,
-            secret,
-            passphrase,
             sim_mode,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Signal all background loops (heartbeat, market WS, user WS) to shut down.
-    #[allow(dead_code)] // graceful shutdown infrastructure
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -189,15 +161,6 @@ impl PolymarketWsGateway {
     // ─────────────────────────────────────────────────────────────────────────
     // Gamma API — Market Discovery & Rotation
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// Query the Gamma API for the next upcoming BTC 15-minute market.
-    ///
-    /// Returns info for the market with the soonest non-expired `endTimestamp`.
-    /// PRD: poll every 10 minutes (Section 5.3).
-    #[allow(dead_code)] // convenience wrapper for manual market queries
-    pub async fn discover_next_market(&self) -> Result<MarketInfo> {
-        rotation::discover_next_market().await
-    }
 
     /// Long-running market rotation manager.
     ///

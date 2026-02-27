@@ -459,7 +459,6 @@ impl Leg2Evaluator {
             Direction::Down => state.poly_yes_book.as_ref().or(state.poly_book.as_ref()),
         };
         let hedge_book = hedge_book?;
-        let hedge_book_snapshot = Some(hedge_book.clone());
         let best_ask_price = hedge_book.best_ask().map(|a| a.price);
         let ask_depth_2tick: Decimal = {
             let ba = hedge_book
@@ -516,7 +515,7 @@ impl Leg2Evaluator {
                     tick,
                     atr,
                     false,
-                    hedge_book_snapshot.clone(),
+                    Some(hedge_book.clone()),
                     Some(exit_reason),
                 );
                 signal.sim_was_taker = true;
@@ -555,7 +554,7 @@ impl Leg2Evaluator {
                     tick,
                     atr,
                     false,
-                    hedge_book_snapshot.clone(),
+                    Some(hedge_book.clone()),
                     Some(exit_reason),
                 );
                 return Some(Leg2Decision::Emergency {
@@ -605,7 +604,7 @@ impl Leg2Evaluator {
                         tick,
                         atr,
                         false,
-                        hedge_book_snapshot.clone(),
+                        Some(hedge_book.clone()),
                         Some(ExitReason::AdverseMovement),
                     );
                     return Some(Leg2Decision::Emergency {
@@ -650,7 +649,7 @@ impl Leg2Evaluator {
                         tick,
                         atr,
                         false,
-                        hedge_book_snapshot.clone(),
+                        Some(hedge_book.clone()),
                         Some(ExitReason::BreakEvenBreach),
                     );
                     return Some(Leg2Decision::Emergency {
@@ -697,7 +696,7 @@ impl Leg2Evaluator {
                     tick,
                     atr,
                     false,
-                    hedge_book_snapshot.clone(),
+                    Some(hedge_book.clone()),
                     Some(ExitReason::BreakEvenBreach),
                 );
                 return Some(Leg2Decision::Emergency {
@@ -768,7 +767,11 @@ impl Leg2Evaluator {
         }
 
         // ── Skip guard: don't repost if current order is already at or better ──
-        if let OrderState::Posted { price: posted_price, .. } = &state.leg2_state {
+        if let OrderState::Posted {
+            price: posted_price,
+            ..
+        } = &state.leg2_state
+        {
             if *posted_price <= target_price {
                 debug!(
                     %posted_price, %target_price,
@@ -803,7 +806,7 @@ impl Leg2Evaluator {
             tick,
             atr,
             bot_contested,
-            hedge_book_snapshot,
+            Some(hedge_book.clone()),
             None,
         );
         Some(Leg2Decision::Erosion {
@@ -1199,7 +1202,10 @@ mod tests {
         );
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::AdverseMovement));
-        assert!(!sig.sim_was_taker, "price-chase should be post-only (not taker)");
+        assert!(
+            !sig.sim_was_taker,
+            "price-chase should be post-only (not taker)"
+        );
     }
 
     #[test]

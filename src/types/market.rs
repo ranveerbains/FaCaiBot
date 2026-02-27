@@ -16,7 +16,6 @@ pub enum DataSource {
     Binance,
     PolymarketMarket,
     PolymarketUser,
-    Rtds,
 }
 
 /// Trade lifecycle status as reported by the Polymarket User WS channel.
@@ -111,7 +110,7 @@ impl OrderBook {
 /// A best bid/ask snapshot from Binance SBE `@bestBidAsk` stream (real-time).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceTick {
-    pub symbol: String,
+    pub symbol: &'static str,
     pub bid_price: Decimal,
     pub bid_qty: Decimal,
     pub ask_price: Decimal,
@@ -129,7 +128,7 @@ impl BinanceTick {
 /// Top-20 depth snapshot from Binance SBE `@depth20` stream (50ms cadence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceDepth {
-    pub symbol: String,
+    pub symbol: &'static str,
     /// Bid levels, sorted highest-price-first (best bid at index 0).
     pub bids: Vec<PriceLevel>,
     /// Ask levels, sorted lowest-price-first (best ask at index 0).
@@ -224,14 +223,8 @@ pub struct MarketState {
     // ── Capital tracking ─────────────────────────────────────────────────
     /// Total USDC allocated in the current market window.
     pub cumulative_used: Decimal,
-    /// USDC locked in markets awaiting UMA resolution.
-    #[allow(dead_code)] // data model field, set via set_locked_in_resolution()
-    pub locked_in_resolution: Decimal,
     /// Available capital = total_capital - locked_in_resolution.
     pub available_capital: Decimal,
-    /// Running daily PnL (reset at UTC midnight or session start).
-    #[allow(dead_code)] // data model field for live mode PnL tracking
-    pub daily_pnl: Decimal,
 
     // ── Staleness ────────────────────────────────────────────────────────
     /// Timestamp of the most recent update (epoch ms).
@@ -256,9 +249,7 @@ impl MarketState {
             spike_detected: false,
             last_spike: None,
             cumulative_used: Decimal::ZERO,
-            locked_in_resolution: Decimal::ZERO,
             available_capital: Decimal::ZERO,
-            daily_pnl: Decimal::ZERO,
             last_update_ms: 0,
         }
     }
@@ -314,8 +305,6 @@ pub enum IngestorEvent {
         asset_id: String,
         best_bid: Decimal,
         best_ask: Decimal,
-        #[allow(dead_code)] // delivered by WS, not read yet
-        spread: Decimal,
     },
 
     /// Dynamic tick size change at price extremes (>0.96 or <0.04).

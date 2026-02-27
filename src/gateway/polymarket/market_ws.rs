@@ -370,17 +370,10 @@ pub(super) fn parse_best_bid_ask_event(event: &serde_json::Value) -> Result<Inge
         .or_else(|_| parse_decimal_field(event, "best_ask"))
         .unwrap_or(Decimal::ZERO);
 
-    let spread = if best_ask >= best_bid {
-        best_ask - best_bid
-    } else {
-        Decimal::ZERO
-    };
-
     Ok(IngestorEvent::PolymarketBestBidAsk {
         asset_id,
         best_bid,
         best_ask,
-        spread,
     })
 }
 
@@ -573,12 +566,10 @@ mod tests {
                 asset_id,
                 best_bid,
                 best_ask,
-                spread,
             } => {
                 assert_eq!(asset_id, "0xtoken456");
                 assert_eq!(best_bid, "0.48".parse::<Decimal>().unwrap());
                 assert_eq!(best_ask, "0.52".parse::<Decimal>().unwrap());
-                assert_eq!(spread, "0.04".parse::<Decimal>().unwrap());
             }
             other => panic!("wrong variant: {:?}", other),
         }

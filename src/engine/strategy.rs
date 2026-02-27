@@ -16,8 +16,6 @@
 //! The engine speculatively posts a Leg 1 order, then waits for `SpikeConfirmed`
 //! (sustain passed → sim fill gate opens) or `SpikeFailed` (cancel speculative order).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, info, warn};
@@ -28,12 +26,20 @@ use crate::types::market::{
     TradeStatus,
 };
 use crate::types::order::{ExecutorCommand, ExitReason, ProfitTier, Side, TradeSignal};
+use crate::utils::time::epoch_ms as now_epoch_ms;
 
 use super::confidence::compute_confidence;
 use super::erosion::{ConnectivityState, ErosionSnap, ErosionState};
 use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
 };
+
+// ─── Precomputed Decimal constants ───────────────────────────────────────────
+
+/// EMA alpha for avg_book_depth smoothing (0.1).
+const BOOK_DEPTH_ALPHA: Decimal = Decimal::from_parts(1, 0, 0, false, 1);
+/// 1.0 - BOOK_DEPTH_ALPHA = 0.9.
+const BOOK_DEPTH_ONE_MINUS: Decimal = Decimal::from_parts(9, 0, 0, false, 1);
 
 // ─── Strategy Engine ─────────────────────────────────────────────────────────
 
@@ -201,10 +207,7 @@ impl StrategyEngine {
                 let total_depth = book.total_bid_depth() + book.total_ask_depth();
                 self.avg_book_depth = Some(match self.avg_book_depth {
                     None => total_depth,
-                    Some(prev) => {
-                        let alpha = Decimal::new(1, 1);
-                        alpha * total_depth + (Decimal::ONE - alpha) * prev
-                    }
+                    Some(prev) => BOOK_DEPTH_ALPHA * total_depth + BOOK_DEPTH_ONE_MINUS * prev,
                 });
                 let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("");
                 if book.asset_id == yes_id {
@@ -264,14 +267,8 @@ impl StrategyEngine {
                 asset_id,
                 best_bid,
                 best_ask,
-                spread: _,
             } => {
-                let yes_id = self
-                    .state
-                    .active_yes_token_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_string();
+                let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("");
                 let is_yes = asset_id == yes_id;
                 let synthetic_depth = Decimal::new(500, 0);
 
@@ -453,7 +450,10 @@ impl StrategyEngine {
                     }
                     OrderState::Filled { .. } => {
                         // Already filled — proceed with Leg 2 normally.
-                        debug!(timestamp_ms, "spike failed but Leg 1 already filled — no-op");
+                        debug!(
+                            timestamp_ms,
+                            "spike failed but Leg 1 already filled — no-op"
+                        );
                     }
                     OrderState::None => {
                         // Evaluator rejected the candidate — no order was posted.
@@ -661,9 +661,6 @@ impl StrategyEngine {
                         warn!("Polymarket User WS disconnected");
                     }
                 }
-                DataSource::Rtds => {
-                    debug!(connected, "RTDS WS status changed");
-                }
             },
         }
 
@@ -763,10 +760,7 @@ impl StrategyEngine {
         // During emergency exit, only Polymarket book changes matter for
         // price-improvement checks. Skip evaluation if the hedge book hasn't
         // changed — UNLESS the hard deadline may have expired (time-based).
-        let in_emergency = self
-            .erosion
-            .as_ref()
-            .is_some_and(|e| e.emergency_submitted);
+        let in_emergency = self.erosion.as_ref().is_some_and(|e| e.emergency_submitted);
         if in_emergency {
             let deadline_may_have_expired = self.erosion.as_ref().is_some_and(|e| {
                 e.emergency_first_post_ms
@@ -1025,17 +1019,26 @@ impl StrategyEngine {
     /// Call this when both legs are `Filled` — right before `on_trade_complete()`
     /// resets state. All required fields are extracted from engine state:
     /// `leg1_state`, `leg2_state`, `erosion`, `pending_leg1_signal`, `leg1_direction`.
-    pub fn record_live_trade(&self, cold: &mut crate::storage::cold::ColdStorage) -> anyhow::Result<()> {
+    pub fn record_live_trade(
+        &self,
+        cold: &mut crate::storage::cold::ColdStorage,
+    ) -> anyhow::Result<()> {
         let (l1_order_id, l1_price, l1_size, l1_fill_ts) = match &self.state.leg1_state {
-            OrderState::Filled { order_id, price, size, fill_timestamp_ms } => {
-                (order_id.as_str(), *price, *size, *fill_timestamp_ms)
-            }
+            OrderState::Filled {
+                order_id,
+                price,
+                size,
+                fill_timestamp_ms,
+            } => (order_id.as_str(), *price, *size, *fill_timestamp_ms),
             _ => return Ok(()), // not filled — nothing to record
         };
         let (l2_order_id, l2_price, l2_size) = match &self.state.leg2_state {
-            OrderState::Filled { order_id, price, size, .. } => {
-                (order_id.as_str(), *price, *size)
-            }
+            OrderState::Filled {
+                order_id,
+                price,
+                size,
+                ..
+            } => (order_id.as_str(), *price, *size),
             _ => return Ok(()), // not filled — nothing to record
         };
 
@@ -1138,26 +1141,6 @@ impl StrategyEngine {
         self.pending_spike_cancel = None;
         self.speculative_awaiting_sustain = false;
         // cumulative_used is NOT reset — capital stays allocated within this market.
-    }
-
-    #[allow(dead_code)] // test helper + live mode
-    pub fn set_available_capital(&mut self, capital: Decimal) {
-        self.state.available_capital = capital;
-    }
-
-    #[allow(dead_code)] // test helper + live mode
-    pub fn set_locked_in_resolution(&mut self, locked: Decimal) {
-        self.state.locked_in_resolution = locked;
-    }
-
-    #[allow(dead_code)] // test helper + live mode
-    pub fn set_market_params(&mut self, tick_size: Decimal) {
-        self.state.tick_size = tick_size;
-    }
-
-    #[allow(dead_code)] // test helper + live mode
-    pub fn record_allocation_used(&mut self, amount: Decimal) {
-        self.state.cumulative_used += amount;
     }
 
     // ─── Simulation helpers ────────────────────────────────────────────────
@@ -1360,7 +1343,9 @@ impl StrategyEngine {
                     // Check hard deadline.
                     let deadline_passed = self.erosion.as_ref().is_some_and(|e| {
                         e.emergency_first_post_ms
-                            .map(|first| now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms)
+                            .map(|first| {
+                                now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms
+                            })
                             .unwrap_or(false)
                     });
 
@@ -1528,14 +1513,6 @@ impl Default for StrategyEngine {
     }
 }
 
-#[inline]
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1632,7 +1609,7 @@ mod tests {
     fn test_binance_tick_updates_price() {
         let mut engine = StrategyEngine::new(&Config::test_defaults());
         engine.on_event(IngestorEvent::BinanceTick(BinanceTick {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT",
             bid_price: Decimal::new(52_000_00, 2),
             bid_qty: Decimal::new(10, 0), // > 1.0 → NOT spike-encoded
             ask_price: Decimal::new(52_001_00, 2),
@@ -2562,7 +2539,10 @@ mod tests {
 
         // Step 0: initial post (no erosion applied).
         let initial = engine.evaluate_leg2();
-        assert!(initial.is_some(), "step 0 should produce initial Leg 2 signal");
+        assert!(
+            initial.is_some(),
+            "step 0 should produce initial Leg 2 signal"
+        );
         assert!(matches!(engine.state.leg2_state, OrderState::Posted { .. }));
         let initial_posted = match &engine.state.leg2_state {
             OrderState::Posted { price, .. } => *price,
@@ -2575,11 +2555,7 @@ mod tests {
         let decay = engine.leg2.erosion_interval_decay;
 
         for expected_step in 1..=MAX_EROSION_STEPS {
-            let interval = ErosionState::interval_for_step(
-                expected_step - 1,
-                base,
-                decay,
-            );
+            let interval = ErosionState::interval_for_step(expected_step - 1, base, decay);
             engine.last_erosion_signal_ms = now_epoch_ms() - interval - 1;
 
             // evaluate_leg2 may return None (skip guard) or Some (target changed a tick).
@@ -2599,7 +2575,10 @@ mod tests {
                     OrderState::Posted { price, .. } => *price,
                     _ => panic!("leg2 should still be Posted"),
                 };
-                assert_eq!(still_posted, initial_posted, "posted price should stay optimal");
+                assert_eq!(
+                    still_posted, initial_posted,
+                    "posted price should stay optimal"
+                );
             }
         }
 

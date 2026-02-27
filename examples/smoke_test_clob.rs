@@ -71,22 +71,26 @@ async fn main() -> Result<()> {
 
     // ── Step 0: Load credentials ─────────────────────────────────────────
     println!("[0] Loading credentials from .env...");
-    let api_key_str = std::env::var("POLYMARKET_API_KEY")
-        .context("POLYMARKET_API_KEY not set in .env")?;
-    let secret = std::env::var("POLYMARKET_SECRET")
-        .context("POLYMARKET_SECRET not set in .env")?;
-    let passphrase = std::env::var("POLYMARKET_PASSPHRASE")
-        .context("POLYMARKET_PASSPHRASE not set in .env")?;
-    let private_key = std::env::var("PRIVATE_KEY")
-        .context("PRIVATE_KEY not set in .env")?;
+    let api_key_str =
+        std::env::var("POLYMARKET_API_KEY").context("POLYMARKET_API_KEY not set in .env")?;
+    let secret = std::env::var("POLYMARKET_SECRET").context("POLYMARKET_SECRET not set in .env")?;
+    let passphrase =
+        std::env::var("POLYMARKET_PASSPHRASE").context("POLYMARKET_PASSPHRASE not set in .env")?;
+    let private_key = std::env::var("PRIVATE_KEY").context("PRIVATE_KEY not set in .env")?;
 
-    let api_key_uuid: Uuid = api_key_str.parse()
+    let api_key_uuid: Uuid = api_key_str
+        .parse()
         .context("POLYMARKET_API_KEY must be a valid UUID")?;
-    println!("    API key: {}...{}", &api_key_str[..8], &api_key_str[api_key_str.len()-4..]);
+    println!(
+        "    API key: {}...{}",
+        &api_key_str[..8],
+        &api_key_str[api_key_str.len() - 4..]
+    );
 
     // ── Step 1: Build signer ─────────────────────────────────────────────
     println!("[1] Building signer...");
-    let signer: PrivateKeySigner = private_key.parse()
+    let signer: PrivateKeySigner = private_key
+        .parse()
         .context("failed to parse PRIVATE_KEY as PrivateKeySigner")?;
     let address = format!("{:?}", signer.address());
     let signer = signer.with_chain_id(Some(POLYGON));
@@ -95,14 +99,13 @@ async fn main() -> Result<()> {
     // ── Step 2: Initialize SDK client ────────────────────────────────────
     println!("[2] Authenticating SDK client...");
     let creds = Credentials::new(api_key_uuid, secret, passphrase);
-    let sdk: SdkClient<Authenticated<Normal>> =
-        SdkClient::new(CLOB_BASE_URL, SdkConfig::default())
-            .map_err(|e| anyhow!("failed to create SDK client: {e}"))?
-            .authentication_builder(&signer)
-            .credentials(creds)
-            .authenticate()
-            .await
-            .map_err(|e| anyhow!("SDK authentication failed: {e}"))?;
+    let sdk: SdkClient<Authenticated<Normal>> = SdkClient::new(CLOB_BASE_URL, SdkConfig::default())
+        .map_err(|e| anyhow!("failed to create SDK client: {e}"))?
+        .authentication_builder(&signer)
+        .credentials(creds)
+        .authenticate()
+        .await
+        .map_err(|e| anyhow!("SDK authentication failed: {e}"))?;
     println!("    SDK client authenticated successfully!");
 
     // ── Step 3: Discover a live market ───────────────────────────────────
@@ -112,9 +115,8 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let gamma_url = format!(
-        "{GAMMA_BASE_URL}/events?tag_id=102467&active=true&closed=false&limit=10"
-    );
+    let gamma_url =
+        format!("{GAMMA_BASE_URL}/events?tag_id=102467&active=true&closed=false&limit=10");
     let events: Vec<GammaEvent> = http.get(&gamma_url).send().await?.json().await?;
 
     let now = std::time::SystemTime::now()
@@ -159,11 +161,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let token_id_str = found_token_id.ok_or_else(|| anyhow!(
-        "no active BTC/ETH 15-min market found — are markets running right now?"
-    ))?;
-    let token_id = U256::from_str(&token_id_str)
-        .context("failed to parse token_id as U256")?;
+    let token_id_str = found_token_id.ok_or_else(|| {
+        anyhow!("no active BTC/ETH 15-min market found — are markets running right now?")
+    })?;
+    let token_id = U256::from_str(&token_id_str).context("failed to parse token_id as U256")?;
 
     println!("    Market: {found_slug}");
     println!("    YES token: {token_id_str}");
@@ -172,8 +173,7 @@ async fn main() -> Result<()> {
 
     // ── Step 4: Place a post-only BUY at $0.01 ──────────────────────────
     let price: Decimal = "0.01".parse().unwrap();
-    let size: Decimal = Decimal::try_from(found_min_size)
-        .unwrap_or_else(|_| Decimal::new(5, 0)); // default to 5
+    let size: Decimal = Decimal::try_from(found_min_size).unwrap_or_else(|_| Decimal::new(5, 0)); // default to 5
 
     println!("\n[4] Placing post-only BUY order...");
     println!("    Token: {token_id_str}");
@@ -182,7 +182,8 @@ async fn main() -> Result<()> {
     println!("    Size:  {size} shares");
     println!("    Type:  GTC post-only");
 
-    let signable = sdk.limit_order()
+    let signable = sdk
+        .limit_order()
         .token_id(token_id)
         .side(Side::Buy)
         .price(price)
@@ -195,13 +196,15 @@ async fn main() -> Result<()> {
 
     println!("    Order built (fee_rate + tick_size fetched from CLOB)");
 
-    let signed = sdk.sign(&signer, signable)
+    let signed = sdk
+        .sign(&signer, signable)
         .await
         .map_err(|e| anyhow!("SDK order signing failed: {e}"))?;
 
     println!("    Order signed (EIP-712)");
 
-    let resp = sdk.post_order(signed)
+    let resp = sdk
+        .post_order(signed)
         .await
         .map_err(|e| anyhow!("SDK post_order failed: {e}"))?;
 
@@ -229,7 +232,8 @@ async fn main() -> Result<()> {
     // ── Step 5: Cancel the order ─────────────────────────────────────────
     println!("\n[5] Cancelling order {}...", resp.order_id);
 
-    let cancel_resp = sdk.cancel_order(&resp.order_id)
+    let cancel_resp = sdk
+        .cancel_order(&resp.order_id)
         .await
         .map_err(|e| anyhow!("cancel_order failed: {e}"))?;
 
@@ -262,7 +266,11 @@ fn parse_iso_epoch(iso: &str) -> u64 {
         return 0;
     }
     let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
-    let (hour, min, sec) = (time_parts[0], time_parts[1], time_parts.get(2).copied().unwrap_or(0));
+    let (hour, min, sec) = (
+        time_parts[0],
+        time_parts[1],
+        time_parts.get(2).copied().unwrap_or(0),
+    );
 
     // Days from epoch (1970-01-01) to date — simplified calculation.
     let mut days: u64 = 0;

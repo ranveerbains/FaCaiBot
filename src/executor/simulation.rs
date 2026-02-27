@@ -238,7 +238,7 @@ impl SimulationExecutor {
                             self.handle_leg1(&signal);
                         }
                     }
-                    ExecutorCommand::MarketRotation { condition_id } => {
+                    ExecutorCommand::MarketRotation { condition_id, .. } => {
                         self.on_market_rotation(&condition_id);
                     }
                     ExecutorCommand::MarketCutoff {
@@ -738,7 +738,7 @@ mod tests {
 
         // Verify state mutation path for unfilled_post_only.
         let mut state = SimulationState::new(Decimal::from(100), 0);
-        state.record_unfilled_post_only();
+        state.unfilled_post_only += 1;
         assert_eq!(state.unfilled_post_only, 1);
         // Balance unchanged.
         assert_eq!(state.virtual_balance, Decimal::from(100));
@@ -770,7 +770,7 @@ mod tests {
         );
 
         let mut state = SimulationState::new(Decimal::from(100), 0);
-        state.record_unfilled_liquidity();
+        state.unfilled_liquidity += 1;
         assert_eq!(state.unfilled_liquidity, 1);
         assert_eq!(state.virtual_balance, Decimal::from(100));
     }
