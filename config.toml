@@ -159,7 +159,7 @@ adverse_threshold = 0.001
 # Step 1 waits longest (market has time to fill at the best price).
 # 4000 = wait 4 seconds before first erosion step.
 # Sequence at decay=0.6: 4000ms → 2400ms → 1440ms → 864ms → 518ms (~9.2s total)
-erosion_base_interval_ms = 3000
+erosion_base_interval_ms = 2000
 
 # Multiply the interval by this factor for each subsequent erosion step.
 # Lower = faster acceleration (later steps fire more rapidly).

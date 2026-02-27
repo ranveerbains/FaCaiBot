@@ -229,35 +229,60 @@ impl StrategyEngine {
                 best_bid,
                 best_ask,
             } => {
-                if let Some(ref mut book) = self.state.poly_book {
-                    if book.asset_id == asset_id {
-                        let levels = match side {
-                            Side::Buy => &mut book.bids,
-                            Side::Sell => &mut book.asks,
-                        };
-                        if let Some(idx) = levels.iter().position(|l| l.price == price) {
-                            if size.is_zero() {
-                                levels.remove(idx);
-                            } else {
-                                levels[idx].size = size;
-                            }
-                        } else if !size.is_zero() {
-                            let insert_pos = match side {
-                                Side::Buy => levels
-                                    .iter()
-                                    .position(|l| l.price < price)
-                                    .unwrap_or(levels.len()),
-                                Side::Sell => levels
-                                    .iter()
-                                    .position(|l| l.price > price)
-                                    .unwrap_or(levels.len()),
+                let _ = (best_bid, best_ask);
+
+                // Helper: apply a single level change to an order book.
+                macro_rules! apply_level {
+                    ($book:expr) => {
+                        if $book.asset_id == asset_id {
+                            let levels = match side {
+                                Side::Buy => &mut $book.bids,
+                                Side::Sell => &mut $book.asks,
                             };
-                            levels.insert(insert_pos, PriceLevel { price, size });
+                            if let Some(idx) = levels.iter().position(|l| l.price == price) {
+                                if size.is_zero() {
+                                    levels.remove(idx);
+                                } else {
+                                    levels[idx].size = size;
+                                }
+                            } else if !size.is_zero() {
+                                let insert_pos = match side {
+                                    Side::Buy => levels
+                                        .iter()
+                                        .position(|l| l.price < price)
+                                        .unwrap_or(levels.len()),
+                                    Side::Sell => levels
+                                        .iter()
+                                        .position(|l| l.price > price)
+                                        .unwrap_or(levels.len()),
+                                };
+                                levels.insert(insert_pos, PriceLevel { price, size });
+                            }
+                            $book.timestamp_ms = now_ms;
                         }
-                        let _ = (best_bid, best_ask);
-                        book.timestamp_ms = now_ms;
+                    };
+                }
+
+                if let Some(ref mut book) = self.state.poly_book {
+                    apply_level!(book);
+                }
+
+                // Also keep directional books in sync so their timestamps stay
+                // fresh and the stale-book guard doesn't reject evaluations
+                // during periods when BestBidAsk events are sparse (e.g., at
+                // market open).
+                let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("").to_owned();
+                let is_yes = asset_id == yes_id;
+                if is_yes {
+                    if let Some(ref mut book) = self.state.poly_yes_book {
+                        apply_level!(book);
+                    }
+                } else {
+                    if let Some(ref mut book) = self.state.poly_no_book {
+                        apply_level!(book);
                     }
                 }
+
                 self.state.last_update_ms = now_ms;
                 self.hedge_book_changed = true;
             }

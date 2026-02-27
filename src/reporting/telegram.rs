@@ -149,15 +149,17 @@ impl TelegramReporter {
 
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            if let Err(e) = post_telegram_message(
-                &inner.tls_connector,
-                &inner.bot_token,
-                &inner.chat_id,
-                &text,
-            )
-            .await
-            {
-                error!(error = %e, "Telegram send failed");
+            for chunk in split_message(&text) {
+                if let Err(e) = post_telegram_message(
+                    &inner.tls_connector,
+                    &inner.bot_token,
+                    &inner.chat_id,
+                    &chunk,
+                )
+                .await
+                {
+                    error!(error = %e, "Telegram send failed");
+                }
             }
         });
     }
@@ -178,18 +180,69 @@ impl TelegramReporter {
             if gap_ms < 1_500 {
                 tokio::time::sleep(std::time::Duration::from_millis(1_500 - gap_ms)).await;
             }
-            if let Err(e) = post_telegram_message(
-                &inner.tls_connector,
-                &inner.bot_token,
-                &inner.chat_id,
-                &text,
-            )
-            .await
-            {
-                error!(error = %e, "Telegram critical send failed");
+            for chunk in split_message(&text) {
+                if let Err(e) = post_telegram_message(
+                    &inner.tls_connector,
+                    &inner.bot_token,
+                    &inner.chat_id,
+                    &chunk,
+                )
+                .await
+                {
+                    error!(error = %e, "Telegram critical send failed");
+                }
             }
         });
     }
+}
+
+// ─── Message Chunking ─────────────────────────────────────────────────────────
+
+const TELEGRAM_MAX_LEN: usize = 4096;
+
+/// Split a message into chunks that fit within Telegram's 4096-character limit.
+/// Splits at newline boundaries where possible to avoid cutting mid-line.
+fn split_message(text: &str) -> Vec<String> {
+    if text.len() <= TELEGRAM_MAX_LEN {
+        return vec![text.to_owned()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in text.split('\n') {
+        // +1 for the '\n' we'd add between lines
+        let needed = if current.is_empty() {
+            line.len()
+        } else {
+            current.len() + 1 + line.len()
+        };
+
+        if needed > TELEGRAM_MAX_LEN {
+            // Flush the current chunk and start a new one.
+            if !current.is_empty() {
+                chunks.push(current.clone());
+                current.clear();
+            }
+            // If a single line is itself over the limit, hard-truncate it.
+            if line.len() > TELEGRAM_MAX_LEN {
+                chunks.push(line[..TELEGRAM_MAX_LEN].to_owned());
+            } else {
+                current.push_str(line);
+            }
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 // ─── HTTP Transport ───────────────────────────────────────────────────────────
