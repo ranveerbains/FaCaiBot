@@ -76,11 +76,11 @@ entry_cutoff_secs = 180
 # SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
 # Events older than this indicate network congestion or clock skew — discard to avoid
 # acting on stale price data.
-binance_stale_event_ms = 100
+binance_stale_event_ms = 50
 
 # Maximum age (ms) of the Polymarket orderbook snapshot before blocking entry.
 # If the book data is older than this, it's considered stale and unreliable.
-stale_book_ms = 150
+stale_book_ms = 30
 
 # Maximum YES mid price before blocking entry (mirrors minimum as 1 - max_price_skew).
 # Prevents trading in near-certain-resolution markets where one side is illiquid.

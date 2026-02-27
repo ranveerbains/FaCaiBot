@@ -124,50 +124,165 @@ Sub-50ms from Binance spike detection to Polymarket Leg 1 order placement (exclu
    - Outbound: all (Binance WS, Polymarket WS+REST, Telegram, Gamma API)
 3. Launch `c7i.xlarge` with Amazon Linux 2023 AMI, 30 GiB gp3, your SSH key
 
+**Pre-flight checklist** (from your local machine):
+- [ ] Have the EC2 SSH private key file (`.pem`) saved locally with `chmod 400` permissions
+- [ ] Know the instance's public IP or DNS name from the AWS console
+- [ ] Have SSH access working (test: `ssh -i key.pem ec2-user@<ip> "echo ok"` should print "ok")
+- [ ] Have a way to authenticate with your private GitHub repo:
+  - Option A: Local GitHub SSH key + `ssh -A` (SSH agent forwarding)
+  - Option B: GitHub deploy key created and added to EC2
+  - Option C: GitHub personal access token (for HTTPS cloning)
+
 ### Step 2: Server Setup
 
-```bash
-ssh -i your-key.pem ec2-user@<public-ip>
+**From your local machine (macOS):**
 
-# Clone the repo
+```bash
+# Make the key file private
+chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
+
+# SSH in with -A to forward your local GitHub SSH key to EC2
+ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
+  ec2-user@ec2-18-175-189-83.eu-west-2.compute.amazonaws.com
+```
+
+> **Note**: The `-A` flag (SSH agent forwarding) passes your local GitHub SSH key to the EC2 session so you can clone the private repo without adding a key to the server. If this doesn't work, see "Git Clone Failures" in Troubleshooting.
+
+**On the EC2 instance — run these in order:**
+
+```bash
+# 1. Install git (not pre-installed on Amazon Linux 2023)
+sudo yum install -y git
+
+# 2. Clone the repo (works if ssh -A was used above)
 git clone git@github.com:ranveerbains/FaCaiBot.git
 cd FaCaiBot
 
-# Run the one-time setup script (installs Rust, Docker, QuestDB, kernel tuning)
+# 3. Run server setup — installs Rust, Docker, QuestDB, kernel tuning, systemd
+#    Takes ~5-10 minutes. Safe to re-run if interrupted.
 sudo bash deploy/setup.sh
+
+# 4. Load Rust into your current shell (setup.sh installs it but doesn't reload)
+source $HOME/.cargo/env
+cargo --version   # Should print: cargo 1.xx.x
 ```
 
-The setup script handles:
-- Rust toolchain + build dependencies
-- Docker + QuestDB (pinned to core 3)
-- Kernel network tuning (TCP low-latency, buffer sizes, THP disabled)
-- ENA NIC tuning (ring buffers, interrupt coalescing disabled)
-- IRQ affinity (network interrupts moved to cores 2-3)
-- CPU frequency locked to max (`performance` governor)
-- Clock sync verified (Amazon Time Sync Service, sub-microsecond accuracy)
-- systemd service installed
+**What setup.sh installs:**
+- `git`, `gcc`, `cmake`, `openssl-devel`, `docker`, `ethtool`, `chrony`
+- Rust toolchain (as ec2-user via rustup)
+- Docker daemon + QuestDB container (pinned to core 3)
+- Kernel network tuning, THP disabled, CPU governor set to `performance`
+- `/etc/systemd/system/facaibot.service` systemd unit
 
 ### Step 3: On-Chain Approvals (One-Time)
 
-Before the bot can trade, your EOA wallet needs 3 on-chain approvals. This is a **one-time** operation — never needs to be repeated.
+Before the bot can trade, your EOA wallet needs 3 on-chain token approvals on Polygon mainnet. This is a **one-time** operation — never needs to be repeated (approvals are persistent on-chain).
 
-**Prerequisites:**
-- [Foundry](https://getfoundry.sh/) installed: `curl -L https://foundry.paradigm.xyz | bash && foundryup`
-- USDC.e in your wallet on Polygon (your trading capital)
-- ~0.01 POL for gas (3 small transactions)
+#### 3a. Install Foundry (Local Machine)
+
+Foundry is a CLI toolkit for Ethereum. We use its `cast` command to send approval transactions.
 
 ```bash
-# Dry run first — checks balances and existing approvals, sends nothing
-PRIVATE_KEY=0x... DRY_RUN=1 ./examples/approve_contracts.sh
+# Download and install Foundry
+curl -L https://foundry.paradigm.xyz | bash
 
-# Execute approvals (idempotent — skips any already set)
-PRIVATE_KEY=0x... ./examples/approve_contracts.sh
+# Add Foundry to your current shell session
+source ~/.bashrc
+# (or: source ~/.zshrc if you use zsh)
+
+# Install the Rust toolchain Foundry needs
+foundryup
+
+# Verify installation
+cast --version
 ```
 
-This approves:
-1. **USDC.e → CTF contract** — so CTF can split your USDC.e into outcome tokens
-2. **CTF tokens → CTF Exchange** — so the exchange can settle standard trades
-3. **CTF tokens → Neg Risk CTF Exchange** — for neg-risk markets (BTC/ETH 15-min)
+**Expected output**: `cast 0.3.0 (abc1234 ...)`
+
+If you get "command not found", reload your shell: `source ~/.bashrc`
+
+#### 3b. Check Your Polygon Wallet
+
+1. Go to [Polygonscan.com](https://polygonscan.com/) → search your EOA address
+2. **POL balance** must be ≥ 0.01 (for gas on 3 transactions, costs ~$0.005)
+3. **USDC.e balance** must be > 0 (this is your trading capital)
+4. Copy your private key (hex format, starting with `0x`) — same one from `.env`
+
+#### 3c. Dry Run First (Test Without Sending)
+
+From your FaCaiBot directory, run the approval script in dry-run mode:
+
+```bash
+PRIVATE_KEY=0x<your-hex-private-key> DRY_RUN=1 ./examples/approve_contracts.sh
+```
+
+Replace `<your-hex-private-key>` with your actual key (e.g., `0x1234567890abcdef...`).
+
+**Expected output:**
+```
+Wallet:  0x1234...abcd
+Chain:   Polygon mainnet (137)
+
+POL balance:    0.025
+USDC.e balance: 100.00 USDC.e
+
+Checking existing approvals...
+  USDC.e → CTF allowance:           0 (need max uint256)
+  CTF → CTF Exchange approved:       false
+  CTF → NegRisk Exchange approved:   false
+
+DRY_RUN=1 — no transactions sent. Remove DRY_RUN to execute.
+```
+
+If this works, your setup is correct. Proceed to step 3d.
+
+#### 3d. Execute Approvals (Send 3 Transactions)
+
+```bash
+PRIVATE_KEY=0x<your-hex-private-key> ./examples/approve_contracts.sh
+```
+
+This will send 3 transactions to Polygon mainnet. Each takes ~10-30 seconds to confirm.
+
+**Expected output:**
+```
+[1/3] Approving USDC.e for CTF contract...
+[tx hash]: 0xabc123...
+  ✓ USDC.e → CTF approved
+[2/3] Approving CTF tokens for CTF Exchange...
+[tx hash]: 0xdef456...
+  ✓ CTF → CTF Exchange approved
+[3/3] Approving CTF tokens for Neg Risk CTF Exchange...
+[tx hash]: 0xghi789...
+  ✓ CTF → Neg Risk CTF Exchange approved
+
+All approvals complete. Your wallet is ready for Polymarket trading.
+```
+
+**If some were already approved**, the script skips those automatically.
+
+#### 3e. Verify Approvals Are Set
+
+Run the dry-run again to confirm all three are now approved:
+
+```bash
+PRIVATE_KEY=0x<your-hex-private-key> DRY_RUN=1 ./examples/approve_contracts.sh
+```
+
+All should show as `true` or with max uint256 value:
+```
+  USDC.e → CTF allowance:           115792089...933129639935 ✓
+  CTF → CTF Exchange approved:       true ✓
+  CTF → NegRisk Exchange approved:   true ✓
+```
+
+#### What Each Approval Does
+
+1. **USDC.e → CTF (ConditionalTokens)**: Lets the CTF contract convert your USDC.e into YES/NO outcome tokens
+2. **CTF → CTF Exchange**: Lets the standard Polymarket exchange settle your YES/NO trades
+3. **CTF → Neg Risk CTF Exchange**: Lets the neg-risk exchange (used for BTC/ETH 15-min markets) settle your positions
+
+Once set, these approvals never expire and never need to be repeated (unless you change wallets).
 
 ### Step 4: Build
 
@@ -184,12 +299,16 @@ cp target/release/facaibot /opt/facaibot/
 cp config.toml /opt/facaibot/
 
 # Create .env with production secrets
+ # Set MODE=live, fill all credentials
 cp .env.example /opt/facaibot/.env
-nano /opt/facaibot/.env   # Set MODE=live, fill all credentials
+nano /opt/facaibot/.env  
 chmod 600 /opt/facaibot/.env
 
 # Start the service
 sudo systemctl enable --now facaibot
+
+# To stop the service
+sudo systemctl stop facaibot
 ```
 
 ### Step 6: Verify
@@ -198,7 +317,7 @@ sudo systemctl enable --now facaibot
 # Check service status
 sudo systemctl status facaibot
 
-# Live logs
+# Live logs (press `Ctrl+C` to exit)
 journalctl -u facaibot -f
 
 # Last hour
@@ -307,3 +426,125 @@ deploy/
 ├── deploy.sh          # Update deployment (git pull, build, restart)
 └── healthcheck.sh     # Cron health check with Telegram alerts
 ```
+
+---
+
+## Troubleshooting
+
+### Git Clone Failures ("Permission denied (publickey)")
+
+**Root cause**: EC2 instance cannot authenticate with your private GitHub repo. SSH key is on your local machine, not on EC2.
+
+**Solution 1: SSH Agent Forwarding (Simplest, one-time setup)**
+
+From your local machine, use `ssh -A` to forward your SSH key:
+```bash
+ssh -A -i /path/to/facaibotkeypair.pem ec2-user@<ec2-ip>
+```
+
+Then on EC2, clone normally:
+```bash
+git clone git@github.com:ranveerbains/FaCaiBot.git
+```
+
+This works because `-A` forwards your local SSH agent to the EC2 instance, so GitHub sees your credentials.
+
+**Solution 2: GitHub Deploy Key (More secure, persistent)**
+
+If SSH forwarding doesn't work, create a deploy key on the EC2 instance:
+
+On EC2:
+```bash
+# Generate an ED25519 key pair (without passphrase)
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+
+# Print the public key
+cat ~/.ssh/id_ed25519.pub
+```
+
+Then:
+1. Go to GitHub repo → Settings → Deploy keys
+2. Click "Add deploy key"
+3. Paste the output from `cat ~/.ssh/id_ed25519.pub`
+4. Check "Allow write access" (needed for deployments)
+5. Click "Add key"
+
+Back on EC2, clone should now work:
+```bash
+git clone git@github.com:ranveerbains/FaCaiBot.git
+```
+
+**Solution 3: HTTPS + Personal Access Token (No SSH setup)**
+
+From your local machine, generate a [GitHub personal access token](https://github.com/settings/tokens) with `repo` scope.
+
+On EC2, clone with HTTPS:
+```bash
+git clone https://<your-github-username>:<personal-access-token>@github.com/ranveerbains/FaCaiBot.git
+```
+
+Or use the interactive prompt:
+```bash
+git clone https://github.com/ranveerbains/FaCaiBot.git
+# GitHub will prompt: Username? → <github-username>
+#                     Password? → <personal-access-token>
+```
+
+**Our recommendation**: Use **Solution 1 (SSH forwarding)** for one-time setup, or **Solution 2 (deploy key)** if you plan to re-deploy via `bash deploy/deploy.sh` later.
+
+### "command not found: git" or "docker"
+
+**Root cause**: These tools are not pre-installed on Amazon Linux 2023. The `setup.sh` script installs them, but you need git available *before* running setup.sh (to clone the repo).
+
+**Solution**: Follow the Step 2 instructions exactly. After SSHing in, run:
+```bash
+sudo yum install -y git
+```
+*before* cloning. Then you can proceed with the rest of the setup. The `setup.sh` script will re-install git along with everything else, so running it again is safe.
+
+### "command not found: cargo" or "rustup"
+
+**Root cause**: Rust was installed for the `ec2-user` account, but your shell environment isn't loading it. Amazon Linux shells don't source `.bashrc` by default.
+
+**Solution**: Add Rust to your PATH manually (this is a one-time fix):
+```bash
+source $HOME/.cargo/env
+```
+
+Or verify it was installed:
+```bash
+which rustup   # Should print /home/ec2-user/.cargo/bin/rustup
+```
+
+If it still doesn't work, re-run the setup script:
+```bash
+sudo bash deploy/setup.sh   # Re-runs steps 1-9, idempotent
+```
+
+### "permission denied: /opt/facaibot" or similar
+
+**Root cause**: File permissions after deployment.
+
+**Solution**:
+```bash
+# Check ownership
+ls -la /opt/facaibot/
+
+# Fix if needed (as root)
+sudo chown ec2-user:ec2-user /opt/facaibot/*
+sudo chmod 600 /opt/facaibot/.env
+```
+
+### systemd service fails to start
+
+Check the logs:
+```bash
+journalctl -u facaibot -n 50   # Last 50 lines
+journalctl -u facaibot -f      # Follow live
+```
+
+Common issues:
+- **`.env` not found**: Verify `/opt/facaibot/.env` exists and is readable
+- **Binary not found**: Verify `/opt/facaibot/facaibot` exists and is executable
+- **Clock skew**: Check `chronyc tracking` — if offset > 1ms, time sync is broken
+- **Port conflict**: Verify QuestDB port 9009 is available: `sudo netstat -tulpn | grep 9009`

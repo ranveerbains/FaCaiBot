@@ -18,7 +18,7 @@ set -euo pipefail
 
 # ─── Contract addresses (Polygon mainnet, chain ID 137) ──────────────────────
 
-RPC_URL="https://polygon-rpc.com"
+RPC_URL="${RPC_URL:-https://polygon.llamarpc.com}"
 CHAIN_ID=137
 
 USDC_E="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"

@@ -6,24 +6,24 @@ set -euo pipefail
 echo "=== FaCaiBot Server Setup ==="
 
 # ── System packages ─────────────────────────────────────────────────
-echo "[1/8] Installing build dependencies..."
-yum install -y gcc gcc-c++ make cmake pkg-config openssl-devel \
+echo "[1/9] Installing system packages..."
+yum install -y git gcc gcc-c++ make cmake pkg-config openssl-devel \
     docker ethtool chrony
 
 # ── Rust toolchain (as ec2-user) ────────────────────────────────────
-echo "[2/8] Installing Rust toolchain..."
+echo "[2/9] Installing Rust toolchain..."
 if ! command -v rustup &>/dev/null; then
     sudo -u ec2-user bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 fi
 
 # ── Docker ──────────────────────────────────────────────────────────
-echo "[3/8] Configuring Docker..."
+echo "[3/9] Configuring Docker..."
 systemctl enable docker
 systemctl start docker
 usermod -aG docker ec2-user
 
 # ── QuestDB (pinned to core 3) ─────────────────────────────────────
-echo "[4/8] Starting QuestDB..."
+echo "[4/9] Starting QuestDB..."
 docker rm -f questdb 2>/dev/null || true
 docker run -d \
     --name questdb \
@@ -36,17 +36,17 @@ docker run -d \
     questdb/questdb:latest
 
 # ── Kernel network tuning ──────────────────────────────────────────
-echo "[5/8] Applying kernel network tuning..."
+echo "[5/9] Applying kernel network tuning..."
 cp /home/ec2-user/FaCaiBot/deploy/sysctl.conf /etc/sysctl.d/99-facaibot.conf
 sysctl -p /etc/sysctl.d/99-facaibot.conf
 
 # ── ENA NIC tuning ──────────────────────────────────────────────────
-echo "[6/8] Tuning ENA network adapter..."
+echo "[6/9] Tuning ENA network adapter..."
 ethtool -G eth0 rx 4096 tx 4096 2>/dev/null || echo "  (ring buffer resize not supported — skipping)"
 ethtool -C eth0 rx-usecs 0 tx-usecs 0 rx-frames 1 tx-frames 1 2>/dev/null || echo "  (coalescing tune not supported — skipping)"
 
 # ── Disable Transparent Huge Pages ──────────────────────────────────
-echo "[7/8] Disabling THP..."
+echo "[7/9] Disabling THP..."
 echo never > /sys/kernel/mm/transparent_hugepage/enabled
 echo never > /sys/kernel/mm/transparent_hugepage/defrag
 
@@ -57,7 +57,7 @@ w /sys/kernel/mm/transparent_hugepage/defrag - - - - never
 EOF
 
 # ── CPU frequency governor ──────────────────────────────────────────
-echo "[8/8] Setting CPU performance governor..."
+echo "[8/9] Setting CPU performance governor..."
 for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     echo performance > "$cpu" 2>/dev/null || true
 done
@@ -81,6 +81,7 @@ echo "Clock sync status:"
 chronyc tracking | head -5
 
 # ── Systemd service ────────────────────────────────────────────────
+echo "[9/9] Installing systemd service..."
 cp /home/ec2-user/FaCaiBot/deploy/facaibot.service /etc/systemd/system/facaibot.service
 systemctl daemon-reload
 
