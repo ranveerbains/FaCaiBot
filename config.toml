@@ -18,7 +18,7 @@ prewarm_lead_secs = 30
 [spike_detection]
 # How many ATRs a single tick must move to start a spike candidate
 # At ATR=$0.61 (observed): 2.5 needs a $1.53 tick, 2.0 needed a $1.22 tick.
-multiplier = 2.5
+multiplier = 3
 
 # All ATR EMAs below use the same tick interval: 50ms per tick (SBE @depth20. (we are not using @BestBidAsk).
 
@@ -46,7 +46,7 @@ min_magnitude_pct = 0.01
 # Filters "fading spikes" where the price spiked but is already retracing.
 # 0.65 = must still hold 65% of peak displacement at sustain time.
 # (was 0.50 — raising this cuts half-retraced spikes that lack conviction)
-momentum_ratio_min = 0.65
+momentum_ratio_min = 0.75
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY GUARDS
@@ -75,12 +75,12 @@ entry_cutoff_secs = 180
 # Maximum age (ms) of a Binance SBE event before it is discarded.
 # SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
 # Events older than this indicate network congestion or clock skew — discard to avoid
-# acting on stale price data.
-binance_stale_event_ms = 50
+# acting on stale price data. ec2 gets 103-104ms no jitter (so assume we are 100ms out of sync w binance sbe)
+binance_stale_event_ms = 150
 
 # Maximum age (ms) of the Polymarket orderbook snapshot before blocking entry.
 # If the book data is older than this, it's considered stale and unreliable.
-stale_book_ms = 30
+stale_book_ms = 250
 
 # Maximum YES mid price before blocking entry (mirrors minimum as 1 - max_price_skew).
 # Prevents trading in near-certain-resolution markets where one side is illiquid.
@@ -121,7 +121,7 @@ low_alloc_pct  = 0.25   # LOW bets a quarter
 
 # Confidence >= this → HIGH tier.
 # Max score is 0.8 (sustain removed from formula).
-high_threshold = 0.6
+high_threshold = 0.5
 
 # Confidence >= this (but < high) → MED tier.
 # Below this → LOW tier.

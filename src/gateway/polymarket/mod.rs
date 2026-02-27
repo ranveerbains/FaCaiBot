@@ -49,9 +49,13 @@ pub(super) const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
 /// Gamma query for upcoming 15-minute crypto markets.
 ///
 /// Uses tag_id=102467 ("15M") to find all 15-minute prediction markets.
-/// Returns up to 10 active, non-closed events; we filter client-side
-/// for BTC/ETH by slug prefix (`btc-updown-15m-` / `eth-updown-15m-`).
-pub(super) const GAMMA_EVENTS_PATH: &str = "/events?tag_id=102467&closed=false&limit=10";
+/// Sorted by end_date ascending so the soonest-expiring market (the currently
+/// active one) always appears first — prevents the active market from being
+/// pushed out of results by older non-closed events when limit is applied.
+/// We filter client-side for BTC/ETH by slug prefix
+/// (`btc-updown-15m-` / `eth-updown-15m-`).
+pub(super) const GAMMA_EVENTS_PATH: &str =
+    "/events?tag_id=102467&closed=false&order=end_date&ascending=true&limit=20";
 
 // ─── Timing constants ─────────────────────────────────────────────────────────
 
