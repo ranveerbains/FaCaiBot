@@ -111,6 +111,7 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
 | 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
 | 10 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
+| 11 | **Hedge feasibility** | `bid_price + opposing_best_ask > $1.00` | `HedgeInfeasible` | After pricing — checks opposing book for guaranteed loss |
 
 ### Direction-aware book selection
 
@@ -153,8 +154,8 @@ Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 s
 
 1. **Base bid:** `round_to_tick(best_bid + tick, tick)` — one tick above current best bid
 2. **Post-only cap:** If `bid_price >= best_ask`, cap at `best_ask - tick` (must not cross spread)
-3. **Smart outbidding:** If a depth wall is detected (single level with > 4x average depth), outbid it by 1 tick. Only if the result stays within break-even and below the ask
-4. **Break-even cap:** Ensures `bid_price` won't cause pair cost > 1.0 even at the initial profit target. Estimated Leg 2 = `1.0 - target_pct - bid_price`; cap = `1.0 - est_leg2 - tick`
+3. **Smart outbidding:** If a depth wall is detected (single level with > 4x average depth), outbid it by 1 tick. Only if `outbid + opposing_best_ask <= $1.00` (hedge feasible) and below the ask
+4. **Hedge feasibility guard:** Checks `bid_price + opposing_best_ask > $1.00` → reject as `HedgeInfeasible`. Uses strict `>` (at exactly $1.00, best-case Leg 2 = opp_ask - tick → profitable by 1 tick). Missing opposing book = allow (Leg 2 evaluator gates later)
 
 ### Fill models
 

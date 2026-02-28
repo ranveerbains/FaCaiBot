@@ -262,6 +262,24 @@ GROUP BY pair_cost_bucket
 ORDER BY pair_cost_bucket;
 
 -- ============================================================
+-- 16. Trades where pair cost exceeded $1.00 (hedge infeasibility at fill time)
+-- Maps to: entry_guards.max_spread_ticks, hedge feasibility guard
+-- ============================================================
+SELECT
+    direction,
+    leg1_price,
+    leg2_price,
+    pair_cost,
+    net_profit,
+    exit_reason,
+    spike_magnitude,
+    timestamp
+FROM simulated_trades
+WHERE pair_cost > 1.0
+ORDER BY timestamp DESC
+LIMIT 50;
+
+-- ============================================================
 -- Pruning (run hourly via automated task)
 -- ============================================================
 -- ALTER TABLE binance_ticks DROP PARTITION WHERE timestamp < dateadd('h', -24, now());

@@ -104,6 +104,7 @@ pub struct StrategyEngine {
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_spread: u64,  // SpreadWide
     diag_rej_depth: u64,   // InsufficientDepth
+    diag_rej_hedge: u64,   // HedgeInfeasible
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
     diag_leg1_fills: u64,
@@ -156,6 +157,7 @@ impl StrategyEngine {
             diag_rej_skew: 0,
             diag_rej_spread: 0,
             diag_rej_depth: 0,
+            diag_rej_hedge: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
             diag_leg1_fills: 0,
@@ -760,6 +762,7 @@ impl StrategyEngine {
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
                     Leg1RejectReason::SpreadWide => self.diag_rej_spread += 1,
                     Leg1RejectReason::InsufficientDepth => self.diag_rej_depth += 1,
+                    Leg1RejectReason::HedgeInfeasible => self.diag_rej_hedge += 1,
                     Leg1RejectReason::Other => self.diag_rej_other += 1,
                 }
                 None
@@ -956,6 +959,7 @@ impl StrategyEngine {
             rej_skew = self.diag_rej_skew,
             rej_spread = self.diag_rej_spread,
             rej_depth = self.diag_rej_depth,
+            rej_hedge = self.diag_rej_hedge,
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,

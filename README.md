@@ -143,7 +143,7 @@ chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 # SSH in with -A to forward your local GitHub SSH key to EC2
 ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-  ec2-user@ec2-18-175-189-83.eu-west-2.compute.amazonaws.com
+  ec2-user@ec2-3-8-210-31.eu-west-2.compute.amazonaws.com
 ```
 
 > **Note**: The `-A` flag (SSH agent forwarding) passes your local GitHub SSH key to the EC2 session so you can clone the private repo without adding a key to the server. If this doesn't work, see "Git Clone Failures" in Troubleshooting.
