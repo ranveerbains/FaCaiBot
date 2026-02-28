@@ -3,6 +3,8 @@
 # Run as ec2-user: bash deploy.sh
 set -euo pipefail
 
+export PATH="$HOME/.cargo/bin:$PATH"
+
 REPO_DIR="/home/ec2-user/FaCaiBot"
 INSTALL_DIR="/opt/facaibot"
 

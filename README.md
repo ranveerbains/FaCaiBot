@@ -154,10 +154,15 @@ ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
 # 1. Install git (not pre-installed on Amazon Linux 2023)
 sudo yum install -y git
 
-# 2. Clone the repo (works if ssh -A was used above)
+# 2. Clone the repo
+
+# Option A: SSH (requires ssh -A or a deploy key set up)
 git clone git@github.com:ranveerbains/FaCaiBot.git
 cd FaCaiBot
 
+# Option B: HTTPS (requires personal access token)
+git clone https://<TOKEN>@github.com/ranveerbains/FaCaiBot.git
+cd FaCaiBot
 # 3. Run server setup — installs Rust, Docker, QuestDB, kernel tuning, systemd
 #    Takes ~5-10 minutes. Safe to re-run if interrupted.
 sudo bash deploy/setup.sh
