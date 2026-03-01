@@ -2,7 +2,7 @@
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, FixedBytes, U256, address};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::ProviderBuilder;
 use alloy::sol;
 use anyhow::{Context, Result};
 use tokio_rustls::TlsConnector;
@@ -100,21 +100,31 @@ pub async fn handle_balance() -> String {
 async fn balance_inner() -> Result<String> {
     let (_signer, address) = get_wallet_info()?;
     let rpc_url = get_rpc_url();
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().context("invalid RPC URL")?);
+    let client = reqwest::Client::new();
 
-    // Native POL balance.
-    let pol_balance = provider
-        .get_balance(address)
-        .await
-        .context("failed to get POL balance")?;
+    // Native POL balance via eth_getBalance.
+    let pol_hex = rpc_call(
+        &client,
+        &rpc_url,
+        "eth_getBalance",
+        serde_json::json!([format!("{address}"), "latest"]),
+    )
+    .await
+    .context("failed to get POL balance")?;
+    let pol_balance = parse_hex_u256(&pol_hex).context("invalid POL balance hex")?;
 
-    // USDC.e balance (ERC20).
-    let usdc_contract = IERC20::new(USDC_E, &provider);
-    let usdc_balance = usdc_contract
-        .balanceOf(address)
-        .call()
-        .await
-        .context("failed to get USDC.e balance")?;
+    // USDC.e balance via eth_call (balanceOf).
+    // Calldata: 0x70a08231 + address padded to 32 bytes.
+    let calldata = format!("0x70a08231{:0>64x}", address);
+    let usdc_hex = rpc_call(
+        &client,
+        &rpc_url,
+        "eth_call",
+        serde_json::json!([{"to": format!("{USDC_E}"), "data": calldata}, "latest"]),
+    )
+    .await
+    .context("failed to get USDC.e balance")?;
+    let usdc_balance = parse_hex_u256(&usdc_hex).context("invalid USDC.e balance hex")?;
 
     Ok(format!(
         "Wallet: {addr}\nUSDC.e: ${usdc}\nPOL: {pol}",
@@ -122,6 +132,49 @@ async fn balance_inner() -> Result<String> {
         usdc = format_token(usdc_balance, 6),
         pol = format_wei(pol_balance, 4),
     ))
+}
+
+/// Make a raw JSON-RPC call via reqwest and return the hex result string.
+async fn rpc_call(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+
+    let resp: serde_json::Value = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .context("RPC request failed")?
+        .json()
+        .await
+        .context("RPC response parse failed")?;
+
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("RPC error: {err}");
+    }
+
+    resp.get("result")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .context("RPC response missing 'result' field")
+}
+
+/// Parse a "0x..." hex string into U256.
+fn parse_hex_u256(hex: &str) -> Result<U256> {
+    let stripped = hex.strip_prefix("0x").unwrap_or(hex);
+    if stripped.is_empty() || stripped == "0" {
+        return Ok(U256::ZERO);
+    }
+    U256::from_str_radix(stripped, 16).context("hex parse failed")
 }
 
 /// `/polybalance` — Show Polymarket positions and total value.

@@ -128,7 +128,10 @@ pub struct StrategyEngine {
     diag_leg1_fills: u64,
     diag_leg2_erosion_steps: u64,
     diag_leg2_fills: u64,
-    diag_emergencies: u64,
+    diag_emg_adverse: u64,
+    diag_emg_breakeven: u64,
+    diag_emg_expiry: u64,
+    diag_emg_favorable: u64,
     diag_leg1_timeouts: u64,
     diag_spike_failures: u64,
     last_diag_ms: u64,
@@ -189,7 +192,10 @@ impl StrategyEngine {
             diag_leg1_fills: 0,
             diag_leg2_erosion_steps: 0,
             diag_leg2_fills: 0,
-            diag_emergencies: 0,
+            diag_emg_adverse: 0,
+            diag_emg_breakeven: 0,
+            diag_emg_expiry: 0,
+            diag_emg_favorable: 0,
             diag_leg1_timeouts: 0,
             diag_spike_failures: 0,
             last_diag_ms: 0,
@@ -568,7 +574,7 @@ impl StrategyEngine {
                                 "rotation emergency: Leg 1 filled, Leg 2 incomplete \
                                  — emitting emergency FOK before state reset"
                             );
-                            self.diag_emergencies += 1;
+                            self.diag_emg_expiry += 1;
                             self.rotation_emergency_buffer.push(signal);
                         } else {
                             warn!(
@@ -918,7 +924,17 @@ impl StrategyEngine {
         let is_emergency = decision.is_emergency();
 
         if is_emergency {
-            self.diag_emergencies += 1;
+            let reason = match &decision {
+                Leg2Decision::Emergency { signal, .. } => signal.exit_reason,
+                _ => None,
+            };
+            match reason {
+                Some(ExitReason::AdverseMovement) => self.diag_emg_adverse += 1,
+                Some(ExitReason::BreakEvenBreach) => self.diag_emg_breakeven += 1,
+                Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
+                Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
+                None => self.diag_emg_adverse += 1, // fallback
+            }
             if let Some(e) = self.erosion.as_mut() {
                 if !e.emergency_submitted {
                     // First emergency post — record the timestamp for deadline tracking.
@@ -1027,7 +1043,10 @@ impl StrategyEngine {
             leg1_fill = self.diag_leg1_fills,
             erosion_stp = self.diag_leg2_erosion_steps,
             leg2_fill = self.diag_leg2_fills,
-            emergency = self.diag_emergencies,
+            emg_adverse = self.diag_emg_adverse,
+            emg_breakeven = self.diag_emg_breakeven,
+            emg_expiry = self.diag_emg_expiry,
+            emg_favorable = self.diag_emg_favorable,
             leg1_timeout = self.diag_leg1_timeouts,
             spike_fail = self.diag_spike_failures,
             "engine 60s"
@@ -1070,7 +1089,8 @@ impl StrategyEngine {
              Signals: {sig}  Fills: {fill}  Timeouts: {timeout}\n\
              \n\
              <b>Leg 2</b>\n\
-             Erosion steps: {erosion}  Fills: {l2fill}  Emergencies: {emergency}",
+             Erosion steps: {erosion}  Fills: {l2fill}\n\
+             Emergencies — adverse: {emg_adv}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
@@ -1089,7 +1109,10 @@ impl StrategyEngine {
             timeout = self.diag_leg1_timeouts,
             erosion = self.diag_leg2_erosion_steps,
             l2fill = self.diag_leg2_fills,
-            emergency = self.diag_emergencies,
+            emg_adv = self.diag_emg_adverse,
+            emg_be = self.diag_emg_breakeven,
+            emg_exp = self.diag_emg_expiry,
+            emg_fav = self.diag_emg_favorable,
         );
 
         Some(msg)
