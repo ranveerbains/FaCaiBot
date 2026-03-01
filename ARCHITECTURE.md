@@ -35,17 +35,18 @@ CPU-pinned core 0          Manual runtime (2 workers)  Manual runtime (2 workers
 Binance SBE WS ──┐
   @depth20 (50ms)│
   @bestBidAsk    ├──► IngestorEvent ──► MarketState update
-Polymarket WS ───┤                      Spike detection
-  Market channel │                      Signal evaluation
-  User channel   │                      Erosion cascade
-Gamma API ───────┘                      advance_simulation() (sim)
-Heartbeat (5s) ──┘                            │
-                                        TradeSignal / ExecutorCommand
-                                              │
-                                              ▼
-                                        Live: LiveExecutor ──► CLOB REST
-                                              ◄── ExecutorFeedback (order IDs)
-                                        Sim: SimulationExecutor ──► Telegram+QuestDB
+Polymarket WS ───┤         ▲              Spike detection
+  Market channel │         │              Signal evaluation
+  User channel   │    Shutdown /          Erosion cascade
+Gamma API ───────┘    DrainAndRestart     advance_simulation() (sim)
+Heartbeat (5s) ──┘         │                    │
+                    CommandListener         TradeSignal / ExecutorCommand
+                    (control/)                   │
+                    Telegram getUpdates          ▼
+                    ◄──► AtomicBool flags   Live: LiveExecutor ──► CLOB REST
+                         (NotifyFlags)           ◄── ExecutorFeedback (order IDs)
+                         watch<BotStatus>   Sim: SimulationExecutor ──► Telegram+QuestDB
+                         watch<DrainStatus>
 ```
 
 ### Simulation Engine Loop
@@ -342,6 +343,7 @@ All have `#[serde(default)]` with production defaults. `Config::test_defaults()`
 | `POLYMARKET_API_KEY/SECRET/PASSPHRASE` | Live only | L2 HMAC auth credentials |
 | `BINANCE_ED25519_API_KEY` | Yes | Binance Ed25519 API key for SBE binary market data streams |
 | `TELEGRAM_BOT_TOKEN/CHAT_ID` | Sim only | Telegram reporting |
+| `TELEGRAM_ALLOWED_USER_ID` | No | Enable Telegram bot control (get from `@userinfobot`) |
 | `QUESTDB_URL` | No (default localhost) | Cold storage (analytics only) |
 | `BINANCE_SBE_WS_URL` | No (default stream-sbe.binance.com) | Binance SBE WS endpoint |
 
@@ -383,9 +385,11 @@ See `queries.sql` for 15 analytics queries (7 operational + 8 tuning). Tuning qu
 
 ---
 
-## 10. Telegram Reporting
+## 10. Telegram Reporting & Control
 
-Three tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
+### Reporting (Outbound)
+
+Four tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
 
 1. **Opportunity Alert**: Per signal — spike info, confidence, allocation, Leg 1 entry, Leg 2 target
 2. **Trade Completed**: Per trade — "Buy YES"/"Buy NO" labels, pair cost, profit (USDC), erosion steps
@@ -393,6 +397,60 @@ Three tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
 4. **Session Summary**: Hourly + shutdown — aggregate stats, win rate, balance
 
 Rate limited at 5s intervals. Critical messages (trade completions) bypass the limiter.
+
+Opportunity alerts and trade completions are gated by `NotifyFlags::trades_enabled`; market summaries by `NotifyFlags::summary_enabled`. Both default to `true`, toggled via `/trades` and `/summary` commands.
+
+### Bot Control (Inbound)
+
+Bidirectional Telegram control via `getUpdates` long-polling (30s timeout). Enabled when `TELEGRAM_ALLOWED_USER_ID` is set. Runs as a separate tokio task — zero overhead on the hot path.
+
+| Command | Action |
+|---------|--------|
+| `/trades on\|off` | Toggle opportunity + trade-completed notifications |
+| `/summary on\|off` | Toggle market summary notifications |
+| `/stop` | Drain mode → graceful shutdown (exit 0, no systemd restart) |
+| `/set <param> <value>` | Validate + write config.toml → drain → restart (exit 42) |
+| `/config [section]` | Show all params, or just one section (e.g. `/config risk`) |
+| `/status` | Uptime, mode, current market, leg states, trade counters, toggle states |
+| `/help` | List commands with usage |
+
+**Security**: Every message verified against `TELEGRAM_ALLOWED_USER_ID` + `TELEGRAM_CHAT_ID`. 2s rate limit between commands. `/set` uses a strict allowlist of 27 params with min/max ranges. No shell execution.
+
+**Notification toggles**: `AtomicBool` flags (`Relaxed` ordering) shared between the command listener and `TelegramReporter`. One CPU instruction per check — zero hot-path impact.
+
+### Drain Mode
+
+The bot never abandons an open position. `/stop` and `/set` both trigger drain mode before exiting:
+
+| Current State | Behavior |
+|---|---|
+| No open position | Immediate exit |
+| Leg 1 posted, unfilled | Cancel Leg 1 → immediate exit |
+| Leg 1 filled, Leg 2 in progress | Block new entries, let Leg 2 continue through erosion/emergency → exit after resolution |
+
+Drain progress is published via `tokio::sync::watch<DrainStatus>` (Idle → Draining → Complete). The command listener watches the channel and sends real-time Telegram updates:
+
+```
+User: /stop
+Bot:  "Stopping bot..."
+Bot:  "Drain mode activated (stop) — Leg 2 in progress, waiting for position to close"
+Bot:  "Bot stopped. Exiting."
+```
+
+**Exit codes**: `/stop` exits with code 0 (success — systemd does not restart). `/set` exits with code 42 (on-failure — systemd restarts in 5s with new config).
+
+### Control Architecture (`src/control/`)
+
+```
+src/control/
+├── mod.rs              # Module declarations
+├── listener.rs         # TelegramCommandListener: getUpdates polling, auth, dispatch
+├── handlers.rs         # Command handlers (pure logic, returns reply strings)
+├── config_editor.rs    # TOML read/write, param allowlist with min/max ranges
+└── types.rs            # NotifyFlags, BotStatus, DrainStatus
+```
+
+**Data flow**: Commands inject `IngestorEvent::Shutdown` or `IngestorEvent::DrainAndRestart` into the existing ingestor channel. The engine handles these in its main loop — sets `draining = true`, publishes `DrainStatus` updates, and breaks when the position resolves.
 
 ---
 
@@ -506,6 +564,8 @@ sudo systemctl enable --now facaibot
 ```
 isolcpus=0,1 nohz_full=0,1 rcu_nocbs=0,1 intel_pstate=disable processor.max_cstate=1 idle=poll
 ```
+
+**systemd restart policy**: `Restart=on-failure` with `RestartSec=5s`. Exit 0 (`/stop`) = success → no restart. Exit 42 (`/set` config change) = failure → restart in 5s with new config. Crashes = failure → restart in 5s.
 
 See `README.md` for step-by-step instructions and `deploy/` for all scripts.
 

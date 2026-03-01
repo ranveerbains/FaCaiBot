@@ -115,6 +115,13 @@ pub struct StrategyEngine {
     diag_spike_failures: u64,
     last_diag_ms: u64,
 
+    // ── Drain mode ────────────────────────────────────────────────────────
+    /// When `true`, `evaluate()` blocks new Leg 1 entries. Set by `/stop` or `/set`.
+    pub draining: bool,
+
+    /// Epoch ms when the engine was created (for uptime calculation).
+    start_ms: u64,
+
     // ── Sub-evaluators ────────────────────────────────────────────────────
     leg1: Leg1Evaluator,
     leg2: Leg2Evaluator,
@@ -167,6 +174,8 @@ impl StrategyEngine {
             diag_leg1_timeouts: 0,
             diag_spike_failures: 0,
             last_diag_ms: 0,
+            draining: false,
+            start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
                 max_spread_ticks,
                 entry_cutoff_secs: config.bot.entry_guards.entry_cutoff_secs,
@@ -689,6 +698,9 @@ impl StrategyEngine {
                     }
                 }
             },
+
+            // Control events are handled in main.rs before on_event() is called.
+            IngestorEvent::Shutdown | IngestorEvent::DrainAndRestart => {}
         }
 
         // ── Cutoff window detection (runs on every event) ──────────────
@@ -726,6 +738,12 @@ impl StrategyEngine {
     /// - Increments `cumulative_used`
     /// - Records `leg1_direction`
     pub fn evaluate(&mut self) -> Option<TradeSignal> {
+        // Drain mode: block new Leg 1 entries.
+        if self.draining {
+            self.state.spike_detected = false;
+            return None;
+        }
+
         let now_ms = now_epoch_ms();
         let outcome = self.leg1.evaluate(&self.state, self.avg_book_depth, now_ms);
 
@@ -1532,6 +1550,53 @@ impl StrategyEngine {
         );
         signal.sim_confirmed_fill = true;
         Some(signal)
+    }
+
+    // ─── Drain & Status ───────────────────────────────────────────────────
+
+    /// Enter drain mode: block new Leg 1 entries, let Leg 2 continue.
+    pub fn set_draining(&mut self) {
+        self.draining = true;
+    }
+
+    /// Returns `true` if no position is open (safe to exit immediately).
+    pub fn has_no_open_position(&self) -> bool {
+        matches!(self.state.leg1_state, OrderState::None)
+            && matches!(self.state.leg2_state, OrderState::None)
+    }
+
+    /// Build a status snapshot for the `/status` command.
+    pub fn build_status(&self, mode_str: &str) -> crate::control::types::BotStatus {
+        use crate::control::types::BotStatus;
+
+        let now_ms = now_epoch_ms();
+        let uptime_secs = now_ms.saturating_sub(self.start_ms) / 1_000;
+
+        let leg1_str = match &self.state.leg1_state {
+            OrderState::None => "None".into(),
+            OrderState::Posted { price, size, .. } => format!("Posted @ ${price} x {size}"),
+            OrderState::Filled { price, size, .. } => format!("Filled @ ${price} x {size}"),
+        };
+        let leg2_str = match &self.state.leg2_state {
+            OrderState::None => "None".into(),
+            OrderState::Posted { price, size, .. } => format!("Posted @ ${price} x {size}"),
+            OrderState::Filled { price, size, .. } => format!("Filled @ ${price} x {size}"),
+        };
+
+        BotStatus {
+            uptime_secs,
+            mode: mode_str.to_string(),
+            current_market: self.state.active_condition_id.clone(),
+            market_end_ms: self.state.market_end_timestamp_ms,
+            leg1_state: leg1_str,
+            leg2_state: leg2_str,
+            spikes_received: self.diag_spikes_received,
+            signals_emitted: self.diag_leg1_signals,
+            trades_completed: self.diag_leg2_fills,
+            trades_enabled: true,  // updated by main loop from NotifyFlags
+            summary_enabled: true, // updated by main loop from NotifyFlags
+            draining: self.draining,
+        }
     }
 }
 
@@ -2635,5 +2700,60 @@ mod tests {
             engine.erosion.as_ref().unwrap().emergency_submitted,
             "emergency_submitted should be true"
         );
+    }
+
+    // ── Drain mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_draining_blocks_new_leg1() {
+        let mut engine = make_engine_with_market(600);
+        set_book(&mut engine, "0.495", "0.505");
+        inject_spike(&mut engine, Direction::Up);
+
+        // Without draining, evaluate would produce a signal.
+        engine.set_draining();
+        let signal = engine.evaluate();
+        assert!(signal.is_none(), "draining should block new Leg 1 entries");
+        assert!(
+            !engine.state.spike_detected,
+            "spike_detected should be cleared"
+        );
+    }
+
+    #[test]
+    fn test_has_no_open_position_when_idle() {
+        let engine = StrategyEngine::default();
+        assert!(engine.has_no_open_position());
+    }
+
+    #[test]
+    fn test_has_open_position_when_leg1_posted() {
+        let mut engine = StrategyEngine::default();
+        engine.state.leg1_state = OrderState::Posted {
+            order_id: "test".into(),
+            price: Decimal::new(50, 2),
+            size: Decimal::new(10, 0),
+            timestamp_ms: 1000,
+        };
+        assert!(!engine.has_no_open_position());
+    }
+
+    #[test]
+    fn test_build_status_snapshot() {
+        let engine = StrategyEngine::default();
+        let status = engine.build_status("simulation");
+        assert_eq!(status.mode, "simulation");
+        assert_eq!(status.leg1_state, "None");
+        assert_eq!(status.leg2_state, "None");
+        assert!(!status.draining);
+    }
+
+    #[test]
+    fn test_on_event_ignores_control_variants() {
+        let mut engine = StrategyEngine::default();
+        // Should not panic or modify state.
+        engine.on_event(IngestorEvent::Shutdown);
+        engine.on_event(IngestorEvent::DrainAndRestart);
+        assert!(engine.has_no_open_position());
     }
 }

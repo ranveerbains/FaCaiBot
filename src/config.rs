@@ -223,6 +223,9 @@ pub struct Config {
     // ── Telegram ──────────────────────────────────────────────────────
     pub telegram_bot_token: String,
     pub telegram_chat_id: String,
+    /// If set, enables bidirectional Telegram command control.
+    /// Only messages from this user ID are accepted.
+    pub telegram_allowed_user_id: Option<i64>,
 
     // ── Tuning parameters (from config.toml) ──────────────────────────
     pub bot: BotConfig,
@@ -318,6 +321,10 @@ impl Config {
             std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default()
         };
 
+        let telegram_allowed_user_id = std::env::var("TELEGRAM_ALLOWED_USER_ID")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+
         // ── Derive Decimal values from BotConfig ─────────────────────
         let max_alloc_per_trade = Decimal::try_from(bot.capital.max_alloc_per_trade)
             .context("capital.max_alloc_per_trade: invalid decimal")?;
@@ -350,6 +357,7 @@ impl Config {
                 .context("BINANCE_ED25519_API_KEY not set (required for SBE market data)")?,
             telegram_bot_token,
             telegram_chat_id,
+            telegram_allowed_user_id,
             bot,
             max_alloc_per_trade,
             high_alloc_pct,
@@ -403,6 +411,7 @@ impl Config {
             binance_ed25519_api_key: "test-key".into(),
             telegram_bot_token: "test-token".into(),
             telegram_chat_id: "test-chat".into(),
+            telegram_allowed_user_id: None,
             bot,
             max_alloc_per_trade,
             high_alloc_pct,

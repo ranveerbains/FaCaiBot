@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod engine;
 mod executor;
 mod gateway;
@@ -11,11 +12,15 @@ mod utils;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Mode};
+use crate::control::listener::TelegramCommandListener;
+use crate::control::types::{BotStatus, DrainStatus, NotifyFlags};
 use crate::engine::strategy::StrategyEngine;
 use crate::executor::live::LiveExecutor;
 use crate::executor::simulation::SimulationExecutor;
@@ -97,6 +102,12 @@ async fn async_main() -> Result<()> {
     let (feedback_tx, feedback_rx): (Sender<ExecutorFeedback>, Receiver<ExecutorFeedback>) =
         bounded(CHANNEL_CAP);
 
+    // ── Control plane ────────────────────────────────────────────────
+    let notify_flags = Arc::new(NotifyFlags::new());
+    let (status_tx, status_rx) = tokio::sync::watch::channel(BotStatus::default());
+    let (drain_status_tx, drain_status_rx) = tokio::sync::watch::channel(DrainStatus::Idle);
+    let ingestor_tx_control = ingestor_tx.clone();
+
     // ── Layer 1: Ingestor (The Ear) ─────────────────────────────────
     // CPU-pinned to core 0 for minimal context-switch jitter.
     let ingestor_config = config.clone();
@@ -171,6 +182,11 @@ async fn async_main() -> Result<()> {
     // ── Layer 2: Strategy Engine (The Brain) ─────────────────────────
     let engine_mode = config.mode;
     let engine_config = config.clone();
+    let engine_notify_flags = Arc::clone(&notify_flags);
+    let mode_str: &'static str = match engine_mode {
+        Mode::Live => "live",
+        Mode::Simulation => "simulation",
+    };
     let engine_handle = tokio::spawn(async move {
         let mut engine = StrategyEngine::new(&engine_config);
 
@@ -184,6 +200,10 @@ async fn async_main() -> Result<()> {
         };
         let mut last_book_snapshot_ms: u64 = 0;
         let mut last_tick_record_ms: u64 = 0;
+        let mut last_status_publish_ms: u64 = 0;
+
+        // Drain state: exit code to use after drain completes.
+        let mut pending_exit_code: Option<i32> = None;
 
         while let Ok(event) = ingestor_rx.recv() {
             // Drain executor feedback (non-blocking). In live mode, the executor
@@ -202,6 +222,67 @@ async fn async_main() -> Result<()> {
                         engine.on_order_failed(is_leg2);
                     }
                 }
+            }
+
+            // ── Handle control events (Shutdown / DrainAndRestart) ────
+            match event {
+                IngestorEvent::Shutdown => {
+                    engine.set_draining();
+                    pending_exit_code = Some(0);
+                    if engine.has_no_open_position() {
+                        let _ = drain_status_tx.send(DrainStatus::Complete {
+                            exit_code: 0,
+                            summary: "No open positions. Bot stopped.".into(),
+                        });
+                        break;
+                    }
+                    // Cancel posted-but-unfilled Leg 1 if applicable.
+                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
+                        let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
+                        let _ = executor_tx.send(cmd);
+                        // If only Leg 1 was posted (not filled), we can exit after cancel.
+                        if matches!(engine.state().leg2_state, OrderState::None) {
+                            let _ = drain_status_tx.send(DrainStatus::Complete {
+                                exit_code: 0,
+                                summary: "Cancelled unfilled Leg 1. Bot stopped.".into(),
+                            });
+                            break;
+                        }
+                    }
+                    let _ = drain_status_tx.send(DrainStatus::Draining {
+                        reason: "stop".into(),
+                        position_info: "Leg 2 in progress — waiting for position to close".into(),
+                    });
+                    continue;
+                }
+                IngestorEvent::DrainAndRestart => {
+                    engine.set_draining();
+                    pending_exit_code = Some(42);
+                    if engine.has_no_open_position() {
+                        let _ = drain_status_tx.send(DrainStatus::Complete {
+                            exit_code: 42,
+                            summary: "No open positions. Restarting with new config...".into(),
+                        });
+                        break;
+                    }
+                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
+                        let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
+                        let _ = executor_tx.send(cmd);
+                        if matches!(engine.state().leg2_state, OrderState::None) {
+                            let _ = drain_status_tx.send(DrainStatus::Complete {
+                                exit_code: 42,
+                                summary: "Cancelled unfilled Leg 1. Restarting...".into(),
+                            });
+                            break;
+                        }
+                    }
+                    let _ = drain_status_tx.send(DrainStatus::Draining {
+                        reason: "config change".into(),
+                        position_info: "Leg 2 in progress — waiting for position to close".into(),
+                    });
+                    continue;
+                }
+                _ => {}
             }
 
             // Detect market rotation to notify executor.
@@ -380,7 +461,29 @@ async fn async_main() -> Result<()> {
                 engine.on_trade_complete();
             }
 
+            // Check drain completion: position fully closed after drain was activated.
+            if let Some(exit_code) = pending_exit_code
+                && engine.has_no_open_position()
+            {
+                let summary = if exit_code == 0 {
+                    "Position closed. Bot stopped.".to_string()
+                } else {
+                    "Position closed. Restarting with new config...".to_string()
+                };
+                let _ = drain_status_tx.send(DrainStatus::Complete { exit_code, summary });
+                break;
+            }
+
             engine.check_diagnostic();
+
+            // Publish engine status every 5 seconds for /status command.
+            if now_ms.saturating_sub(last_status_publish_ms) >= 5_000 {
+                let mut status = engine.build_status(mode_str);
+                status.trades_enabled = engine_notify_flags.trades_on();
+                status.summary_enabled = engine_notify_flags.summary_on();
+                let _ = status_tx.send(status);
+                last_status_publish_ms = now_ms;
+            }
         }
         // Flush any remaining buffered ticks before exiting.
         if let Some(ref mut c) = cold {
@@ -393,16 +496,18 @@ async fn async_main() -> Result<()> {
 
     // ── Layer 3: Executor (The Hand) ─────────────────────────────────
     let executor_config = config.clone();
+    let executor_notify_flags = Arc::clone(&notify_flags);
     let executor_handle = tokio::spawn(async move {
         match executor_config.mode {
             Mode::Simulation => {
                 info!("starting simulation executor");
 
-                // Build Telegram reporter.
+                // Build Telegram reporter with notification gating.
                 let reporter = TelegramReporter::new(
                     executor_config.telegram_bot_token.clone(),
                     executor_config.telegram_chat_id.clone(),
-                );
+                )
+                .with_notify_flags(Arc::clone(&executor_notify_flags));
 
                 // Build QuestDB cold storage (optional — executor runs without it).
                 let cold = match ColdStorage::new(&executor_config.questdb_url) {
@@ -439,7 +544,8 @@ async fn async_main() -> Result<()> {
                 let reporter = TelegramReporter::new(
                     executor_config.telegram_bot_token.clone(),
                     executor_config.telegram_chat_id.clone(),
-                );
+                )
+                .with_notify_flags(Arc::clone(&executor_notify_flags));
 
                 let live_executor = LiveExecutor::new(poly, feedback_tx, reporter, cold);
 
@@ -449,6 +555,24 @@ async fn async_main() -> Result<()> {
             }
         }
     });
+
+    // ── Command Listener (optional) ─────────────────────────────────
+    // Spawned only if TELEGRAM_ALLOWED_USER_ID is configured.
+    if let Some(user_id) = config.telegram_allowed_user_id {
+        let tls_connector = crate::reporting::telegram::build_tls_connector();
+        let listener = TelegramCommandListener::new(
+            config.telegram_bot_token.clone(),
+            config.telegram_chat_id.clone(),
+            user_id,
+            tls_connector,
+            Arc::clone(&notify_flags),
+            ingestor_tx_control,
+            status_rx,
+            drain_status_rx,
+        );
+        tokio::spawn(listener.run());
+        info!(user_id, "command listener spawned");
+    }
 
     // ── Wait ─────────────────────────────────────────────────────────
     // The ingestor runs on a dedicated OS thread; the other two are tokio tasks.

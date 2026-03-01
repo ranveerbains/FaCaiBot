@@ -54,7 +54,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design, trade lifecycle, 
 cargo build                # Debug build
 cargo build --release      # Release (LTO, single codegen unit, stripped)
 cargo run                  # Run the bot
-cargo test                 # Run all tests (136 tests)
+cargo test                 # Run all tests (142 tests)
 cargo clippy               # Lint
 cargo fmt                  # Format
 ```
@@ -72,7 +72,33 @@ cargo fmt                  # Format
 | `PRIVATE_KEY` | Live only | Hex wallet private key (EIP-712 signing) |
 | `POLYMARKET_API_KEY/SECRET/PASSPHRASE` | Live only | L2 HMAC auth credentials |
 | `TELEGRAM_BOT_TOKEN/CHAT_ID` | Sim only | Telegram reporting |
+| `TELEGRAM_ALLOWED_USER_ID` | No | Enable Telegram bot control (get from `@userinfobot`) |
 | `QUESTDB_URL` | No | Default `127.0.0.1:9009` |
+
+## Telegram Bot Control
+
+When `TELEGRAM_ALLOWED_USER_ID` is set in `.env`, the bot accepts commands via Telegram — no SSH required.
+
+**Setup**: Message `@userinfobot` on Telegram to get your user ID. Add it to `.env`:
+```
+TELEGRAM_ALLOWED_USER_ID=123456789
+```
+
+**Commands**:
+
+| Command | Example | Action |
+|---------|---------|--------|
+| `/trades on\|off` | `/trades off` | Toggle trade notifications |
+| `/summary on\|off` | `/summary off` | Toggle market summary notifications |
+| `/stop` | `/stop` | Graceful shutdown (drains open position first) |
+| `/set <param> <value>` | `/set spike_detection.multiplier 4.0` | Update config + restart |
+| `/config [section]` | `/config risk` | Show current config values |
+| `/status` | `/status` | Show uptime, mode, market, counters |
+| `/help` | `/help` | List all commands |
+
+**Drain mode**: `/stop` and `/set` never abandon open positions. If a trade is in progress, the bot blocks new entries, lets the current Leg 2 resolve through its normal erosion/emergency cycle, then exits. `/stop` exits cleanly (no restart). `/set` restarts with the new config via systemd.
+
+**Security**: Commands are only accepted from the configured user ID and chat ID. `/set` validates against a strict allowlist of 27 parameters with min/max range checks.
 
 ## Key Documents
 
@@ -183,109 +209,60 @@ cargo --version   # Should print: cargo 1.xx.x
 
 Before the bot can trade, your EOA wallet needs 3 on-chain token approvals on Polygon mainnet. This is a **one-time** operation — never needs to be repeated (approvals are persistent on-chain).
 
-#### 3a. Install Foundry (Local Machine)
+Do this via Polygonscan using MetaMask (or any browser wallet). No CLI tools needed.
 
-Foundry is a CLI toolkit for Ethereum. We use its `cast` command to send approval transactions.
+**Prerequisites:**
+- MetaMask connected to **Polygon Mainnet** with your trading wallet
+- POL balance ≥ 0.01 for gas (~$0.005 total for all 3 transactions)
+- USDC.e balance > 0 (your trading capital)
 
-```bash
-# Download and install Foundry
-curl -L https://foundry.paradigm.xyz | bash
+#### Approval 1 of 3: USDC.e → CTF Contract
 
-# Add Foundry to your current shell session
-source ~/.bashrc
-# (or: source ~/.zshrc if you use zsh)
+Lets the CTF contract convert your USDC.e into YES/NO outcome tokens.
 
-# Install the Rust toolchain Foundry needs
-foundryup
+1. Open: `https://polygonscan.com/address/0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174#writeProxyContract`
+2. Click **"Connect to Web3"** → connect MetaMask → confirm you're on Polygon Mainnet
+3. Find the **`approve`** function and expand it
+4. Fill in:
+   - `spender (address)`: `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`
+   - `amount (uint256)`: `115792089237316195423570985008687907853269984665640564039457584007913129639935`
+5. Click **Write** → confirm in MetaMask → wait for the transaction to confirm (~10-30s)
 
-# Verify installation
-cast --version
-```
+#### Approval 2 of 3: CTF → CTF Exchange
 
-**Expected output**: `cast 0.3.0 (abc1234 ...)`
+Lets the standard Polymarket exchange settle your YES/NO trades.
 
-If you get "command not found", reload your shell: `source ~/.bashrc`
+1. Open: `https://polygonscan.com/address/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045#writeContract`
+2. Click **"Connect to Web3"** (stays connected from above)
+3. Find the **`setApprovalForAll`** function and expand it
+4. Fill in:
+   - `operator (address)`: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
+   - `approved (bool)`: `true`
+5. Click **Write** → confirm in MetaMask → wait for confirmation
 
-#### 3b. Check Your Polygon Wallet
+#### Approval 3 of 3: CTF → Neg Risk CTF Exchange
 
-1. Go to [Polygonscan.com](https://polygonscan.com/) → search your EOA address
-2. **POL balance** must be ≥ 0.01 (for gas on 3 transactions, costs ~$0.005)
-3. **USDC.e balance** must be > 0 (this is your trading capital)
-4. Copy your private key (hex format, starting with `0x`) — same one from `.env`
+Lets the neg-risk exchange (used for BTC/ETH 15-min markets) settle your positions.
 
-#### 3c. Dry Run First (Test Without Sending)
+1. Stay on the same CTF contract page from Approval 2
+2. Find **`setApprovalForAll`** again
+3. Fill in:
+   - `operator (address)`: `0xC5d563A36AE78145C45a50134d48A1215220f80b`
+   - `approved (bool)`: `true`
+4. Click **Write** → confirm in MetaMask → wait for confirmation
 
-From your FaCaiBot directory, run the approval script in dry-run mode:
+#### Verify All 3 Are Set
 
-```bash
-PRIVATE_KEY=0x<your-hex-private-key> DRY_RUN=1 ./examples/approve_contracts.sh
-```
+**Approval 1** (USDC.e allowance for CTF):
+1. Open: `https://polygonscan.com/address/0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174#readProxyContract`
+2. Find **`allowance`** → fill in your wallet as `owner`, `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` as `spender`
+3. Click **Query** → should return `115792089237316195423570985008687907853269984665640564039457584007913129639935`
 
-Replace `<your-hex-private-key>` with your actual key (e.g., `0x1234567890abcdef...`).
-
-**Expected output:**
-```
-Wallet:  0x1234...abcd
-Chain:   Polygon mainnet (137)
-
-POL balance:    0.025
-USDC.e balance: 100.00 USDC.e
-
-Checking existing approvals...
-  USDC.e → CTF allowance:           0 (need max uint256)
-  CTF → CTF Exchange approved:       false
-  CTF → NegRisk Exchange approved:   false
-
-DRY_RUN=1 — no transactions sent. Remove DRY_RUN to execute.
-```
-
-If this works, your setup is correct. Proceed to step 3d.
-
-#### 3d. Execute Approvals (Send 3 Transactions)
-
-```bash
-PRIVATE_KEY=0x<your-hex-private-key> ./examples/approve_contracts.sh
-```
-
-This will send 3 transactions to Polygon mainnet. Each takes ~10-30 seconds to confirm.
-
-**Expected output:**
-```
-[1/3] Approving USDC.e for CTF contract...
-[tx hash]: 0xabc123...
-  ✓ USDC.e → CTF approved
-[2/3] Approving CTF tokens for CTF Exchange...
-[tx hash]: 0xdef456...
-  ✓ CTF → CTF Exchange approved
-[3/3] Approving CTF tokens for Neg Risk CTF Exchange...
-[tx hash]: 0xghi789...
-  ✓ CTF → Neg Risk CTF Exchange approved
-
-All approvals complete. Your wallet is ready for Polymarket trading.
-```
-
-**If some were already approved**, the script skips those automatically.
-
-#### 3e. Verify Approvals Are Set
-
-Run the dry-run again to confirm all three are now approved:
-
-```bash
-PRIVATE_KEY=0x<your-hex-private-key> DRY_RUN=1 ./examples/approve_contracts.sh
-```
-
-All should show as `true` or with max uint256 value:
-```
-  USDC.e → CTF allowance:           115792089...933129639935 ✓
-  CTF → CTF Exchange approved:       true ✓
-  CTF → NegRisk Exchange approved:   true ✓
-```
-
-#### What Each Approval Does
-
-1. **USDC.e → CTF (ConditionalTokens)**: Lets the CTF contract convert your USDC.e into YES/NO outcome tokens
-2. **CTF → CTF Exchange**: Lets the standard Polymarket exchange settle your YES/NO trades
-3. **CTF → Neg Risk CTF Exchange**: Lets the neg-risk exchange (used for BTC/ETH 15-min markets) settle your positions
+**Approvals 2 & 3** (CTF setApprovalForAll):
+1. Open: `https://polygonscan.com/address/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045#readContract`
+2. Find **`isApprovedForAll`** → fill in your wallet as `owner`, `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` as `operator`
+3. Click **Query** → should return `true`
+4. Repeat with operator `0xC5d563A36AE78145C45a50134d48A1215220f80b` → should return `true`
 
 Once set, these approvals never expire and never need to be repeated (unless you change wallets).
 

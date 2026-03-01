@@ -26,6 +26,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, warn};
 
+use crate::control::types::NotifyFlags;
 use crate::types::market::OrderBook;
 use crate::types::order::TradeSignal;
 use crate::types::simulation::{MarketSummary, SessionSummary, SimTrade};
@@ -47,6 +48,8 @@ struct ReporterInner {
     tls_connector: TlsConnector,
     /// Epoch ms of the last dispatched message. Rate limiting: 5s minimum interval.
     last_send_ms: AtomicU64,
+    /// Optional notification flags (shared with command listener).
+    notify_flags: Option<Arc<NotifyFlags>>,
 }
 
 impl TelegramReporter {
@@ -70,7 +73,38 @@ impl TelegramReporter {
                 chat_id,
                 tls_connector,
                 last_send_ms: AtomicU64::new(0),
+                notify_flags: None,
             }),
+        }
+    }
+
+    /// Builder: attach notification flags for command-driven gating.
+    /// Must be called immediately after `new()` before cloning.
+    pub fn with_notify_flags(self, flags: Arc<NotifyFlags>) -> Self {
+        // Re-create inner with flags set. Safe because we just constructed it.
+        match Arc::try_unwrap(self.inner) {
+            Ok(old) => Self {
+                inner: Arc::new(ReporterInner {
+                    bot_token: old.bot_token,
+                    chat_id: old.chat_id,
+                    tls_connector: old.tls_connector,
+                    last_send_ms: old.last_send_ms,
+                    notify_flags: Some(flags),
+                }),
+            },
+            Err(arc) => {
+                // Fallback: should never happen if called right after new().
+                // Clone the fields we need.
+                Self {
+                    inner: Arc::new(ReporterInner {
+                        bot_token: arc.bot_token.clone(),
+                        chat_id: arc.chat_id.clone(),
+                        tls_connector: arc.tls_connector.clone(),
+                        last_send_ms: AtomicU64::new(arc.last_send_ms.load(Ordering::Relaxed)),
+                        notify_flags: Some(flags),
+                    }),
+                }
+            }
         }
     }
 
@@ -97,6 +131,7 @@ impl TelegramReporter {
     ///
     /// Sent immediately when a signal is detected and Leg 1 post-only fill
     /// is simulated against the current orderbook.
+    /// Gated by `NotifyFlags::trades_enabled`.
     pub fn send_opportunity_alert(
         &self,
         signal: &TradeSignal,
@@ -104,6 +139,11 @@ impl TelegramReporter {
         leg1_fill_size: Decimal,
         book: &OrderBook,
     ) {
+        if let Some(ref flags) = self.inner.notify_flags {
+            if !flags.trades_on() {
+                return;
+            }
+        }
         let text =
             formatter::format_opportunity_alert(signal, leg1_fill_price, leg1_fill_size, book);
         self.fire_critical(text);
@@ -112,14 +152,26 @@ impl TelegramReporter {
     /// Tier 1 — trade completion alert (both legs filled or hedge failed).
     ///
     /// Sent after Leg 2 fill (or emergency taker) completes the paired trade.
+    /// Gated by `NotifyFlags::trades_enabled`.
     pub fn send_trade_completed(&self, trade: &SimTrade) {
+        if let Some(ref flags) = self.inner.notify_flags {
+            if !flags.trades_on() {
+                return;
+            }
+        }
         let text = formatter::format_trade_completed(trade);
         self.fire_critical(text);
     }
 
     /// Tier 2 — market summary (sent at each 15-min market expiry).
     /// Uses fire_critical() so summaries are never silently dropped by the rate limiter.
+    /// Gated by `NotifyFlags::summary_enabled`.
     pub fn send_market_summary(&self, summary: &MarketSummary) {
+        if let Some(ref flags) = self.inner.notify_flags {
+            if !flags.summary_on() {
+                return;
+            }
+        }
         let text = formatter::format_market_summary(summary);
         self.fire_critical(text);
     }
@@ -247,15 +299,26 @@ fn split_message(text: &str) -> Vec<String> {
 
 // ─── HTTP Transport ───────────────────────────────────────────────────────────
 
-const TELEGRAM_HOST: &str = "api.telegram.org";
+pub(crate) const TELEGRAM_HOST: &str = "api.telegram.org";
 const TELEGRAM_PORT: u16 = 443;
+
+/// Build a TLS connector for Telegram API calls.
+pub(crate) fn build_tls_connector() -> TlsConnector {
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(tls_config))
+}
 
 /// POST a single JSON message to the Telegram Bot API.
 ///
 /// Opens a fresh TLS connection per call. This is intentionally simple
 /// (no connection pooling) — Telegram calls are infrequent (< 1/s) so
 /// connection overhead is acceptable.
-async fn post_telegram_message(
+pub(crate) async fn post_telegram_message(
     tls_connector: &TlsConnector,
     bot_token: &str,
     chat_id: &str,

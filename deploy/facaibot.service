@@ -11,7 +11,8 @@ User=ec2-user
 WorkingDirectory=/opt/facaibot
 EnvironmentFile=/opt/facaibot/.env
 ExecStart=/opt/facaibot/facaibot
-Restart=always
+# on-failure: exit 0 (/stop) = no restart, exit 42 (/set) or crash = restart
+Restart=on-failure
 RestartSec=5
 
 # Resource limits

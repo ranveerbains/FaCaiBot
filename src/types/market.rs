@@ -361,4 +361,10 @@ pub enum IngestorEvent {
 
     /// WebSocket connection status change.
     WsStatus { source: DataSource, connected: bool },
+
+    // ── Control ───────────────────────────────────────────────────────
+    /// Graceful shutdown (from /stop). Drain open position, then exit 0.
+    Shutdown,
+    /// Config changed (from /set). Drain open position, then exit 42 for systemd restart.
+    DrainAndRestart,
 }
