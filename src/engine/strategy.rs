@@ -1037,32 +1037,53 @@ impl StrategyEngine {
         // Build combined Telegram message (spike + engine).
         let spike_section = if let Some(ref s) = self.last_spike_diag {
             format!(
-                "Spike: ATR={:.2} thr={:.2} mid={:.2}\n  \
-                 cand={} rej_mom={} rej_mag={} conf={} stale={}",
-                s.atr, s.threshold, s.mid,
-                s.candidates, s.rej_momentum, s.rej_magnitude, s.confirmed, s.stale,
+                "<b>Spike Detector</b>\n\
+                 ATR: <code>{atr:.4}</code>  Threshold: <code>{thr:.4}</code>  Mid: <code>${mid:.2}</code>\n\
+                 Candidates: {cand}  Confirmed: {conf}  Stale: {stale}\n\
+                 Rejected — momentum: {rej_mom}  magnitude: {rej_mag}",
+                atr = s.atr,
+                thr = s.threshold,
+                mid = s.mid,
+                cand = s.candidates,
+                conf = s.confirmed,
+                stale = s.stale,
+                rej_mom = s.rej_momentum,
+                rej_mag = s.rej_magnitude,
             )
         } else {
-            "Spike: (no data yet)".to_string()
+            "<b>Spike Detector</b>\n(no data yet)".to_string()
         };
 
         let msg = format!(
-            "Diagnostics (60s)\n\n\
-             {spike}\n\n\
-             Engine: mkts={mkts} spikes={spikes} spike_fail={spike_fail}\n  \
-             rej: busy={busy} spread={spread} depth={depth} skew={skew} stale={stale} hedge={hedge}\n  \
-             leg1: sig={sig} fill={fill} timeout={timeout}\n  \
-             leg2: erosion={erosion} fill={l2fill} emergency={emergency}",
+            "<b>--- DIAGNOSTICS (60s) ---</b>\n\
+             \n\
+             {spike}\n\
+             \n\
+             <b>Engine</b>\n\
+             Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}\n\
+             \n\
+             <b>Leg 1 Rejections</b>\n\
+             Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
+             Spread: {spread}  Depth: {depth}  Hedge: {hedge}  Other: {other}\n\
+             \n\
+             <b>Leg 1</b>\n\
+             Signals: {sig}  Fills: {fill}  Timeouts: {timeout}\n\
+             \n\
+             <b>Leg 2</b>\n\
+             Erosion steps: {erosion}  Fills: {l2fill}  Emergencies: {emergency}",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
             spike_fail = self.diag_spike_failures,
+            spikes_cut = self.diag_spikes_dropped_cutoff,
             busy = self.diag_rej_busy,
+            no_book = self.diag_rej_no_book,
+            stale = self.diag_rej_stale,
+            skew = self.diag_rej_skew,
             spread = self.diag_rej_spread,
             depth = self.diag_rej_depth,
-            skew = self.diag_rej_skew,
-            stale = self.diag_rej_stale,
             hedge = self.diag_rej_hedge,
+            other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
             timeout = self.diag_leg1_timeouts,
