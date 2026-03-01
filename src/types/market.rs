@@ -347,6 +347,18 @@ pub enum IngestorEvent {
     /// Spike candidate failed momentum/sustain check — cancel speculative Leg 1.
     SpikeFailed { timestamp_ms: u64 },
 
+    /// Periodic spike detector diagnostics (every 60s).
+    SpikeDiagnostic {
+        atr: f64,
+        threshold: f64,
+        mid: f64,
+        candidates: u64,
+        rej_momentum: u64,
+        rej_magnitude: u64,
+        confirmed: u64,
+        stale: u64,
+    },
+
     // ── Lifecycle ────────────────────────────────────────────────────────
     /// Emitted when the active 15-min market rotates (anticipatory loading complete).
     MarketRotation {

@@ -146,7 +146,7 @@ impl TelegramCommandListener {
                     }
                 }
                 Err(e) => {
-                    debug!(error = %e, "getUpdates failed — retrying in 5s");
+                    warn!(error = %e, "getUpdates failed — retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
@@ -206,6 +206,7 @@ fn handle_message(
     let reply = match cmd {
         "trades" => handlers::handle_trades(args, notify_flags),
         "summary" => handlers::handle_summary(args, notify_flags),
+        "diag" => handlers::handle_diag(args, notify_flags),
         "stop" => handlers::handle_stop(ingestor_tx),
         "set" => handlers::handle_set(args, ingestor_tx),
         "config" => handlers::handle_config(args),
@@ -227,7 +228,7 @@ async fn poll_updates(
     last_update_id: &mut i64,
 ) -> anyhow::Result<Vec<TelegramMessage>> {
     let path = format!(
-        "/bot{}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\"]",
+        "/bot{}/getUpdates?offset={}&timeout=30&allowed_updates=%5B%22message%22%5D",
         bot_token,
         *last_update_id + 1
     );

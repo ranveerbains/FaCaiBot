@@ -313,6 +313,20 @@ fn handle_sbe_message(
                     }
                     SpikeEvent::None => {}
                 }
+
+                // Emit spike diagnostics when the 60s gate fires.
+                if let Some(snap) = detector.take_diagnostic() {
+                    let _ = tx.try_send(IngestorEvent::SpikeDiagnostic {
+                        atr: snap.atr,
+                        threshold: snap.threshold,
+                        mid: snap.mid,
+                        candidates: snap.candidates,
+                        rej_momentum: snap.rej_momentum,
+                        rej_magnitude: snap.rej_magnitude,
+                        confirmed: snap.confirmed,
+                        stale: snap.stale,
+                    });
+                }
             }
 
             if tx.try_send(IngestorEvent::BinanceDepth(depth)).is_err() {

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct NotifyFlags {
     pub trades_enabled: AtomicBool,
     pub summary_enabled: AtomicBool,
+    pub diagnostics_enabled: AtomicBool,
 }
 
 impl NotifyFlags {
@@ -14,6 +15,7 @@ impl NotifyFlags {
         Self {
             trades_enabled: AtomicBool::new(true),
             summary_enabled: AtomicBool::new(true),
+            diagnostics_enabled: AtomicBool::new(false),
         }
     }
 
@@ -23,6 +25,10 @@ impl NotifyFlags {
 
     pub fn summary_on(&self) -> bool {
         self.summary_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn diagnostics_on(&self) -> bool {
+        self.diagnostics_enabled.load(Ordering::Relaxed)
     }
 }
 

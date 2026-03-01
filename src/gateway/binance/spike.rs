@@ -32,6 +32,21 @@ pub enum SpikeEvent {
     Failed { timestamp_ms: u64 },
 }
 
+// ─── SpikeDiagSnapshot ───────────────────────────────────────────────────────
+
+/// Snapshot of spike detector diagnostics, emitted every 60s.
+#[derive(Debug, Clone)]
+pub struct SpikeDiagSnapshot {
+    pub atr: f64,
+    pub threshold: f64,
+    pub mid: f64,
+    pub candidates: u64,
+    pub rej_momentum: u64,
+    pub rej_magnitude: u64,
+    pub confirmed: u64,
+    pub stale: u64,
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// ATR warmup period: no spikes emitted until this many samples have been seen.
@@ -79,6 +94,9 @@ pub struct SpikeDetector {
     diag_below_magnitude: u64,
     diag_confirmed: u64,
     last_diag_log_ms: u64,
+
+    /// Pending diagnostic snapshot, set when the 60s gate fires in `update()`.
+    pending_diag: Option<SpikeDiagSnapshot>,
 }
 
 impl SpikeDetector {
@@ -103,6 +121,7 @@ impl SpikeDetector {
             diag_below_magnitude: 0,
             diag_confirmed: 0,
             last_diag_log_ms: 0,
+            pending_diag: None,
         }
     }
 
@@ -134,9 +153,11 @@ impl SpikeDetector {
 
         // ── Periodic diagnostic log (every 60s) ─────────────────────
         if now_ms.saturating_sub(self.last_diag_log_ms) >= 60_000 {
+            let atr_val = self.ema_atr;
+            let threshold_val = self.multiplier * atr_val.max(1e-10);
             info!(
-                atr = format!("{:.2}", self.ema_atr),
-                threshold = format!("{:.2}", self.multiplier * self.ema_atr.max(1e-10)),
+                atr = format!("{:.2}", atr_val),
+                threshold = format!("{:.2}", threshold_val),
                 mid = format!("{:.2}", mid),
                 candidates = self.diag_candidates_started,
                 rej_momentum = self.diag_fading_momentum,
@@ -145,6 +166,16 @@ impl SpikeDetector {
                 stale = self.stale_count,
                 "spike 60s"
             );
+            self.pending_diag = Some(SpikeDiagSnapshot {
+                atr: atr_val,
+                threshold: threshold_val,
+                mid,
+                candidates: self.diag_candidates_started,
+                rej_momentum: self.diag_fading_momentum,
+                rej_magnitude: self.diag_below_magnitude,
+                confirmed: self.diag_confirmed,
+                stale: self.stale_count,
+            });
             self.last_diag_log_ms = now_ms;
         }
 
@@ -308,6 +339,11 @@ impl SpikeDetector {
         self.spike_direction = None;
         self.spike_origin_mid = 0.0;
         self.spike_peak_delta = 0.0;
+    }
+
+    /// Take the pending diagnostic snapshot (if the 60s gate fired since the last call).
+    pub fn take_diagnostic(&mut self) -> Option<SpikeDiagSnapshot> {
+        self.pending_diag.take()
     }
 
     /// Record a discarded stale event. Count is included in the next "spike 60s" log.

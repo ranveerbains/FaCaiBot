@@ -187,6 +187,11 @@ async fn async_main() -> Result<()> {
         Mode::Live => "live",
         Mode::Simulation => "simulation",
     };
+    // TLS connector + credentials for diagnostic Telegram forwarding from engine loop.
+    let diag_tls = crate::reporting::telegram::build_tls_connector();
+    let diag_bot_token = config.telegram_bot_token.clone();
+    let diag_chat_id = config.telegram_chat_id.clone();
+
     let engine_handle = tokio::spawn(async move {
         let mut engine = StrategyEngine::new(&engine_config);
 
@@ -474,7 +479,19 @@ async fn async_main() -> Result<()> {
                 break;
             }
 
-            engine.check_diagnostic();
+            if let Some(diag_msg) = engine.check_diagnostic()
+                && engine_notify_flags.diagnostics_on()
+            {
+                let tls = diag_tls.clone();
+                let token = diag_bot_token.clone();
+                let chat = diag_chat_id.clone();
+                tokio::spawn(async move {
+                    let _ = crate::reporting::telegram::post_telegram_message(
+                        &tls, &token, &chat, &diag_msg,
+                    )
+                    .await;
+                });
+            }
 
             // Publish engine status every 5 seconds for /status command.
             if now_ms.saturating_sub(last_status_publish_ms) >= 5_000 {

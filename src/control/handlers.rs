@@ -38,6 +38,21 @@ pub fn handle_summary(args: &str, flags: &Arc<NotifyFlags>) -> String {
     }
 }
 
+/// Handle `/diag on|off`.
+pub fn handle_diag(args: &str, flags: &Arc<NotifyFlags>) -> String {
+    match args.trim().to_lowercase().as_str() {
+        "on" => {
+            flags.diagnostics_enabled.store(true, Ordering::Relaxed);
+            "Diagnostic forwarding enabled.".into()
+        }
+        "off" => {
+            flags.diagnostics_enabled.store(false, Ordering::Relaxed);
+            "Diagnostic forwarding disabled.".into()
+        }
+        _ => "Usage: /diag on|off".into(),
+    }
+}
+
 /// Handle `/stop`. Sends Shutdown event to engine via ingestor channel.
 /// Returns the initial reply text. Progress updates come via DrainStatus watch.
 pub fn handle_stop(ingestor_tx: &Sender<IngestorEvent>) -> String {
@@ -151,6 +166,7 @@ pub fn handle_status(status: &BotStatus) -> String {
 pub fn handle_help() -> String {
     "/trades on|off — Toggle trade notifications\n\
      /summary on|off — Toggle market summary notifications\n\
+     /diag on|off — Toggle 60s diagnostic forwarding\n\
      /stop — Graceful shutdown (drains open position)\n\
      /set <param> <value> — Update config + restart\n\
      /config [section] — Show current config\n\

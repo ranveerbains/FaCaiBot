@@ -34,6 +34,21 @@ use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
 };
 
+// ─── Spike diagnostic snapshot (stored from SpikeDiagnostic event) ───────────
+
+/// Lightweight copy of spike detector diagnostics for Telegram forwarding.
+#[derive(Debug, Clone)]
+struct SpikeDiagData {
+    atr: f64,
+    threshold: f64,
+    mid: f64,
+    candidates: u64,
+    rej_momentum: u64,
+    rej_magnitude: u64,
+    confirmed: u64,
+    stale: u64,
+}
+
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
 
 /// EMA alpha for avg_book_depth smoothing (0.1).
@@ -92,6 +107,9 @@ pub struct StrategyEngine {
     /// During emergency mode, `evaluate_leg2()` skips evaluation if this is `false`
     /// (Binance ticks can't change the Polymarket book, so re-evaluation is pointless).
     hedge_book_changed: bool,
+
+    /// Latest spike detector diagnostics (received via `SpikeDiagnostic` event).
+    last_spike_diag: Option<SpikeDiagData>,
 
     // ── Diagnostic counters (cumulative from app start, logged every 60s) ──
     diag_markets_rotated: u64,
@@ -155,6 +173,7 @@ impl StrategyEngine {
             pending_spike_cancel: None,
             speculative_awaiting_sustain: false,
             hedge_book_changed: false,
+            last_spike_diag: None,
             diag_markets_rotated: 0,
             diag_spikes_received: 0,
             diag_spikes_dropped_cutoff: 0,
@@ -699,6 +718,29 @@ impl StrategyEngine {
                 }
             },
 
+            // ── Spike diagnostic snapshot (for Telegram forwarding) ────
+            IngestorEvent::SpikeDiagnostic {
+                atr,
+                threshold,
+                mid,
+                candidates,
+                rej_momentum,
+                rej_magnitude,
+                confirmed,
+                stale,
+            } => {
+                self.last_spike_diag = Some(SpikeDiagData {
+                    atr,
+                    threshold,
+                    mid,
+                    candidates,
+                    rej_momentum,
+                    rej_magnitude,
+                    confirmed,
+                    stale,
+                });
+            }
+
             // Control events are handled in main.rs before on_event() is called.
             IngestorEvent::Shutdown | IngestorEvent::DrainAndRestart => {}
         }
@@ -957,15 +999,17 @@ impl StrategyEngine {
     // ─── Diagnostic ─────────────────────────────────────────────────────
 
     /// Log cumulative engine diagnostics every 60 seconds.
+    /// Returns a formatted diagnostic message when the 60s gate fires (for Telegram
+    /// forwarding), or `None` otherwise.
     /// Call this once per engine loop iteration (cheap — checks timestamp first).
-    pub fn check_diagnostic(&mut self) {
+    pub fn check_diagnostic(&mut self) -> Option<String> {
         let now_ms = now_epoch_ms();
         if self.last_diag_ms == 0 {
             self.last_diag_ms = now_ms;
-            return;
+            return None;
         }
         if now_ms.saturating_sub(self.last_diag_ms) < 60_000 {
-            return;
+            return None;
         }
         info!(
             markets = self.diag_markets_rotated,
@@ -989,6 +1033,45 @@ impl StrategyEngine {
             "engine 60s"
         );
         self.last_diag_ms = now_ms;
+
+        // Build combined Telegram message (spike + engine).
+        let spike_section = if let Some(ref s) = self.last_spike_diag {
+            format!(
+                "Spike: ATR={:.2} thr={:.2} mid={:.2}\n  \
+                 cand={} rej_mom={} rej_mag={} conf={} stale={}",
+                s.atr, s.threshold, s.mid,
+                s.candidates, s.rej_momentum, s.rej_magnitude, s.confirmed, s.stale,
+            )
+        } else {
+            "Spike: (no data yet)".to_string()
+        };
+
+        let msg = format!(
+            "Diagnostics (60s)\n\n\
+             {spike}\n\n\
+             Engine: mkts={mkts} spikes={spikes} spike_fail={spike_fail}\n  \
+             rej: busy={busy} spread={spread} depth={depth} skew={skew} stale={stale} hedge={hedge}\n  \
+             leg1: sig={sig} fill={fill} timeout={timeout}\n  \
+             leg2: erosion={erosion} fill={l2fill} emergency={emergency}",
+            spike = spike_section,
+            mkts = self.diag_markets_rotated,
+            spikes = self.diag_spikes_received,
+            spike_fail = self.diag_spike_failures,
+            busy = self.diag_rej_busy,
+            spread = self.diag_rej_spread,
+            depth = self.diag_rej_depth,
+            skew = self.diag_rej_skew,
+            stale = self.diag_rej_stale,
+            hedge = self.diag_rej_hedge,
+            sig = self.diag_leg1_signals,
+            fill = self.diag_leg1_fills,
+            timeout = self.diag_leg1_timeouts,
+            erosion = self.diag_leg2_erosion_steps,
+            l2fill = self.diag_leg2_fills,
+            emergency = self.diag_emergencies,
+        );
+
+        Some(msg)
     }
 
     // ─── Accessors and Executor callbacks ────────────────────────────────

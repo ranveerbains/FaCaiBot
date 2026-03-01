@@ -107,7 +107,7 @@ max_alloc_per_trade = 10
 
 # Fraction of max_alloc_per_trade for each confidence tier.
 # alloc = max(round(max_alloc_per_trade × tier_pct), 1)
-high_alloc_pct = 1.00   # HIGH confidence bets the full max
+high_alloc_pct = 1  # HIGH confidence bets the full max
 med_alloc_pct  = 0.50   # MED bets half
 low_alloc_pct  = 0.25   # LOW bets a quarter
 

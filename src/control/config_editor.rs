@@ -163,7 +163,7 @@ pub fn read_config_section(path: &Path, section: &str) -> Result<String> {
 
     let mut out = format!("[{section}]\n");
     for (key, value) in table {
-        out.push_str(&format!("  {} = {}\n", key, format_toml_value(value)));
+        out.push_str(&format!("  {section}.{key} = {}\n", format_toml_value(value)));
     }
     Ok(out)
 }
@@ -183,7 +183,7 @@ pub fn read_config_all(path: &Path) -> Result<String> {
             if let Some(inner) = item.as_table() {
                 out.push_str(&format!("[{section_name}]\n"));
                 for (key, value) in inner {
-                    out.push_str(&format!("  {} = {}\n", key, format_toml_value(value)));
+                    out.push_str(&format!("  {section_name}.{key} = {}\n", format_toml_value(value)));
                 }
                 out.push('\n');
             }
