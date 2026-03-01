@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::control::handlers;
 use crate::control::types::{BotStatus, DrainStatus, NotifyFlags};
+use crate::control::wallet;
 use crate::reporting::telegram::{TELEGRAM_HOST, post_telegram_message};
 use crate::types::market::IngestorEvent;
 
@@ -133,7 +134,8 @@ impl TelegramCommandListener {
                             &notify_flags,
                             &ingestor_tx,
                             &status_rx,
-                        );
+                        )
+                        .await;
                         if let Some(reply_text) = reply {
                             let _ = post_telegram_message(
                                 &tls_connector,
@@ -162,7 +164,7 @@ impl TelegramCommandListener {
 
 /// Process a single incoming message: auth check, parse command, dispatch.
 /// Returns the reply text, or None if the message should be ignored.
-fn handle_message(
+async fn handle_message(
     msg: &TelegramMessage,
     allowed_user_id: i64,
     chat_id: &str,
@@ -214,6 +216,9 @@ fn handle_message(
             let status = status_rx.borrow().clone();
             handlers::handle_status(&status)
         }
+        "balance" => wallet::handle_balance().await,
+        "polybalance" => wallet::handle_polybalance().await,
+        "redeem" => wallet::handle_redeem().await,
         "help" => handlers::handle_help(),
         _ => format!("Unknown command: /{cmd}. Send /help for usage."),
     };

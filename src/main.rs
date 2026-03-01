@@ -591,6 +591,18 @@ async fn async_main() -> Result<()> {
         info!(user_id, "command listener spawned");
     }
 
+    // ── Auto-Redeem (every 24h) ────────────────────────────────────────
+    {
+        let redeem_tls = crate::reporting::telegram::build_tls_connector();
+        let redeem_bot_token = config.telegram_bot_token.clone();
+        let redeem_chat_id = config.telegram_chat_id.clone();
+        tokio::spawn(crate::control::wallet::auto_redeem_loop(
+            redeem_tls,
+            redeem_bot_token,
+            redeem_chat_id,
+        ));
+    }
+
     // ── Wait ─────────────────────────────────────────────────────────
     // The ingestor runs on a dedicated OS thread; the other two are tokio tasks.
     let _ = engine_handle.await;

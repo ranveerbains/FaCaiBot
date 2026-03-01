@@ -40,7 +40,7 @@ sustain_ms = 300
 # 0.005 = 0.5 bps = ~$3.24 at BTC $65K.  (old value)
 # 0.015 = 1.5 bps = ~$9.70 at BTC $65K.  (new value — filters marginal moves)
 # 0.030 = 3.0 bps = ~$19.5 at BTC $65K.
-min_magnitude_pct = 0.015
+min_magnitude_pct = 0.01
 
 # At sustain time, current displacement must be >= this fraction of peak displacement.
 # Filters "fading spikes" where the price spiked but is already retracing.
@@ -80,7 +80,7 @@ binance_stale_event_ms = 150
 
 # Maximum age (ms) of the Polymarket orderbook snapshot before blocking entry.
 # If the book data is older than this, it's considered stale and unreliable.
-stale_book_ms = 250
+stale_book_ms = 500
 
 # Maximum YES mid price before blocking entry (mirrors minimum as 1 - max_price_skew).
 # Prevents trading in near-certain-resolution markets where one side is illiquid.
@@ -93,7 +93,7 @@ max_price_skew = 0.85
 # In sim mode, fills are near-instant so this rarely fires. Essential for live mode
 # where real CLOB queue priority means fills can take much longer.
 # 5000 = cancel after 5 seconds if not filled.
-leg1_timeout_ms = 1000
+leg1_timeout_ms = 2000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAPITAL

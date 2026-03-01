@@ -171,6 +171,9 @@ pub fn handle_help() -> String {
      /set <param> <value> — Update config + restart\n\
      /config [section] — Show current config\n\
      /status — Bot status and counters\n\
+     /balance — Wallet balance (USDC.e + POL)\n\
+     /polybalance — Polymarket positions and value\n\
+     /redeem — Redeem resolved positions to USDC.e\n\
      /help — This message"
         .into()
 }
