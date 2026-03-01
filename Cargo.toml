@@ -14,7 +14,7 @@ polymarket-client-sdk = { version = "0.4", features = ["clob"] }
 uuid = "1"
 
 # EVM / Polygon interactions, EIP-712 signing
-alloy = { version = "1.7", features = ["signers", "signer-local"] }
+alloy = { version = "1.7", features = ["signers", "signer-local", "providers", "transport-http", "network", "contract", "sol-types"] }
 
 # Low-latency SIMD-accelerated WebSocket client
 fastwebsockets = { version = "0.10", features = ["upgrade"] }

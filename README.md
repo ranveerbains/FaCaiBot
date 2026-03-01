@@ -20,7 +20,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-  ec2-user@ec2-13-40-175-179.eu-west-2.compute.amazonaws.com
+  ec2-user@ec2-54-75-122-253.eu-west-1.compute.amazonaws.com
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server.
@@ -29,7 +29,7 @@ ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
 
 ```bash
 sudo yum install -y git
-git clone git@github.com:ranveerbains/FaCaiBot.git
+git clone https://github.com/ranveerbains/FaCaiBot.git
 cd FaCaiBot
 
 sudo bash deploy/setup.sh     # installs Rust, Docker, QuestDB, systemd unit (~5-10 min)
@@ -100,6 +100,9 @@ Verifies your credentials and on-chain approvals work before going live.
 cd ~/FaCaiBot
 cp /opt/facaibot/.env .env
 cargo run --example smoke_test_clob
+#if it doesnt work try this
+  ln -s /opt/facaibot/.env .env
+  cargo run --example smoke_test_clob
 ```
 
 Expected output: `=== SMOKE TEST PASSED ===`
