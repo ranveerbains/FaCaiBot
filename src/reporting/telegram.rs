@@ -694,7 +694,7 @@ mod formatter {
             \n\
             {trade_lines}\n\
             \n\
-            Allocation used: ${alloc:.0} / ${cap:.0} ({alloc_pct:.0}%)\n\
+            Allocation used: ${alloc:.2} / ${cap:.2} ({alloc_pct:.0}%)\n\
             Taker fees paid: {fee_label}\n\
             Gross market PnL: {gross_sign}${gross:.4}\n\
             Net market PnL: {net_label}\n\
