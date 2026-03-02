@@ -205,15 +205,18 @@ impl Leg1Evaluator {
                 (yes_b, Decimal::ONE - yes_ask, Decimal::ONE - yes_bid)
             }
         };
-        // Read opposing book's best ask for hedge feasibility check.
+        // Read opposing book's best bid for hedge feasibility check.
+        // Leg 2 is a maker order (posted to the book), not a taker — so the opposing
+        // best bid is the relevant price. Using best ask would over-reject because
+        // ask-side prices include the vig.
         // No poly_book fallback — poly_book holds the LAST book received (any side)
         // and could be the entry-side book, causing a false rejection.
-        let opposing_best_ask: Option<Decimal> = {
+        let opposing_best_bid: Option<Decimal> = {
             let opposing_book = match direction {
                 Direction::Up => state.poly_no_book.as_ref(),
                 Direction::Down => state.poly_yes_book.as_ref(),
             };
-            opposing_book.and_then(|b| b.best_ask()).map(|a| a.price)
+            opposing_book.and_then(|b| b.best_bid()).map(|b| b.price)
         };
 
         let reference_price = match state.binance_price {
@@ -347,8 +350,8 @@ impl Leg1Evaluator {
         let bot_contested = wall.is_some();
         if let Some(wall_price) = wall.filter(|&wp| wp >= bid_price) {
             let outbid = round_to_tick(wall_price + tick, tick);
-            let outbid_feasible = match opposing_best_ask {
-                Some(opp_ask) => outbid + opp_ask <= Decimal::ONE,
+            let outbid_feasible = match opposing_best_bid {
+                Some(opp_bid) => outbid + opp_bid <= Decimal::ONE,
                 None => true,
             };
             if outbid_feasible && outbid < best_ask_price {
@@ -358,8 +361,9 @@ impl Leg1Evaluator {
         }
 
         // Hedge feasibility: reject if pair cost exceeds $1.00 (guaranteed loss).
-        if let Some(opp_ask) = opposing_best_ask.filter(|&a| bid_price + a > Decimal::ONE) {
-            debug!(%bid_price, %opp_ask, pair_cost = %(bid_price + opp_ask),
+        // Uses opposing best bid (not ask) because Leg 2 is a maker order.
+        if let Some(opp_bid) = opposing_best_bid.filter(|&b| bid_price + b > Decimal::ONE) {
+            debug!(%bid_price, %opp_bid, pair_cost = %(bid_price + opp_bid),
                 "evaluate() BLOCKED: hedge infeasible — pair cost > $1.00");
             return Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible);
         }
@@ -1370,11 +1374,11 @@ mod tests {
 
     /// Build a minimal MarketState suitable for Leg 1 hedge feasibility tests.
     /// Sets spike_detected=true, both YES and NO books, active tokens, and a spike
-    /// in the given direction. `no_ask_opt` controls the NO book's ask (None = no NO book).
+    /// in the given direction. `no_bid_opt` controls the NO book's bid (None = no NO book).
     fn make_market_state(
         yes_bid: &str,
         yes_ask: &str,
-        no_ask_opt: Option<&str>,
+        no_bid_opt: Option<&str>,
         direction: Direction,
     ) -> (MarketState, Leg1Evaluator) {
         let tick = Decimal::new(1, 2);
@@ -1393,8 +1397,8 @@ mod tests {
             timestamp_ms: now_ms,
         };
 
-        let no_book = no_ask_opt.map(|no_ask| {
-            let no_bid_price = Decimal::ONE - yes_ask.parse::<Decimal>().unwrap();
+        let no_book = no_bid_opt.map(|no_bid| {
+            let no_bid_price: Decimal = no_bid.parse().unwrap();
             OrderBook {
                 asset_id: "no".to_string(),
                 bids: vec![PriceLevel {
@@ -1402,7 +1406,7 @@ mod tests {
                     size: Decimal::new(500, 0),
                 }],
                 asks: vec![PriceLevel {
-                    price: no_ask.parse().unwrap(),
+                    price: no_bid_price + Decimal::new(2, 2),
                     size: Decimal::new(500, 0),
                 }],
                 timestamp_ms: now_ms,
@@ -1455,7 +1459,7 @@ mod tests {
 
     #[test]
     fn test_hedge_infeasible_rejects_underwater_pair() {
-        // YES bid=0.50/ask=0.52, NO ask=0.52 → bid_price=0.51, pair=0.51+0.52=1.03 > 1.0
+        // YES bid=0.50/ask=0.52, NO bid=0.52 → bid_price=0.51, pair=0.51+0.52=1.03 > 1.0
         let (state, evaluator) = make_market_state("0.50", "0.52", Some("0.52"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
@@ -1466,8 +1470,8 @@ mod tests {
 
     #[test]
     fn test_hedge_feasible_allows_profitable_pair() {
-        // YES bid=0.10/ask=0.12, NO ask=0.80 → bid_price=0.11, pair=0.11+0.80=0.91 → allow
-        let (state, evaluator) = make_market_state("0.10", "0.12", Some("0.80"), Direction::Up);
+        // YES bid=0.10/ask=0.12, NO bid=0.30 → bid_price=0.11, pair=0.11+0.30=0.41 → allow
+        let (state, evaluator) = make_market_state("0.10", "0.12", Some("0.30"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
             matches!(result, Leg1Outcome::Signal(_)),
@@ -1477,8 +1481,8 @@ mod tests {
 
     #[test]
     fn test_hedge_exact_dollar_allowed() {
-        // bid_price + opp_ask = exactly 1.00 → allowed (strict >).
-        // YES bid=0.49/ask=0.52, NO ask=0.50 → bid_price=0.50, pair=0.50+0.50=1.00
+        // bid_price + opp_bid = exactly 1.00 → allowed (strict >).
+        // YES bid=0.49/ask=0.52, NO bid=0.50 → bid_price=0.50, pair=0.50+0.50=1.00
         let (state, evaluator) = make_market_state("0.49", "0.52", Some("0.50"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
@@ -1500,8 +1504,8 @@ mod tests {
 
     #[test]
     fn test_hedge_direction_down() {
-        // Spike Down → buying NO. NO bid=0.50/ask=0.52, YES ask=0.52
-        // Opposing book = YES book. YES ask = 0.52.
+        // Spike Down → buying NO. NO bid=0.50/ask=0.52, YES bid=0.52
+        // Opposing book = YES book. YES bid = 0.52.
         // NO bid=0.50 → bid_price=0.51, pair=0.51+0.52=1.03 > 1.0 → reject
         let tick = Decimal::new(1, 2);
         let now_ms = 100_000u64;
@@ -1509,11 +1513,11 @@ mod tests {
         let yes_book = OrderBook {
             asset_id: "yes".to_string(),
             bids: vec![PriceLevel {
-                price: Decimal::new(48, 2),
+                price: Decimal::new(52, 2),
                 size: Decimal::new(500, 0),
             }],
             asks: vec![PriceLevel {
-                price: Decimal::new(52, 2),
+                price: Decimal::new(54, 2),
                 size: Decimal::new(500, 0),
             }],
             timestamp_ms: now_ms,
@@ -1576,15 +1580,15 @@ mod tests {
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), now_ms);
         assert!(
             matches!(result, Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible)),
-            "Direction::Down should check YES ask as opposing book, got: {result:?}"
+            "Direction::Down should check YES bid as opposing book, got: {result:?}"
         );
     }
 
     #[test]
     fn test_hedge_one_tick_over_rejected() {
         // Pair cost just barely over $1.00 — should be rejected.
-        // YES bid=0.50/ask=0.52, NO ask=0.51 → bid_price=0.51, pair=0.51+0.51=1.02 > 1.0
-        let (state, evaluator) = make_market_state("0.50", "0.52", Some("0.51"), Direction::Up);
+        // YES bid=0.50/ask=0.52, NO bid=0.50 → bid_price=0.51, pair=0.51+0.50=1.01 > 1.0
+        let (state, evaluator) = make_market_state("0.50", "0.52", Some("0.50"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
             matches!(result, Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible)),
