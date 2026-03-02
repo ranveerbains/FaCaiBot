@@ -26,7 +26,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.max_price_skew", min: 0.5, max: 0.99 },
     ParamSpec { name: "entry_guards.leg1_timeout_ms", min: 500.0, max: 30000.0 },
     // capital
-    ParamSpec { name: "capital.max_alloc_per_trade", min: 1.0, max: 10000.0 },
+    ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
     ParamSpec { name: "capital.high_alloc_pct", min: 0.01, max: 1.0 },
     ParamSpec { name: "capital.med_alloc_pct", min: 0.01, max: 1.0 },
     ParamSpec { name: "capital.low_alloc_pct", min: 0.01, max: 1.0 },

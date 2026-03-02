@@ -292,8 +292,8 @@ impl Leg1Evaluator {
             ProfitTier::Low => self.low_alloc_pct,
         };
         let alloc = (self.max_alloc_per_trade * tier_pct)
-            .round_dp(0)
-            .max(Decimal::ONE);
+            .round_dp(2)
+            .max(Decimal::new(1, 2));
 
         // Guard: liquidity
         let required_depth = if !best_bid_price.is_zero() {
@@ -348,7 +348,7 @@ impl Leg1Evaluator {
         if let Some(wall_price) = wall.filter(|&wp| wp >= bid_price) {
             let outbid = round_to_tick(wall_price + tick, tick);
             let outbid_feasible = match opposing_best_ask {
-                Some(opp_ask) => outbid + opp_ask <= Decimal::ONE,
+                Some(opp_ask) => outbid + opp_ask <= Decimal::ONE - target_pct,
                 None => true,
             };
             if outbid_feasible && outbid < best_ask_price {
@@ -357,11 +357,11 @@ impl Leg1Evaluator {
             }
         }
 
-        // Hedge feasibility: reject if pair cost at current opposing ask is already underwater.
-        // Best-case Leg 2 fill = opposing_ask - tick, so reject only when strictly > $1.00.
-        if let Some(opp_ask) = opposing_best_ask.filter(|&a| bid_price + a > Decimal::ONE) {
-            debug!(%bid_price, %opp_ask, pair_cost = %(bid_price + opp_ask),
-                "evaluate() BLOCKED: hedge infeasible — pair cost > $1.00");
+        // Hedge feasibility: reject if pair cost at current opposing ask leaves insufficient margin.
+        // Requires at least target_pct headroom: bid + opp_ask must be <= $1.00 - target_pct.
+        if let Some(opp_ask) = opposing_best_ask.filter(|&a| bid_price + a > Decimal::ONE - target_pct) {
+            debug!(%bid_price, %opp_ask, pair_cost = %(bid_price + opp_ask), %target_pct,
+                "evaluate() BLOCKED: hedge infeasible — pair cost > $1.00 - target_pct");
             return Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible);
         }
 
@@ -629,12 +629,13 @@ impl Leg2Evaluator {
         // ── Break-even breach (after first erosion step) ─────────────────
         // Only fire after at least one erosion step has completed (~3.5s).
         // This gives the Polymarket book time to react to spike momentum.
-        // Triggers when pair cost (leg1 + opposing ask) >= $1.00 — position is unprofitable.
+        // Triggers when pair cost (leg1 + opposing ask) exceeded $1.00 — position is losing.
+        // At exactly $1.00 (break-even), the emergency exit often fills WORSE, so strict >.
         // Uses post-only pricing (best_ask - tick), consistent with all other emergencies.
         // FOK fallback after emergency_deadline_ms (via price-chase block).
         if snap.steps_applied >= 1 {
             if let Some(ask_price) = best_ask_price {
-                if leg1_price + ask_price >= Decimal::ONE {
+                if leg1_price + ask_price > Decimal::ONE {
                     let price = round_to_tick(ask_price - tick, tick);
                     let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
                     if fok_size <= Decimal::ZERO {
@@ -1476,14 +1477,28 @@ mod tests {
     }
 
     #[test]
-    fn test_hedge_exact_dollar_allowed() {
-        // bid_price + opp_ask = exactly 1.00 → allowed (best-case profit = 1 tick/share)
-        // YES bid=0.49/ask=0.52, NO ask=0.50 → bid_price=0.50, pair=0.50+0.50=1.00 → allow
+    fn test_hedge_exact_dollar_rejected_by_buffer() {
+        // bid_price + opp_ask = exactly 1.00, but buffer requires headroom of target_pct.
+        // YES bid=0.49/ask=0.52, NO ask=0.50 → bid_price=0.50, pair=0.50+0.50=1.00
+        // HIGH tier (confidence=0.8) → target_pct=0.025 → threshold=0.975 → 1.00 > 0.975 → reject
         let (state, evaluator) = make_market_state("0.49", "0.52", Some("0.50"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
+            matches!(result, Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible)),
+            "pair cost $1.00 should be rejected by margin buffer, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hedge_within_buffer_allowed() {
+        // Pair cost under the buffer threshold → allowed.
+        // YES bid=0.46/ask=0.48, NO ask=0.50 → bid_price=0.47, pair=0.47+0.50=0.97
+        // HIGH tier → target_pct=0.025 → threshold=0.975 → 0.97 <= 0.975 → allow
+        let (state, evaluator) = make_market_state("0.46", "0.48", Some("0.50"), Direction::Up);
+        let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
+        assert!(
             matches!(result, Leg1Outcome::Signal(_)),
-            "should allow when pair cost == $1.00 (strict >), got: {result:?}"
+            "pair cost $0.97 should be allowed (under buffer threshold), got: {result:?}"
         );
     }
 

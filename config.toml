@@ -11,17 +11,17 @@ atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
 # Minimum spike magnitude in bps (0.0125 = 1.25 bps)
-min_magnitude_pct = 0.0125
+min_magnitude_pct = 0.02
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
 [entry_guards]
 # Maximum bid-ask spread in dollars
-max_spread = 0.025
+max_spread = 0.02
 # Minimum book depth as fraction of trade size
 depth_min_pct = 0.20
 # No entries within this many seconds of market expiry
-entry_cutoff_secs = 50
+entry_cutoff_secs = 40
 # Max age (ms) of Binance SBE event before discard
 binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
@@ -43,11 +43,11 @@ low_alloc_pct = 0.3
 # Score >= this → HIGH tier (max score 0.8)
 high_threshold = 0.5
 # Score >= this → MED tier, below → LOW
-med_threshold = 0.3
+med_threshold = 0.35
 # Profit target % for HIGH tier
-high_target_pct = 0.03
+high_target_pct = 0.04
 # Profit target % for MED tier
-med_target_pct = 0.02
+med_target_pct = 0.03
 # Profit target % for LOW tier
 low_target_pct = 0.010
 

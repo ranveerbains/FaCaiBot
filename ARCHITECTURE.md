@@ -157,13 +157,13 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 | No Binance price | `binance_price` absent | — |
 | Stale book | book age > `stale_book_ms` (500ms) | — |
 | Price skew | YES mid > 0.80 or < 0.20 | Near-certain-resolution, Leg 2 fill collapses |
-| Spread | > `max_spread` ($0.025) | Dollar-based, consistent across tick sizes |
+| Spread | > `max_spread` ($0.02) | Dollar-based, consistent across tick sizes |
 | Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Depth | < `depth_min_pct` (20%) of required | — |
-| Hedge feasibility | `bid_price + opposing_best_ask > $1.00` | Pair already underwater at current opposing book |
+| Hedge feasibility | `bid_price + opposing_best_ask > $1.00 - target_pct` | Pair lacks minimum profit margin at current opposing book |
 
-**Bidding**: `round_to_tick(best_bid + tick, tick)` → smart outbid walls by 1 tick (>4x avg depth, capped by hedge feasibility) → hedge feasibility guard. Submit GTC, post_only=true.
+**Bidding**: `round_to_tick(best_bid + tick, tick)` → smart outbid walls by 1 tick (>4x avg depth, capped by hedge feasibility with margin buffer) → hedge feasibility guard. Submit GTC, post_only=true.
 
 **Sizing**: Confidence-weighted allocation (see Section 5).
 
@@ -177,13 +177,13 @@ Triggered when Leg 1 fills. In live mode, fills arrive via User WS `TradeStatusU
 
 **Step sizes** — front-loaded using triangle weights `[5, 4, 3, 2, 1]` (sum=15). Early steps give up more margin (higher chance of fill at a good price); later steps give up less:
 
-| Step | Weight | % of margin | HIGH (2.5%) | MED (1.5%) | LOW (1.0%) |
-|------|--------|-------------|-------------|------------|------------|
-| 1 | 5/15 | 33.3% | 0.83% | 0.50% | 0.33% |
-| 2 | 4/15 | 26.7% | 0.67% | 0.40% | 0.27% |
-| 3 | 3/15 | 20.0% | 0.50% | 0.30% | 0.20% |
-| 4 | 2/15 | 13.3% | 0.33% | 0.20% | 0.13% |
-| 5 | 1/15 | 6.7% | 0.17% | 0.10% | 0.07% |
+| Step | Weight | % of margin | HIGH (4%) | MED (3%) | LOW (1%) |
+|------|--------|-------------|-----------|----------|----------|
+| 1 | 5/15 | 33.3% | 1.33% | 1.00% | 0.33% |
+| 2 | 4/15 | 26.7% | 1.07% | 0.80% | 0.27% |
+| 3 | 3/15 | 20.0% | 0.80% | 0.60% | 0.20% |
+| 4 | 2/15 | 13.3% | 0.53% | 0.40% | 0.13% |
+| 5 | 1/15 | 6.7% | 0.27% | 0.20% | 0.07% |
 
 **Intervals** — exponential decay: `interval_i = base × decay^i`. Early steps wait longer (market has time to fill); later steps fire faster (urgency):
 
@@ -206,7 +206,7 @@ Three independent exit paths triggered by different signals. All use a **price-i
 | Trigger | Condition | Timing |
 |---------|-----------|--------|
 | **Adverse movement** | Binance reversal > `adverse_threshold` (0.1%) from Binance price at Leg 1 fill | **Immediate** — zero grace period. Post-only first, price-chase until deadline |
-| **Break-even breach** | Pair cost (leg1 + opposing ask) >= $1.00 | **After first erosion step** (~3s). Gives Polymarket time to react to spike momentum |
+| **Break-even breach** | Pair cost (leg1 + opposing ask) > $1.00 | **After first erosion step** (~3s). Gives Polymarket time to react to spike momentum |
 | **Erosion exhausted** | All 5 erosion steps applied, profit target = 0. Cascade reached break-even without filling | **After step 5** (~5.8s). Auto-escalates as `BreakEvenBreach` emergency |
 | **Market expiry** | `MarketRotation` arrives while Leg 1 is Filled but Leg 2 incomplete | **At rotation** — last-resort FOK before state reset. Best-effort; CLOB may reject if market expired |
 
@@ -247,9 +247,9 @@ Max score: 0.8 (sustain removed — all confirmed spikes already passed the gate
 **Allocation**: `alloc = max(round(max_alloc_per_trade × tier_pct), $1)`
 | Confidence | Tier | Profit Target | Default tier_pct | Example ($10 max) |
 |------------|------|---------------|-------------------|-------------------|
-| ≥ 0.6 | HIGH | 2.5% | 100% | $10 |
-| ≥ 0.3 | MED | 1.5% | 50% | $5 |
-| < 0.3 | LOW | 1.0% | 25% | $3 |
+| ≥ 0.5 | HIGH | 4% | 100% | $10 |
+| ≥ 0.35 | MED | 3% | 50% | $5 |
+| < 0.35 | LOW | 1% | 25% | $3 |
 
 Minimum allocation is $1 regardless of tier. `max_alloc_per_trade` is the sole capital control; the wallet balance is the real constraint in live trading.
 

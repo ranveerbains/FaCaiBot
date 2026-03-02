@@ -107,11 +107,11 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 4 | **Binance price** | `binance_price` exists | `NoBinance` | Reference price needed |
 | 5 | **Stale book** | `book_age_ms > stale_book_ms` (500ms) | `StaleBook` | Stale data = unreliable pricing |
 | 6 | **Price skew** | YES mid > 0.80 or < 0.20 | `PriceSkewed` | Near-certain markets have illiquid sides |
-| 7 | **Spread** | `(ask - bid) > max_spread` ($0.025) | `SpreadWide` | Book too thin for reliable entry |
+| 7 | **Spread** | `(ask - bid) > max_spread` ($0.02) | `SpreadWide` | Book too thin for reliable entry |
 | 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
 | 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
 | 10 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
-| 11 | **Hedge feasibility** | `bid_price + opposing_best_ask > $1.00` | `HedgeInfeasible` | After pricing — checks opposing book for guaranteed loss |
+| 11 | **Hedge feasibility** | `bid_price + opposing_best_ask > $1.00 - target_pct` | `HedgeInfeasible` | After pricing — checks opposing book for insufficient profit margin |
 
 ### Direction-aware book selection
 
@@ -136,9 +136,9 @@ Max possible: **0.8**. The sustain factor was removed — all confirmed spikes a
 
 | Confidence | Tier | Profit Target | Default `tier_pct` | Example ($20 max) |
 |------------|------|---------------|--------------------|-------------------|
-| >= 0.6 | HIGH | 2.5% | 100% | $20 |
-| >= 0.3 | MED | 1.5% | 50% | $10 |
-| < 0.3 | LOW | 1.0% | 25% | $5 |
+| >= 0.5 | HIGH | 4% | 100% | $20 |
+| >= 0.35 | MED | 3% | 50% | $10 |
+| < 0.35 | LOW | 1% | 25% | $5 |
 
 ### Allocation
 
@@ -155,7 +155,7 @@ Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 s
 1. **Base bid:** `round_to_tick(best_bid + tick, tick)` — one tick above current best bid
 2. **Post-only cap:** If `bid_price >= best_ask`, cap at `best_ask - tick` (must not cross spread)
 3. **Smart outbidding:** If a depth wall is detected (single level with > 4x average depth), outbid it by 1 tick. Only if `outbid + opposing_best_ask <= $1.00` (hedge feasible) and below the ask
-4. **Hedge feasibility guard:** Checks `bid_price + opposing_best_ask > $1.00` → reject as `HedgeInfeasible`. Uses strict `>` (at exactly $1.00, best-case Leg 2 = opp_ask - tick → profitable by 1 tick). Missing opposing book = allow (Leg 2 evaluator gates later)
+4. **Hedge feasibility guard:** Checks `bid_price + opposing_best_ask > $1.00 - target_pct` → reject as `HedgeInfeasible`. Requires at least the profit target's worth of headroom at entry. Missing opposing book = allow (Leg 2 evaluator gates later)
 
 ### Fill models
 
@@ -183,13 +183,13 @@ When Leg 1 fills, the engine captures: fill timestamp, fill price, fill size, in
 
 Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15). Early steps give up more margin (higher chance of fill at a good price); later steps give up less:
 
-| Step | Weight | % of margin | HIGH (2.5%) | MED (1.5%) | LOW (1.0%) |
-|------|--------|-------------|-------------|------------|------------|
-| 0 | 5/15 | 33.3% | 0.833% | 0.500% | 0.333% |
-| 1 | 4/15 | 26.7% | 0.667% | 0.400% | 0.267% |
-| 2 | 3/15 | 20.0% | 0.500% | 0.300% | 0.200% |
-| 3 | 2/15 | 13.3% | 0.333% | 0.200% | 0.133% |
-| 4 | 1/15 | 6.7% | 0.167% | 0.100% | 0.067% |
+| Step | Weight | % of margin | HIGH (4%) | MED (3%) | LOW (1%) |
+|------|--------|-------------|-----------|----------|----------|
+| 0 | 5/15 | 33.3% | 1.333% | 1.000% | 0.333% |
+| 1 | 4/15 | 26.7% | 1.067% | 0.800% | 0.267% |
+| 2 | 3/15 | 20.0% | 0.800% | 0.600% | 0.200% |
+| 3 | 2/15 | 13.3% | 0.533% | 0.400% | 0.133% |
+| 4 | 1/15 | 6.7% | 0.267% | 0.200% | 0.067% |
 
 After all 5 steps: 100% of margin eroded → price is at break-even.
 
@@ -255,11 +255,11 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 ### 7b. Break-Even Breach
 
-**Trigger:** Pair cost has reached or exceeded $1.00 after first erosion step.
+**Trigger:** Pair cost has exceeded $1.00 after first erosion step.
 
 **Gates (all must be true):**
 1. `steps_applied >= 1` (at least one erosion step completed, ~3s after fill)
-2. `leg1_price + current_opposing_ask >= 1.0` (pair cost exceeds $1.00)
+2. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
 
 **Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
 
