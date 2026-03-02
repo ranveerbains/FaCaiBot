@@ -263,7 +263,7 @@ ORDER BY pair_cost_bucket;
 
 -- ============================================================
 -- 16. Trades where pair cost exceeded $1.00 (hedge infeasibility at fill time)
--- Maps to: entry_guards.max_spread, hedge feasibility guard
+-- Maps to: entry_guards.max_spread
 -- ============================================================
 SELECT
     direction,

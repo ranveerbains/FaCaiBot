@@ -1,4 +1,4 @@
-//! Heartbeat loop — sends `POST /heartbeat` every 5 seconds.
+//! Heartbeat loop — sends `POST /v1/heartbeats` every 5 seconds via SDK.
 //!
 //! Tracks consecutive failures and logs alerts on 2+ consecutive misses.
 //! Skipped in simulation mode.
@@ -7,23 +7,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use alloy::signers::Signer as _;
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
-use serde::Deserialize;
+use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::{Credentials, Normal};
+use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use super::tls_helpers::http_post;
 use super::{
-    CLOB_BASE_URL, HEARTBEAT_FAIL_ALERT_THRESHOLD, HEARTBEAT_INTERVAL_MS,
-    MATCHING_ENGINE_RESTART_ET_SECS, MONDAY, PRE_CANCEL_ET_START_SECS,
+    HEARTBEAT_FAIL_ALERT_THRESHOLD, HEARTBEAT_INTERVAL_MS, MATCHING_ENGINE_RESTART_ET_SECS,
+    MONDAY, PRE_CANCEL_ET_START_SECS,
 };
 use crate::types::IngestorEvent;
+use crate::utils::signing::build_signer;
 
-/// Send `POST /heartbeat` every 5 seconds to the CLOB.
+/// Send `POST /v1/heartbeats` every 5 seconds to the CLOB.
 ///
-/// - Tracks `heartbeat_id`: empty string on first call; updated from server
-///   response on subsequent calls.
-/// - On 400 response: immediately retries with the id from the response body.
+/// Uses the SDK's `post_heartbeat()` method which handles the correct endpoint
+/// path, body format, and L2 HMAC authentication automatically.
+///
+/// - Tracks `heartbeat_id`: `None` on first call; updated from server response.
 /// - Emits `IngestorEvent::HeartbeatStatus` after each attempt.
 /// - Logs an error if 2 consecutive heartbeats fail (Section 5.4).
 /// - Skipped in simulation mode.
@@ -32,6 +38,10 @@ use crate::types::IngestorEvent;
 pub(super) async fn run_heartbeat(
     shutdown: Arc<AtomicBool>,
     sim_mode: bool,
+    api_key: Option<String>,
+    secret: Option<String>,
+    passphrase: Option<String>,
+    private_key: Option<String>,
     tx: Sender<IngestorEvent>,
 ) -> Result<()> {
     if sim_mode {
@@ -40,7 +50,34 @@ pub(super) async fn run_heartbeat(
         return Ok(());
     }
 
-    let mut heartbeat_id = String::new();
+    // Initialize SDK client for authenticated heartbeat calls.
+    let api_key = api_key.context("api_key required for heartbeat")?;
+    let secret = secret.context("secret required for heartbeat")?;
+    let passphrase = passphrase.context("passphrase required for heartbeat")?;
+    let private_key = private_key.context("private_key required for heartbeat")?;
+
+    let signer = build_signer(&private_key)
+        .context("failed to build signer for heartbeat")?
+        .with_chain_id(Some(POLYGON));
+
+    let uuid: Uuid = api_key
+        .parse()
+        .context("POLYMARKET_API_KEY must be a valid UUID")?;
+
+    let creds = Credentials::new(uuid, secret, passphrase);
+
+    let sdk: SdkClient<Authenticated<Normal>> =
+        SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
+            .map_err(|e| anyhow!("failed to create SDK client for heartbeat: {e}"))?
+            .authentication_builder(&signer)
+            .credentials(creds)
+            .authenticate()
+            .await
+            .map_err(|e| anyhow!("SDK heartbeat auth failed: {e}"))?;
+
+    info!("heartbeat SDK client authenticated");
+
+    let mut heartbeat_id: Option<Uuid> = None;
     let mut consecutive_failures: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
 
@@ -56,12 +93,12 @@ pub(super) async fn run_heartbeat(
         check_matching_engine_restart_window();
 
         let start = SystemTime::now();
-        match send_heartbeat(&heartbeat_id).await {
-            Ok(new_id) => {
+        match sdk.post_heartbeat(heartbeat_id).await {
+            Ok(resp) => {
                 let latency_ms = start.elapsed().unwrap_or_default().as_millis() as u64;
 
-                debug!(latency_ms, new_heartbeat_id = %new_id, "heartbeat OK");
-                heartbeat_id = new_id;
+                debug!(latency_ms, heartbeat_id = %resp.heartbeat_id, "heartbeat OK");
+                heartbeat_id = Some(resp.heartbeat_id);
                 consecutive_failures = 0;
 
                 let _ = tx.try_send(IngestorEvent::HeartbeatStatus {
@@ -71,6 +108,9 @@ pub(super) async fn run_heartbeat(
             }
             Err(e) => {
                 consecutive_failures += 1;
+                // Reset heartbeat_id on error — server will issue a new session.
+                heartbeat_id = None;
+
                 warn!(
                     error = %e,
                     consecutive_failures,
@@ -94,28 +134,6 @@ pub(super) async fn run_heartbeat(
             }
         }
     }
-}
-
-/// Send `POST /heartbeat` and return the updated `heartbeat_id`.
-///
-/// On HTTP 400, the server provides a new `heartbeat_id` in the body —
-/// parse it and return it so the caller can retry immediately.
-async fn send_heartbeat(heartbeat_id: &str) -> Result<String> {
-    let url = format!("{CLOB_BASE_URL}/heartbeat");
-    let body_json = serde_json::json!({ "id": heartbeat_id }).to_string();
-
-    let response_bytes = http_post(&url, body_json.as_bytes()).await?;
-    let body_str = std::str::from_utf8(&response_bytes).unwrap_or("{}");
-
-    // Parse the heartbeat_id from the response (success or 400 body).
-    #[derive(Deserialize, Default)]
-    struct HeartbeatResponse {
-        #[serde(default)]
-        id: String,
-    }
-
-    let resp: HeartbeatResponse = serde_json::from_str(body_str).unwrap_or_default();
-    Ok(resp.id)
 }
 
 // ─── Matching engine restart guard ───────────────────────────────────────────

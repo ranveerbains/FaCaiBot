@@ -28,6 +28,8 @@ pub(super) async fn run_user_ws(
     shutdown: Arc<AtomicBool>,
     sim_mode: bool,
     api_key: Option<String>,
+    secret: Option<String>,
+    passphrase: Option<String>,
     tx: Sender<IngestorEvent>,
 ) -> Result<()> {
     if sim_mode {
@@ -42,6 +44,14 @@ pub(super) async fn run_user_ws(
         .as_deref()
         .context("api_key required for User WS")?
         .to_string();
+    let secret = secret
+        .as_deref()
+        .context("secret required for User WS")?
+        .to_string();
+    let passphrase = passphrase
+        .as_deref()
+        .context("passphrase required for User WS")?
+        .to_string();
 
     let mut backoff_ms = BACKOFF_INITIAL_MS;
 
@@ -53,7 +63,7 @@ pub(super) async fn run_user_ws(
 
         info!("connecting to Polymarket User WS");
 
-        match user_ws_session(shutdown.clone(), &api_key, &tx).await {
+        match user_ws_session(shutdown.clone(), &api_key, &secret, &passphrase, &tx).await {
             Ok(()) => {
                 info!("Polymarket User WS closed cleanly — reconnecting");
             }
@@ -76,10 +86,15 @@ pub(super) async fn run_user_ws(
     }
 }
 
+/// Keepalive interval — Polymarket requires text "PING" every 10 seconds.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Single User WS session: connect, authenticate, pump frames.
 async fn user_ws_session(
     shutdown: Arc<AtomicBool>,
     api_key: &str,
+    secret: &str,
+    passphrase: &str,
     tx: &Sender<IngestorEvent>,
 ) -> Result<()> {
     let mut ws = tls_connect(USER_WS_URL).await?;
@@ -90,34 +105,42 @@ async fn user_ws_session(
     });
     info!("Polymarket User WS connected");
 
-    // Authentication subscription message (Section 5.1 — User WS).
-    // The Integration Agent will wire the full HMAC auth when the SDK
-    // credential derivation (`create_or_derive_api_creds`) is available.
-    // For now we use the api_key as a placeholder identity.
-    let auth_msg = serde_json::json!({
-        "type": "user",
-        "apiKey": api_key,
-    })
-    .to_string();
+    // Authentication subscription message.
+    // Format matches SDK's `WithCredentials::as_authenticated()` (ws/traits.rs).
+    let auth_msg = build_user_auth_msg(api_key, secret, passphrase);
 
     ws.write_frame(Frame::text(auth_msg.into_bytes().into()))
         .await
         .context("failed to send User WS auth subscription")?;
     debug!("sent User WS auth subscription");
 
-    // Main frame loop.
+    // Main frame loop with text-based PING keepalive.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        let frame = ws.read_frame().await.context("User WS read_frame error")?;
+        // Wait for next frame OR send PING on timeout.
+        let frame = match tokio::time::timeout(PING_INTERVAL, ws.read_frame()).await {
+            Ok(result) => result.context("User WS read_frame error")?,
+            Err(_timeout) => {
+                // No data received within PING_INTERVAL — send text PING.
+                ws.write_frame(Frame::text(fastwebsockets::Payload::Borrowed(b"PING")))
+                    .await
+                    .context("failed to send User WS PING")?;
+                continue;
+            }
+        };
 
         match frame.opcode {
             OpCode::Text | OpCode::Binary => {
-                let json = std::str::from_utf8(&frame.payload)
+                let payload = std::str::from_utf8(&frame.payload)
                     .context("User WS payload is not valid UTF-8")?;
-                if let Err(e) = handle_user_message(json, tx) {
+                // Filter text-based PONG responses.
+                if payload == "PONG" {
+                    continue;
+                }
+                if let Err(e) = handle_user_message(payload, tx) {
                     debug!(error = %e, "User WS message handling error (non-fatal)");
                 }
             }
@@ -135,6 +158,25 @@ async fn user_ws_session(
     }
 
     Ok(())
+}
+
+/// Build the authenticated User WS subscription message.
+///
+/// Format matches SDK's `WithCredentials::as_authenticated()` (ws/traits.rs:36-51).
+pub(super) fn build_user_auth_msg(api_key: &str, secret: &str, passphrase: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "operation": "subscribe",
+        "markets": [],
+        "asset_ids": [],
+        "initial_dump": true,
+        "auth": {
+            "apiKey": api_key,
+            "secret": secret,
+            "passphrase": passphrase
+        }
+    })
+    .to_string()
 }
 
 // ─── User WS message parsing ──────────────────────────────────────────────────
@@ -273,6 +315,23 @@ mod tests {
     fn test_parse_trade_status_unknown_errors() {
         let result = parse_trade_status("PENDING_QUEUE");
         assert!(result.is_err(), "unknown status should return Err");
+    }
+
+    #[test]
+    fn test_build_user_auth_msg_format() {
+        let msg = build_user_auth_msg("my-api-key", "my-secret", "my-passphrase");
+        let parsed: serde_json::Value = serde_json::from_str(&msg).expect("valid JSON");
+
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["operation"], "subscribe");
+        assert_eq!(parsed["initial_dump"], true);
+        assert!(parsed["markets"].as_array().unwrap().is_empty());
+        assert!(parsed["asset_ids"].as_array().unwrap().is_empty());
+
+        let auth = &parsed["auth"];
+        assert_eq!(auth["apiKey"], "my-api-key");
+        assert_eq!(auth["secret"], "my-secret");
+        assert_eq!(auth["passphrase"], "my-passphrase");
     }
 
     #[test]

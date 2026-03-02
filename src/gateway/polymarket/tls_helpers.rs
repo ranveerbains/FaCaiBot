@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use fastwebsockets::{WebSocket, handshake};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
-use hyper::header::{CONNECTION, CONTENT_TYPE, UPGRADE};
+use hyper::header::{CONNECTION, UPGRADE};
 use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
@@ -14,7 +14,7 @@ use rustls::ClientConfig as TlsClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::warn;
 
 // ─── TLS WebSocket helpers ────────────────────────────────────────────────────
 
@@ -131,65 +131,6 @@ pub(super) async fn http_get(url: &str) -> Result<Vec<u8>> {
         .collect()
         .await
         .context("GET body collect failed")?
-        .to_bytes();
-
-    Ok(body.to_vec())
-}
-
-/// Make a POST request to `url` with a JSON body and return the response body.
-pub(super) async fn http_post(url: &str, body_bytes: &[u8]) -> Result<Vec<u8>> {
-    let uri: Uri = url.parse().context("invalid URL")?;
-    let host = uri.host().context("URL missing host")?.to_string();
-    let port = uri.port_u16().unwrap_or(443);
-    let addr = format!("{host}:{port}");
-
-    let tcp = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("TCP connect to {addr} failed"))?;
-    let tls_config = build_tls_config()?;
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = ServerName::try_from(host.as_str())
-        .map_err(|e| anyhow!("TLS server name error: {e}"))?
-        .to_owned();
-    let tls_stream = connector
-        .connect(server_name, tcp)
-        .await
-        .context("TLS handshake failed")?;
-
-    let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1.1 handshake failed")?;
-    tokio::spawn(conn);
-
-    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let body = Full::new(Bytes::copy_from_slice(body_bytes));
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(path)
-        .header("Host", &host)
-        .header("User-Agent", "facaibot/0.1")
-        .header(CONTENT_TYPE, "application/json")
-        .body(body)
-        .context("POST request build failed")?;
-
-    let resp = sender.send_request(req).await.context("POST send failed")?;
-    let status = resp.status();
-
-    if status == StatusCode::BAD_REQUEST {
-        // 400 on heartbeat — server wants us to update the heartbeat_id.
-        debug!(url = %url, "HTTP 400 — heartbeat_id desync; will update from response");
-    } else if status == StatusCode::from_u16(425).unwrap() {
-        warn!(url = %url, "HTTP 425 — matching engine restart; backing off");
-    } else if !status.is_success() {
-        warn!(url = %url, status = %status, "HTTP POST non-2xx response");
-    }
-
-    let body = resp
-        .into_body()
-        .collect()
-        .await
-        .context("POST body collect failed")?
         .to_bytes();
 
     Ok(body.to_vec())

@@ -468,7 +468,7 @@ mod formatter {
             \n\
             <b>Leg 2 target</b>\n\
             Buy {l2_side}  <code>${leg2_tgt}</code> | Break-even: ${be}\n\
-            Est. profit: {target:.2}% (~<code>${est_usdc:.2}</code>) | FOK fee: ${ef:.4}/sh\n\
+            Est. profit: {target:.2}% (~<code>${est_usdc:.4}</code>) | FOK fee: ${ef:.4}/sh\n\
             \n\
             Status: Watching for hedge...",
             market = market_short,
@@ -552,7 +552,7 @@ mod formatter {
                 ""
             };
             format!(
-                "Gross: {sg}<code>${gross:.2}</code> | Fee: -${fee:.4} | Net: {sn}<code>${net:.2}</code> ({pct:.2}%)",
+                "Gross: {sg}<code>${gross:.4}</code> | Fee: -${fee:.4} | Net: {sn}<code>${net:.4}</code> ({pct:.2}%)",
                 sg = sign_g,
                 gross = trade.gross_profit,
                 fee = trade.taker_fee,
@@ -567,7 +567,7 @@ mod formatter {
                 ""
             };
             format!(
-                "Profit: {sign}<code>${net:.2}</code> ({pct:.2}%)",
+                "Profit: {sign}<code>${net:.4}</code> ({pct:.2}%)",
                 sign = sign,
                 net = trade.net_profit,
                 pct = trade.profit_pct,
@@ -644,7 +644,7 @@ mod formatter {
                     let net_sign = if t.net_profit >= Decimal::ZERO { "+" } else { "" };
                     // pair_cost is per-share; net_profit is USDC
                     format!(
-                        "YES@{l1:.3} + NO@{l2:.3} = ${pair:.3}/sh × {sz:.2}sh → maker+{fee} → net {sign}${net:.2} USDC ({pct:.2}%)",
+                        "YES@{l1:.3} + NO@{l2:.3} = ${pair:.3}/sh × {sz:.2}sh → maker+{fee} → net {sign}${net:.4} USDC ({pct:.2}%)",
                         l1 = t.leg1.price,
                         l2 = l2.price,
                         pair = t.pair_cost,

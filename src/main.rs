@@ -138,11 +138,16 @@ async fn async_main() -> Result<()> {
 
             // Polymarket WS gateway — live mode passes creds, sim mode passes None.
             let poly_ws = if ingestor_config.mode == Mode::Live {
-                PolymarketWsGateway::new(Some(ingestor_config.polymarket_api_key.clone()))
+                PolymarketWsGateway::new(
+                    Some(ingestor_config.polymarket_api_key.clone()),
+                    Some(ingestor_config.polymarket_secret.clone()),
+                    Some(ingestor_config.polymarket_passphrase.clone()),
+                    Some(ingestor_config.private_key.clone()),
+                )
             } else {
                 // Simulation: no User WS or heartbeat, but Market WS still runs
                 // for live orderbook data.
-                PolymarketWsGateway::new(None)
+                PolymarketWsGateway::new(None, None, None, None)
             };
 
             let tx_binance = ingestor_tx_binance;

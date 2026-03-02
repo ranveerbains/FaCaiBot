@@ -5,7 +5,7 @@
 //! - [`rest`] — CLOB REST gateway: SDK-based order placement/cancel, public book queries.
 //! - [`market_ws`] — Public Market WebSocket: book, price, tick events.
 //! - [`user_ws`] — Authenticated User WebSocket: trade fills, order events.
-//! - [`heartbeat`] — `POST /heartbeat` loop (every 5 seconds).
+//! - [`heartbeat`] — `POST /v1/heartbeats` loop (every 5 seconds).
 //! - [`rotation`] — Gamma API market discovery and rotation manager.
 //! - [`tls_helpers`] — Shared TLS WebSocket + HTTP helpers.
 //!
@@ -94,6 +94,12 @@ pub(super) use crate::utils::time::epoch_ms as now_epoch_ms;
 pub struct PolymarketWsGateway {
     /// CLOB API key (L2 HMAC credential). `None` in simulation mode.
     api_key: Option<String>,
+    /// CLOB API secret (L2 HMAC credential). `None` in simulation mode.
+    secret: Option<String>,
+    /// CLOB API passphrase (L2 HMAC credential). `None` in simulation mode.
+    passphrase: Option<String>,
+    /// Hex-encoded private key for EIP-712 signing. `None` in simulation mode.
+    private_key: Option<String>,
     /// `true` = simulation mode — User WS and heartbeat loop are skipped.
     sim_mode: bool,
     /// Shared flag allowing callers to signal a graceful shutdown.
@@ -104,12 +110,20 @@ pub struct PolymarketWsGateway {
 impl PolymarketWsGateway {
     /// Create a new gateway instance.
     ///
-    /// - Pass `api_key / secret / passphrase` as `Some(...)` in live mode.
+    /// - Pass `api_key / secret / passphrase / private_key` as `Some(...)` in live mode.
     /// - Pass all as `None` in simulation mode — User WS and heartbeat will be skipped.
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(
+        api_key: Option<String>,
+        secret: Option<String>,
+        passphrase: Option<String>,
+        private_key: Option<String>,
+    ) -> Self {
         let sim_mode = api_key.is_none();
         Self {
             api_key,
+            secret,
+            passphrase,
+            private_key,
             sim_mode,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -146,6 +160,8 @@ impl PolymarketWsGateway {
             self.shutdown.clone(),
             self.sim_mode,
             self.api_key.clone(),
+            self.secret.clone(),
+            self.passphrase.clone(),
             tx,
         )
         .await
@@ -155,11 +171,20 @@ impl PolymarketWsGateway {
     // Heartbeat Loop
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Send `POST /heartbeat` every 5 seconds to the CLOB.
+    /// Send `POST /v1/heartbeats` every 5 seconds to the CLOB.
     ///
     /// Skipped in simulation mode.
     pub async fn run_heartbeat(&self, tx: Sender<IngestorEvent>) -> Result<()> {
-        heartbeat::run_heartbeat(self.shutdown.clone(), self.sim_mode, tx).await
+        heartbeat::run_heartbeat(
+            self.shutdown.clone(),
+            self.sim_mode,
+            self.api_key.clone(),
+            self.secret.clone(),
+            self.passphrase.clone(),
+            self.private_key.clone(),
+            tx,
+        )
+        .await
     }
 
     // ─────────────────────────────────────────────────────────────────────────

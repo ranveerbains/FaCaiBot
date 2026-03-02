@@ -90,6 +90,9 @@ pub(super) async fn run_market_ws(
     }
 }
 
+/// Keepalive interval — Polymarket requires text "PING" every 10 seconds.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Single Market WS session: connect, subscribe, pump frames.
 async fn market_ws_session(
     shutdown: Arc<AtomicBool>,
@@ -112,22 +115,33 @@ async fn market_ws_session(
         .await
         .context("failed to send Market WS subscription")?;
 
-    // Main frame loop.
+    // Main frame loop with text-based PING keepalive.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        let frame = ws
-            .read_frame()
-            .await
-            .context("Market WS read_frame error")?;
+        // Wait for next frame OR send PING on timeout.
+        let frame = match tokio::time::timeout(PING_INTERVAL, ws.read_frame()).await {
+            Ok(result) => result.context("Market WS read_frame error")?,
+            Err(_timeout) => {
+                // No data received within PING_INTERVAL — send text PING.
+                ws.write_frame(Frame::text(fastwebsockets::Payload::Borrowed(b"PING")))
+                    .await
+                    .context("failed to send Market WS PING")?;
+                continue;
+            }
+        };
 
         match frame.opcode {
             OpCode::Text | OpCode::Binary => {
-                let json = std::str::from_utf8(&frame.payload)
+                let payload = std::str::from_utf8(&frame.payload)
                     .context("Market WS payload is not valid UTF-8")?;
-                if let Err(e) = handle_market_message(json, tx) {
+                // Filter text-based PONG responses.
+                if payload == "PONG" {
+                    continue;
+                }
+                if let Err(e) = handle_market_message(payload, tx) {
                     debug!(error = %e, "Market WS message handling error (non-fatal)");
                 }
             }
