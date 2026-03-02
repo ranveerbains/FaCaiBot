@@ -108,7 +108,7 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 | Leg 2 erosion | Cancel previous resting order → repost at eroded price |
 | Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first, FOK fallback) |
 | Leg 2 emergency | Cancel resting → aggressive post-only at `best_ask - 1 tick` → FOK fallback if rejected → Telegram critical alert |
-| Market rotation | `cancel_all()` → reset state |
+| Market rotation | `cancel_all()` → reset state → pre-warm SDK caches (`tick_size`, `neg_risk`) from CLOB → `caches_warm = true` (signals blocked until warm) |
 
 On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`.
 
@@ -491,17 +491,20 @@ PolymarketGateway {
 **Initialization** (async — `PolymarketGateway::new().await` in `main.rs`):
 1. `build_signer()` parses hex private key → `PrivateKeySigner` with `chain_id=137` (Polygon)
 2. `init_sdk_client()` creates `SdkClient`, passes pre-existing L2 credentials (`Credentials::new(uuid, secret, passphrase)`), calls `.authenticate().await` — validates without `create_or_derive_api_key` network call
-3. If either step fails → read-only mode (`sdk_client = None`, order placement unavailable)
+3. Logs signer address at `info!` level — user should verify it matches their Polymarket wallet. On failure, logs address + hint to check `PRIVATE_KEY` matches API key wallet
+4. If either step fails → read-only mode (`sdk_client = None`, order placement unavailable)
 
 **Order flow** (`place_order`):
 ```
 OrderRequest
   → sdk.limit_order().token_id().side().price().size().order_type().post_only().build().await
-    (SDK fetches tick_size per token internally — DashMap cache, one CLOB call then cached)
+    (SDK auto-fetches tick_size, fee_rate, neg_risk per token — DashMap cache, one CLOB call each then cached)
+  → debug! log: signer_address, token_id, side, price, size (diagnostic for signature issues)
   → sdk.sign(signer, signable).await
     (EIP-712 typed data — auto-detects neg_risk for correct exchange contract domain separator)
   → sdk.post_order(signed).await
     (L2 HMAC auth headers constructed internally, POST /order)
+    (error includes token/price/size for diagnosing 400 rejections)
   → PostOrderResponse mapped to OrderResponse { order_id, status, timestamp_ms }
 ```
 
@@ -509,7 +512,7 @@ OrderRequest
 - `cancel_order(id)` → `sdk.cancel_order(id).await` → `DELETE /order`
 - `cancel_all()` → `sdk.cancel_all_orders().await` → `DELETE /cancel-all`
 
-**SDK cache pre-population**: On market rotation, `LiveExecutor` pre-populates the SDK's per-token `DashMap` caches (`tick_size`, `fee_rate_bps=0`, `neg_risk=true`) using token IDs from the `MarketRotation` command. This eliminates the first-order CLOB round-trip per token that the SDK would otherwise make to fetch tick size.
+**SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size(token_id)` and `sdk.neg_risk(token_id)` for both YES and NO tokens, populating the SDK's internal `DashMap` caches with real CLOB values. A `caches_warm: bool` field gates all order placement — if any pre-warm fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation succeeds. This eliminates the ~150ms first-order latency from auto-fetch while guaranteeing correctness (no hardcoded values that could cause "invalid signature" or 400 errors).
 
 `signing.rs` contains only `build_signer()` — hex private key parsing to `PrivateKeySigner`.
 

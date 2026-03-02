@@ -11,10 +11,11 @@
 
 use std::str::FromStr;
 
+use alloy::primitives::U256;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::Decimal;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::gateway::polymarket::PolymarketGateway;
 use crate::reporting::telegram::TelegramReporter;
@@ -34,6 +35,11 @@ pub struct LiveExecutor {
     /// QuestDB cold storage. `None` if QuestDB is unavailable — the executor
     /// still runs without analytics.
     cold: Option<ColdStorage>,
+
+    // ── SDK cache gate ────────────────────────────────────────────────
+    /// `true` once `tick_size` and `neg_risk` have been pre-warmed from the CLOB
+    /// for both tokens of the current market. All signals are rejected while `false`.
+    caches_warm: bool,
 
     // ── Position tracking ───────────────────────────────────────────
     /// Current active Leg 2 order ID on the CLOB. `None` if no Leg 2 posted.
@@ -61,6 +67,7 @@ impl LiveExecutor {
             feedback_tx,
             reporter,
             cold,
+            caches_warm: false,
             active_leg2_order_id: None,
             orders_placed: 0,
             orders_cancelled: 0,
@@ -109,6 +116,17 @@ impl LiveExecutor {
     // ─── Signal dispatch ────────────────────────────────────────────────
 
     async fn handle_signal(&mut self, signal: TradeSignal) {
+        if !self.caches_warm {
+            warn!(
+                token = %signal.token_id,
+                "signal REJECTED — SDK caches not warm (pre-warm failed on rotation)"
+            );
+            let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed {
+                is_leg2: signal.is_leg2,
+            });
+            return;
+        }
+
         if !signal.is_leg2 {
             self.handle_leg1(&signal).await;
         } else if signal.exit_reason.is_some() {
@@ -508,7 +526,7 @@ impl LiveExecutor {
         condition_id: &str,
         yes_token_id: &str,
         no_token_id: &str,
-        tick_size: rust_decimal::Decimal,
+        _tick_size: rust_decimal::Decimal,
     ) {
         info!(
             condition_id,
@@ -521,18 +539,39 @@ impl LiveExecutor {
 
         self.active_leg2_order_id = None;
 
-        // Pre-populate SDK caches for the new market's tokens.
+        // Reset warm flag — block trading until pre-warm succeeds.
+        self.caches_warm = false;
+
         if let Some(sdk) = self.poly.sdk_client() {
-            if let Some(sdk_tick) = decimal_to_tick_size(tick_size) {
-                for token_id_str in [yes_token_id, no_token_id] {
-                    if let Ok(id) = alloy::primitives::U256::from_str(token_id_str) {
-                        sdk.set_tick_size(id, sdk_tick);
-                        sdk.set_fee_rate_bps(id, 0); // maker fee = 0
-                        sdk.set_neg_risk(id, true); // all crypto up/down markets are neg_risk
+            let mut all_ok = true;
+            for token_id_str in [yes_token_id, no_token_id] {
+                if let Ok(id) = U256::from_str(token_id_str) {
+                    if let Err(e) = sdk.tick_size(id).await {
+                        warn!(token = token_id_str, error = %e, "tick_size pre-warm FAILED");
+                        all_ok = false;
                     }
+                    if let Err(e) = sdk.neg_risk(id).await {
+                        warn!(token = token_id_str, error = %e, "neg_risk pre-warm FAILED");
+                        all_ok = false;
+                    }
+                } else {
+                    warn!(token = token_id_str, "failed to parse token_id as U256");
+                    all_ok = false;
                 }
-                debug!("SDK caches pre-populated for new market tokens");
             }
+            if all_ok {
+                self.caches_warm = true;
+                info!(
+                    condition_id,
+                    yes_token_id,
+                    no_token_id,
+                    "SDK caches pre-warmed from CLOB (tick_size, neg_risk) — trading enabled"
+                );
+            } else {
+                warn!("SDK cache pre-warm incomplete — trading BLOCKED until next rotation");
+            }
+        } else {
+            warn!("no SDK client — trading BLOCKED");
         }
     }
 
@@ -603,19 +642,3 @@ impl LiveExecutor {
 }
 
 use crate::utils::time::epoch_ms as now_epoch_ms;
-
-/// Convert a `Decimal` tick_size to the SDK's `TickSize` enum.
-fn decimal_to_tick_size(d: Decimal) -> Option<polymarket_client_sdk::clob::types::TickSize> {
-    use polymarket_client_sdk::clob::types::TickSize;
-    if d == Decimal::new(1, 1) {
-        Some(TickSize::Tenth)
-    } else if d == Decimal::new(1, 2) {
-        Some(TickSize::Hundredth)
-    } else if d == Decimal::new(1, 3) {
-        Some(TickSize::Thousandth)
-    } else if d == Decimal::new(1, 4) {
-        Some(TickSize::TenThousandth)
-    } else {
-        None
-    }
-}

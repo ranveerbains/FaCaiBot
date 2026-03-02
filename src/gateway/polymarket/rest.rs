@@ -87,14 +87,20 @@ impl PolymarketGateway {
         let sdk_client = if let Some(ref signer) = signer {
             match init_sdk_client(signer, &config).await {
                 Ok(client) => {
-                    info!("PolymarketGateway: SDK CLOB client authenticated");
+                    info!(
+                        signer_address = %format!("{:?}", signer.address()),
+                        "PolymarketGateway: SDK CLOB client authenticated — \
+                         verify this address matches your Polymarket wallet"
+                    );
                     Some(client)
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
+                        signer_address = %format!("{:?}", signer.address()),
                         "PolymarketGateway: SDK CLOB client init failed — \
-                         order placement disabled (read-only mode)"
+                         order placement disabled (read-only mode). \
+                         Check that PRIVATE_KEY matches the wallet used to derive API credentials"
                     );
                     None
                 }
@@ -104,6 +110,14 @@ impl PolymarketGateway {
         };
 
         Self { signer, sdk_client }
+    }
+
+    /// Return a reference to the authenticated SDK client (if available).
+    ///
+    /// Used by `LiveExecutor` to pre-warm SDK caches (`tick_size`, `neg_risk`)
+    /// on market rotation so the first order has zero extra latency.
+    pub fn sdk_client(&self) -> Option<&SdkClient<Authenticated<Normal>>> {
+        self.sdk_client.as_ref()
     }
 
     // ─── Public REST methods ──────────────────────────────────────────────────
@@ -164,7 +178,23 @@ impl PolymarketGateway {
         let signable = builder
             .build()
             .await
-            .map_err(|e| anyhow!("SDK order build failed: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "SDK order build failed (token={}, price={}, size={}): {e}",
+                    order.token_id,
+                    order.price,
+                    order.size
+                )
+            })?;
+
+        debug!(
+            signer_address = %format!("{:?}", signer.address()),
+            token_id = %order.token_id,
+            side = ?order.side,
+            price = %order.price,
+            size = %order.size,
+            "signing order via SDK (neg_risk auto-fetched from CLOB if not cached)"
+        );
 
         // Sign: EIP-712 typed data with correct domain separator (auto-detects neg_risk).
         let signed = sdk
@@ -176,7 +206,15 @@ impl PolymarketGateway {
         let resp: PostOrderResponse = sdk
             .post_order(signed)
             .await
-            .map_err(|e| anyhow!("SDK post_order failed: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "SDK post_order failed (token={}, side={:?}, price={}, size={}): {e}",
+                    order.token_id,
+                    order.side,
+                    order.price,
+                    order.size
+                )
+            })?;
 
         debug!(
             order_id = %resp.order_id,
@@ -244,10 +282,6 @@ impl PolymarketGateway {
         Ok(())
     }
 
-    /// Accessor for the SDK client (used for cache pre-population on market rotation).
-    pub fn sdk_client(&self) -> Option<&SdkClient<Authenticated<Normal>>> {
-        self.sdk_client.as_ref()
-    }
 }
 
 // ─── SDK client initialization ───────────────────────────────────────────────

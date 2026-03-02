@@ -10,7 +10,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets
 cargo build              # Build (debug)
 cargo build --release    # Build (release — LTO, single codegen unit)
 cargo run                # Run the bot
-cargo test               # Run all tests (124 tests)
+cargo test               # Run all tests (141 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -114,7 +114,7 @@ src/
 - **Erosion model**: Triangle-weighted steps `[5,4,3,2,1]` (front-loaded) with exponential decay intervals (3s→1.5s→0.75s→0.375s→0.2s). ~5.8s to break-even. Capped at `MAX_EROSION_STEPS` (5) — exhaustion auto-triggers `BreakEvenBreach` emergency. **Skip guard**: if posted Leg 2 price is already at or better than the next erosion target, the repost is skipped (preserves favorable exits)
 - **Emergency exits**: Price-improvement chase with hard deadline. Post-only at `best_ask - 1 tick`, only repost when book offers strictly better price (preserves FIFO queue priority). After `emergency_deadline_ms` (2500ms) → FOK taker at `best_ask`. Three triggers: (1) Adverse movement — Binance reversal >0.1%, zero grace; (2) Break-even breach — pair cost strictly > $1.00, after first erosion step; (3) Erosion exhausted — all 5 steps applied without fill
 - **Leg 1 staleness**: Unfilled Leg 1 post-only orders are cancelled after `leg1_timeout_ms` (default 5000ms) to free the slot for the next spike. `CancelLeg1` executor command in live mode; handled in `advance_simulation()` for sim
-- **SDK cache pre-population**: On market rotation, `LiveExecutor` pre-populates the SDK's per-token caches (`tick_size`, `fee_rate_bps=0`, `neg_risk=true`) using token IDs from the `MarketRotation` command. Eliminates the first-order CLOB round-trip per token
+- **SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size()` and `sdk.neg_risk()` for both tokens — populating the SDK's `DashMap` caches with real CLOB values. `caches_warm: bool` gates all order placement: if any fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation. Eliminates the ~150ms first-order latency penalty from auto-fetch while guaranteeing correctness (no hardcoded values)
 - **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
 
