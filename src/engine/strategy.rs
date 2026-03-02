@@ -215,7 +215,8 @@ impl StrategyEngine {
     pub fn new(config: &Config) -> Self {
         let state = MarketState::new();
 
-        let max_spread_ticks = config.bot.entry_guards.max_spread_ticks;
+        let max_spread = Decimal::try_from(config.bot.entry_guards.max_spread)
+            .unwrap_or(Decimal::new(25, 3));
         let depth_min_pct =
             Decimal::try_from(config.bot.entry_guards.depth_min_pct).unwrap_or(Decimal::new(15, 2));
         let depth_wall_multiplier =
@@ -280,7 +281,7 @@ impl StrategyEngine {
             draining: false,
             start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
-                max_spread_ticks,
+                max_spread,
                 entry_cutoff_secs: config.bot.entry_guards.entry_cutoff_secs,
                 depth_min_pct,
                 stale_book_ms: config.bot.entry_guards.stale_book_ms,

@@ -22,7 +22,7 @@ use super::market_ws::{parse_price_levels, parse_timestamp_field};
 use super::tls_helpers::http_get;
 use super::{CLOB_BASE_URL, GAMMA_BASE_URL, GAMMA_EVENTS_PATH};
 
-/// Information about a discovered upcoming 15-minute market.
+/// Information about a discovered upcoming 5-minute market.
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     /// Polymarket condition ID (e.g. `"0xabc123..."`).
@@ -306,13 +306,13 @@ pub(super) async fn poll_gamma_and_emit(
     }
 }
 
-/// Query the Gamma API for the next upcoming BTC 15-minute market.
+/// Query the Gamma API for the next upcoming BTC 5-minute market.
 ///
 /// Returns info for the market with the soonest non-expired `endTimestamp`.
 /// PRD: poll every 10 minutes (Section 5.3).
 pub(super) async fn discover_next_market() -> Result<MarketInfo> {
     let url = format!("{GAMMA_BASE_URL}{GAMMA_EVENTS_PATH}");
-    debug!(url = %url, "querying Gamma API for next 15-min market");
+    debug!(url = %url, "querying Gamma API for next 5-min market");
 
     let response_bytes = http_get(&url).await?;
     let body_str =
@@ -381,12 +381,12 @@ async fn fetch_order_book(token_id: &str) -> Result<OrderBook> {
 // ─── Gamma API response parsing ───────────────────────────────────────────────
 
 /// Slug prefixes for the crypto assets we trade.
-const TARGET_SLUG_PREFIXES: &[&str] = &["btc-updown-15m-", "eth-updown-15m-"];
+const TARGET_SLUG_PREFIXES: &[&str] = &["btc-updown-5m-"];
 
 /// Raw event from the Gamma API `/events` response.
 #[derive(Deserialize, Debug)]
 struct GammaEvent {
-    /// Event slug (e.g. `"btc-updown-15m-1771676100"`).
+    /// Event slug (e.g. `"btc-updown-5m-1771676100"`).
     #[serde(default)]
     slug: String,
 
@@ -394,7 +394,7 @@ struct GammaEvent {
     #[serde(rename = "endDate", default)]
     end_date: String,
 
-    /// Nested markets — for 15-min events there is exactly 1 market per event.
+    /// Nested markets — for 5-min events there is exactly 1 market per event.
     #[serde(default)]
     markets: Vec<GammaEventMarket>,
 }
@@ -412,9 +412,9 @@ struct GammaEventMarket {
     clob_token_ids: String,
 }
 
-/// Parse the Gamma API `/events?tag_id=102467` response into a `MarketInfo`.
+/// Parse the Gamma API `/events?tag_id=102892` response into a `MarketInfo`.
 ///
-/// Filters for BTC/ETH 15-minute markets by slug prefix, selects the
+/// Filters for BTC 5-minute markets by slug prefix, selects the
 /// soonest non-expired event with valid token IDs.
 pub(super) fn parse_gamma_events_response(body: &str) -> Result<MarketInfo> {
     parse_gamma_events_response_after(body, now_epoch_ms())
@@ -521,7 +521,7 @@ fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<
     }
 
     best.map(|(_, info)| info)
-        .ok_or_else(|| anyhow!("no valid upcoming BTC/ETH 15-min market found"))
+        .ok_or_else(|| anyhow!("no valid upcoming BTC 5-min market found"))
 }
 
 /// Minimal RFC 3339 parser — avoids pulling in `chrono`.
@@ -578,10 +578,10 @@ mod tests {
 
     // ── Gamma API events response parsing ───────────────────────────────
 
-    /// BTC 15-min event with a future endDate.
+    /// BTC 5-min event with a future endDate.
     const GAMMA_EVENTS_BTC: &str = r#"[
         {
-            "slug": "btc-updown-15m-9999999900",
+            "slug": "btc-updown-5m-9999999900",
             "endDate": "2099-01-01T00:00:00Z",
             "markets": [{
                 "conditionId": "0xabc123",
@@ -591,10 +591,10 @@ mod tests {
         }
     ]"#;
 
-    /// ETH 15-min event with a future endDate.
+    /// ETH 5-min event with a future endDate (not targeted, kept for mixed test).
     const GAMMA_EVENTS_ETH: &str = r#"[
         {
-            "slug": "eth-updown-15m-9999999900",
+            "slug": "eth-updown-5m-9999999900",
             "endDate": "2099-01-01T00:00:00Z",
             "markets": [{
                 "conditionId": "0xeth456",
@@ -607,7 +607,7 @@ mod tests {
     /// All events expired.
     const GAMMA_EVENTS_EXPIRED: &str = r#"[
         {
-            "slug": "btc-updown-15m-1",
+            "slug": "btc-updown-5m-1",
             "endDate": "1970-01-01T00:01:00Z",
             "markets": [{
                 "conditionId": "0xold",
@@ -617,10 +617,10 @@ mod tests {
         }
     ]"#;
 
-    /// Mix of BTC (expired), ETH (valid), SOL (valid but not targeted).
+    /// Mix of BTC (expired), BTC (valid), SOL (valid but not targeted), ETH (not targeted).
     const GAMMA_EVENTS_MIXED: &str = r#"[
         {
-            "slug": "btc-updown-15m-1",
+            "slug": "btc-updown-5m-1",
             "endDate": "1970-01-01T00:01:00Z",
             "markets": [{
                 "conditionId": "0xexpired",
@@ -629,7 +629,7 @@ mod tests {
             }]
         },
         {
-            "slug": "sol-updown-15m-9999999900",
+            "slug": "sol-updown-5m-9999999900",
             "endDate": "2099-01-01T00:00:00Z",
             "markets": [{
                 "conditionId": "0xsol_skip",
@@ -638,7 +638,7 @@ mod tests {
             }]
         },
         {
-            "slug": "eth-updown-15m-9999999900",
+            "slug": "btc-updown-5m-9999999900",
             "endDate": "2099-01-01T00:00:00Z",
             "markets": [{
                 "conditionId": "0xvalid",
@@ -658,9 +658,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_gamma_events_eth() {
-        let info = parse_gamma_events_response(GAMMA_EVENTS_ETH).expect("parse failed");
-        assert_eq!(info.condition_id, "0xeth456");
+    fn test_parse_gamma_events_eth_not_targeted() {
+        // ETH is no longer a target — only BTC 5m is targeted.
+        let result = parse_gamma_events_response(GAMMA_EVENTS_ETH);
+        assert!(result.is_err(), "ETH should not match BTC-only target slugs");
     }
 
     #[test]
@@ -673,7 +674,7 @@ mod tests {
     fn test_parse_gamma_events_picks_valid_target() {
         let info =
             parse_gamma_events_response(GAMMA_EVENTS_MIXED).expect("should find valid market");
-        // Should pick ETH (valid target), skipping expired BTC and non-target SOL.
+        // Should pick valid BTC, skipping expired BTC and non-target SOL.
         assert_eq!(info.condition_id, "0xvalid");
     }
 
@@ -705,7 +706,7 @@ mod tests {
     /// When skip_before = Market A's end time, only Market B should be returned.
     const GAMMA_EVENTS_TWO_MARKETS: &str = r#"[
         {
-            "slug": "btc-updown-15m-1111111111",
+            "slug": "btc-updown-5m-1111111111",
             "endDate": "2098-06-15T12:00:00Z",
             "markets": [{
                 "conditionId": "0xmarketA",
@@ -714,7 +715,7 @@ mod tests {
             }]
         },
         {
-            "slug": "btc-updown-15m-2222222222",
+            "slug": "btc-updown-5m-2222222222",
             "endDate": "2099-06-15T12:00:00Z",
             "markets": [{
                 "conditionId": "0xmarketB",
@@ -760,7 +761,7 @@ mod tests {
     /// We only need token IDs for discovery; engine guards prevent premature trading.
     const GAMMA_EVENTS_NOT_ACCEPTING: &str = r#"[
         {
-            "slug": "btc-updown-15m-9999999900",
+            "slug": "btc-updown-5m-9999999900",
             "endDate": "2099-01-01T00:00:00Z",
             "markets": [{
                 "conditionId": "0xnotyet",

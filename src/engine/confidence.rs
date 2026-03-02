@@ -9,14 +9,14 @@ use rust_decimal::Decimal;
 const WEIGHT_SPIKE: Decimal = Decimal::from_parts(4, 0, 0, false, 1); // 0.4
 const WEIGHT_DEPTH: Decimal = Decimal::from_parts(2, 0, 0, false, 1); // 0.2
 const WEIGHT_TIME: Decimal = Decimal::from_parts(2, 0, 0, false, 1); // 0.2
-const MARKET_DURATION: Decimal = Decimal::from_parts(900, 0, 0, false, 0); // 900
+const MARKET_DURATION: Decimal = Decimal::from_parts(300, 0, 0, false, 0); // 300
 
 /// Compute the 3-factor confidence score in [0.0, 0.8].
 ///
 /// ```text
 /// confidence = 0.4 * min(spike_magnitude / ATR, 1.0)   [spike quality vs recent volatility]
 ///            + 0.2 * min(poly_book_depth / avg_book_depth, 1.0)
-///            + 0.2 * (time_remaining_secs / 900.0)
+///            + 0.2 * (time_remaining_secs / 300.0)
 /// ```
 ///
 /// Thresholds: HIGH >= 0.6 | MED >= 0.3 | LOW < 0.3
@@ -65,7 +65,7 @@ mod tests {
             Decimal::new(1, 0), // atr = 1 → f1 = 1.0
             Decimal::new(100, 0),
             Decimal::new(100, 0),
-            900, // full 15 min
+            300, // full 5 min
         );
         // f1=1.0, f3=1.0, f4=1.0 → 0.4 + 0.2 + 0.2 = 0.8
         assert_eq!(c, Decimal::new(8, 1));

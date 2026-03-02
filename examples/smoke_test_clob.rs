@@ -9,7 +9,7 @@
 //! - Token approvals for CTF Exchange (one-time on-chain tx)
 //!
 //! What it does:
-//! 1. Discovers a live BTC 15-min market via Gamma API
+//! 1. Discovers a live BTC 5-min market via Gamma API
 //! 2. Places a BUY YES at $0.01 (far below market — guaranteed to rest unfilled)
 //! 3. Verifies the CLOB accepted it (status = Placed/Live)
 //! 4. Cancels the order
@@ -109,14 +109,14 @@ async fn main() -> Result<()> {
     println!("    SDK client authenticated successfully!");
 
     // ── Step 3: Discover a live market ───────────────────────────────────
-    println!("[3] Discovering a live BTC 15-min market via Gamma API...");
+    println!("[3] Discovering a live BTC 5-min market via Gamma API...");
     let http = reqwest::Client::builder()
         .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let gamma_url =
-        format!("{GAMMA_BASE_URL}/events?tag_id=102467&active=true&closed=false&limit=10");
+        format!("{GAMMA_BASE_URL}/events?tag_id=102892&active=true&closed=false&limit=10");
     let events: Vec<GammaEvent> = http.get(&gamma_url).send().await?.json().await?;
 
     let now = std::time::SystemTime::now()
@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
     }
 
     let token_id_str = found_token_id.ok_or_else(|| {
-        anyhow!("no active BTC/ETH 15-min market found — are markets running right now?")
+        anyhow!("no active BTC 5-min market found — are markets running right now?")
     })?;
     let token_id = U256::from_str(&token_id_str).context("failed to parse token_id as U256")?;
 

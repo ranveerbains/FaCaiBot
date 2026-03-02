@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-FaCaiBot is a Polymarket arbitrage bot targeting BTC/ETH 15-minute prediction markets. It detects Binance price spikes in real-time, buys cheap directional shares on the Polymarket CLOB before it reprices, then hedges with the opposite side — locking in a sub-$1.00 pair that pays $1.00 on resolution. See `ARCHITECTURE.md` for full system design.
+FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets. It detects Binance price spikes in real-time, buys cheap directional shares on the Polymarket CLOB before it reprices, then hedges with the opposite side — locking in a sub-$1.00 pair that pays $1.00 on resolution. See `ARCHITECTURE.md` for full system design.
 
 ## Build Commands
 

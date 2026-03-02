@@ -192,18 +192,18 @@ pub struct MarketState {
     pub binance_price: Option<Decimal>,
 
     // ── Active market identifiers ────────────────────────────────────────
-    /// Active Polymarket 15-minute market condition ID.
+    /// Active Polymarket 5-minute market condition ID.
     pub active_condition_id: Option<String>,
-    /// Active YES token ID for the current 15-min window.
+    /// Active YES token ID for the current 5-min window.
     pub active_yes_token_id: Option<String>,
-    /// Active NO token ID for the current 15-min window.
+    /// Active NO token ID for the current 5-min window.
     pub active_no_token_id: Option<String>,
 
     // ── Market parameters (cached at rotation) ───────────────────────────
     /// Tick size for the current market token (dynamic, cached once per rotation).
     /// Updated on rare `tick_size_change` WS events.
     pub tick_size: Decimal,
-    /// Epoch ms when the current 15-min market expires.
+    /// Epoch ms when the current 5-min market expires.
     pub market_end_timestamp_ms: u64,
 
     // ── Order tracking ───────────────────────────────────────────────────
@@ -360,7 +360,7 @@ pub enum IngestorEvent {
     },
 
     // ── Lifecycle ────────────────────────────────────────────────────────
-    /// Emitted when the active 15-min market rotates (anticipatory loading complete).
+    /// Emitted when the active 5-min market rotates (anticipatory loading complete).
     MarketRotation {
         condition_id: String,
         yes_token_id: String,

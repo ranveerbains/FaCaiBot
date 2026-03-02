@@ -44,8 +44,8 @@ impl Default for SpikeDetectionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EntryGuardsConfig {
-    /// Max bid-ask spread in ticks (uniform regardless of mid price).
-    pub max_spread_ticks: u32,
+    /// Max bid-ask spread in absolute dollars (e.g. 0.025 = $0.025).
+    pub max_spread: f64,
     /// Min book depth as fraction of required depth.
     pub depth_min_pct: f64,
     /// No entries within this many seconds of market expiry.
@@ -63,7 +63,7 @@ pub struct EntryGuardsConfig {
 impl Default for EntryGuardsConfig {
     fn default() -> Self {
         Self {
-            max_spread_ticks: 2,
+            max_spread: 0.025,
             depth_min_pct: 0.15,
             entry_cutoff_secs: 180,
             binance_stale_event_ms: 50,

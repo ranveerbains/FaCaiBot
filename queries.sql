@@ -190,7 +190,7 @@ ORDER BY erosion_steps;
 
 -- ============================================================
 -- 12. Time remaining at entry vs. outcome (last 24h)
--- Answers: "Am I entering too late in the 15-min window?"
+-- Answers: "Am I entering too late in the 5-min window?"
 -- Tune: entry_guards.entry_cutoff_secs
 -- ============================================================
 SELECT
@@ -263,7 +263,7 @@ ORDER BY pair_cost_bucket;
 
 -- ============================================================
 -- 16. Trades where pair cost exceeded $1.00 (hedge infeasibility at fill time)
--- Maps to: entry_guards.max_spread_ticks, hedge feasibility guard
+-- Maps to: entry_guards.max_spread, hedge feasibility guard
 -- ============================================================
 SELECT
     direction,

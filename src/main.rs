@@ -87,7 +87,7 @@ async fn async_main() -> Result<()> {
         mode = ?config.mode,
         max_alloc_per_trade = %config.max_alloc_per_trade,
         spike_multiplier = config.bot.spike_detection.multiplier,
-        max_spread_ticks = config.bot.entry_guards.max_spread_ticks,
+        max_spread = config.bot.entry_guards.max_spread,
         stale_book_ms = config.bot.entry_guards.stale_book_ms,
         sustain_ms = config.bot.spike_detection.sustain_ms,
         "FaCaiBot starting"

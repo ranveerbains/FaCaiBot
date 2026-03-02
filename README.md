@@ -1,6 +1,6 @@
 # FaCaiBot
 
-Polymarket arbitrage bot for BTC/ETH 15-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
+Polymarket arbitrage bot for BTC 5-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC.md](TRADING_LOGIC.md) for trading logic details.
 

@@ -1,7 +1,7 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROTATION
-# Market rotation manager: discovery and pre-warming of upcoming 15-min markets.
+# Market rotation manager: discovery and pre-warming of upcoming 5-min markets.
 # ─────────────────────────────────────────────────────────────────────────────
 [rotation]
 
@@ -55,11 +55,10 @@ momentum_ratio_min = 0.75
 # ─────────────────────────────────────────────────────────────────────────────
 [entry_guards]
 
-# Maximum bid-ask spread in ticks on the Polymarket book.
-# If the spread is wider than this many ticks, the book is too thin to enter safely.
-# Uniform regardless of mid price — prevents lopsided markets from getting extra allowance.
-# 2 = allow up to 2 ticks ($0.02) between best bid and best ask.
-max_spread_ticks = 2
+# Maximum bid-ask spread in dollars. If the spread is wider than this,
+# the book is too thin to enter safely.
+# 0.025 = $0.025 between best bid and best ask.
+max_spread = 0.025
 
 # Minimum book depth as a fraction of the required trade size.
 # If the available depth is less than this fraction, the trade is too large
@@ -70,7 +69,8 @@ depth_min_pct = 0.20
 # No entries allowed within this many seconds of market expiry.
 # Protects against entering too close to expiry where there's not enough
 # time for the erosion cascade + hedge to complete.
-entry_cutoff_secs = 120
+# 30s = 10% of a 5-minute market.
+entry_cutoff_secs = 60
 
 # Maximum age (ms) of a Binance SBE event before it is discarded.
 # SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
@@ -86,7 +86,7 @@ stale_book_ms = 1000
 # Prevents trading in near-certain-resolution markets where one side is illiquid.
 # If YES mid > 0.90 or YES mid < 0.10, leg 2 fill probability collapses → skip.
 # 0.90 = block if market implies >90% or <10% probability for YES.
-max_price_skew = 0.85
+max_price_skew = 0.9
 
 # Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
 # After timeout, the slot is freed for the next spike. Prevents blocking on stale orders.
@@ -114,7 +114,7 @@ low_alloc_pct  = 0.3
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIDENCE
 # 3-factor scoring (sustain removed — all confirmed spikes passed it, no discriminative value).
-# Score = 0.4*(spike/ATR) + 0.2*(depth/avg) + 0.2*(time/900)
+# Score = 0.4*(spike/ATR) + 0.2*(depth/avg) + 0.2*(time/300)
 # Max possible score: 0.8
 # ─────────────────────────────────────────────────────────────────────────────
 [confidence]
@@ -157,9 +157,9 @@ adverse_threshold = 0.001
 # First erosion step interval (ms). Each subsequent step decays by erosion_interval_decay.
 # The erosion cascade progressively lowers the Leg 2 limit price toward break-even.
 # Step 1 waits longest (market has time to fill at the best price).
-# 4000 = wait 4 seconds before first erosion step.
-# Sequence at decay=0.6: 4000ms → 2400ms → 1440ms → 864ms → 518ms (~9.2s total)
-erosion_base_interval_ms = 2500
+# Sequence at decay=0.5: 1500ms → 750ms → 375ms → 188ms → 94ms (~2.9s total)
+# Tighter than 15m (was 2500ms) — 5m markets need faster hedge completion.
+erosion_base_interval_ms = 2000
 
 # Multiply the interval by this factor for each subsequent erosion step.
 # Lower = faster acceleration (later steps fire more rapidly).
@@ -177,5 +177,6 @@ depth_wall_multiplier = 4.0
 # Hard deadline (ms) from first emergency post to FOK taker fallback.
 # During this window, the engine only reposts when the book offers a strictly
 # better price (price-improvement chase). If no fill by deadline, FOK at best_ask.
-# 2500 = 2.5 seconds of price-chasing before forced taker exit.
-emergency_deadline_ms = 2500
+# 1500 = 1.5 seconds of price-chasing before forced taker exit.
+# Tighter than 15m (was 2500ms) — 5m markets need faster emergency resolution.
+emergency_deadline_ms = 2000

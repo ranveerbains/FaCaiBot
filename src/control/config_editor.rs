@@ -18,7 +18,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "spike_detection.min_magnitude_pct", min: 0.001, max: 0.5 },
     ParamSpec { name: "spike_detection.momentum_ratio_min", min: 0.0, max: 1.0 },
     // entry_guards
-    ParamSpec { name: "entry_guards.max_spread_ticks", min: 1.0, max: 20.0 },
+    ParamSpec { name: "entry_guards.max_spread", min: 0.001, max: 0.10 },
     ParamSpec { name: "entry_guards.depth_min_pct", min: 0.01, max: 1.0 },
     ParamSpec { name: "entry_guards.entry_cutoff_secs", min: 30.0, max: 600.0 },
     ParamSpec { name: "entry_guards.binance_stale_event_ms", min: 10.0, max: 1000.0 },

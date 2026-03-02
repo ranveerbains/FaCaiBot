@@ -536,7 +536,7 @@ impl LiveExecutor {
                     if let Ok(id) = alloy::primitives::U256::from_str(token_id_str) {
                         sdk.set_tick_size(id, sdk_tick);
                         sdk.set_fee_rate_bps(id, 0); // maker fee = 0
-                        sdk.set_neg_risk(id, true); // all 15-min markets are neg_risk
+                        sdk.set_neg_risk(id, true); // all crypto up/down markets are neg_risk
                     }
                 }
                 debug!("SDK caches pre-populated for new market tokens");

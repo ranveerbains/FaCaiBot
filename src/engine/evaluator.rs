@@ -53,7 +53,7 @@ pub(crate) enum Leg1RejectReason {
     StaleBook,
     /// YES mid-price outside the tradeable range (too skewed toward resolution).
     PriceSkewed,
-    /// Bid-ask spread exceeds `max_spread_ticks`.
+    /// Bid-ask spread exceeds `max_spread`.
     SpreadWide,
     /// Book depth insufficient relative to required trade size.
     InsufficientDepth,
@@ -82,7 +82,7 @@ pub(crate) enum Leg1Outcome {
 /// Holds only the config fields required for Leg 1 guard checks and signal building.
 /// All reads are from borrowed `&MarketState`; no mutation occurs here.
 pub(crate) struct Leg1Evaluator {
-    pub max_spread_ticks: u32,
+    pub max_spread: Decimal,
     pub entry_cutoff_secs: u64,
     pub depth_min_pct: Decimal,
     pub stale_book_ms: u64,
@@ -249,15 +249,10 @@ impl Leg1Evaluator {
             }
         }
 
-        // Guard: spread too wide (tick-based, uniform regardless of mid price)
-        let tick = state.tick_size;
-        let spread_ticks = if !tick.is_zero() {
-            (best_ask_price - best_bid_price) / tick
-        } else {
-            Decimal::ZERO
-        };
-        if spread_ticks > Decimal::from(self.max_spread_ticks) {
-            debug!(%spread_ticks, "evaluate() BLOCKED: spread too wide");
+        // Guard: spread too wide (dollar-based)
+        let spread = best_ask_price - best_bid_price;
+        if spread > self.max_spread {
+            debug!(%spread, "evaluate() BLOCKED: spread too wide");
             return Leg1Outcome::Rejected(Leg1RejectReason::SpreadWide);
         }
 
@@ -324,6 +319,7 @@ impl Leg1Evaluator {
         };
 
         // Leg 1 bid price — post just above the current best bid of the direction book.
+        let tick = state.tick_size;
         let mut bid_price = round_to_tick(best_bid_price + tick, tick);
 
         // Cap at one tick below ask if bid would cross (post-only constraint).
@@ -1436,7 +1432,7 @@ mod tests {
         };
 
         let evaluator = Leg1Evaluator {
-            max_spread_ticks: 5,
+            max_spread: Decimal::new(5, 2),
             entry_cutoff_secs: 60,
             depth_min_pct: Decimal::new(1, 2),
             stale_book_ms: 5_000,
@@ -1559,7 +1555,7 @@ mod tests {
         };
 
         let evaluator = Leg1Evaluator {
-            max_spread_ticks: 5,
+            max_spread: Decimal::new(5, 2),
             entry_cutoff_secs: 60,
             depth_min_pct: Decimal::new(1, 2),
             stale_book_ms: 5_000,

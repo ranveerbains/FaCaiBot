@@ -28,7 +28,7 @@ This document covers FaCaiBot's trading logic: signal detection, entry validatio
 
 ## 1. Core Trade Model
 
-FaCaiBot exploits the repricing lag between Binance (source of truth) and Polymarket's CLOB (15-minute BTC/ETH prediction markets). When BTC spikes on Binance, Polymarket market makers take seconds to adjust quotes. The bot enters before repricing and hedges with the opposite side:
+FaCaiBot exploits the repricing lag between Binance (source of truth) and Polymarket's CLOB (5-minute BTC prediction markets). When BTC spikes on Binance, Polymarket market makers take seconds to adjust quotes. The bot enters before repricing and hedges with the opposite side:
 
 ```
 Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
@@ -107,7 +107,7 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 4 | **Binance price** | `binance_price` exists | `NoBinance` | Reference price needed |
 | 5 | **Stale book** | `book_age_ms > stale_book_ms` (500ms) | `StaleBook` | Stale data = unreliable pricing |
 | 6 | **Price skew** | YES mid > 0.80 or < 0.20 | `PriceSkewed` | Near-certain markets have illiquid sides |
-| 7 | **Spread** | `(ask - bid) / tick > max_spread_ticks` (2 ticks) | `SpreadWide` | Book too thin for reliable entry |
+| 7 | **Spread** | `(ask - bid) > max_spread` ($0.025) | `SpreadWide` | Book too thin for reliable entry |
 | 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
 | 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
 | 10 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
@@ -128,7 +128,7 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 
 ### Confidence formula
 
-`confidence = 0.4 × min(spike_magnitude / ATR, 1.0) + 0.2 × min(total_book_depth / avg_depth, 1.0) + 0.2 × (time_remaining_secs / 900.0)`
+`confidence = 0.4 × min(spike_magnitude / ATR, 1.0) + 0.2 × min(total_book_depth / avg_depth, 1.0) + 0.2 × (time_remaining_secs / 300.0)`
 
 Max possible: **0.8**. The sustain factor was removed — all confirmed spikes already passed the sustain gate, so it contributed a constant offset with zero discriminative value.
 
@@ -372,7 +372,7 @@ T-0      Instant switch: emit pre-warmed MarketRotation + books
 
 ### Market discovery
 
-Gamma API `GET /events?tag_id=102467&active=true&closed=false&limit=10`. Tag 102467 = "15M" markets. Filter by slug prefix `btc-updown-15m-` or `eth-updown-15m-`. Note: `clobTokenIds` is a JSON-encoded string (not an array) — index 0 = YES, index 1 = NO.
+Gamma API `GET /events?tag_id=102892&closed=false&order=endDate&ascending=true&limit=100`. Tag 102892 = "5M" markets. Filter by slug prefix `btc-updown-5m-`. Note: `clobTokenIds` is a JSON-encoded string (not an array) — index 0 = YES, index 1 = NO.
 
 Pre-warming at T-180s: query for markets ending after the current one, skipping Market A to find Market B. Pre-fetch both YES and NO books via REST.
 
@@ -427,7 +427,7 @@ When first entering cutoff with an open position, a log notes "Leg 2 will contin
 
 ### Per-market budget
 
-`cumulative_used` tracks total USDC allocated in the current 15-minute market. Reset to 0 on rotation. No explicit per-market cap guard — the single-trade-at-a-time constraint plus `max_alloc_per_trade` naturally bound exposure.
+`cumulative_used` tracks total USDC allocated in the current 5-minute market. Reset to 0 on rotation. No explicit per-market cap guard — the single-trade-at-a-time constraint plus `max_alloc_per_trade` naturally bound exposure.
 
 ### Session tracking (simulation only)
 
@@ -588,7 +588,7 @@ The `ActiveTrade` guard rejects the spike, incrementing `rej_busy`. The spike is
 
 ## 16. Complete Trade Example
 
-**Scenario:** BTC spikes up $400 (0.77% at $52,000). 15-minute market has 10 minutes remaining.
+**Scenario:** BTC spikes up $400 (0.77% at $52,000). 5-minute market has 3 minutes remaining.
 
 ### Step 1: Spike Candidate (T+0ms)
 

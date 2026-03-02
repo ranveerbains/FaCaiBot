@@ -50,7 +50,7 @@ impl SimFill {
     ///
     /// Pure function — no side effects.
     pub fn compute_taker_fee(price: Decimal, size: Decimal) -> Decimal {
-        // Polymarket 15-min crypto: fee = C × feeRate × (p × (1 - p))^2
+        // Polymarket 5-min crypto: fee = C × feeRate × (p × (1 - p))^2
         // where C = shares, feeRate = 0.25, exponent = 2
         let one = Decimal::ONE;
         let factor = Decimal::new(25, 2); // 0.25
@@ -164,7 +164,7 @@ pub struct SimTrade {
 
 // ─── Helper Structs for Telegram Reporting ───────────────────────────────────
 
-/// Aggregated stats for a single 15-minute market window.
+/// Aggregated stats for a single 5-minute market window.
 /// Used for Tier 2 Telegram messages.
 #[derive(Debug, Clone)]
 pub struct MarketSummary {
@@ -215,7 +215,7 @@ pub struct MarketSummary {
 pub struct SessionSummary {
     /// Uptime in seconds since session_start.
     pub uptime_secs: u64,
-    /// Number of 15-min markets observed.
+    /// Number of 5-min markets observed.
     pub markets_observed: u32,
     /// Total signals generated.
     pub signals_detected: u32,
@@ -343,7 +343,7 @@ pub struct SimulationState {
     pub current_market_walls: u32,
 
     // ── Session metadata ─────────────────────────────────────────────────
-    /// Number of 15-min markets observed this session.
+    /// Number of 5-min markets observed this session.
     pub markets_observed: u32,
     /// Epoch ms when this simulation session started.
     pub session_start: u64,

@@ -91,7 +91,7 @@ impl SimulationExecutor {
         self.binance_mid = Some(mid);
     }
 
-    /// Update market parameters at each 15-minute market rotation.
+    /// Update market parameters at each 5-minute market rotation.
     pub fn update_market_params(&mut self, market_end_ms: u64, tick_size: Decimal) {
         self.market_end_ms = market_end_ms;
         self.tick_size = tick_size;
@@ -177,7 +177,7 @@ impl SimulationExecutor {
         let end_secs = market_end_ms / 1_000;
         let hh = (end_secs % 86_400) / 3_600;
         let mm = (end_secs % 3_600) / 60;
-        let start_secs = end_secs.saturating_sub(900);
+        let start_secs = end_secs.saturating_sub(300);
         let start_hh = (start_secs % 86_400) / 3_600;
         let start_mm = (start_secs % 3_600) / 60;
         let period_label = format!(
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_taker_fee_formula() {
-        // Polymarket 15-min crypto: fee = C × 0.25 × (p × (1 - p))²
+        // Polymarket 5-min crypto: fee = C × 0.25 × (p × (1 - p))²
         // At price = 0.50, size = 100:
         //   fee = 100 * 0.25 * (0.50 * 0.50)^2 = 100 * 0.25 * 0.0625 = 1.5625
         let price = d("0.50");

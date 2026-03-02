@@ -174,7 +174,7 @@ impl TelegramReporter {
         self.fire_critical(text);
     }
 
-    /// Tier 2 — market summary (sent at each 15-min market expiry).
+    /// Tier 2 — market summary (sent at each 5-min market expiry).
     /// Uses fire_critical() so summaries are never silently dropped by the rate limiter.
     /// Gated by `NotifyFlags::summary_enabled`.
     pub fn send_market_summary(&self, summary: &MarketSummary) {
@@ -601,7 +601,7 @@ mod formatter {
         )
     }
 
-    /// Tier 2 — per-market summary (sent at each 15-min market expiry).
+    /// Tier 2 — per-market summary (sent at each 5-min market expiry).
     pub(super) fn format_market_summary(s: &MarketSummary) -> String {
         let resolution_line = if s.resolution == "pending" {
             format!(

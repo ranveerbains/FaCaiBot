@@ -46,17 +46,16 @@ pub(super) const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 /// Gamma API base URL — market metadata / discovery.
 pub(super) const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
 
-/// Gamma query for upcoming 15-minute crypto markets.
+/// Gamma query for upcoming 5-minute crypto markets.
 ///
-/// Uses tag_id=102467 ("15M") to find all 15-minute prediction markets.
+/// Uses tag_id=102892 ("5M") to find all 5-minute prediction markets.
 /// Sorted by endDate ascending so the soonest-expiring market (the currently
 /// active one) appears early in results. Limit set high enough (100) to
 /// accommodate both stale events the API returns as `closed=false` and
 /// pre-created future markets across all assets (BTC, ETH, SOL, etc.).
-/// We filter client-side for BTC/ETH by slug prefix
-/// (`btc-updown-15m-` / `eth-updown-15m-`).
+/// We filter client-side for BTC by slug prefix (`btc-updown-5m-`).
 pub(super) const GAMMA_EVENTS_PATH: &str =
-    "/events?tag_id=102467&closed=false&order=endDate&ascending=true&limit=100";
+    "/events?tag_id=102892&closed=false&order=endDate&ascending=true&limit=100";
 
 // ─── Timing constants ─────────────────────────────────────────────────────────
 

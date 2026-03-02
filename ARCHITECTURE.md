@@ -157,7 +157,7 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 | No Binance price | `binance_price` absent | — |
 | Stale book | book age > `stale_book_ms` (500ms) | — |
 | Price skew | YES mid > 0.80 or < 0.20 | Near-certain-resolution, Leg 2 fill collapses |
-| Spread | > `max_spread_ticks` (2 ticks) | Tick-based, uniform regardless of mid price |
+| Spread | > `max_spread` ($0.025) | Dollar-based, consistent across tick sizes |
 | Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Depth | < `depth_min_pct` (20%) of required | — |
@@ -238,7 +238,7 @@ Both legs Filled → reset `leg1_state`, `leg2_state`, `erosion` to None. `cumul
 ```
 confidence = 0.4 * min(spike_magnitude / ATR, 1.0)   [spike quality vs. recent volatility]
            + 0.2 * min(poly_book_depth / avg_book_depth, 1.0)
-           + 0.2 * (time_remaining / 900.0)
+           + 0.2 * (time_remaining / 300.0)
 
 Max score: 0.8 (sustain removed — all confirmed spikes already passed the gate,
                so it contributed a constant offset with no discriminative value)
@@ -257,8 +257,8 @@ Minimum allocation is $1 regardless of tier. `max_alloc_per_trade` is the sole c
 
 ## 6. Market Rotation
 
-- **Discovery**: Gamma API `GET /events?tag_id=102467&active=true&closed=false&limit=10` every 10 min
-  - Tag 102467 = "15M". Filter by slug prefix `btc-updown-15m-` / `eth-updown-15m-`
+- **Discovery**: Gamma API `GET /events?tag_id=102892&closed=false&order=endDate&ascending=true&limit=100` every 10 min
+  - Tag 102892 = "5M". Filter by slug prefix `btc-updown-5m-`
   - `clobTokenIds` is a JSON-encoded string (index 0 = YES, index 1 = NO)
 - **Anticipatory pre-warming** (T-180s = 3 min before current market expires):
   - `discover_market_after(current_end_ms)` queries Gamma for markets ending **after** the current one, skipping the still-active Market A to find Market B
@@ -315,7 +315,7 @@ min_magnitude_pct, momentum_ratio_min
 # NOTE: no spikes emitted for first ~0.5s (10 ticks at 50ms) while ATR warms up
 
 [entry_guards]         # 6 params
-max_spread_ticks, depth_min_pct, entry_cutoff_secs, stale_book_ms, max_price_skew,
+max_spread, depth_min_pct, entry_cutoff_secs, stale_book_ms, max_price_skew,
 leg1_timeout_ms
 
 [capital]              # 4 params
@@ -393,7 +393,7 @@ Four tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
 
 1. **Opportunity Alert**: Per signal — spike info, confidence, allocation, Leg 1 entry, Leg 2 target
 2. **Trade Completed**: Per trade — "Buy YES"/"Buy NO" labels, pair cost, profit (USDC), erosion steps
-3. **Market Summary**: Per 15-min expiry — fill rate, trades, PnL
+3. **Market Summary**: Per 5-min expiry — fill rate, trades, PnL
 4. **Session Summary**: Hourly + shutdown — aggregate stats, win rate, balance
 
 Rate limited at 5s intervals. Critical messages (trade completions) bypass the limiter.
