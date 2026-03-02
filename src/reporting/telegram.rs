@@ -121,6 +121,17 @@ impl TelegramReporter {
         self.fire_and_forget(text);
     }
 
+    /// Send a live-mode startup notice — "FaCaiBot live started".
+    pub fn send_live_startup_message(&self) {
+        let text = concat!(
+            "<b>FaCaiBot live started</b>\n\n",
+            "Connected to Binance SBE + Polymarket CLOB. ",
+            "Real orders will be placed.",
+        )
+        .to_owned();
+        self.fire_and_forget(text);
+    }
+
     /// Send a generic alert string (kill switch, UMA dispute, etc.).
     pub fn send_alert(&self, msg: &str) {
         let text = format!("<b>ALERT</b>\n\n{}", formatter::escape_html(msg));

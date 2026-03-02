@@ -21,11 +21,13 @@ use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::reporting::telegram::TelegramReporter;
 use crate::types::market::{
     DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState, PriceLevel,
     TradeStatus,
 };
 use crate::types::order::{ExecutorCommand, ExitReason, ProfitTier, Side, TradeSignal};
+use crate::types::simulation::{MarketSummary, SessionSummary, SimFill, SimTrade};
 use crate::utils::time::epoch_ms as now_epoch_ms;
 
 use super::confidence::compute_confidence;
@@ -47,6 +49,33 @@ struct SpikeDiagData {
     rej_magnitude: u64,
     confirmed: u64,
     stale: u64,
+}
+
+// ─── Live executor diagnostic snapshot ───────────────────────────────────────
+
+/// Lightweight copy of live executor diagnostics for Telegram forwarding.
+#[derive(Debug, Clone)]
+struct LiveDiagData {
+    placed: u64,
+    cancelled: u64,
+    failed: u64,
+    emergency_foks: u64,
+    emergency_makers: u64,
+    favorable_takers: u64,
+}
+
+// ─── Per-trade Leg 2 metadata for live mode Telegram reporting ───────────────
+
+/// Tracks Leg 2 exit metadata in live mode so `on_trade_complete()` can build
+/// the correct tags for the trade-completed Telegram message.
+/// Reset to default at the start of each trade (on Leg 1 fill).
+#[derive(Debug, Default, Clone)]
+struct LiveTradeMeta {
+    leg2_was_taker: bool,
+    emergency_maker: bool,
+    adverse_movement: bool,
+    favorable_taker: bool,
+    exit_reason: Option<ExitReason>,
 }
 
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
@@ -110,6 +139,36 @@ pub struct StrategyEngine {
 
     /// Latest spike detector diagnostics (received via `SpikeDiagnostic` event).
     last_spike_diag: Option<SpikeDiagData>,
+
+    /// Latest live executor diagnostics (received via `ExecutorFeedback::DiagSnapshot`).
+    last_live_diag: Option<LiveDiagData>,
+
+    /// Set `true` when the engine's 60s terminal log fires. Cleared after the
+    /// combined Telegram diagnostic is sent (requires both flags to be set).
+    engine_diag_ready: bool,
+    /// Set `true` when a `SpikeDiagnostic` event is received. Cleared after the
+    /// combined Telegram diagnostic is sent (requires both flags to be set).
+    spike_diag_ready: bool,
+    /// Pending combined Telegram diagnostic message (spike + engine counters).
+    /// Built only when both `engine_diag_ready` and `spike_diag_ready` are set.
+    /// Drained by main loop via `take_pending_telegram_diag()`.
+    pending_telegram_diag: Option<String>,
+
+    // ── Live mode Telegram reporting ───────────────────────────────────────
+    /// Telegram reporter for live mode. `None` in simulation mode.
+    reporter: Option<TelegramReporter>,
+    /// Leg 2 metadata for the current live trade (reset on Leg 1 fill).
+    live_trade_meta: LiveTradeMeta,
+    /// Completed trades for the current market window (cleared on rotation).
+    live_market_trades: Vec<SimTrade>,
+    /// Completed trades for the entire session.
+    live_session_trades: Vec<SimTrade>,
+    /// Leg 1 signals sent for the current market window (cleared on rotation).
+    live_market_signals: u32,
+    /// Depth walls outbid for the current market window (cleared on rotation).
+    live_market_walls: u32,
+    /// Epoch ms when set_reporter() was called (used for session uptime).
+    live_session_start_ms: u64,
 
     // ── Diagnostic counters (cumulative from app start, logged every 60s) ──
     diag_markets_rotated: u64,
@@ -181,6 +240,17 @@ impl StrategyEngine {
             speculative_awaiting_sustain: false,
             hedge_book_changed: false,
             last_spike_diag: None,
+            last_live_diag: None,
+            engine_diag_ready: false,
+            spike_diag_ready: false,
+            pending_telegram_diag: None,
+            reporter: None,
+            live_trade_meta: LiveTradeMeta::default(),
+            live_market_trades: Vec::new(),
+            live_session_trades: Vec::new(),
+            live_market_signals: 0,
+            live_market_walls: 0,
+            live_session_start_ms: 0,
             diag_markets_rotated: 0,
             diag_spikes_received: 0,
             diag_spikes_dropped_cutoff: 0,
@@ -622,6 +692,10 @@ impl StrategyEngine {
                 self.speculative_awaiting_sustain = false;
                 self.in_cutoff_window = false;
                 self.diag_markets_rotated += 1;
+                // Reset per-market live reporting state.
+                self.live_market_trades.clear();
+                self.live_market_signals = 0;
+                self.live_market_walls = 0;
             }
 
             // ── Trade status update (fill tracking via User WS) ───────────
@@ -645,6 +719,30 @@ impl StrategyEngine {
                                 fill_timestamp_ms: now_ms,
                             };
                             self.init_erosion(price, size, now_ms);
+                            // Reset live trade meta for the new trade.
+                            self.live_trade_meta = LiveTradeMeta::default();
+
+                            // Send opportunity alert via Telegram in live mode.
+                            if let (Some(reporter), Some(signal)) = (
+                                self.reporter.clone(),
+                                self.pending_leg1_signal.clone(),
+                            ) {
+                                let book = signal
+                                    .book_snapshot
+                                    .clone()
+                                    .or_else(|| self.state.poly_book.clone())
+                                    .unwrap_or_else(|| OrderBook {
+                                        asset_id: signal.token_id.clone(),
+                                        bids: vec![],
+                                        asks: vec![],
+                                        timestamp_ms: now_ms,
+                                    });
+                                reporter.send_opportunity_alert(&signal, price, size, &book);
+                                self.live_market_signals += 1;
+                                if signal.bot_contested {
+                                    self.live_market_walls += 1;
+                                }
+                            }
                         }
                         TradeStatus::Failed => {
                             warn!(%order_id, "Leg 1 FAILED — resetting to None");
@@ -754,6 +852,8 @@ impl StrategyEngine {
                     confirmed,
                     stale,
                 });
+                self.spike_diag_ready = true;
+                self.try_build_telegram_diag();
             }
 
             // Control events are handled in main.rs before on_event() is called.
@@ -933,9 +1033,11 @@ impl StrategyEngine {
         let is_emergency = decision.is_emergency();
 
         if is_emergency {
-            let reason = match &decision {
-                Leg2Decision::Emergency { signal, .. } => signal.exit_reason,
-                _ => None,
+            let (reason, was_taker) = match &decision {
+                Leg2Decision::Emergency { signal, .. } => {
+                    (signal.exit_reason, signal.sim_was_taker)
+                }
+                _ => (None, false),
             };
             match reason {
                 Some(ExitReason::AdverseMovement) => self.diag_emg_adverse += 1,
@@ -944,6 +1046,14 @@ impl StrategyEngine {
                 Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
                 None => self.diag_emg_adverse += 1, // fallback
             }
+            // Track for live mode trade-completed Telegram message.
+            self.live_trade_meta = LiveTradeMeta {
+                leg2_was_taker: was_taker,
+                exit_reason: reason,
+                emergency_maker: reason.is_some() && !was_taker,
+                adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
+                favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)) && was_taker,
+            };
             if let Some(e) = self.erosion.as_mut() {
                 if !e.emergency_submitted {
                     // First emergency post — record the timestamp for deadline tracking.
@@ -1023,18 +1133,22 @@ impl StrategyEngine {
 
     // ─── Diagnostic ─────────────────────────────────────────────────────
 
-    /// Log cumulative engine diagnostics every 60 seconds.
-    /// Returns a formatted diagnostic message when the 60s gate fires (for Telegram
-    /// forwarding), or `None` otherwise.
+    /// Log cumulative engine diagnostics every 60 seconds (terminal only).
+    ///
+    /// Sets `engine_diag_ready` and calls `try_build_telegram_diag()`. The
+    /// Telegram message is only built once both the engine and spike detector
+    /// have provided fresh data in the same 60s window — decoupled from this
+    /// timer so spike + engine data are always in sync in the Telegram message.
+    ///
     /// Call this once per engine loop iteration (cheap — checks timestamp first).
-    pub fn check_diagnostic(&mut self) -> Option<String> {
+    pub fn check_diagnostic(&mut self) {
         let now_ms = now_epoch_ms();
         if self.last_diag_ms == 0 {
             self.last_diag_ms = now_ms;
-            return None;
+            return;
         }
         if now_ms.saturating_sub(self.last_diag_ms) < 60_000 {
-            return None;
+            return;
         }
         info!(
             markets = self.diag_markets_rotated,
@@ -1065,8 +1179,21 @@ impl StrategyEngine {
             "engine 60s"
         );
         self.last_diag_ms = now_ms;
+        self.engine_diag_ready = true;
+        self.try_build_telegram_diag();
+    }
 
-        // Build combined Telegram message (spike + engine).
+    /// Build and store the combined Telegram diagnostic message if both fresh
+    /// engine and spike detector data are available (`engine_diag_ready &&
+    /// spike_diag_ready`). Clears both flags after building so the next message
+    /// waits for both sources to refresh again.
+    fn try_build_telegram_diag(&mut self) {
+        if !self.engine_diag_ready || !self.spike_diag_ready {
+            return;
+        }
+        self.engine_diag_ready = false;
+        self.spike_diag_ready = false;
+
         let spike_section = if let Some(ref s) = self.last_spike_diag {
             format!(
                 "<b>Spike Detector</b>\n\
@@ -1086,7 +1213,23 @@ impl StrategyEngine {
             "<b>Spike Detector</b>\n(no data yet)".to_string()
         };
 
-        let msg = format!(
+        let live_section = if let Some(ref l) = self.last_live_diag {
+            format!(
+                "\n\n<b>Live Executor</b>\n\
+                 Placed: {placed}  Cancelled: {cancelled}  Failed: {failed}\n\
+                 Emergency FOK: {efok}  Emergency maker: {emkr}  Favorable taker: {ftaker}",
+                placed = l.placed,
+                cancelled = l.cancelled,
+                failed = l.failed,
+                efok = l.emergency_foks,
+                emkr = l.emergency_makers,
+                ftaker = l.favorable_takers,
+            )
+        } else {
+            String::new()
+        };
+
+        self.pending_telegram_diag = Some(format!(
             "<b>--- DIAGNOSTICS (60s) ---</b>\n\
              \n\
              {spike}\n\
@@ -1104,7 +1247,7 @@ impl StrategyEngine {
              <b>Leg 2</b>\n\
              Erosion steps: {erosion}  Fills: {l2_maker} maker / {l2_taker} taker\n\
              Emergencies — adverse: {emg_adv}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
-             Emergency fills — {emg_mkr} maker / {emg_tkr} taker",
+             Emergency fills — {emg_mkr} maker / {emg_tkr} taker{live}",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
@@ -1131,12 +1274,38 @@ impl StrategyEngine {
             emg_fav = self.diag_emg_favorable,
             emg_mkr = self.diag_emg_maker,
             emg_tkr = self.diag_emg_taker,
-        );
+            live = live_section,
+        ));
+    }
 
-        Some(msg)
+    /// Drain the pending combined Telegram diagnostic message (if any).
+    /// Called by the main loop to send to Telegram when both engine and spike
+    /// detector have provided fresh data.
+    pub fn take_pending_telegram_diag(&mut self) -> Option<String> {
+        self.pending_telegram_diag.take()
     }
 
     // ─── Accessors and Executor callbacks ────────────────────────────────
+
+    /// Store latest live executor diagnostic snapshot for Telegram forwarding.
+    pub fn on_live_diag(
+        &mut self,
+        placed: u64,
+        cancelled: u64,
+        failed: u64,
+        emergency_foks: u64,
+        emergency_makers: u64,
+        favorable_takers: u64,
+    ) {
+        self.last_live_diag = Some(LiveDiagData {
+            placed,
+            cancelled,
+            failed,
+            emergency_foks,
+            emergency_makers,
+            favorable_takers,
+        });
+    }
 
     pub fn state(&self) -> &MarketState {
         &self.state
@@ -1337,23 +1506,43 @@ impl StrategyEngine {
     /// Called in live mode when both legs are filled (detected in main engine loop).
     /// Replicates the trade completion logic from `advance_simulation()`.
     pub fn on_trade_complete(&mut self) {
-        if let (
-            OrderState::Filled {
-                price: l1_price, ..
-            },
-            OrderState::Filled {
-                price: l2_price, ..
-            },
-        ) = (&self.state.leg1_state, &self.state.leg2_state)
-        {
-            let pair_cost = *l1_price + *l2_price;
+        let now_ms = now_epoch_ms();
+
+        // Extract fill data before clearing state.
+        let l1_data = match &self.state.leg1_state {
+            OrderState::Filled { price, size, fill_timestamp_ms, .. } => {
+                Some((*price, *size, *fill_timestamp_ms))
+            }
+            _ => None,
+        };
+        let l2_data = match &self.state.leg2_state {
+            OrderState::Filled { price, size, .. } => Some((*price, *size)),
+            _ => None,
+        };
+
+        if let (Some((l1_price, l1_size, l1_ts)), Some((l2_price, l2_size))) = (l1_data, l2_data) {
+            let pair_cost = l1_price + l2_price;
             let net_profit = Decimal::ONE - pair_cost;
             info!(
-                l1_price = %l1_price, l2_price = %l2_price,
+                %l1_price, %l2_price,
                 %pair_cost, %net_profit,
                 "live trade pair complete — resetting for next trade"
             );
+
+            // Build SimTrade and send Telegram messages if reporter is set.
+            if self.reporter.is_some() {
+                if let Some(trade) =
+                    self.build_live_sim_trade(l1_price, l1_size, l1_ts, l2_price, l2_size, now_ms)
+                {
+                    if let Some(ref reporter) = self.reporter.clone() {
+                        reporter.send_trade_completed(&trade);
+                    }
+                    self.live_market_trades.push(trade.clone());
+                    self.live_session_trades.push(trade);
+                }
+            }
         }
+
         self.state.leg1_state = OrderState::None;
         self.state.leg2_state = OrderState::None;
         self.erosion = None;
@@ -1736,6 +1925,311 @@ impl StrategyEngine {
         );
         signal.sim_confirmed_fill = true;
         Some(signal)
+    }
+
+    // ─── Live mode Telegram reporting ────────────────────────────────────────
+
+    /// Attach a Telegram reporter for live mode reporting.
+    /// Sets `live_session_start_ms` to now so uptime is tracked from bot startup.
+    pub fn set_reporter(&mut self, reporter: TelegramReporter) {
+        self.reporter = Some(reporter);
+        self.live_session_start_ms = now_epoch_ms();
+    }
+
+    /// Send a full market summary via Telegram for the given market.
+    ///
+    /// Called by main.rs on the cutoff trigger in live mode. Builds the summary
+    /// from `live_market_trades` and current per-market counters.
+    pub fn send_live_market_summary(&self, condition_id: &str, market_end_ms: u64) {
+        let reporter = match &self.reporter {
+            Some(r) => r,
+            None => return,
+        };
+
+        let end_secs = market_end_ms / 1_000;
+        let start_secs = end_secs.saturating_sub(15 * 60);
+        let start_h = (start_secs / 3600) % 24;
+        let start_m = (start_secs % 3600) / 60;
+        let end_h = (end_secs / 3600) % 24;
+        let end_m = (end_secs % 3600) / 60;
+        let period_label = format!(
+            "{:02}:{:02} - {:02}:{:02} UTC",
+            start_h, start_m, end_h, end_m
+        );
+
+        let trades: Vec<SimTrade> = self
+            .live_market_trades
+            .iter()
+            .filter(|t| t.market_id == condition_id)
+            .cloned()
+            .collect();
+
+        let leg1_fills = trades.len() as u32;
+        let trades_hedged = trades.iter().filter(|t| t.leg2.is_some()).count() as u32;
+        let emergency_taker_fills = trades.iter().filter(|t| t.leg2_was_taker).count() as u32;
+        let emergency_maker_fills = trades.iter().filter(|t| t.emergency_maker).count() as u32;
+        let favorable_taker_fills = trades.iter().filter(|t| t.favorable_taker).count() as u32;
+
+        let mut allocation_used = Decimal::ZERO;
+        let mut taker_fees_paid = Decimal::ZERO;
+        let mut gross_market_pnl = Decimal::ZERO;
+        let mut net_market_pnl = Decimal::ZERO;
+        for t in &trades {
+            allocation_used += t.alloc_amount;
+            taker_fees_paid += t.taker_fee;
+            gross_market_pnl += t.gross_profit;
+            net_market_pnl += t.net_profit;
+        }
+
+        let summary = MarketSummary {
+            market_id: condition_id.to_owned(),
+            period_label,
+            resolution: "pending".to_owned(),
+            uma_hours_remaining: Some(2),
+            signals_detected: self.live_market_signals,
+            leg1_fills,
+            trades_hedged,
+            total_trades: leg1_fills,
+            walls_outbid: self.live_market_walls,
+            emergency_taker_fills,
+            emergency_maker_fills,
+            favorable_taker_fills,
+            trades,
+            allocation_used,
+            allocation_cap: Decimal::ZERO,
+            taker_fees_paid,
+            gross_market_pnl,
+            net_market_pnl,
+            capital_locked: Decimal::ZERO,
+        };
+
+        reporter.send_market_summary(&summary);
+    }
+
+    /// Send a session summary via Telegram.
+    ///
+    /// Called by main.rs on graceful shutdown in live mode.
+    pub fn send_live_session_summary(&self) {
+        let reporter = match &self.reporter {
+            Some(r) => r,
+            None => return,
+        };
+
+        let now_ms = now_epoch_ms();
+        let uptime_secs = now_ms.saturating_sub(self.live_session_start_ms) / 1_000;
+
+        let trades = &self.live_session_trades;
+        let total_trades = trades.len() as u32;
+        let leg1_fills = total_trades;
+        let trades_hedged = trades.iter().filter(|t| t.leg2.is_some()).count() as u32;
+        let signals_detected = self.diag_leg1_signals as u32;
+        let unfilled_post_only = (self.diag_leg1_signals as u32).saturating_sub(leg1_fills);
+
+        let mut high_count: u32 = 0;
+        let mut med_count: u32 = 0;
+        let mut low_count: u32 = 0;
+        let mut high_alloc_sum = Decimal::ZERO;
+        let mut med_alloc_sum = Decimal::ZERO;
+        let mut low_alloc_sum = Decimal::ZERO;
+        let mut conf_sum = Decimal::ZERO;
+        let mut gross_pnl = Decimal::ZERO;
+        let mut taker_fees = Decimal::ZERO;
+        let mut profit_pct_sum = Decimal::ZERO;
+        let mut best_pct = Decimal::MIN;
+        let mut best_market = String::new();
+        let mut best_conf = Decimal::ZERO;
+        let mut worst_pct = Decimal::MAX;
+        let mut worst_market = String::new();
+        let mut worst_conf = Decimal::ZERO;
+        let mut walls_outbid: u32 = 0;
+        let mut adverse_fok: u32 = 0;
+        let mut break_even_fok: u32 = 0;
+        let mut timer_fok: u32 = 0;
+        let mut emergency_taker: u32 = 0;
+        let mut emergency_maker: u32 = 0;
+        let mut favorable_taker: u32 = 0;
+
+        for t in trades {
+            gross_pnl += t.gross_profit;
+            taker_fees += t.taker_fee;
+            conf_sum += t.confidence;
+            profit_pct_sum += t.profit_pct;
+            if t.bot_contested { walls_outbid += 1; }
+            if t.leg2_was_taker { emergency_taker += 1; }
+            if t.emergency_maker { emergency_maker += 1; }
+            if t.favorable_taker { favorable_taker += 1; }
+            if t.adverse_movement_hedge && t.leg2_was_taker { adverse_fok += 1; }
+            match t.exit_reason {
+                Some(ExitReason::BreakEvenBreach) => break_even_fok += 1,
+                Some(ExitReason::MarketExpiry) => timer_fok += 1,
+                _ => {}
+            }
+            match t.profit_target_tier {
+                ProfitTier::High => { high_count += 1; high_alloc_sum += t.alloc_amount; }
+                ProfitTier::Med => { med_count += 1; med_alloc_sum += t.alloc_amount; }
+                ProfitTier::Low => { low_count += 1; low_alloc_sum += t.alloc_amount; }
+            }
+            if t.profit_pct > best_pct {
+                best_pct = t.profit_pct;
+                best_market = t.market_id.clone();
+                best_conf = t.confidence;
+            }
+            if t.profit_pct < worst_pct {
+                worst_pct = t.profit_pct;
+                worst_market = t.market_id.clone();
+                worst_conf = t.confidence;
+            }
+        }
+
+        if total_trades == 0 {
+            best_pct = Decimal::ZERO;
+            worst_pct = Decimal::ZERO;
+        }
+
+        let net_pnl = gross_pnl - taker_fees;
+        let avg_confidence = if total_trades > 0 {
+            conf_sum / Decimal::from(total_trades)
+        } else {
+            Decimal::ZERO
+        };
+        let avg_net_profit_pct = if total_trades > 0 {
+            profit_pct_sum / Decimal::from(total_trades)
+        } else {
+            Decimal::ZERO
+        };
+        let win_rate_pct = if total_trades > 0 {
+            let wins = trades.iter().filter(|t| t.net_profit > Decimal::ZERO).count() as u64;
+            Decimal::from(wins) / Decimal::from(total_trades) * Decimal::ONE_HUNDRED
+        } else {
+            Decimal::ZERO
+        };
+
+        let summary = SessionSummary {
+            uptime_secs,
+            markets_observed: self.diag_markets_rotated as u32,
+            signals_detected,
+            leg1_fills,
+            trades_hedged,
+            total_trades,
+            walls_outbid,
+            adverse_movement_fok: adverse_fok,
+            break_even_fok,
+            timer_deadline_fok: timer_fok,
+            emergency_taker_fills: emergency_taker,
+            emergency_maker_fills: emergency_maker,
+            favorable_taker_fills: favorable_taker,
+            high_conf_trades: high_count,
+            high_conf_avg_alloc: if high_count > 0 { high_alloc_sum / Decimal::from(high_count) } else { Decimal::ZERO },
+            med_conf_trades: med_count,
+            med_conf_avg_alloc: if med_count > 0 { med_alloc_sum / Decimal::from(med_count) } else { Decimal::ZERO },
+            low_conf_trades: low_count,
+            low_conf_avg_alloc: if low_count > 0 { low_alloc_sum / Decimal::from(low_count) } else { Decimal::ZERO },
+            avg_confidence,
+            gross_pnl,
+            emergency_taker_fees: taker_fees,
+            est_maker_rebates: Decimal::ZERO,
+            net_pnl,
+            win_rate_pct,
+            avg_net_profit_pct,
+            best_trade_pct: best_pct,
+            best_trade_market: best_market,
+            best_trade_conf: best_conf,
+            worst_trade_pct: worst_pct,
+            worst_trade_market: worst_market,
+            worst_trade_conf: worst_conf,
+            unfilled_signals: unfilled_post_only,
+            unfilled_post_only,
+            unfilled_liquidity: 0,
+            unfilled_spread_wide: 0,
+            capital_locked: Decimal::ZERO,
+            virtual_balance: Decimal::ZERO,
+            starting_balance: Decimal::ZERO,
+        };
+
+        reporter.send_session_summary(&summary);
+    }
+
+    /// Build a `SimTrade` from live fill data for Telegram reporting.
+    ///
+    /// Returns `None` if required state (erosion or pending signal) is unavailable.
+    fn build_live_sim_trade(
+        &self,
+        l1_price: Decimal,
+        l1_size: Decimal,
+        l1_ts: u64,
+        l2_price: Decimal,
+        l2_size: Decimal,
+        now_ms: u64,
+    ) -> Option<SimTrade> {
+        let erosion = self.erosion.as_ref()?;
+        let signal = self.pending_leg1_signal.as_ref()?;
+
+        let pair_cost = l1_price + l2_price;
+        let gross_profit = (Decimal::ONE - pair_cost) * l1_size;
+        let taker_fee = if self.live_trade_meta.leg2_was_taker {
+            SimFill::compute_taker_fee(l2_price, l2_size)
+        } else {
+            Decimal::ZERO
+        };
+        let net_profit = gross_profit - taker_fee;
+        let total_cost = pair_cost * l1_size;
+        let profit_pct = if total_cost.is_zero() {
+            Decimal::ZERO
+        } else {
+            net_profit / total_cost * Decimal::ONE_HUNDRED
+        };
+
+        let leg1_side = match erosion.direction {
+            Direction::Up => crate::types::order::Side::Buy,
+            Direction::Down => crate::types::order::Side::Buy,
+        };
+        let leg2_side = leg1_side;
+
+        let leg1_fill = SimFill {
+            side: leg1_side,
+            price: l1_price,
+            size: l1_size,
+            timestamp_ms: l1_ts,
+            was_partial: false,
+            was_taker: false,
+            taker_fee: Decimal::ZERO,
+        };
+        let leg2_fill = SimFill {
+            side: leg2_side,
+            price: l2_price,
+            size: l2_size,
+            timestamp_ms: now_ms,
+            was_partial: false,
+            was_taker: self.live_trade_meta.leg2_was_taker,
+            taker_fee,
+        };
+
+        Some(SimTrade {
+            market_id: signal.condition_id.clone(),
+            direction: erosion.direction,
+            leg1: leg1_fill,
+            leg2: Some(leg2_fill),
+            confidence: erosion.confidence,
+            profit_target_tier: erosion.tier,
+            alloc_amount: signal.alloc_amount,
+            pair_cost,
+            gross_profit,
+            taker_fee,
+            net_profit,
+            profit_pct,
+            resolution: None,
+            resolution_timestamp_ms: None,
+            erosion_steps: erosion.steps_applied,
+            leg2_was_taker: self.live_trade_meta.leg2_was_taker,
+            adverse_movement_hedge: self.live_trade_meta.adverse_movement,
+            bot_contested: signal.bot_contested,
+            favorable_taker: self.live_trade_meta.favorable_taker,
+            emergency_maker: self.live_trade_meta.emergency_maker,
+            exit_reason: self.live_trade_meta.exit_reason,
+            spike_magnitude: erosion.spike_info.magnitude,
+            open_timestamp_ms: l1_ts,
+            close_timestamp_ms: now_ms,
+        })
     }
 
     // ─── Drain & Status ───────────────────────────────────────────────────

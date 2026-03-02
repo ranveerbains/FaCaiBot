@@ -40,7 +40,7 @@ sustain_ms = 300
 # 0.005 = 0.5 bps = ~$3.24 at BTC $65K.  (old value)
 # 0.015 = 1.5 bps = ~$9.70 at BTC $65K.  (new value — filters marginal moves)
 # 0.030 = 3.0 bps = ~$19.5 at BTC $65K.
-min_magnitude_pct = 0.012
+min_magnitude_pct = 0.0125
 
 # At sustain time, current displacement must be >= this fraction of peak displacement.
 # Filters "fading spikes" where the price spiked but is already retracing.
@@ -70,7 +70,7 @@ depth_min_pct = 0.20
 # No entries allowed within this many seconds of market expiry.
 # Protects against entering too close to expiry where there's not enough
 # time for the erosion cascade + hedge to complete.
-entry_cutoff_secs = 180
+entry_cutoff_secs = 120
 
 # Maximum age (ms) of a Binance SBE event before it is discarded.
 # SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
@@ -103,13 +103,13 @@ leg1_timeout_ms = 2500
 
 # Maximum USDC to allocate per leg per trade (nearest dollar).
 # The confidence tier takes a fraction of this; minimum is always $1.
-max_alloc_per_trade = 10
+max_alloc_per_trade = 0.1
 
 # Fraction of max_alloc_per_trade for each confidence tier.
 # alloc = max(round(max_alloc_per_trade × tier_pct), 1)
 high_alloc_pct = 1  # HIGH confidence bets the full max
-med_alloc_pct  = 0.50   # MED bets half
-low_alloc_pct  = 0.25   # LOW bets a quarter
+med_alloc_pct  = 0.5   
+low_alloc_pct  = 0.3   
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIDENCE

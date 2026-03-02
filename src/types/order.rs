@@ -319,4 +319,14 @@ pub enum ExecutorFeedback {
     },
     /// Order placement failed — reset the leg state to `OrderState::None`.
     OrderFailed { is_leg2: bool },
+    /// Periodic diagnostic snapshot from the live executor (sent every 60s).
+    /// Forwarded to the engine so it can be included in the Telegram diagnostic.
+    DiagSnapshot {
+        placed: u64,
+        cancelled: u64,
+        failed: u64,
+        emergency_foks: u64,
+        emergency_makers: u64,
+        favorable_takers: u64,
+    },
 }

@@ -75,7 +75,7 @@ impl LiveExecutor {
     /// Main receive loop — consumes `ExecutorCommand` from the engine channel.
     pub async fn run(mut self, rx: Receiver<ExecutorCommand>) -> Result<()> {
         info!("LiveExecutor: starting receive loop");
-        self.reporter.send_startup_message();
+        self.reporter.send_live_startup_message();
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
@@ -99,15 +99,6 @@ impl LiveExecutor {
                         condition_id,
                         market_end_ms, "LiveExecutor: market cutoff entered"
                     );
-                    let short_id = if condition_id.len() > 5 {
-                        &condition_id[condition_id.len() - 5..]
-                    } else {
-                        &condition_id
-                    };
-                    self.reporter.send_alert(&format!(
-                        "MARKET CUTOFF: #{} — no new entries allowed. Leg 2 erosion continues for open positions.",
-                        short_id,
-                    ));
                 }
                 ExecutorCommand::CancelLeg1 { order_id } => {
                     info!(%order_id, "cancelling stale Leg 1 order");
@@ -340,14 +331,7 @@ impl LiveExecutor {
                         size: signal.size,
                     });
 
-                    let one = Decimal::ONE;
-                    let inner = signal.price * (one - signal.price);
-                    let fee_per_share = Decimal::new(25, 2) * inner * inner;
-                    let est_fee = fee_per_share * signal.size;
-                    self.reporter.send_alert(&format!(
-                        "FAVORABLE TAKER FOK: at {} for {} shares (est. fee: ${:.4})",
-                        signal.price, signal.size, est_fee,
-                    ));
+                    info!(price = %signal.price, size = %signal.size, "Leg 2 favorable exit: FOK fallback filled");
                 }
             }
             Err(e) => {
@@ -429,11 +413,6 @@ impl LiveExecutor {
                             price: signal.price,
                             size: signal.size,
                         });
-
-                        self.reporter.send_alert(&format!(
-                            "EMERGENCY POST-ONLY: {:?} at {} for {} shares (zero fee)",
-                            exit_reason, signal.price, signal.size,
-                        ));
                     }
                 }
                 Err(e) => {
@@ -463,6 +442,7 @@ impl LiveExecutor {
                 info!(
                     order_id = %resp.order_id,
                     status = ?resp.status,
+                    reason = ?exit_reason,
                     "Leg 2 emergency: FOK fallback placed"
                 );
                 self.active_leg2_order_id = Some(resp.order_id.clone());
@@ -475,11 +455,6 @@ impl LiveExecutor {
                     price: signal.price,
                     size: signal.size,
                 });
-
-                self.reporter.send_alert(&format!(
-                    "EMERGENCY FOK FALLBACK: {:?} at {} for {} shares",
-                    exit_reason, signal.price, signal.size,
-                ));
             }
             Err(e) => {
                 error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — POSITION EXPOSED");
@@ -488,11 +463,6 @@ impl LiveExecutor {
                 let _ = self
                     .feedback_tx
                     .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-
-                self.reporter.send_alert(&format!(
-                    "CRITICAL: Emergency FOK FAILED: {} — position unhedged!",
-                    e
-                ));
             }
         }
     }
@@ -514,6 +484,7 @@ impl LiveExecutor {
                     order_id = %resp.order_id,
                     status = ?resp.status,
                     %price,
+                    reason = ?exit_reason,
                     "Leg 2 emergency: FOK at price placed"
                 );
                 self.active_leg2_order_id = Some(resp.order_id.clone());
@@ -526,11 +497,6 @@ impl LiveExecutor {
                     price,
                     size: signal.size,
                 });
-
-                self.reporter.send_alert(&format!(
-                    "EMERGENCY FOK FALLBACK: {:?} at {} for {} shares",
-                    exit_reason, price, signal.size,
-                ));
             }
             Err(e) => {
                 error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — POSITION EXPOSED");
@@ -539,11 +505,6 @@ impl LiveExecutor {
                 let _ = self
                     .feedback_tx
                     .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-
-                self.reporter.send_alert(&format!(
-                    "CRITICAL: Emergency FOK FAILED: {} — position unhedged!",
-                    e
-                ));
             }
         }
     }
@@ -637,6 +598,14 @@ impl LiveExecutor {
             favorable_taker = self.favorable_taker_fills,
             "live executor 60s"
         );
+        let _ = self.feedback_tx.try_send(ExecutorFeedback::DiagSnapshot {
+            placed: self.orders_placed,
+            cancelled: self.orders_cancelled,
+            failed: self.orders_failed,
+            emergency_foks: self.emergency_foks,
+            emergency_makers: self.emergency_maker_posts,
+            favorable_takers: self.favorable_taker_fills,
+        });
         self.last_diag_ms = now_ms;
     }
 }

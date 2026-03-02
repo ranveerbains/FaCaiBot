@@ -192,8 +192,27 @@ async fn async_main() -> Result<()> {
     let diag_bot_token = config.telegram_bot_token.clone();
     let diag_chat_id = config.telegram_chat_id.clone();
 
+    // In live mode, pre-build the Telegram reporter so the engine can send
+    // opportunity alerts, trade-completed messages, market summaries, and
+    // session summaries directly (fills arrive via User WS, not the executor).
+    let live_reporter_for_engine: Option<TelegramReporter> = if engine_mode == Mode::Live {
+        let r = TelegramReporter::new(
+            config.telegram_bot_token.clone(),
+            config.telegram_chat_id.clone(),
+        )
+        .with_notify_flags(Arc::clone(&notify_flags));
+        Some(r)
+    } else {
+        None
+    };
+
     let engine_handle = tokio::spawn(async move {
         let mut engine = StrategyEngine::new(&engine_config);
+
+        // Attach the Telegram reporter to the engine in live mode.
+        if let Some(reporter) = live_reporter_for_engine {
+            engine.set_reporter(reporter);
+        }
 
         // QuestDB analytics — fire-and-forget, not on the execution path.
         let mut cold = match ColdStorage::new(&engine_config.questdb_url) {
@@ -226,6 +245,23 @@ async fn async_main() -> Result<()> {
                     ExecutorFeedback::OrderFailed { is_leg2 } => {
                         engine.on_order_failed(is_leg2);
                     }
+                    ExecutorFeedback::DiagSnapshot {
+                        placed,
+                        cancelled,
+                        failed,
+                        emergency_foks,
+                        emergency_makers,
+                        favorable_takers,
+                    } => {
+                        engine.on_live_diag(
+                            placed,
+                            cancelled,
+                            failed,
+                            emergency_foks,
+                            emergency_makers,
+                            favorable_takers,
+                        );
+                    }
                 }
             }
 
@@ -235,6 +271,9 @@ async fn async_main() -> Result<()> {
                     engine.set_draining();
                     pending_exit_code = Some(0);
                     if engine.has_no_open_position() {
+                        if engine_mode == Mode::Live {
+                            engine.send_live_session_summary();
+                        }
                         let _ = drain_status_tx.send(DrainStatus::Complete {
                             exit_code: 0,
                             summary: "No open positions. Bot stopped.".into(),
@@ -247,6 +286,9 @@ async fn async_main() -> Result<()> {
                         let _ = executor_tx.send(cmd);
                         // If only Leg 1 was posted (not filled), we can exit after cancel.
                         if matches!(engine.state().leg2_state, OrderState::None) {
+                            if engine_mode == Mode::Live {
+                                engine.send_live_session_summary();
+                            }
                             let _ = drain_status_tx.send(DrainStatus::Complete {
                                 exit_code: 0,
                                 summary: "Cancelled unfilled Leg 1. Bot stopped.".into(),
@@ -264,6 +306,9 @@ async fn async_main() -> Result<()> {
                     engine.set_draining();
                     pending_exit_code = Some(42);
                     if engine.has_no_open_position() {
+                        if engine_mode == Mode::Live {
+                            engine.send_live_session_summary();
+                        }
                         let _ = drain_status_tx.send(DrainStatus::Complete {
                             exit_code: 42,
                             summary: "No open positions. Restarting with new config...".into(),
@@ -274,6 +319,9 @@ async fn async_main() -> Result<()> {
                         let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
                         let _ = executor_tx.send(cmd);
                         if matches!(engine.state().leg2_state, OrderState::None) {
+                            if engine_mode == Mode::Live {
+                                engine.send_live_session_summary();
+                            }
                             let _ = drain_status_tx.send(DrainStatus::Complete {
                                 exit_code: 42,
                                 summary: "Cancelled unfilled Leg 1. Restarting...".into(),
@@ -393,6 +441,10 @@ async fn async_main() -> Result<()> {
 
             // Send cutoff command once when entering the 3-min window.
             if let Some((cond_id, market_end_ms)) = engine.take_cutoff_trigger() {
+                // In live mode, send the full market summary via Telegram.
+                if engine_mode == Mode::Live {
+                    engine.send_live_market_summary(&cond_id, market_end_ms);
+                }
                 if let Err(e) = executor_tx.send(ExecutorCommand::MarketCutoff {
                     condition_id: cond_id,
                     market_end_ms,
@@ -470,6 +522,9 @@ async fn async_main() -> Result<()> {
             if let Some(exit_code) = pending_exit_code
                 && engine.has_no_open_position()
             {
+                if engine_mode == Mode::Live {
+                    engine.send_live_session_summary();
+                }
                 let summary = if exit_code == 0 {
                     "Position closed. Bot stopped.".to_string()
                 } else {
@@ -479,7 +534,8 @@ async fn async_main() -> Result<()> {
                 break;
             }
 
-            if let Some(diag_msg) = engine.check_diagnostic()
+            engine.check_diagnostic();
+            if let Some(diag_msg) = engine.take_pending_telegram_diag()
                 && engine_notify_flags.diagnostics_on()
             {
                 let tls = diag_tls.clone();
