@@ -7,6 +7,12 @@ services:
       - "8812:8812"   # Postgres wire protocol
     volumes:
       - questdb_data:/var/lib/questdb
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      - vm.max_map_count=1048576
 
 volumes:
   questdb_data:

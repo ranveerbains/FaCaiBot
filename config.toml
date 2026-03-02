@@ -40,7 +40,7 @@ sustain_ms = 300
 # 0.005 = 0.5 bps = ~$3.24 at BTC $65K.  (old value)
 # 0.015 = 1.5 bps = ~$9.70 at BTC $65K.  (new value — filters marginal moves)
 # 0.030 = 3.0 bps = ~$19.5 at BTC $65K.
-min_magnitude_pct = 0.01
+min_magnitude_pct = 0.012
 
 # At sustain time, current displacement must be >= this fraction of peak displacement.
 # Filters "fading spikes" where the price spiked but is already retracing.

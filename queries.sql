@@ -279,6 +279,80 @@ WHERE pair_cost > 1.0
 ORDER BY timestamp DESC
 LIMIT 50;
 
+-- ════════════════════════════════════════════════════════════
+-- LIVE MODE QUERIES — executed_trades (same schema as sim)
+-- ════════════════════════════════════════════════════════════
+
+-- ============================================================
+-- 17. Live mode: overall performance (last 24h)
+-- ============================================================
+SELECT
+    count(*) AS trades,
+    avg(profit_pct) AS avg_net_pct,
+    sum(net_profit) AS total_net,
+    avg(taker_fee) AS avg_taker_fee,
+    sum(CASE WHEN leg2_was_taker THEN 1 ELSE 0 END) AS emergency_taker_count
+FROM executed_trades
+WHERE timestamp > dateadd('h', -24, now());
+
+-- ============================================================
+-- 18. Live mode: loss attribution by exit reason (last 24h)
+-- ============================================================
+SELECT
+    exit_reason,
+    count(*) AS trades,
+    sum(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END) AS wins,
+    sum(CASE WHEN net_profit <= 0 THEN 1 ELSE 0 END) AS losses,
+    round(sum(CASE WHEN net_profit > 0 THEN 1.0 ELSE 0 END) / count(*) * 100, 1) AS win_rate_pct,
+    round(avg(net_profit), 6) AS avg_net_profit,
+    round(sum(net_profit), 6) AS total_net_profit,
+    round(avg(taker_fee), 6) AS avg_taker_fee,
+    round(avg(pair_cost), 4) AS avg_pair_cost,
+    round(avg(erosion_steps), 1) AS avg_erosion_steps
+FROM executed_trades
+WHERE timestamp > dateadd('h', -24, now())
+GROUP BY exit_reason
+ORDER BY total_net_profit ASC;
+
+-- ============================================================
+-- 19. Live mode: emergency taker vs. maker exit (last 24h)
+-- ============================================================
+SELECT
+    CASE
+        WHEN leg2_was_taker THEN 'taker (FOK)'
+        WHEN emergency_maker THEN 'maker (post-only emergency)'
+        ELSE 'maker (normal erosion)'
+    END AS fill_type,
+    count(*) AS trades,
+    round(avg(taker_fee), 6) AS avg_fee,
+    round(sum(taker_fee), 6) AS total_fees,
+    round(avg(net_profit), 6) AS avg_net_profit,
+    round(sum(net_profit), 6) AS total_net_profit,
+    round(sum(CASE WHEN net_profit > 0 THEN 1.0 ELSE 0 END) / count(*) * 100, 1) AS win_rate_pct
+FROM executed_trades
+WHERE timestamp > dateadd('h', -24, now())
+GROUP BY fill_type;
+
+-- ============================================================
+-- 20. Live mode: spike quality vs. outcome (last 24h)
+-- ============================================================
+SELECT
+    CASE
+        WHEN spike_magnitude < 0.001 THEN '<0.10%'
+        WHEN spike_magnitude < 0.002 THEN '0.10-0.20%'
+        WHEN spike_magnitude < 0.005 THEN '0.20-0.50%'
+        ELSE '>=0.50%'
+    END AS spike_bucket,
+    count(*) AS trades,
+    round(sum(CASE WHEN net_profit > 0 THEN 1.0 ELSE 0 END) / count(*) * 100, 1) AS win_rate_pct,
+    round(avg(net_profit), 6) AS avg_net_profit,
+    round(sum(net_profit), 6) AS total_net_profit,
+    round(avg(confidence), 3) AS avg_confidence
+FROM executed_trades
+WHERE timestamp > dateadd('h', -24, now())
+GROUP BY spike_bucket
+ORDER BY spike_bucket;
+
 -- ============================================================
 -- Pruning (run hourly via automated task)
 -- ============================================================
@@ -286,3 +360,4 @@ LIMIT 50;
 -- ALTER TABLE poly_book_snapshots DROP PARTITION WHERE timestamp < dateadd('h', -24, now());
 -- ALTER TABLE trade_signals DROP PARTITION WHERE timestamp < dateadd('h', -24, now());
 -- ALTER TABLE simulated_trades DROP PARTITION WHERE timestamp < dateadd('h', -24, now());
+-- ALTER TABLE executed_trades DROP PARTITION WHERE timestamp < dateadd('h', -24, now());

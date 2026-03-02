@@ -252,6 +252,11 @@ impl ColdStorage {
     /// - leg2_was_taker (bool): true if Leg 2 used emergency FOK
     /// - adverse_movement (bool): true if FOK triggered by adverse Binance movement
     /// - bot_contested (bool): true if a competitor depth wall was detected
+    /// - favorable_taker (bool): true if Leg 2 filled via favorable taker crossing
+    /// - emergency_maker (bool): true if Leg 2 filled as maker during emergency chase
+    /// - spike_magnitude (f64): spike size relative to ATR at entry
+    /// - exit_reason (symbol): "NormalErosion" | "AdverseMovement" | "BreakEvenBreach" |
+    ///                         "MarketExpiry" | "FavorableTaker"
     /// - leg1_order_id (symbol): CLOB order ID for Leg 1
     /// - leg2_order_id (symbol): CLOB order ID for Leg 2 ("" if unhedged)
     /// - timestamp (designated timestamp): Leg 1 fill time
@@ -281,16 +286,29 @@ impl ColdStorage {
         leg1_order_id: &str,
         leg2_order_id: Option<&str>,
         leg1_fill_timestamp_ms: u64,
+        exit_reason: Option<ExitReason>,
+        favorable_taker: bool,
+        emergency_maker: bool,
+        spike_magnitude: Decimal,
     ) -> Result<()> {
         let leg2_price_f64: f64 = leg2_price.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
         let leg2_size_f64: f64 = leg2_size.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
         let leg2_order_id_str = leg2_order_id.unwrap_or("");
+
+        let exit_reason_str = match exit_reason {
+            Some(ExitReason::AdverseMovement) => "AdverseMovement",
+            Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+            Some(ExitReason::MarketExpiry) => "MarketExpiry",
+            Some(ExitReason::FavorableTaker) => "FavorableTaker",
+            None => "NormalErosion",
+        };
 
         self.buffer
             .table("executed_trades")?
             .symbol("market_id", market_id)?
             .symbol("direction", direction)?
             .symbol("profit_tier", profit_tier)?
+            .symbol("exit_reason", exit_reason_str)?
             .symbol("leg1_order_id", leg1_order_id)?
             .symbol("leg2_order_id", leg2_order_id_str)?
             .column_f64("leg1_price", leg1_price.try_into().unwrap_or(0.0))?
@@ -308,6 +326,9 @@ impl ColdStorage {
             .column_bool("leg2_was_taker", leg2_was_taker)?
             .column_bool("adverse_movement", adverse_movement)?
             .column_bool("bot_contested", bot_contested)?
+            .column_bool("favorable_taker", favorable_taker)?
+            .column_bool("emergency_maker", emergency_maker)?
+            .column_f64("spike_magnitude", spike_magnitude.try_into().unwrap_or(0.0))?
             .column_ts(
                 "leg1_fill_time",
                 TimestampMicros::new(leg1_fill_timestamp_ms as i64 * 1000),

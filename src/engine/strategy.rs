@@ -127,12 +127,16 @@ pub struct StrategyEngine {
     diag_leg1_signals: u64,
     diag_leg1_fills: u64,
     diag_leg2_erosion_steps: u64,
-    diag_leg2_fills: u64,
+    diag_leg2_fills_maker: u64,
+    diag_leg2_fills_taker: u64,
     diag_emg_adverse: u64,
     diag_emg_breakeven: u64,
     diag_emg_expiry: u64,
     diag_emg_favorable: u64,
+    diag_emg_maker: u64,  // emergency exits filled as post-only maker
+    diag_emg_taker: u64,  // emergency exits filled as FOK taker
     diag_leg1_timeouts: u64,
+    diag_spike_sustain_cancel: u64,
     diag_spike_failures: u64,
     last_diag_ms: u64,
 
@@ -191,12 +195,16 @@ impl StrategyEngine {
             diag_leg1_signals: 0,
             diag_leg1_fills: 0,
             diag_leg2_erosion_steps: 0,
-            diag_leg2_fills: 0,
+            diag_leg2_fills_maker: 0,
+            diag_leg2_fills_taker: 0,
             diag_emg_adverse: 0,
             diag_emg_breakeven: 0,
             diag_emg_expiry: 0,
             diag_emg_favorable: 0,
+            diag_emg_maker: 0,
+            diag_emg_taker: 0,
             diag_leg1_timeouts: 0,
+            diag_spike_sustain_cancel: 0,
             diag_spike_failures: 0,
             last_diag_ms: 0,
             draining: false,
@@ -500,6 +508,7 @@ impl StrategyEngine {
                 match &self.state.leg1_state {
                     OrderState::Posted { order_id, .. } => {
                         info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
+                        self.diag_spike_sustain_cancel += 1;
                         self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
                             order_id: order_id.clone(),
                         });
@@ -1042,12 +1051,16 @@ impl StrategyEngine {
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
             erosion_stp = self.diag_leg2_erosion_steps,
-            leg2_fill = self.diag_leg2_fills,
+            l2_maker = self.diag_leg2_fills_maker,
+            l2_taker = self.diag_leg2_fills_taker,
             emg_adverse = self.diag_emg_adverse,
             emg_breakeven = self.diag_emg_breakeven,
             emg_expiry = self.diag_emg_expiry,
             emg_favorable = self.diag_emg_favorable,
+            emg_maker = self.diag_emg_maker,
+            emg_taker = self.diag_emg_taker,
             leg1_timeout = self.diag_leg1_timeouts,
+            sustain_cancel = self.diag_spike_sustain_cancel,
             spike_fail = self.diag_spike_failures,
             "engine 60s"
         );
@@ -1086,11 +1099,12 @@ impl StrategyEngine {
              Spread: {spread}  Depth: {depth}  Hedge: {hedge}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
-             Signals: {sig}  Fills: {fill}  Timeouts: {timeout}\n\
+             Signals: {sig}  Fills: {fill}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
              \n\
              <b>Leg 2</b>\n\
-             Erosion steps: {erosion}  Fills: {l2fill}\n\
-             Emergencies — adverse: {emg_adv}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}",
+             Erosion steps: {erosion}  Fills: {l2_maker} maker / {l2_taker} taker\n\
+             Emergencies — adverse: {emg_adv}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
+             Emergency fills — {emg_mkr} maker / {emg_tkr} taker",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
@@ -1107,12 +1121,16 @@ impl StrategyEngine {
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
             timeout = self.diag_leg1_timeouts,
+            sus_cancel = self.diag_spike_sustain_cancel,
             erosion = self.diag_leg2_erosion_steps,
-            l2fill = self.diag_leg2_fills,
+            l2_maker = self.diag_leg2_fills_maker,
+            l2_taker = self.diag_leg2_fills_taker,
             emg_adv = self.diag_emg_adverse,
             emg_be = self.diag_emg_breakeven,
             emg_exp = self.diag_emg_expiry,
             emg_fav = self.diag_emg_favorable,
+            emg_mkr = self.diag_emg_maker,
+            emg_tkr = self.diag_emg_taker,
         );
 
         Some(msg)
@@ -1226,29 +1244,55 @@ impl StrategyEngine {
         let gross_profit = (Decimal::ONE - pair_cost) * l1_size;
 
         // Extract erosion metadata (if available).
-        let (confidence, profit_tier, erosion_steps, exit_reason, alloc_amount, bot_contested) =
-            match (&self.erosion, &self.pending_leg1_signal) {
-                (Some(ero), Some(sig)) => (
-                    ero.confidence,
-                    ero.tier.label(),
-                    ero.steps_applied,
-                    ero.exit_reason,
-                    sig.alloc_amount,
-                    sig.bot_contested,
-                ),
-                (Some(ero), None) => (
-                    ero.confidence,
-                    ero.tier.label(),
-                    ero.steps_applied,
-                    ero.exit_reason,
-                    Decimal::ZERO,
-                    false,
-                ),
-                _ => (Decimal::ZERO, "LOW", 0, None, Decimal::ZERO, false),
-            };
+        let (
+            confidence,
+            profit_tier,
+            erosion_steps,
+            exit_reason,
+            alloc_amount,
+            bot_contested,
+            emergency_submitted,
+            spike_magnitude,
+        ) = match (&self.erosion, &self.pending_leg1_signal) {
+            (Some(ero), Some(sig)) => (
+                ero.confidence,
+                ero.tier.label(),
+                ero.steps_applied,
+                ero.exit_reason,
+                sig.alloc_amount,
+                sig.bot_contested,
+                ero.emergency_submitted,
+                ero.spike_info.magnitude,
+            ),
+            (Some(ero), None) => (
+                ero.confidence,
+                ero.tier.label(),
+                ero.steps_applied,
+                ero.exit_reason,
+                Decimal::ZERO,
+                false,
+                ero.emergency_submitted,
+                ero.spike_info.magnitude,
+            ),
+            _ => (
+                Decimal::ZERO,
+                "LOW",
+                0,
+                None,
+                Decimal::ZERO,
+                false,
+                false,
+                Decimal::ZERO,
+            ),
+        };
 
         let leg2_was_taker = exit_reason.is_some();
         let adverse_movement = exit_reason == Some(ExitReason::AdverseMovement);
+        let favorable_taker = exit_reason == Some(ExitReason::FavorableTaker);
+        // In live mode, we can't distinguish maker vs taker fills during emergency chase
+        // (no executor feedback). Conservative: only true if emergency entered but no exit_reason
+        // was set (meaning the maker order filled before FOK deadline).
+        let emergency_maker = emergency_submitted && exit_reason.is_none();
 
         // Taker fee: CLOB deducts fees automatically; the REST response and User WS
         // do not return the actual amount charged. Recorded as zero in QuestDB.
@@ -1283,6 +1327,10 @@ impl StrategyEngine {
             l1_order_id,
             Some(l2_order_id),
             l1_fill_ts,
+            exit_reason,
+            favorable_taker,
+            emergency_maker,
+            spike_magnitude,
         )
     }
 
@@ -1563,7 +1611,18 @@ impl StrategyEngine {
             };
 
             if should_fill {
-                self.diag_leg2_fills += 1;
+                if sim_was_taker {
+                    self.diag_leg2_fills_taker += 1;
+                } else {
+                    self.diag_leg2_fills_maker += 1;
+                }
+                if is_emergency {
+                    if sim_was_taker {
+                        self.diag_emg_taker += 1;
+                    } else {
+                        self.diag_emg_maker += 1;
+                    }
+                }
                 info!(
                     %posted_price, %posted_size, %fill_price, is_emergency, is_favorable_taker, sim_was_taker,
                     "advance_simulation: Leg 2 simulated fill"
@@ -1719,7 +1778,7 @@ impl StrategyEngine {
             leg2_state: leg2_str,
             spikes_received: self.diag_spikes_received,
             signals_emitted: self.diag_leg1_signals,
-            trades_completed: self.diag_leg2_fills,
+            trades_completed: self.diag_leg2_fills_maker + self.diag_leg2_fills_taker,
             trades_enabled: true,  // updated by main loop from NotifyFlags
             summary_enabled: true, // updated by main loop from NotifyFlags
             draining: self.draining,
