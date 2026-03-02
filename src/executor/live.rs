@@ -87,6 +87,7 @@ impl LiveExecutor {
                     yes_token_id,
                     no_token_id,
                     tick_size,
+                    ..
                 } => {
                     self.on_market_rotation(&condition_id, &yes_token_id, &no_token_id, tick_size)
                         .await;

@@ -104,21 +104,40 @@ impl SimulationExecutor {
     /// 1. Force-close any open positions that were not hedged before expiry.
     ///    Open positions (Leg 1 filled, no Leg 2) are closed at full loss with
     ///    Telegram notification. Other statuses are locked for UMA resolution.
-    /// 2. Build and send the per-market Telegram summary.
+    /// 2. Build and send the per-market Telegram summary (if prior market exists).
     /// 3. Reset per-market counters via `SimulationState::on_market_rotation()`.
-    pub fn on_market_rotation(&mut self, market_id: &str) {
+    ///
+    /// `outgoing_id` is the condition ID of the market that just expired (None
+    /// on the first rotation after startup). `outgoing_end_ms` is that market's
+    /// end timestamp (epoch ms), used for the period label.
+    pub fn on_market_rotation(
+        &mut self,
+        outgoing_id: Option<&str>,
+        outgoing_end_ms: u64,
+    ) {
         let now_ms = epoch_ms();
+
+        // Determine which market ID to use for force-closing positions.
+        // On the first rotation (no prior market), there are no positions.
+        let summary_market_id = match outgoing_id {
+            Some(id) => id,
+            None => {
+                debug!("first rotation after startup — no prior market to summarize");
+                self.state.on_market_rotation();
+                return;
+            }
+        };
 
         // Force-close or lock for resolution any positions still in this market.
         // We iterate in reverse so that removal by index remains stable.
         let open_count = self.state.open_positions.len();
         if open_count > 0 {
             info!(
-                market_id,
+                market_id = summary_market_id,
                 open_count, "simulation: market rotation — closing open positions"
             );
         } else {
-            debug!(market_id, "simulation: market rotation — no open positions");
+            debug!(market_id = summary_market_id, "simulation: market rotation — no open positions");
         }
         for idx in (0..open_count).rev() {
             // Extract fields before borrowing self.state mutably.
@@ -126,14 +145,14 @@ impl SimulationExecutor {
                 let p = &self.state.open_positions[idx];
                 (p.market_id.clone(), p.status == PositionStatus::Open)
             };
-            if pos_market != market_id {
+            if pos_market != summary_market_id {
                 continue;
             }
             if pos_open {
                 // Leg 1 filled, no Leg 2 — force-close, record full loss.
                 if let Some(trade) = self.state.close_trade(idx, now_ms) {
                     warn!(
-                        market_id,
+                        market_id = summary_market_id,
                         position_idx = idx,
                         net_profit_usdc = %trade.net_profit,
                         leg1_cost_usdc = %(trade.leg1.price * trade.leg1.size),
@@ -150,7 +169,7 @@ impl SimulationExecutor {
                 // AwaitingResolution or Hedged from prior market — keep tracking.
                 self.state.lock_for_resolution(idx);
                 warn!(
-                    market_id,
+                    market_id = summary_market_id,
                     position_idx = idx,
                     "simulation: position locked for UMA resolution"
                 );
@@ -158,7 +177,7 @@ impl SimulationExecutor {
         }
 
         // Send market summary before resetting counters.
-        let end_secs = self.market_end_ms / 1_000;
+        let end_secs = outgoing_end_ms / 1_000;
         let hh = (end_secs % 86_400) / 3_600;
         let mm = (end_secs % 3_600) / 60;
         let market_duration_secs = 300u64;
@@ -172,7 +191,7 @@ impl SimulationExecutor {
 
         let summary = self
             .state
-            .market_summary(market_id, period_label, self.fixed_alloc);
+            .market_summary(summary_market_id, period_label, self.fixed_alloc);
         self.reporter.send_market_summary(&summary);
 
         // Reset per-market counters.
@@ -226,8 +245,15 @@ impl SimulationExecutor {
                             self.handle_leg1(&signal);
                         }
                     }
-                    ExecutorCommand::MarketRotation { condition_id, .. } => {
-                        self.on_market_rotation(&condition_id);
+                    ExecutorCommand::MarketRotation {
+                        outgoing_condition_id,
+                        outgoing_end_timestamp_ms,
+                        ..
+                    } => {
+                        self.on_market_rotation(
+                            outgoing_condition_id.as_deref(),
+                            outgoing_end_timestamp_ms,
+                        );
                     }
                     ExecutorCommand::CancelLeg1 { order_id } => {
                         debug!(%order_id, "SimExecutor: Leg 1 cancel (handled by engine)");

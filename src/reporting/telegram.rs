@@ -132,12 +132,6 @@ impl TelegramReporter {
         self.fire_and_forget(text);
     }
 
-    /// Send a generic alert string (kill switch, UMA dispute, etc.).
-    pub fn send_alert(&self, msg: &str) {
-        let text = format!("<b>ALERT</b>\n\n{}", formatter::escape_html(msg));
-        self.fire_and_forget(text);
-    }
-
     /// Tier 1 — real-time opportunity alert (Leg 1 simulated fill).
     ///
     /// Sent immediately when a signal is detected and Leg 1 post-only fill
@@ -917,10 +911,4 @@ mod formatter {
         d.to_f64().unwrap_or(0.0)
     }
 
-    /// Escape HTML special characters for Telegram HTML parse_mode.
-    pub(super) fn escape_html(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    }
 }

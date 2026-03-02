@@ -189,7 +189,7 @@ pub enum ExecutorCommand {
     Signal(TradeSignal),
     /// Market rotation — executor should close open positions and send summary.
     MarketRotation {
-        /// Condition ID of the market that just rotated.
+        /// Condition ID of the new market.
         condition_id: String,
         /// YES token ID for the new market.
         yes_token_id: String,
@@ -197,6 +197,10 @@ pub enum ExecutorCommand {
         no_token_id: String,
         /// Tick size for the new market.
         tick_size: Decimal,
+        /// Condition ID of the outgoing market (None on first rotation after startup).
+        outgoing_condition_id: Option<String>,
+        /// End timestamp of the outgoing market (epoch ms). 0 if no prior market.
+        outgoing_end_timestamp_ms: u64,
     },
     /// Cancel a stale Leg 1 order that wasn't filled in time.
     CancelLeg1 { order_id: String },

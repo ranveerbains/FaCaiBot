@@ -369,6 +369,22 @@ async fn async_main() -> Result<()> {
                 }
             }
 
+            // Capture outgoing market state BEFORE on_event() overwrites it.
+            // In live mode, also send the market summary now while counters
+            // and trades still reflect the outgoing market.
+            let (outgoing_condition_id, outgoing_end_ms) = if rotation_info.is_some() {
+                let old = (
+                    engine.state().active_condition_id.clone(),
+                    engine.state().market_end_timestamp_ms,
+                );
+                if engine_mode == Mode::Live {
+                    engine.send_live_market_summary();
+                }
+                old
+            } else {
+                (None, 0)
+            };
+
             engine.on_event(event);
 
             // Record Polymarket book snapshots every 5 seconds.
@@ -427,17 +443,14 @@ async fn async_main() -> Result<()> {
 
             // Notify executor of market rotation (before evaluating signals,
             // so the executor can close positions before receiving new ones).
-            // In live mode, send the market summary BEFORE the rotation command
-            // so counters still reflect the old market.
             if let Some((cond_id, yes_id, no_id)) = rotation_info {
-                if engine_mode == Mode::Live {
-                    engine.send_live_market_summary();
-                }
                 if let Err(e) = executor_tx.send(ExecutorCommand::MarketRotation {
                     condition_id: cond_id,
                     yes_token_id: yes_id,
                     no_token_id: no_id,
                     tick_size: engine.state().tick_size,
+                    outgoing_condition_id,
+                    outgoing_end_timestamp_ms: outgoing_end_ms,
                 }) {
                     error!(error = %e, "failed to send MarketRotation to executor");
                     break;
