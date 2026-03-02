@@ -348,7 +348,7 @@ impl Leg1Evaluator {
         if let Some(wall_price) = wall.filter(|&wp| wp >= bid_price) {
             let outbid = round_to_tick(wall_price + tick, tick);
             let outbid_feasible = match opposing_best_ask {
-                Some(opp_ask) => outbid + opp_ask <= Decimal::ONE - target_pct,
+                Some(opp_ask) => outbid + opp_ask <= Decimal::ONE,
                 None => true,
             };
             if outbid_feasible && outbid < best_ask_price {
@@ -357,11 +357,10 @@ impl Leg1Evaluator {
             }
         }
 
-        // Hedge feasibility: reject if pair cost at current opposing ask leaves insufficient margin.
-        // Requires at least target_pct headroom: bid + opp_ask must be <= $1.00 - target_pct.
-        if let Some(opp_ask) = opposing_best_ask.filter(|&a| bid_price + a > Decimal::ONE - target_pct) {
-            debug!(%bid_price, %opp_ask, pair_cost = %(bid_price + opp_ask), %target_pct,
-                "evaluate() BLOCKED: hedge infeasible — pair cost > $1.00 - target_pct");
+        // Hedge feasibility: reject if pair cost exceeds $1.00 (guaranteed loss).
+        if let Some(opp_ask) = opposing_best_ask.filter(|&a| bid_price + a > Decimal::ONE) {
+            debug!(%bid_price, %opp_ask, pair_cost = %(bid_price + opp_ask),
+                "evaluate() BLOCKED: hedge infeasible — pair cost > $1.00");
             return Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible);
         }
 
@@ -1477,28 +1476,14 @@ mod tests {
     }
 
     #[test]
-    fn test_hedge_exact_dollar_rejected_by_buffer() {
-        // bid_price + opp_ask = exactly 1.00, but buffer requires headroom of target_pct.
+    fn test_hedge_exact_dollar_allowed() {
+        // bid_price + opp_ask = exactly 1.00 → allowed (strict >).
         // YES bid=0.49/ask=0.52, NO ask=0.50 → bid_price=0.50, pair=0.50+0.50=1.00
-        // HIGH tier (confidence=0.8) → target_pct=0.025 → threshold=0.975 → 1.00 > 0.975 → reject
         let (state, evaluator) = make_market_state("0.49", "0.52", Some("0.50"), Direction::Up);
         let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
         assert!(
-            matches!(result, Leg1Outcome::Rejected(Leg1RejectReason::HedgeInfeasible)),
-            "pair cost $1.00 should be rejected by margin buffer, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_hedge_within_buffer_allowed() {
-        // Pair cost under the buffer threshold → allowed.
-        // YES bid=0.46/ask=0.48, NO ask=0.50 → bid_price=0.47, pair=0.47+0.50=0.97
-        // HIGH tier → target_pct=0.025 → threshold=0.975 → 0.97 <= 0.975 → allow
-        let (state, evaluator) = make_market_state("0.46", "0.48", Some("0.50"), Direction::Up);
-        let result = evaluator.evaluate(&state, Some(Decimal::new(500, 0)), 100_000);
-        assert!(
             matches!(result, Leg1Outcome::Signal(_)),
-            "pair cost $0.97 should be allowed (under buffer threshold), got: {result:?}"
+            "pair cost exactly $1.00 should be allowed, got: {result:?}"
         );
     }
 

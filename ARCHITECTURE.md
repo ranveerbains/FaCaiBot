@@ -161,9 +161,9 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 | Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Depth | < `depth_min_pct` (20%) of required | — |
-| Hedge feasibility | `bid_price + opposing_best_ask > $1.00 - target_pct` | Pair lacks minimum profit margin at current opposing book |
+| Hedge feasibility | `bid_price + opposing_best_ask > $1.00` | Pair would be a guaranteed loss at current opposing book |
 
-**Bidding**: `round_to_tick(best_bid + tick, tick)` → smart outbid walls by 1 tick (>4x avg depth, capped by hedge feasibility with margin buffer) → hedge feasibility guard. Submit GTC, post_only=true.
+**Bidding**: `round_to_tick(best_bid + tick, tick)` → smart outbid walls by 1 tick (>4x avg depth, capped by hedge feasibility) → hedge feasibility guard. Submit GTC, post_only=true.
 
 **Sizing**: Confidence-weighted allocation (see Section 5).
 
