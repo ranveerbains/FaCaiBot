@@ -198,13 +198,6 @@ pub enum ExecutorCommand {
         /// Tick size for the new market.
         tick_size: Decimal,
     },
-    /// x-minute entry cutoff window entered — executor should send market summary.
-    MarketCutoff {
-        /// Condition ID of the current market.
-        condition_id: String,
-        /// Epoch ms when the market ends.
-        market_end_ms: u64,
-    },
     /// Cancel a stale Leg 1 order that wasn't filled in time.
     CancelLeg1 { order_id: String },
 }

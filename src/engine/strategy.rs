@@ -112,10 +112,6 @@ pub struct StrategyEngine {
     /// `true` once the entry_cutoff window is entered for the current market.
     /// Reset to `false` on `MarketRotation`.
     in_cutoff_window: bool,
-    /// Set to `true` when first entering the cutoff window; cleared by `take_cutoff_trigger()`.
-    cutoff_trigger_pending: bool,
-    /// The `market_end_ms` captured when the cutoff was first detected.
-    cutoff_market_end_ms: u64,
 
     /// Stored Leg 1 signal for building confirmed fill signals in advance_simulation().
     pending_leg1_signal: Option<TradeSignal>,
@@ -233,8 +229,6 @@ impl StrategyEngine {
             last_erosion_signal_ms: 0,
             leg1_direction: None,
             in_cutoff_window: false,
-            cutoff_trigger_pending: false,
-            cutoff_market_end_ms: 0,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
             pending_spike_cancel: None,
@@ -868,11 +862,9 @@ impl StrategyEngine {
             let time_remaining_secs = self.state.time_remaining_ms(now_ms) / 1_000;
             if time_remaining_secs < self.leg1.entry_cutoff_secs {
                 self.in_cutoff_window = true;
-                self.cutoff_trigger_pending = true;
-                self.cutoff_market_end_ms = self.state.market_end_timestamp_ms;
                 info!(
                     time_remaining_secs,
-                    "entering cutoff window — trading suspended, sending market summary"
+                    "entering cutoff window — trading suspended"
                 );
                 if matches!(
                     self.state.leg1_state,
@@ -1096,21 +1088,6 @@ impl StrategyEngine {
         }
 
         Some(decision.into_signal())
-    }
-
-    // ─── Cutoff trigger ───────────────────────────────────────────────────
-
-    /// Returns `Some((condition_id, market_end_ms))` exactly once when the bot
-    /// first enters the cutoff window for the current market.
-    /// Returns `None` on subsequent calls until the next `MarketRotation`.
-    pub fn take_cutoff_trigger(&mut self) -> Option<(String, u64)> {
-        if self.cutoff_trigger_pending {
-            self.cutoff_trigger_pending = false;
-            let cond_id = self.state.active_condition_id.clone()?;
-            Some((cond_id, self.cutoff_market_end_ms))
-        } else {
-            None
-        }
     }
 
     // ─── Spike cancel drain ─────────────────────────────────────────────
@@ -1937,18 +1914,25 @@ impl StrategyEngine {
         self.live_session_start_ms = now_epoch_ms();
     }
 
-    /// Send a full market summary via Telegram for the given market.
+    /// Send a full market summary via Telegram for the current market.
     ///
-    /// Called by main.rs on the cutoff trigger in live mode. Builds the summary
-    /// from `live_market_trades` and current per-market counters.
-    pub fn send_live_market_summary(&self, condition_id: &str, market_end_ms: u64) {
+    /// Called by main.rs just before `MarketRotation` is sent to the executor,
+    /// so counters still reflect the outgoing market.
+    pub fn send_live_market_summary(&self) {
         let reporter = match &self.reporter {
             Some(r) => r,
             None => return,
         };
 
+        let condition_id = match &self.state.active_condition_id {
+            Some(id) => id.as_str(),
+            None => return,
+        };
+
+        let market_end_ms = self.state.market_end_timestamp_ms;
         let end_secs = market_end_ms / 1_000;
-        let start_secs = end_secs.saturating_sub(15 * 60);
+        let market_duration_secs = 300u64;
+        let start_secs = end_secs.saturating_sub(market_duration_secs);
         let start_h = (start_secs / 3600) % 24;
         let start_m = (start_secs % 3600) / 60;
         let end_h = (end_secs / 3600) % 24;

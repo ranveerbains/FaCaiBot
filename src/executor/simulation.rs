@@ -157,31 +157,16 @@ impl SimulationExecutor {
             }
         }
 
-        // Reset per-market counters.
-        // Note: the market summary is already sent at the x-min cutoff via
-        // on_market_cutoff() — no second summary is needed here.
-        self.state.on_market_rotation();
-    }
-
-    /// Handle the x-minute entry cutoff event.
-    ///
-    /// Sends a market summary to Telegram immediately. Does NOT reset per-market
-    /// counters — that only happens on actual `MarketRotation`.
-    pub fn on_market_cutoff(&mut self, market_id: &str, market_end_ms: u64) {
-        info!(
-            market_id,
-            "simulation: 3-min cutoff — sending market summary"
-        );
-
-        // Compute UTC period label from market_end_ms.
-        let end_secs = market_end_ms / 1_000;
+        // Send market summary before resetting counters.
+        let end_secs = self.market_end_ms / 1_000;
         let hh = (end_secs % 86_400) / 3_600;
         let mm = (end_secs % 3_600) / 60;
-        let start_secs = end_secs.saturating_sub(300);
+        let market_duration_secs = 300u64;
+        let start_secs = end_secs.saturating_sub(market_duration_secs);
         let start_hh = (start_secs % 86_400) / 3_600;
         let start_mm = (start_secs % 3_600) / 60;
         let period_label = format!(
-            "{:02}:{:02} - {:02}:{:02} UTC (3-min cutoff)",
+            "{:02}:{:02} - {:02}:{:02} UTC",
             start_hh, start_mm, hh, mm
         );
 
@@ -189,6 +174,9 @@ impl SimulationExecutor {
             .state
             .market_summary(market_id, period_label, self.fixed_alloc);
         self.reporter.send_market_summary(&summary);
+
+        // Reset per-market counters.
+        self.state.on_market_rotation();
     }
 
     /// Generate and send a session summary via Telegram. Call this on shutdown.
@@ -240,12 +228,6 @@ impl SimulationExecutor {
                     }
                     ExecutorCommand::MarketRotation { condition_id, .. } => {
                         self.on_market_rotation(&condition_id);
-                    }
-                    ExecutorCommand::MarketCutoff {
-                        condition_id,
-                        market_end_ms,
-                    } => {
-                        self.on_market_cutoff(&condition_id, market_end_ms);
                     }
                     ExecutorCommand::CancelLeg1 { order_id } => {
                         debug!(%order_id, "SimExecutor: Leg 1 cancel (handled by engine)");

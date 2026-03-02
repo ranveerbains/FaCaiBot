@@ -91,15 +91,6 @@ impl LiveExecutor {
                     self.on_market_rotation(&condition_id, &yes_token_id, &no_token_id, tick_size)
                         .await;
                 }
-                ExecutorCommand::MarketCutoff {
-                    condition_id,
-                    market_end_ms,
-                } => {
-                    info!(
-                        condition_id,
-                        market_end_ms, "LiveExecutor: market cutoff entered"
-                    );
-                }
                 ExecutorCommand::CancelLeg1 { order_id } => {
                     info!(%order_id, "cancelling stale Leg 1 order");
                     if let Err(e) = self.poly.cancel_order(&order_id).await {

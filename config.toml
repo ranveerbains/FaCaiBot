@@ -1,182 +1,64 @@
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROTATION
-# Market rotation manager: discovery and pre-warming of upcoming 5-min markets.
-# ─────────────────────────────────────────────────────────────────────────────
 [rotation]
+# Seconds before expiry to discover and pre-fetch the next market
+prewarm_lead_secs = 20
 
-# How many seconds before the current market expires we discover and pre-warm
-# the next market. Lower = less wasted API calls; higher = more buffer.
-# 30 = start looking 30s before expiry.
-prewarm_lead_secs = 30
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SPIKE DETECTION
-# Detects sudden BTC price movements on Binance that create a repricing lag on Polymarket.
-# Pipeline: single-tick trigger → sustain → momentum → magnitude → confirmed spike.
-# ─────────────────────────────────────────────────────────────────────────────
 [spike_detection]
-# How many ATRs a single tick must move to start a spike candidate
-# At ATR=$0.61 (observed): 2.5 needs a $1.53 tick, 2.0 needed a $1.22 tick.
+# ATR multiplier for spike candidate trigger
 multiplier = 3
-
-# All ATR EMAs below use the same tick interval: 50ms per tick (SBE @depth20. (we are not using @BestBidAsk).
-
-# EMA smoothing factor for the ATR (~10s memory at 50ms ticks).
-# Lower = smoother/slower ATR adaptation (ATR stays stable longer after a spike).
-# Higher = ATR reacts faster to recent volatility (threshold rises quickly after a spike).
-# 0.01 gives 10seconds of smoothing. at 50ms/tick --> 20 tick/s. 0.02 gives 5 seconds of smoothing 
-# NOTE: No spikes are emitted for the first 10 ticks (~0.5s) after startup while the ATR warms up.
+# EMA smoothing for ATR (~5s memory at 50ms ticks)
 atr_alpha = 0.02
-
-# How long (ms) the price must stay displaced above threshold before confirmation
-# This is about the MARKET, not your latency — confirms the spike is real and not a momentary liquidity gap. The spike must hold for this duration.
-# Lower = faster confirmation, more risk of false positives from transient gaps
-# Higher = stronger confirmation, but may miss fast-moving spikes.
+# Sustain duration (ms) before spike confirmation
 sustain_ms = 300
-
-# Minimum spike magnitude as a percentage of price. Spikes below this are
-# discarded even if they pass all other checks.
-# 0.005 = 0.5 bps = ~$3.24 at BTC $65K.  (old value)
-# 0.015 = 1.5 bps = ~$9.70 at BTC $65K.  (new value — filters marginal moves)
-# 0.030 = 3.0 bps = ~$19.5 at BTC $65K.
+# Minimum spike magnitude in bps (0.0125 = 1.25 bps)
 min_magnitude_pct = 0.0125
-
-# At sustain time, current displacement must be >= this fraction of peak displacement.
-# Filters "fading spikes" where the price spiked but is already retracing.
-# 0.65 = must still hold 65% of peak displacement at sustain time.
-# (was 0.50 — raising this cuts half-retraced spikes that lack conviction)
+# Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY GUARDS
-# Pre-entry checks that must all pass before a Leg 1 signal is emitted.
-# If any guard fails, the spike is acknowledged but no trade is placed.
-# ─────────────────────────────────────────────────────────────────────────────
 [entry_guards]
-
-# Maximum bid-ask spread in dollars. If the spread is wider than this,
-# the book is too thin to enter safely.
-# 0.025 = $0.025 between best bid and best ask.
+# Maximum bid-ask spread in dollars
 max_spread = 0.025
-
-# Minimum book depth as a fraction of the required trade size.
-# If the available depth is less than this fraction, the trade is too large
-# relative to what the book can absorb.
-# 0.20 = book must have at least 20% of the trade size available (was 0.15).
+# Minimum book depth as fraction of trade size
 depth_min_pct = 0.20
-
-# No entries allowed within this many seconds of market expiry.
-# Protects against entering too close to expiry where there's not enough
-# time for the erosion cascade + hedge to complete.
-# 30s = 10% of a 5-minute market.
-entry_cutoff_secs = 60
-
-# Maximum age (ms) of a Binance SBE event before it is discarded.
-# SBE over a co-located connection should be sub-10ms. 50ms is a tight but safe budget.
-# Events older than this indicate network congestion or clock skew — discard to avoid
-# acting on stale price data. ec2 gets 103-104ms no jitter (so assume we are 100ms out of sync w binance sbe)
+# No entries within this many seconds of market expiry
+entry_cutoff_secs = 50
+# Max age (ms) of Binance SBE event before discard
 binance_stale_event_ms = 150
-
-# Maximum age (ms) of the Polymarket orderbook snapshot before blocking entry.
-# If the book data is older than this, it's considered stale and unreliable.
+# Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 1000
+# Block entry if YES mid > this or < (1 - this)
+max_price_skew = 0.85
+# Cancel unfilled Leg 1 after this many ms
+leg1_timeout_ms = 1500
 
-# Maximum YES mid price before blocking entry (mirrors minimum as 1 - max_price_skew).
-# Prevents trading in near-certain-resolution markets where one side is illiquid.
-# If YES mid > 0.90 or YES mid < 0.10, leg 2 fill probability collapses → skip.
-# 0.90 = block if market implies >90% or <10% probability for YES.
-max_price_skew = 0.9
-
-# Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
-# After timeout, the slot is freed for the next spike. Prevents blocking on stale orders.
-# In sim mode, fills are near-instant so this rarely fires. Essential for live mode
-# where real CLOB queue priority means fills can take much longer.
-# 5000 = cancel after 5 seconds if not filled.
-leg1_timeout_ms = 2500
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CAPITAL
-# Controls how much USDC the bot allocates per leg per trade.
-# ─────────────────────────────────────────────────────────────────────────────
 [capital]
-
-# Maximum USDC to allocate per leg per trade (nearest dollar).
-# The confidence tier takes a fraction of this; minimum is always $1.
+# Maximum USDC per leg per trade
 max_alloc_per_trade = 0.1
+# Fraction of max_alloc for each confidence tier
+high_alloc_pct = 1
+med_alloc_pct = 0.5
+low_alloc_pct = 0.3
 
-# Fraction of max_alloc_per_trade for each confidence tier.
-# alloc = max(round(max_alloc_per_trade × tier_pct), 1)
-high_alloc_pct = 1  # HIGH confidence bets the full max
-med_alloc_pct  = 0.5   
-low_alloc_pct  = 0.3   
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIDENCE
-# 3-factor scoring (sustain removed — all confirmed spikes passed it, no discriminative value).
-# Score = 0.4*(spike/ATR) + 0.2*(depth/avg) + 0.2*(time/300)
-# Max possible score: 0.8
-# ─────────────────────────────────────────────────────────────────────────────
 [confidence]
-
-# Confidence >= this → HIGH tier.
-# Max score is 0.8 (sustain removed from formula).
+# Score >= this → HIGH tier (max score 0.8)
 high_threshold = 0.5
-
-# Confidence >= this (but < high) → MED tier.
-# Below this → LOW tier.
+# Score >= this → MED tier, below → LOW
 med_threshold = 0.3
-
-# Initial profit target for each confidence tier.
-# This is the percentage margin the pair must lock in: pair cost must be <= 1 - target.
-# Example: high_target_pct = 0.030 means we need pair cost <= $0.970 to enter.
-# HIGH tier profit target (e.g. 0.025 = 2.5%). For strongest signals.
+# Profit target % for HIGH tier
 high_target_pct = 0.03
-
-# MED tier profit target (e.g. 0.015 = 1.5%). For medium confidence signals.
+# Profit target % for MED tier
 med_target_pct = 0.02
-
-# LOW tier profit target (e.g. 0.010 = 1.0%). For weakest acceptable signals.
+# Profit target % for LOW tier
 low_target_pct = 0.010
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RISK
-# Controls the Leg 2 hedge: erosion cascade timing, emergency exit triggers,
-# and loss caps. Two independent emergency exit paths protect against losses:
-#   Path 1 (Binance): adverse movement reversal, immediate FOK, no grace period
-#   Path 2 (Polymarket): break-even breach after 1st erosion step, FOK capped
-# ─────────────────────────────────────────────────────────────────────────────
 [risk]
-
-# If Binance price reverses by more than this fraction after Leg 1 fill,
-# the spike thesis is dead → immediate emergency FOK hedge (no grace period).
-# This is the ultimate safeguard. Fires at ANY point after fill.
-# 0.003 = 0.3% reversal (~$200 at BTC $68K).
+# Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.
 adverse_threshold = 0.001
-
-# First erosion step interval (ms). Each subsequent step decays by erosion_interval_decay.
-# The erosion cascade progressively lowers the Leg 2 limit price toward break-even.
-# Step 1 waits longest (market has time to fill at the best price).
-# Sequence at decay=0.5: 1500ms → 750ms → 375ms → 188ms → 94ms (~2.9s total)
-# Tighter than 15m (was 2500ms) — 5m markets need faster hedge completion.
-erosion_base_interval_ms = 2000
-
-# Multiply the interval by this factor for each subsequent erosion step.
-# Lower = faster acceleration (later steps fire more rapidly).
-# Higher = more uniform pacing.
-# 0.6 at base=4000: steps at 4s, 2.4s, 1.4s, 0.9s, 0.5s
-# 0.8 at base=4000: steps at 4s, 3.2s, 2.6s, 2.0s, 1.6s (slower, more patient)
+# First erosion step interval (ms), decays by erosion_interval_decay each step
+erosion_base_interval_ms = 2500
+# Decay factor for each subsequent erosion interval
 erosion_interval_decay = 0.5
-
-# A depth level is considered a "competitor wall" if its size exceeds
-# this multiple of the average depth across the book.
-# When a wall is detected, the bot outbids it by 1 tick for queue priority.
-# 4.0 = a level with 4x the average depth is a wall.
+# Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
-
-# Hard deadline (ms) from first emergency post to FOK taker fallback.
-# During this window, the engine only reposts when the book offers a strictly
-# better price (price-improvement chase). If no fill by deadline, FOK at best_ask.
-# 1500 = 1.5 seconds of price-chasing before forced taker exit.
-# Tighter than 15m (was 2500ms) — 5m markets need faster emergency resolution.
+# Hard deadline (ms) from first emergency post to FOK taker fallback
 emergency_deadline_ms = 2000

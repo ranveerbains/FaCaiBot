@@ -427,7 +427,12 @@ async fn async_main() -> Result<()> {
 
             // Notify executor of market rotation (before evaluating signals,
             // so the executor can close positions before receiving new ones).
+            // In live mode, send the market summary BEFORE the rotation command
+            // so counters still reflect the old market.
             if let Some((cond_id, yes_id, no_id)) = rotation_info {
+                if engine_mode == Mode::Live {
+                    engine.send_live_market_summary();
+                }
                 if let Err(e) = executor_tx.send(ExecutorCommand::MarketRotation {
                     condition_id: cond_id,
                     yes_token_id: yes_id,
@@ -436,20 +441,6 @@ async fn async_main() -> Result<()> {
                 }) {
                     error!(error = %e, "failed to send MarketRotation to executor");
                     break;
-                }
-            }
-
-            // Send cutoff command once when entering the 3-min window.
-            if let Some((cond_id, market_end_ms)) = engine.take_cutoff_trigger() {
-                // In live mode, send the full market summary via Telegram.
-                if engine_mode == Mode::Live {
-                    engine.send_live_market_summary(&cond_id, market_end_ms);
-                }
-                if let Err(e) = executor_tx.send(ExecutorCommand::MarketCutoff {
-                    condition_id: cond_id,
-                    market_end_ms,
-                }) {
-                    error!(error = %e, "failed to send MarketCutoff to executor");
                 }
             }
 
