@@ -33,11 +33,11 @@ leg1_timeout_ms = 1000
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 0.1
+max_alloc_per_trade = 4.5
 # Fraction of max_alloc for each confidence tier
 high_alloc_pct = 1
-med_alloc_pct = 0.5
-low_alloc_pct = 0.3
+med_alloc_pct = 1
+low_alloc_pct = 1
 
 [confidence]
 # Score >= this → HIGH tier (max score 0.8)

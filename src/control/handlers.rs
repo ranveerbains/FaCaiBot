@@ -53,12 +53,27 @@ pub fn handle_diag(args: &str, flags: &Arc<NotifyFlags>) -> String {
     }
 }
 
-/// Handle `/stop`. Sends Shutdown event to engine via ingestor channel.
-/// Returns the initial reply text. Progress updates come via DrainStatus watch.
+/// Handle `/stop`. Pauses trading (blocks new entries, Leg 2 continues, bot stays alive).
 pub fn handle_stop(ingestor_tx: &Sender<IngestorEvent>) -> String {
+    match ingestor_tx.try_send(IngestorEvent::PauseTrading) {
+        Ok(()) => "Trading paused. Use /resume to restart.".into(),
+        Err(e) => format!("Failed: {e}"),
+    }
+}
+
+/// Handle `/resume`. Resumes trading after a /stop pause.
+pub fn handle_resume(ingestor_tx: &Sender<IngestorEvent>) -> String {
+    match ingestor_tx.try_send(IngestorEvent::ResumeTrading) {
+        Ok(()) => "Trading resumed.".into(),
+        Err(e) => format!("Failed: {e}"),
+    }
+}
+
+/// Handle `/shutdown`. Full graceful shutdown (drain + exit).
+pub fn handle_shutdown(ingestor_tx: &Sender<IngestorEvent>) -> String {
     match ingestor_tx.try_send(IngestorEvent::Shutdown) {
-        Ok(()) => "Stopping bot...".into(),
-        Err(e) => format!("Failed to send shutdown: {e}"),
+        Ok(()) => "Shutting down...".into(),
+        Err(e) => format!("Failed: {e}"),
     }
 }
 
@@ -134,6 +149,8 @@ pub fn handle_status(status: &BotStatus) -> String {
 
     let drain_status = if status.draining {
         " [DRAINING]"
+    } else if status.paused {
+        " [PAUSED]"
     } else {
         ""
     };
@@ -167,7 +184,9 @@ pub fn handle_help() -> String {
     "/trades on|off — Toggle trade notifications\n\
      /summary on|off — Toggle market summary notifications\n\
      /diag on|off — Toggle 60s diagnostic forwarding\n\
-     /stop — Graceful shutdown (drains open position)\n\
+     /stop — Pause trading (keeps connections alive)\n\
+     /resume — Resume trading after /stop\n\
+     /shutdown — Graceful shutdown (drains open position)\n\
      /set <param> <value> — Update config + restart\n\
      /config [section] — Show current config\n\
      /status — Bot status and counters\n\

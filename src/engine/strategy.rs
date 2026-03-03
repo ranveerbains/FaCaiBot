@@ -194,9 +194,17 @@ pub struct StrategyEngine {
     diag_spike_failures: u64,
     last_diag_ms: u64,
 
-    // ── Drain mode ────────────────────────────────────────────────────────
-    /// When `true`, `evaluate()` blocks new Leg 1 entries. Set by `/stop` or `/set`.
+    // ── Drain / pause mode ─────────────────────────────────────────────
+    /// When `true`, `evaluate()` blocks new Leg 1 entries. Set by `/shutdown` or `/set`.
     pub draining: bool,
+    /// When `true`, `evaluate()` blocks new Leg 1 entries but the bot stays alive.
+    /// Set by `/stop`, cleared by `/resume`. Unlike `draining`, does not exit.
+    paused: bool,
+
+    /// When `true`, the next Leg 1 `OrderPosted` feedback will be cancelled
+    /// instead of resurrecting `leg1_state`. Set by `SpikeFailed` / staleness
+    /// when the order_id is still provisional ("sim-...").
+    pub cancel_leg1_on_feedback: bool,
 
     /// Epoch ms when the engine was created (for uptime calculation).
     start_ms: u64,
@@ -271,6 +279,8 @@ impl StrategyEngine {
             diag_spike_failures: 0,
             last_diag_ms: 0,
             draining: false,
+            paused: false,
+            cancel_leg1_on_feedback: false,
             start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
                 max_spread,
@@ -299,6 +309,15 @@ impl StrategyEngine {
                 emergency_deadline_ms: config.bot.risk.emergency_deadline_ms,
             },
         }
+    }
+
+    // ─── Provisional Order ID ──────────────────────────────────────────────
+
+    /// Returns `true` if `order_id` is a provisional ID set by `evaluate()`.
+    /// Provisional IDs start with `"sim-"` and are replaced by the real CLOB ID
+    /// when `OrderPosted` feedback arrives from the executor.
+    pub fn is_provisional_order_id(order_id: &str) -> bool {
+        order_id.starts_with("sim-")
     }
 
     // ─── Public Interface ─────────────────────────────────────────────────
@@ -570,11 +589,21 @@ impl StrategyEngine {
 
                 match &self.state.leg1_state {
                     OrderState::Posted { order_id, .. } => {
-                        info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
                         self.diag_spike_sustain_cancel += 1;
-                        self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
-                            order_id: order_id.clone(),
-                        });
+                        if Self::is_provisional_order_id(order_id) {
+                            // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
+                            info!(
+                                %order_id, timestamp_ms,
+                                "spike FAILED — deferring cancel to feedback (provisional ID)"
+                            );
+                            self.cancel_leg1_on_feedback = true;
+                        } else {
+                            // Real CLOB ID is available — cancel immediately.
+                            info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
+                            self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
+                                order_id: order_id.clone(),
+                            });
+                        }
                         self.state.leg1_state = OrderState::None;
                         self.pending_leg1_signal = None;
                         self.leg1_direction = None;
@@ -683,6 +712,7 @@ impl StrategyEngine {
                 self.pending_leg1_signal = None;
                 self.pending_spike_cancel = None;
                 self.speculative_awaiting_sustain = false;
+                self.cancel_leg1_on_feedback = false;
                 self.in_cutoff_window = false;
                 self.diag_markets_rotated += 1;
                 // Reset per-market live reporting state.
@@ -850,7 +880,10 @@ impl StrategyEngine {
             }
 
             // Control events are handled in main.rs before on_event() is called.
-            IngestorEvent::Shutdown | IngestorEvent::DrainAndRestart => {}
+            IngestorEvent::Shutdown
+            | IngestorEvent::DrainAndRestart
+            | IngestorEvent::PauseTrading
+            | IngestorEvent::ResumeTrading => {}
         }
 
         // ── Cutoff window detection (runs on every event) ──────────────
@@ -886,8 +919,8 @@ impl StrategyEngine {
     /// - Increments `cumulative_used`
     /// - Records `leg1_direction`
     pub fn evaluate(&mut self) -> Option<TradeSignal> {
-        // Drain mode: block new Leg 1 entries.
-        if self.draining {
+        // Drain/pause mode: block new Leg 1 entries.
+        if self.draining || self.paused {
             self.state.spike_detected = false;
             return None;
         }
@@ -1295,34 +1328,51 @@ impl StrategyEngine {
         } = &self.state.leg1_state
         {
             if now_ms.saturating_sub(*timestamp_ms) > self.leg1.leg1_timeout_ms {
-                let cmd = ExecutorCommand::CancelLeg1 {
-                    order_id: order_id.clone(),
-                };
                 info!(
                     elapsed_ms = now_ms.saturating_sub(*timestamp_ms),
                     timeout_ms = self.leg1.leg1_timeout_ms,
                     "Leg 1 stale — cancelling unfilled order"
                 );
+                let cmd = if Self::is_provisional_order_id(order_id) {
+                    // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
+                    self.cancel_leg1_on_feedback = true;
+                    None
+                } else {
+                    Some(ExecutorCommand::CancelLeg1 {
+                        order_id: order_id.clone(),
+                    })
+                };
                 self.state.leg1_state = OrderState::None;
                 self.pending_leg1_signal = None;
                 self.leg1_direction = None;
                 self.pending_spike_cancel = None;
                 self.speculative_awaiting_sustain = false;
                 self.diag_leg1_timeouts += 1;
-                return Some(cmd);
+                return cmd;
             }
         }
         None
     }
 
     /// Called by the Executor when an order is successfully posted to the CLOB.
+    /// Returns `Some(CancelLeg1)` if the order should be immediately cancelled
+    /// (deferred cancel from SpikeFailed/staleness while the ID was provisional).
     pub fn on_order_posted(
         &mut self,
         is_leg2: bool,
         order_id: String,
         price: Decimal,
         size: Decimal,
-    ) {
+    ) -> Option<ExecutorCommand> {
+        // Deferred cancel: SpikeFailed/staleness arrived while ID was provisional.
+        // Now we have the real CLOB ID — cancel it instead of resurrecting state.
+        if !is_leg2 && self.cancel_leg1_on_feedback {
+            self.cancel_leg1_on_feedback = false;
+            info!(%order_id, "deferred cancel: cancelling real CLOB order");
+            return Some(ExecutorCommand::CancelLeg1 { order_id });
+            // leg1_state stays None — do NOT resurrect.
+        }
+
         let now_ms = now_epoch_ms();
         let leg = if is_leg2 {
             &mut self.state.leg2_state
@@ -1335,11 +1385,18 @@ impl StrategyEngine {
             size,
             timestamp_ms: now_ms,
         };
+        None
     }
 
     /// Called by the live executor (via feedback channel) when order placement fails.
     /// Resets the affected leg state to `None` so the engine can re-evaluate.
     pub fn on_order_failed(&mut self, is_leg2: bool) {
+        if !is_leg2 && self.cancel_leg1_on_feedback {
+            // SpikeFailed/staleness already reset state — nothing to cancel.
+            self.cancel_leg1_on_feedback = false;
+            info!("deferred cancel: order placement failed — flag cleared (no cancel needed)");
+            return;
+        }
         if is_leg2 {
             self.state.leg2_state = OrderState::None;
         } else {
@@ -1524,6 +1581,7 @@ impl StrategyEngine {
         self.pending_leg1_signal = None;
         self.pending_spike_cancel = None;
         self.speculative_awaiting_sustain = false;
+        self.cancel_leg1_on_feedback = false;
         // cumulative_used is NOT reset — capital stays allocated within this market.
     }
 
@@ -2219,6 +2277,33 @@ impl StrategyEngine {
         self.draining = true;
     }
 
+    /// Pause trading: block new Leg 1 entries, keep connections alive.
+    pub fn set_paused(&mut self, v: bool) {
+        self.paused = v;
+    }
+
+    /// Returns `true` if trading is paused.
+    #[allow(dead_code)] // public API for /status and future use
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Set the deferred Leg 1 cancel flag (used when Shutdown/DrainAndRestart
+    /// encounters a provisional order ID that can't be cancelled yet).
+    pub fn set_cancel_leg1_on_feedback(&mut self, v: bool) {
+        self.cancel_leg1_on_feedback = v;
+    }
+
+    /// Reset Leg 1 state to `None` and clear associated tracking fields.
+    pub fn reset_leg1_state(&mut self) {
+        self.state.leg1_state = OrderState::None;
+        self.pending_leg1_signal = None;
+        self.leg1_direction = None;
+        self.state.spike_detected = false;
+        self.state.last_spike = None;
+        self.speculative_awaiting_sustain = false;
+    }
+
     /// Returns `true` if no position is open (safe to exit immediately).
     pub fn has_no_open_position(&self) -> bool {
         matches!(self.state.leg1_state, OrderState::None)
@@ -2256,6 +2341,7 @@ impl StrategyEngine {
             trades_enabled: true,  // updated by main loop from NotifyFlags
             summary_enabled: true, // updated by main loop from NotifyFlags
             draining: self.draining,
+            paused: self.paused,
         }
     }
 }
@@ -3181,13 +3267,26 @@ mod tests {
             "speculative gate should be cleared"
         );
 
-        // The cancel command should be pending.
-        let cancel = engine.take_spike_cancel();
-        assert!(cancel.is_some(), "should have a pending CancelLeg1 command");
-        match cancel.unwrap() {
-            ExecutorCommand::CancelLeg1 { .. } => {}
+        // Provisional ID → cancel is deferred to feedback, not immediate.
+        assert!(
+            engine.take_spike_cancel().is_none(),
+            "provisional ID should NOT produce immediate spike cancel"
+        );
+        assert!(
+            engine.cancel_leg1_on_feedback,
+            "cancel_leg1_on_feedback should be set for provisional ID"
+        );
+
+        // Simulate real CLOB ID arriving via feedback.
+        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0));
+        assert!(cancel_cmd.is_some(), "should return CancelLeg1 for deferred cancel");
+        match cancel_cmd.unwrap() {
+            ExecutorCommand::CancelLeg1 { order_id } => {
+                assert_eq!(order_id, "real-clob-id-123", "should cancel with real CLOB ID");
+            }
             other => panic!("expected CancelLeg1, got {other:?}"),
         }
+        assert!(!engine.cancel_leg1_on_feedback, "flag should be cleared after deferred cancel");
     }
 
     #[test]

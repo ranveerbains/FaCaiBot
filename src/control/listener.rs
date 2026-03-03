@@ -210,6 +210,8 @@ async fn handle_message(
         "summary" => handlers::handle_summary(args, notify_flags),
         "diag" => handlers::handle_diag(args, notify_flags),
         "stop" => handlers::handle_stop(ingestor_tx),
+        "resume" => handlers::handle_resume(ingestor_tx),
+        "shutdown" => handlers::handle_shutdown(ingestor_tx),
         "set" => handlers::handle_set(args, ingestor_tx),
         "config" => handlers::handle_config(args),
         "status" => {

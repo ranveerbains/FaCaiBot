@@ -375,8 +375,12 @@ pub enum IngestorEvent {
     WsStatus { source: DataSource, connected: bool },
 
     // ── Control ───────────────────────────────────────────────────────
-    /// Graceful shutdown (from /stop). Drain open position, then exit 0.
+    /// Graceful shutdown (from /shutdown). Drain open position, then exit 0.
     Shutdown,
     /// Config changed (from /set). Drain open position, then exit 42 for systemd restart.
     DrainAndRestart,
+    /// Pause trading (from /stop). Block new entries, complete open Leg 2, stay alive.
+    PauseTrading,
+    /// Resume trading (from /resume).
+    ResumeTrading,
 }

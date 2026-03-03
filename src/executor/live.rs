@@ -554,6 +554,10 @@ impl LiveExecutor {
                         warn!(token = token_id_str, error = %e, "neg_risk pre-warm FAILED");
                         all_ok = false;
                     }
+                    if let Err(e) = sdk.fee_rate_bps(id).await {
+                        warn!(token = token_id_str, error = %e, "fee_rate_bps pre-warm FAILED");
+                        all_ok = false;
+                    }
                 } else {
                     warn!(token = token_id_str, "failed to parse token_id as U256");
                     all_ok = false;
@@ -565,7 +569,7 @@ impl LiveExecutor {
                     condition_id,
                     yes_token_id,
                     no_token_id,
-                    "SDK caches pre-warmed from CLOB (tick_size, neg_risk) — trading enabled"
+                    "SDK caches pre-warmed from CLOB (tick_size, neg_risk, fee_rate) — trading enabled"
                 );
             } else {
                 warn!("SDK cache pre-warm incomplete — trading BLOCKED until next rotation");

@@ -54,6 +54,7 @@ pub struct BotStatus {
     pub trades_enabled: bool,
     pub summary_enabled: bool,
     pub draining: bool,
+    pub paused: bool,
 }
 
 impl Default for BotStatus {
@@ -71,6 +72,7 @@ impl Default for BotStatus {
             trades_enabled: true,
             summary_enabled: true,
             draining: false,
+            paused: false,
         }
     }
 }

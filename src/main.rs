@@ -245,7 +245,11 @@ async fn async_main() -> Result<()> {
                         price,
                         size,
                     } => {
-                        engine.on_order_posted(is_leg2, order_id, price, size);
+                        if let Some(cancel_cmd) =
+                            engine.on_order_posted(is_leg2, order_id, price, size)
+                        {
+                            let _ = executor_tx.send(cancel_cmd);
+                        }
                     }
                     ExecutorFeedback::OrderFailed { is_leg2 } => {
                         engine.on_order_failed(is_leg2);
@@ -287,8 +291,13 @@ async fn async_main() -> Result<()> {
                     }
                     // Cancel posted-but-unfilled Leg 1 if applicable.
                     if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
-                        let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
-                        let _ = executor_tx.send(cmd);
+                        if StrategyEngine::is_provisional_order_id(order_id) {
+                            engine.set_cancel_leg1_on_feedback(true);
+                        } else {
+                            let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
+                            let _ = executor_tx.send(cmd);
+                        }
+                        engine.reset_leg1_state();
                         // If only Leg 1 was posted (not filled), we can exit after cancel.
                         if matches!(engine.state().leg2_state, OrderState::None) {
                             if engine_mode == Mode::Live {
@@ -298,11 +307,15 @@ async fn async_main() -> Result<()> {
                                 exit_code: 0,
                                 summary: "Cancelled unfilled Leg 1. Bot stopped.".into(),
                             });
-                            break;
+                            // Don't break immediately — allow feedback loop to process
+                            // the deferred cancel if the ID was provisional.
+                            if !engine.cancel_leg1_on_feedback {
+                                break;
+                            }
                         }
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
-                        reason: "stop".into(),
+                        reason: "shutdown".into(),
                         position_info: "Leg 2 in progress — waiting for position to close".into(),
                     });
                     continue;
@@ -321,8 +334,13 @@ async fn async_main() -> Result<()> {
                         break;
                     }
                     if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
-                        let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
-                        let _ = executor_tx.send(cmd);
+                        if StrategyEngine::is_provisional_order_id(order_id) {
+                            engine.set_cancel_leg1_on_feedback(true);
+                        } else {
+                            let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
+                            let _ = executor_tx.send(cmd);
+                        }
+                        engine.reset_leg1_state();
                         if matches!(engine.state().leg2_state, OrderState::None) {
                             if engine_mode == Mode::Live {
                                 engine.send_live_session_summary();
@@ -331,13 +349,36 @@ async fn async_main() -> Result<()> {
                                 exit_code: 42,
                                 summary: "Cancelled unfilled Leg 1. Restarting...".into(),
                             });
-                            break;
+                            if !engine.cancel_leg1_on_feedback {
+                                break;
+                            }
                         }
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
                         reason: "config change".into(),
                         position_info: "Leg 2 in progress — waiting for position to close".into(),
                     });
+                    continue;
+                }
+                IngestorEvent::PauseTrading => {
+                    engine.set_paused(true);
+                    // Cancel unfilled Leg 1 if posted (but not filled).
+                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
+                        if StrategyEngine::is_provisional_order_id(order_id) {
+                            engine.set_cancel_leg1_on_feedback(true);
+                        } else {
+                            let _ = executor_tx.send(ExecutorCommand::CancelLeg1 {
+                                order_id: order_id.clone(),
+                            });
+                        }
+                        engine.reset_leg1_state();
+                    }
+                    info!("trading PAUSED — new entries blocked, Leg 2 continues if open");
+                    continue;
+                }
+                IngestorEvent::ResumeTrading => {
+                    engine.set_paused(false);
+                    info!("trading RESUMED");
                     continue;
                 }
                 _ => {}
