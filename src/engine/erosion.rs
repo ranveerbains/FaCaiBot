@@ -42,6 +42,9 @@ pub(crate) struct ErosionState {
     pub emergency_first_post_ms: Option<u64>,
     /// Price of the currently resting emergency order (for price-chase comparison).
     pub emergency_posted_price: Option<Decimal>,
+    /// Set once a deadline-triggered FOK signal has been emitted to the executor.
+    /// Prevents the evaluator from re-emitting FOK on every cycle (~2-50ms).
+    pub fok_emitted: bool,
 }
 
 impl ErosionState {
@@ -71,6 +74,7 @@ impl ErosionState {
             exit_reason: None,
             emergency_first_post_ms: None,
             emergency_posted_price: None,
+            fok_emitted: false,
         }
     }
 
@@ -155,6 +159,9 @@ pub(crate) struct ErosionSnap {
     pub emergency_first_post_ms: Option<u64>,
     /// Price of the currently resting emergency order (for price-chase comparison).
     pub emergency_posted_price: Option<Decimal>,
+    /// `true` once a deadline-triggered FOK signal has been emitted. Prevents
+    /// the evaluator from flooding the executor with duplicate FOK signals.
+    pub fok_emitted: bool,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

@@ -146,7 +146,7 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 
 On network error during cancel, the executor cannot determine state — it proceeds with the replacement (cancel counted, no `CancelResult` sent). The User WS is the final authority: if the old order filled, the MATCHED event will arrive and be matched by the engine.
 
-On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`. **Exception**: Emergency FOK orders (`emergency_fok_fallback` and `emergency_fok_at_price`) retry internally until the CLOB accepts — they never send `OrderFailed`. After Leg 1 fills, the position must be hedged; the ~1.2s HTTP round-trip per attempt is the natural rate limiter.
+On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`. **Exception**: Emergency FOK orders (`emergency_fok_fallback` and `emergency_fok_at_price`) retry up to `MAX_FOK_RETRIES` (10) before sending `OrderFailed`. FOK sizes are sanitized via `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB maker_amount precision requirement). After Leg 1 fills, the position must be hedged; the ~1.2s HTTP round-trip per attempt is the natural rate limiter. **"Crosses book" errors**: If a Leg 2 erosion post-only order fails with a "crosses book" error (SDK returns this as `Err`, not `Ok(Rejected)`), the executor routes to `attempt_favorable_exit()` instead of sending `OrderFailed` — the favorable pricing is preserved.
 
 ---
 
@@ -333,8 +333,8 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
               │    │          Erosion: attempt_favorable_exit()           │
               │    │          Emergency: FOK fallback (retries internally) │
               │    │      → Network error:                               │
-              │    │          Emergency FOK: retry (never sends feedback) │
-              │    │          Other orders: OrderFailed feedback          │
+              │    │          Emergency FOK: retry (max 10, then OrderFailed) │
+              │    │          Other orders: OrderFailed feedback            │
               │    │                                                     │
               │    └────────────────────────────────────────────────────┘
               │                                                         │
@@ -453,7 +453,7 @@ Total: ~5.8s to break-even
 - **Not confirmed**: The old order may have filled. Skip replacement, send `CancelResult`. Engine restores old order state, User WS MATCHED arrives → trade complete.
 - **Network error**: Post replacement anyway (best effort). User WS is final authority.
 
-Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted (profit target = 0) and auto-escalates to a `BreakEvenBreach` emergency.
+Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted (profit target = 0) and auto-escalates to an `ErosionExhausted` emergency. **Silent step advance guard**: Steps only advance silently (when the evaluator returns `None`) if a Leg 2 order is actually resting (`leg2_state == Posted`). If `leg2_state` is `None` (e.g., after an `OrderFailed` reset), the evaluator will emit a signal at the current step's price, so steps advance via the normal evaluation path instead of burning without a resting order.
 
 **Skip guard**: Before reposting, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new erosion target. If so, the cancel-and-repost is skipped — preserving a favorable position. This prevents erosion from overwriting a good price with a worse one.
 
@@ -465,11 +465,11 @@ Four independent exit paths. All use a **price-improvement chase with hard deadl
 |---------|-----------|--------|
 | **Adverse movement** | Binance reversal > `adverse_threshold` (0.1%) from Binance price at Leg 1 fill | **Immediate** — zero grace period |
 | **Break-even breach** | Pair cost (leg1 + opposing ask) > $1.00 | **After first erosion step** (~3s) |
-| **Erosion exhausted** | All 5 erosion steps applied without fill | **After step 5** (~5.8s). Auto-escalates as `BreakEvenBreach` |
+| **Erosion exhausted** | All 5 erosion steps applied without fill | **After step 5** (~5.8s). Auto-escalates as `ErosionExhausted` |
 | **Market expiry** | `MarketRotation` while Leg 1 Filled, Leg 2 incomplete | **At rotation** — last-resort FOK before state reset |
 
 **Price-improvement chase flow**: The evaluator tracks `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). On each Polymarket book update:
-1. `emergency_deadline_ms` elapsed? → FOK at `best_ask` (`sim_was_taker=true`)
+1. `emergency_deadline_ms` elapsed? → FOK at `best_ask` (`sim_was_taker=true`). **FOK dedup**: Once a deadline FOK is emitted (`fok_emitted=true` on `ErosionState`), subsequent evaluation cycles return `None` — the executor's internal retry loop handles persistence
 2. `best_ask - 1 tick` better than posted price? → cancel and repost (price-chase)
 3. Neither? → hold current order, preserve FIFO queue priority
 
@@ -650,7 +650,7 @@ All execution state lives in-memory (no database on the hot path). QuestDB is us
 ### Tuning Analytics
 
 `simulated_trades` carries full context for outcome correlation:
-- `exit_reason` (symbol): `NormalErosion`, `AdverseMovement`, `BreakEvenBreach`, `MarketExpiry`, `FavorableTaker` — loss attribution
+- `exit_reason` (symbol): `NormalErosion`, `AdverseMovement`, `BreakEvenBreach`, `ErosionExhausted`, `MarketExpiry`, `FavorableTaker` — loss attribution
 - `spike_magnitude` (f64): spike quality vs. outcome correlation
 - `favorable_taker`, `emergency_maker` (bool): exit type flags
 

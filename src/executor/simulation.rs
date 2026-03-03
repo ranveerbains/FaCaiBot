@@ -447,14 +447,20 @@ impl SimulationExecutor {
                     );
                 }
             }
-            Some(ExitReason::BreakEvenBreach) => {
+            Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
+                let label = if signal.exit_reason == Some(ExitReason::ErosionExhausted) {
+                    "erosion exhausted"
+                } else {
+                    "break-even breach"
+                };
+                let reason_ref = signal.exit_reason.unwrap_or(ExitReason::BreakEvenBreach);
                 if is_taker {
                     info!(
                         token_id = %signal.token_id,
                         taker_price = %fill.price,
                         taker_fee = %fill.taker_fee,
                         position_idx,
-                        "Leg 2: break-even breach FOK fallback"
+                        "Leg 2: {label} FOK fallback"
                     );
                     self.state.trades_break_even_fok += 1;
                     self.state.record_emergency_taker(position_idx, fill);
@@ -463,12 +469,12 @@ impl SimulationExecutor {
                         token_id = %signal.token_id,
                         price = %fill.price,
                         position_idx,
-                        "Leg 2: break-even breach post-only (maker)"
+                        "Leg 2: {label} post-only (maker)"
                     );
                     self.state.record_emergency_maker(
                         position_idx,
                         fill,
-                        &ExitReason::BreakEvenBreach,
+                        &reason_ref,
                     );
                 }
             }

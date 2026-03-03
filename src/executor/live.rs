@@ -27,6 +27,25 @@ use crate::types::order::{
 
 use super::fill_engine::round_to_tick;
 
+/// Maximum number of FOK retry attempts before giving up. Prevents infinite
+/// loops on non-transient CLOB errors (e.g., decimal precision violations).
+const MAX_FOK_RETRIES: u32 = 10;
+
+/// Adjusts `size` so that `price * size` has at most 2 decimal places,
+/// as required by the Polymarket CLOB for Buy FOK orders (maker_amount).
+fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
+    let maker = price * size;
+    if maker == maker.round_dp(2) {
+        return size;
+    }
+    // Floor maker_amount to 2dp, recompute size, then truncate size to 2dp.
+    // Double-truncation guarantees the final maker_amount has <=2dp.
+    let safe_maker = (maker * Decimal::ONE_HUNDRED).floor() / Decimal::ONE_HUNDRED;
+    let adjusted = safe_maker / price;
+    let truncated = (adjusted * Decimal::ONE_HUNDRED).floor() / Decimal::ONE_HUNDRED;
+    truncated.max(Decimal::ZERO)
+}
+
 /// Live executor that submits real orders to the Polymarket CLOB.
 pub struct LiveExecutor {
     poly: PolymarketGateway,
@@ -280,13 +299,24 @@ impl LiveExecutor {
                 }
             }
             Err(e) => {
-                error!(error = %e, "Leg 2 erosion: order placement FAILED");
-                self.orders_failed += 1;
-                self.active_leg2_order_id = None;
+                let err_msg = e.to_string();
+                if err_msg.contains("crosses book") {
+                    // CLOB returned "crosses book" as an Err (not Ok(Rejected)).
+                    // This means the ask dropped below our bid — favorable pricing.
+                    warn!(
+                        error = %e,
+                        "Leg 2 erosion: 'crosses book' error — attempting favorable exit"
+                    );
+                    self.attempt_favorable_exit(signal).await;
+                } else {
+                    error!(error = %e, "Leg 2 erosion: order placement FAILED");
+                    self.orders_failed += 1;
+                    self.active_leg2_order_id = None;
 
-                let _ = self
-                    .feedback_tx
-                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                    let _ = self
+                        .feedback_tx
+                        .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                }
             }
         }
     }
@@ -339,11 +369,12 @@ impl LiveExecutor {
     }
 
     async fn favorable_exit_fok_fallback(&mut self, signal: &TradeSignal) {
+        let safe_size = clob_safe_fok_size(signal.price, signal.size);
         let order = OrderRequest::emergency_fok(
             signal.token_id.clone(),
             signal.side,
             signal.price,
-            signal.size,
+            safe_size,
         );
 
         match self.poly.place_order(&order).await {
@@ -492,13 +523,15 @@ impl LiveExecutor {
     ) {
         // Retry until the CLOB accepts the FOK. After Leg 1 fills we hold a
         // directional position — Leg 2 *must* fill. The ~1.2s HTTP round-trip
-        // per attempt is the natural rate limiter.
-        loop {
+        // per attempt is the natural rate limiter. Max retries prevent infinite
+        // loops on non-transient errors (e.g., decimal precision violations).
+        let safe_size = clob_safe_fok_size(signal.price, signal.size);
+        for attempt in 1..=MAX_FOK_RETRIES {
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
                 signal.side,
                 signal.price,
-                signal.size,
+                safe_size,
             );
 
             match self.poly.place_order(&order).await {
@@ -507,6 +540,7 @@ impl LiveExecutor {
                         warn!(
                             order_id = %resp.order_id,
                             reason = ?exit_reason,
+                            attempt,
                             "Leg 2 emergency: FOK rejected — retrying"
                         );
                         self.orders_failed += 1;
@@ -527,17 +561,25 @@ impl LiveExecutor {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: signal.price,
-                        size: signal.size,
+                        size: safe_size,
                     });
-                    break;
+                    return;
                 }
                 Err(e) => {
-                    error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
+                    error!(error = %e, attempt, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
                     self.orders_failed += 1;
                     continue;
                 }
             }
         }
+        error!(
+            max_retries = MAX_FOK_RETRIES,
+            reason = ?exit_reason,
+            "Leg 2 emergency: FOK exhausted max retries — sending OrderFailed"
+        );
+        let _ = self
+            .feedback_tx
+            .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
     }
 
     // ─── Emergency FOK at a specific price (CLOB rejection fallback) ────
@@ -549,13 +591,15 @@ impl LiveExecutor {
         price: Decimal,
     ) {
         // Retry until the CLOB accepts the FOK — same rationale as
-        // emergency_fok_fallback(). We must exit the position.
-        loop {
+        // emergency_fok_fallback(). We must exit the position. Max retries
+        // prevent infinite loops on non-transient errors.
+        let safe_size = clob_safe_fok_size(price, signal.size);
+        for attempt in 1..=MAX_FOK_RETRIES {
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
                 signal.side,
                 price,
-                signal.size,
+                safe_size,
             );
 
             match self.poly.place_order(&order).await {
@@ -565,6 +609,7 @@ impl LiveExecutor {
                             order_id = %resp.order_id,
                             %price,
                             reason = ?exit_reason,
+                            attempt,
                             "Leg 2 emergency: FOK at price rejected — retrying"
                         );
                         self.orders_failed += 1;
@@ -586,17 +631,26 @@ impl LiveExecutor {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price,
-                        size: signal.size,
+                        size: safe_size,
                     });
-                    break;
+                    return;
                 }
                 Err(e) => {
-                    error!(error = %e, %price, "Leg 2 emergency: FOK at price FAILED — retrying");
+                    error!(error = %e, %price, attempt, "Leg 2 emergency: FOK at price FAILED — retrying");
                     self.orders_failed += 1;
                     continue;
                 }
             }
         }
+        error!(
+            max_retries = MAX_FOK_RETRIES,
+            %price,
+            reason = ?exit_reason,
+            "Leg 2 emergency: FOK at price exhausted max retries — sending OrderFailed"
+        );
+        let _ = self
+            .feedback_tx
+            .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
     }
 
     // ─── Market rotation ────────────────────────────────────────────────

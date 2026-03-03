@@ -477,6 +477,11 @@ impl Leg2Evaluator {
                 .unwrap_or(0);
 
             if elapsed >= self.emergency_deadline_ms {
+                if snap.fok_emitted {
+                    // FOK already sent to executor — its internal retry loop handles
+                    // persistence. Don't flood the command channel with duplicates.
+                    return None;
+                }
                 let leg1_size = match &state.leg1_state {
                     OrderState::Filled { size, .. } => *size,
                     _ => return None,
@@ -663,7 +668,7 @@ impl Leg2Evaluator {
                 }
                 warn!(
                     %price, %fok_size, steps = snap.steps_applied,
-                    "erosion exhausted — escalating to BreakEvenBreach emergency"
+                    "erosion exhausted — escalating to ErosionExhausted emergency"
                 );
                 let signal = make_leg2_signal(
                     &hedge_token_id,
@@ -683,7 +688,7 @@ impl Leg2Evaluator {
                     atr,
                     false,
                     Some(hedge_book.clone()),
-                    Some(ExitReason::BreakEvenBreach),
+                    Some(ExitReason::ErosionExhausted),
                 );
                 return Some(Leg2Decision::Emergency {
                     signal,
@@ -1145,6 +1150,7 @@ mod tests {
             exit_reason: Some(ExitReason::AdverseMovement),
             emergency_first_post_ms: Some(now_ms - 1_000),
             emergency_posted_price: Some(Decimal::new(48, 2)),
+            fok_emitted: false,
         };
 
         let evaluator = Leg2Evaluator {
@@ -1256,7 +1262,7 @@ mod tests {
         );
         assert!(result.as_ref().unwrap().is_emergency());
         let sig = result.unwrap().into_signal();
-        assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+        assert_eq!(sig.exit_reason, Some(ExitReason::ErosionExhausted));
         // Price should be post-only: 0.49 - 0.01 = 0.48
         assert_eq!(sig.price, Decimal::new(48, 2));
     }

@@ -1086,6 +1086,7 @@ impl StrategyEngine {
                 exit_reason: e.exit_reason,
                 emergency_first_post_ms: e.emergency_first_post_ms,
                 emergency_posted_price: e.emergency_posted_price,
+                fok_emitted: e.fok_emitted,
             },
         };
 
@@ -1102,7 +1103,12 @@ impl StrategyEngine {
                 // tick size (e.g. MED tier's 2% margin over 5 steps < $0.01 tick).
                 // Without this, steps_applied never reaches MAX_EROSION_STEPS and the
                 // erosion-exhausted emergency never fires.
-                if last_erosion_ms > 0 && !snap.is_exhausted() {
+                // Only advance silently when a Leg 2 order is actually resting
+                // on the book. If leg2_state is None (e.g. after OrderFailed reset),
+                // the evaluator will emit a signal at the current step's price on the
+                // next cycle — steps advance via the normal evaluation path instead.
+                let leg2_posted = matches!(self.state.leg2_state, OrderState::Posted { .. });
+                if leg2_posted && last_erosion_ms > 0 && !snap.is_exhausted() {
                     let interval = ErosionState::interval_for_step(
                         snap.steps_applied,
                         self.leg2.erosion_base_interval_ms,
@@ -1139,7 +1145,9 @@ impl StrategyEngine {
             };
             match reason {
                 Some(ExitReason::AdverseMovement) => self.diag_emg_adverse += 1,
-                Some(ExitReason::BreakEvenBreach) => self.diag_emg_breakeven += 1,
+                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
+                    self.diag_emg_breakeven += 1;
+                }
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
                 None => self.diag_emg_adverse += 1, // fallback
@@ -1163,6 +1171,9 @@ impl StrategyEngine {
                     Leg2Decision::Emergency { signal, .. } => signal.exit_reason,
                     _ => None,
                 };
+                if was_taker {
+                    e.fok_emitted = true;
+                }
             }
             self.last_erosion_signal_ms = now_ms;
             self.state.leg2_state = OrderState::Posted {
@@ -2335,7 +2346,9 @@ impl StrategyEngine {
             if t.favorable_taker { favorable_taker += 1; }
             if t.adverse_movement_hedge && t.leg2_was_taker { adverse_fok += 1; }
             match t.exit_reason {
-                Some(ExitReason::BreakEvenBreach) => break_even_fok += 1,
+                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
+                    break_even_fok += 1;
+                }
                 Some(ExitReason::MarketExpiry) => timer_fok += 1,
                 _ => {}
             }
@@ -3701,8 +3714,8 @@ mod tests {
         let sig = emergency.unwrap();
         assert_eq!(
             sig.exit_reason,
-            Some(ExitReason::BreakEvenBreach),
-            "exhaustion emergency should have BreakEvenBreach exit reason"
+            Some(ExitReason::ErosionExhausted),
+            "exhaustion emergency should have ErosionExhausted exit reason"
         );
         assert!(
             engine.erosion.as_ref().unwrap().emergency_submitted,

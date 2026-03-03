@@ -205,7 +205,7 @@ After all 5 steps: 100% of margin eroded → price is at break-even.
 | 3 | 375ms | 5.625s |
 | 4 | 200ms | 5.825s |
 
-Early steps wait longer (market has time to fill). Later steps fire rapidly (urgency). Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to a `BreakEvenBreach` emergency.
+Early steps wait longer (market has time to fill). Later steps fire rapidly (urgency). Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to an `ErosionExhausted` emergency. **Silent step advance guard**: Steps only advance silently when a Leg 2 order is actually resting (`leg2_state == Posted`). If `leg2_state` is `None`, steps advance via the normal evaluation path.
 
 ### Erosion evaluation flow
 
@@ -279,9 +279,9 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 **Trigger:** `steps_applied >= MAX_EROSION_STEPS (5)` — the full cascade completed without filling. Profit target is zero (break-even).
 
-Checked after break-even breach, before the erosion interval gate. Auto-escalates as a `BreakEvenBreach` emergency (semantically identical — the cascade reached break-even without filling).
+Checked after break-even breach, before the erosion interval gate. Distinct from `BreakEvenBreach` — the pair cost may still be favorable (e.g., $0.70 + $0.25 = $0.95 < $1.00). The trigger is step exhaustion, not pair cost exceeding $1.00.
 
-**Exit reason:** `BreakEvenBreach`
+**Exit reason:** `ErosionExhausted`
 
 ---
 

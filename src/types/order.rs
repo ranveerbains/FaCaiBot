@@ -21,6 +21,9 @@ pub enum ExitReason {
     /// Opposing ask dropped below posted bid — market-take at ask price.
     /// Taker fee is acceptable insurance vs leaving Leg 1 unhedged.
     FavorableTaker,
+    /// All erosion steps exhausted without Leg 2 fill. Distinct from
+    /// `BreakEvenBreach` — the pair cost may still be favorable.
+    ErosionExhausted,
 }
 
 // ─── Side ────────────────────────────────────────────────────────────────────

@@ -298,6 +298,7 @@ impl ColdStorage {
         let exit_reason_str = match exit_reason {
             Some(ExitReason::AdverseMovement) => "AdverseMovement",
             Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+            Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
             Some(ExitReason::MarketExpiry) => "MarketExpiry",
             Some(ExitReason::FavorableTaker) => "FavorableTaker",
             None => "NormalErosion",
@@ -401,6 +402,7 @@ impl ColdStorage {
                 match trade.exit_reason {
                     Some(ExitReason::AdverseMovement) => "AdverseMovement",
                     Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+                    Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
                     Some(ExitReason::MarketExpiry) => "MarketExpiry",
                     Some(ExitReason::FavorableTaker) => "FavorableTaker",
                     None => "NormalErosion",
