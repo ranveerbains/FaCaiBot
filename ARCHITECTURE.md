@@ -76,28 +76,58 @@ evaluate_leg2()      → Leg 2 erosion/emergency signal (self-gates after emitti
 
 In live mode, the CLOB is the fill authority. Fills arrive via the authenticated User WebSocket as `TradeStatusUpdate` events. The engine matches these against posted order IDs to transition `OrderState::Posted → Filled`.
 
-A reverse `ExecutorFeedback` channel (executor → engine) sends real CLOB order IDs back after placement, so the engine can match User WS fill events to the correct leg. Additionally, `CancelResult` feedback reports whether each cancel was confirmed by the CLOB — if not confirmed (order may have filled), the engine restores the Posted state so User WS events can still match.
+Three feedback types flow from executor → engine via the `ExecutorFeedback` channel:
 
-**User WS event types**: The Polymarket User WS sends two event types for fills: `"order"` events (carrying the hex order hash, e.g. `0x13828d75...`) and `"trade"` events (carrying a UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate`, because their `id` field matches the hex order hash format stored by the engine from `ExecutorFeedback::OrderPosted`. `"trade"` events are logged but their UUIDs never match any stored order ID — they are harmlessly ignored. Actionable statuses (MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED) are forwarded; non-actionable statuses (LIVE, etc.) are silently skipped.
+| Feedback | When | Engine action |
+|----------|------|---------------|
+| `OrderPosted { order_id, price, size, is_leg2 }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. Replay `pending_fills` buffer |
+| `OrderFailed { is_leg2 }` | CLOB rejected or network error (non-emergency only — emergency FOKs retry internally, never send this) | Reset leg state to `None`. If `cancel_leg1_on_feedback` is set, clear the flag (nothing to cancel) |
+| `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, replay `pending_fills` buffer |
 
-**Speculative posting**: Leg 1 is posted to the CLOB immediately on `SpikeCandidate` (gaining ~300ms queue priority). If `SpikeFailed` arrives and the order hasn't filled yet, a `CancelLeg1` is sent to the executor. If the order already filled before `SpikeFailed`, Leg 2 proceeds normally.
+**User WS event routing**: The Polymarket User WS sends two event types: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate` — their `id` field matches the hex hash stored from `OrderPosted` feedback. `"trade"` UUIDs never match and are harmlessly ignored. Actionable statuses forwarded: MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED. Non-actionable statuses (LIVE) are silently skipped by `parse_trade_status()`.
+
+**Speculative posting**: Leg 1 is posted to the CLOB immediately on `SpikeCandidate` (gaining ~300ms queue priority). If `SpikeFailed` arrives before the order fills, a `CancelLeg1` is sent. If it already filled, Leg 2 proceeds normally. The engine saves order info before clearing state, so a `CancelResult { was_cancelled: false }` can restore it.
 
 ```
-drain feedback_rx    → apply ExecutorFeedback::OrderPosted / OrderFailed / CancelResult
-                       (updates OrderState with real CLOB order IDs, restores state on unconfirmed cancels)
-on_event()           → update book/price state + match User WS fills
-                       SpikeCandidate/SpikeConfirmed/SpikeFailed handling
-take_spike_cancel()  → drain CancelLeg1 from SpikeFailed
-evaluate()           → Leg 1 signal → executor places post-only GTC
-evaluate_leg2()      → ALL signals sent (erosion + emergency post-only/FOK)
-trade completion     → both legs Filled → on_trade_complete() → reset
+Engine loop (one iteration per IngestorEvent):
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. DRAIN FEEDBACK (non-blocking)                                │
+│    while feedback_rx.try_recv():                                │
+│      OrderPosted  → set real CLOB ID, replay pending_fills      │
+│      OrderFailed  → reset leg to None                           │
+│      CancelResult → restore or clear saved order info           │
+│      DiagSnapshot → store for Telegram forwarding               │
+│                                                                 │
+│ 2. CONTROL EVENTS                                               │
+│    Shutdown / DrainAndRestart / PauseTrading / ResumeTrading     │
+│    (cancel unfilled Leg 1 with save-before-clear, set flags)     │
+│                                                                 │
+│ 3. ON_EVENT (state update)                                      │
+│    Book/price updates, spike lifecycle, rotation, User WS fills  │
+│    TradeStatusUpdate: match order_id against leg1/leg2 state     │
+│      → Matched/Mined/Confirmed → transition to Filled           │
+│      → Failed → reset to None                                   │
+│      → Canceled → reset to None (CLOB auto-cancel)              │
+│      → unmatched → buffer in pending_fills (cap 8)              │
+│                                                                 │
+│ 4. SIGNAL GENERATION                                            │
+│    take_spike_cancel() → drain CancelLeg1 from SpikeFailed      │
+│    check_leg1_staleness() → cancel stale orders (save-then-clear)│
+│    evaluate() → Leg 1 signal (self-gates after emitting)         │
+│    evaluate_leg2() → Leg 2 erosion/emergency (save-then-overwrite)│
+│                                                                 │
+│ 5. TRADE COMPLETION                                             │
+│    Both legs Filled → record to QuestDB → on_trade_complete()    │
+│    (clears all state including saved order info + pending_fills)  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **Key differences from sim**:
 - `advance_simulation()` never runs — no speculative fill gate needed (CLOB is fill authority)
 - Emergency signals are NOT filtered — the executor places FOK orders on the CLOB
 - Trade completion detected in the main loop (both `leg1_state` and `leg2_state` are `Filled`)
-- Feedback is drained before `on_event()` — CLOB round-trip (~50-100ms) is faster than User WS notification (~200-500ms), so order IDs are set before fill events arrive
+- Feedback is drained before `on_event()` — CLOB round-trip (~1.2s) completes before User WS notification (~1.5-2s), so order IDs are typically set before fill events arrive
+- Cancel operations are fire-and-confirm — the executor checks the CLOB DELETE response and sends `CancelResult` feedback so the engine can detect orders that filled before the cancel
 
 ### LiveExecutor (`executor/live.rs`)
 
@@ -107,12 +137,16 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 |--------|--------|
 | Leg 1 | Post-only GTC → feedback `OrderPosted` to engine |
 | Leg 1 rejected | CLOB returns `Rejected` → feedback `OrderFailed` to engine |
-| Leg 2 erosion | Cancel previous resting order → if cancel confirmed, repost at eroded price; if cancel NOT confirmed (may have filled), send `CancelResult` feedback and skip replacement |
+| CancelLeg1 | Send cancel → `CancelResult { was_cancelled }` feedback to engine |
+| Leg 2 erosion | Cancel previous → confirmed: repost at eroded price. NOT confirmed: `CancelResult` feedback, skip replacement |
 | Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first, FOK fallback) |
-| Leg 2 emergency | Cancel resting → if cancel confirmed, place emergency order; if cancel NOT confirmed, send `CancelResult` feedback and skip replacement → Telegram critical alert |
-| Market rotation | `cancel_all()` → reset state → pre-warm SDK caches (`tick_size`, `neg_risk`, `fee_rate_bps`) from CLOB → `caches_warm = true` (signals blocked until warm) |
+| Leg 2 emergency | Cancel resting → confirmed: place emergency order. NOT confirmed: `CancelResult` feedback, skip replacement |
+| Leg 2 emergency rejected | Post-only rejected → FOK fallback at `best_ask + 1 tick` (retries internally until CLOB accepts — never sends `OrderFailed`) |
+| Market rotation | `cancel_all()` → reset state → pre-warm SDK caches → `caches_warm = true` |
 
-On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`.
+On network error during cancel, the executor cannot determine state — it proceeds with the replacement (cancel counted, no `CancelResult` sent). The User WS is the final authority: if the old order filled, the MATCHED event will arrive and be matched by the engine.
+
+On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`. **Exception**: Emergency FOK orders (`emergency_fok_fallback` and `emergency_fok_at_price`) retry internally until the CLOB accepts — they never send `OrderFailed`. After Leg 1 fills, the position must be hedged; the ~1.2s HTTP round-trip per attempt is the natural rate limiter.
 
 ---
 
@@ -144,11 +178,195 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 
 ---
 
-## 4. Trade Lifecycle
+## 4. Trade Lifecycle (Live Mode)
+
+The diagram below shows the complete live-mode trade lifecycle. Every state transition, cancel path, and edge case is covered. Simulation mode is simpler (engine is sole fill authority via `advance_simulation()`; no CLOB round-trips, no cancel races).
+
+```
+                    ┌──────────────────────────────────────────────────────────────────┐
+                    │                    LIVE TRADE STATE MACHINE                       │
+                    └──────────────────────────────────────────────────────────────────┘
+
+     IDLE                                      LEG 1                                          LEG 2
+    ═════                          ════════════════════════                        ════════════════════════
+
+                 SpikeCandidate
+    leg1=None ─────────────────► evaluate() passes guards
+                                  │
+                                  │  Engine: leg1_state = Posted("sim-leg1-{ts}")
+                                  │          pending_leg1_signal = Some(signal)
+                                  │          spike_detected cleared (self-gate)
+                                  │          send Signal to executor
+                                  ▼
+                            ┌───────────┐
+                            │  Leg 1    │
+                            │  POSTED   │◄──────────────────────────────────┐
+                            │(provisional)                                  │
+                            └─────┬─────┘                                   │
+                                  │                                         │
+                    ┌─────────────┼──────────────┐                          │
+                    │             │              │                          │
+               SpikeFailed   OrderPosted    OrderFailed                     │
+               (before fill)  feedback      feedback                       │
+                    │             │              │                          │
+                    ▼             ▼              ▼                          │
+              provisional?   overwrite ID    reset to None                  │
+              ┌───┴───┐      with real hex   (slot freed)                   │
+              │       │      CLOB hash                                     │
+            YES      NO         │                                          │
+              │       │         │                                          │
+  set defer   │  save info     ┌┴──────────┐                               │
+  cancel flag │  send Cancel   │  Leg 1    │                               │
+  leg1=None   │  leg1=None     │  POSTED   │                               │
+              │       │        │ (real ID) │                               │
+              │       │        └─────┬─────┘                               │
+              │       │              │                                     │
+              │       │    ┌─────────┼──────────┬──────────┐               │
+              │       │    │         │          │          │               │
+              │       │  Staleness  User WS   User WS    SpikeFailed      │
+              │       │  timeout    MATCHED   CANCELED   (already filled)  │
+              │       │    │         │          │          │               │
+              │       │    ▼         │          ▼         no-op            │
+              │       │  save info  │       reset to None                  │
+              │       │  send Cancel│       (CLOB killed it)               │
+              │       │  leg1=None  │                                      │
+              │       │    │        │                                      │
+              │       ▼    ▼        ▼                                      │
+              │   ┌─────────────────────────┐                              │
+              │   │    CANCEL RESULT        │                              │
+              │   │  (from executor)        │                              │
+              │   │                         │                              │
+              │   │  was_cancelled = true   │                              │
+              │   │    → clear saved info   │                              │
+              │   │    → slot freed         │                              │
+              │   │                         │                              │
+              │   │  was_cancelled = false  │                              │
+              │   │    → RESTORE leg1_state │                              │
+              │   │      from saved info    │──── User WS MATCHED ──┐     │
+              │   │    → replay pending_fills                       │     │
+              │   └─────────────────────────┘                       │     │
+              │                                                     │     │
+              │   OrderPosted arrives (deferred cancel flag set)     │     │
+              │     → cancel_leg1_on_feedback = false                │     │
+              │     → send CancelLeg1 with real ID ─────────────────┤     │
+              │                                                     │     │
+              │                                                     ▼     │
+              │                                              ┌────────────┴──┐
+              │                                              │   Leg 1       │
+              │                                              │   FILLED      │
+              │                                              │               │
+              │                                              │ init_erosion()│
+              │                                              │ Telegram alert│
+              │                                              └───────┬───────┘
+              │                                                      │
+              │                                           evaluate_leg2()
+              │                                                      │
+              │                    Engine: save prev Leg 2 info (if real CLOB ID)
+              │                           leg2_state = Posted("sim-leg2-{type}-{ts}")
+              │                           send Signal to executor
+              │                                                      │
+              │                                                      ▼
+              │                                              ┌───────────────┐
+              │                                              │   Leg 2       │
+              │                                              │   POSTED      │
+              │                                              │ (provisional) │
+              │                                              └───────┬───────┘
+              │                                                      │
+              │                               ┌──────────────────────┼──────────────────────┐
+              │                               │                      │                      │
+              │                          OrderPosted              Erosion step         Emergency trigger
+              │                          feedback                 (timer elapsed)      (adverse/BE/exhausted)
+              │                               │                      │                      │
+              │                               ▼                      │                      │
+              │                        ┌──────────────┐              │                      │
+              │                        │   Leg 2      │              │                      │
+              │                        │   POSTED     │              │                      │
+              │                        │  (real ID)   │              │                      │
+              │                        └──────┬───────┘              │                      │
+              │                               │                      │                      │
+              │              ┌────────────────┼──────────────────┐   │                      │
+              │              │                │                  │   │                      │
+              │         User WS          User WS           User WS  │                      │
+              │         MATCHED          CANCELED          FAILED   │                      │
+              │              │                │                  │   │                      │
+              │              ▼                ▼                  ▼   │                      │
+              │        ┌──────────┐    reset to None      reset to None                    │
+              │        │  Leg 2   │    clear saved info   (evaluate_leg2                   │
+              │        │  FILLED  │    (CLOB killed it)    will regenerate)                 │
+              │        │          │                             │                           │
+              │        └────┬─────┘                             │                           │
+              │             │                                   │                           │
+              │             ▼                                   │                           │
+              │     ┌───────────────┐                           │                           │
+              │     │ TRADE         │                           │                           │
+              │     │ COMPLETE      │                           │                           │
+              │     │               │                           │                           │
+              │     │ Both Filled   │                           │                           │
+              │     │ Record QuestDB│                           │                           │
+              │     │ Telegram msg  │                           │                           │
+              │     │ Clear all     │                           │                           │
+              │     │ saved state   │                           │                           │
+              │     └───────┬───────┘                           │                           │
+              │             │                                   │                           │
+              └─────────────┴───────────────────────────────────┘                           │
+                     back to IDLE                                                           │
+                                                                                            │
+                     ┌──────────────────────────────────────────────────────────────────────┘
+                     │
+                     ▼
+              ┌──────────────────────────────────────────────────────────┐
+              │              LEG 2 CANCEL-REPLACE FLOW                  │
+              │                                                         │
+              │  Engine: evaluate_leg2() returns Erosion or Emergency    │
+              │          save current Leg 2 info (prev_leg2_order)       │
+              │          overwrite leg2_state with provisional ID        │
+              │          send Signal to executor                         │
+              │                                                         │
+              │  Executor receives Signal:                               │
+              │    1. Cancel previous resting order via CLOB DELETE      │
+              │                                                         │
+              │    ┌─── cancel confirmed (order was in canceled list) ───┐
+              │    │                                                     │
+              │    │  2a. Post replacement order                         │
+              │    │      → Accepted: OrderPosted feedback               │
+              │    │      → Rejected (post-only would cross):            │
+              │    │          Erosion: attempt_favorable_exit()           │
+              │    │          Emergency: FOK fallback (retries internally) │
+              │    │      → Network error:                               │
+              │    │          Emergency FOK: retry (never sends feedback) │
+              │    │          Other orders: OrderFailed feedback          │
+              │    │                                                     │
+              │    └────────────────────────────────────────────────────┘
+              │                                                         │
+              │    ┌─── cancel NOT confirmed (not in canceled list) ────┐
+              │    │                                                     │
+              │    │  The order may have filled before the cancel.       │
+              │    │  2b. DO NOT post replacement                        │
+              │    │      Send CancelResult { was_cancelled: false }     │
+              │    │      Engine restores prev Leg 2 Posted state        │
+              │    │      User WS MATCHED event arrives → Leg 2 Filled   │
+              │    │      → trade complete                               │
+              │    │                                                     │
+              │    └────────────────────────────────────────────────────┘
+              │                                                         │
+              │    ┌─── cancel network error ──────────────────────────┐
+              │    │                                                     │
+              │    │  Cannot determine state.                            │
+              │    │  2c. Post replacement anyway (best effort)          │
+              │    │      No CancelResult sent.                          │
+              │    │      User WS is final authority — if old order      │
+              │    │      filled, MATCHED arrives and engine matches it  │
+              │    │      via pending_fills buffer (old ID won't match   │
+              │    │      current leg state, gets buffered, replayed     │
+              │    │      if state changes).                             │
+              │    │                                                     │
+              │    └────────────────────────────────────────────────────┘
+              └──────────────────────────────────────────────────────────┘
+```
 
 ### Leg 1: Entry
 
-**Speculative entry**: Leg 1 is posted speculatively on `SpikeCandidate` (before sustain confirmation). `evaluate(&mut self)` clears `spike_detected`, sets `leg1_state = Posted`, increments `cumulative_used`. One trade at a time. If `SpikeFailed` arrives before fill, the order is cancelled and state reset (post-only = zero cost).
+**Speculative entry**: Leg 1 is posted speculatively on `SpikeCandidate` (before sustain confirmation). `evaluate(&mut self)` clears `spike_detected`, sets `leg1_state = Posted` with a provisional `"sim-leg1-{ts}"` ID, and increments `cumulative_used`. One trade at a time. If `SpikeFailed` arrives before fill, the order is cancelled and state reset (post-only = zero cost).
 
 **Pre-entry guards** (abort if any fail):
 
@@ -163,14 +381,50 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 | Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Depth | < `depth_min_pct` (20%) of required | — |
+| Paused/Draining | `paused` or `draining` flag set | `/stop` or `/shutdown` in effect |
 
 **Bidding**: `round_to_tick(best_bid + tick, tick)` → smart outbid walls by 1 tick (>4x avg depth). Submit GTC, post_only=true.
 
 **Sizing**: Confidence-weighted allocation (see Section 5).
 
+**Provisional ID lifecycle** (live mode only):
+
+```
+evaluate() sets:      leg1_state = Posted("sim-leg1-{ts}")    ← provisional
+Executor places:      POST /order → CLOB returns hex hash
+OrderPosted feedback: leg1_state = Posted("0x13828d75...")     ← real
+```
+
+Three things can happen to the provisional ID before `OrderPosted` arrives:
+1. **SpikeFailed**: Set `cancel_leg1_on_feedback` flag. When `OrderPosted` arrives later, immediately return `CancelLeg1` with the real ID instead of resurrecting state.
+2. **Staleness timeout**: Same as SpikeFailed — `check_leg1_staleness()` skips provisional IDs, so this can't fire until the real ID is set. But if the engine code path reaches it while provisional, the flag mechanism applies.
+3. **OrderFailed**: Placement failed at the CLOB — clear the flag (nothing to cancel), state already `None`.
+
+### Leg 1 Cancel Edge Cases
+
+Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows the **save-then-clear** pattern:
+
+1. If the order has a real CLOB ID: save `(order_id, price, size)` in `cancelled_leg1_info`, send `CancelLeg1` to executor, set `leg1_state = None`
+2. If the order has a provisional ID: set `cancel_leg1_on_feedback = true`, set `leg1_state = None` (cancel deferred until real ID arrives)
+3. Executor sends cancel to CLOB, receives response, sends `CancelResult` feedback
+4. Engine `on_cancel_result()`:
+   - `was_cancelled = true`: order was actually on the book and is now gone. Clear `cancelled_leg1_info`. Slot freed.
+   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
+
+**Why not just ignore the CancelResult?** Without restore, the MATCHED event arrives to `leg1_state = None` → unmatched → the fill is silently lost. The bot has an untracked position with no hedge.
+
+### Leg 1 Staleness Timeout
+
+If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike.
+
+- **Timer start**: Begins when `on_order_posted()` sets the real CLOB ID (resets `timestamp_ms`). The ~1.2s CLOB round-trip does NOT count.
+- **Provisional skip**: `check_leg1_staleness()` returns `None` for `"sim-..."` IDs — the order hasn't reached the book yet.
+- **Save-then-clear**: Order info saved in `cancelled_leg1_info` before clearing state.
+- **Sim mode**: `advance_simulation()` handles staleness directly (no CLOB round-trip, provisional timing is correct).
+
 ### Leg 2: Hedge
 
-Triggered when Leg 1 fills. In live mode, fills arrive via User WS `"order"` events forwarded as `TradeStatusUpdate` (matched by hex order hash from `ExecutorFeedback`). `"trade"` events carry UUID trade IDs that don't match stored order hashes and are harmlessly ignored. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally — but only after `SpikeConfirmed` clears the speculative fill gate.
+Triggered when Leg 1 fills. In live mode, fills arrive via User WS `"order"` events with MATCHED status. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally (only after `SpikeConfirmed` clears the speculative fill gate).
 
 **Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)`
 
@@ -194,42 +448,68 @@ Step 0: 3000ms → Step 1: 1500ms → Step 2: 750ms → Step 3: 375ms → Step 4
 Total: ~5.8s to break-even
 ```
 
-Each erosion step cancels the previous unfilled order before posting the new one (cancel-replace). All prices rounded to tick size. Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted (profit target = 0) and auto-escalates to a `BreakEvenBreach` emergency.
+**Cancel-replace with confirmation** (live mode): Each erosion step generates a new signal. The executor cancels the previous resting order and checks the CLOB response:
+- **Confirmed**: Post replacement at the eroded price.
+- **Not confirmed**: The old order may have filled. Skip replacement, send `CancelResult`. Engine restores old order state, User WS MATCHED arrives → trade complete.
+- **Network error**: Post replacement anyway (best effort). User WS is final authority.
 
-**Skip guard**: Before reposting, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new erosion target. If so, the cancel-and-repost is skipped — preserving a favorable position (e.g. from a favorable exit post-only). This prevents erosion from overwriting a good price with a worse one.
+Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted (profit target = 0) and auto-escalates to a `BreakEvenBreach` emergency.
 
-**Leg 1 staleness timeout**: If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. In live mode, the timer skips provisional order IDs (`"sim-..."`) — it starts when `on_order_posted()` resets `timestamp_ms` with the real CLOB ID, so the ~1.2s CLOB round-trip doesn't count against the timeout. In sim mode, `advance_simulation()` handles staleness directly (no CLOB round-trip).
+**Skip guard**: Before reposting, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new erosion target. If so, the cancel-and-repost is skipped — preserving a favorable position. This prevents erosion from overwriting a good price with a worse one.
 
 ### Emergency Triggers (price-improvement chase with hard deadline)
 
-Three independent exit paths triggered by different signals. All use a **price-improvement chase with hard deadline** strategy: the engine posts an aggressive post-only limit at `best_ask - 1 tick` (zero fee) and preserves FIFO queue priority. The engine only cancels and reposts when the Polymarket book offers a strictly better price (price-improvement). After `emergency_deadline_ms` (default 2500ms) from the first emergency post without a fill, the engine escalates to a FOK taker at `best_ask` to guarantee execution.
+Four independent exit paths. All use a **price-improvement chase with hard deadline** strategy: the engine posts an aggressive post-only limit at `best_ask - 1 tick` (zero fee) and preserves FIFO queue priority. Only cancels and reposts when the Polymarket book offers a strictly better price. After `emergency_deadline_ms` (default 2500ms) from the first emergency post without a fill, the engine escalates to a FOK taker at `best_ask`.
 
 | Trigger | Condition | Timing |
 |---------|-----------|--------|
-| **Adverse movement** | Binance reversal > `adverse_threshold` (0.1%) from Binance price at Leg 1 fill | **Immediate** — zero grace period. Post-only first, price-chase until deadline |
-| **Break-even breach** | Pair cost (leg1 + opposing ask) > $1.00 | **After first erosion step** (~3s). Gives Polymarket time to react to spike momentum |
-| **Erosion exhausted** | All 5 erosion steps applied, profit target = 0. Cascade reached break-even without filling | **After step 5** (~5.8s). Auto-escalates as `BreakEvenBreach` emergency |
-| **Market expiry** | `MarketRotation` arrives while Leg 1 is Filled but Leg 2 incomplete | **At rotation** — last-resort FOK before state reset. Best-effort; CLOB may reject if market expired |
+| **Adverse movement** | Binance reversal > `adverse_threshold` (0.1%) from Binance price at Leg 1 fill | **Immediate** — zero grace period |
+| **Break-even breach** | Pair cost (leg1 + opposing ask) > $1.00 | **After first erosion step** (~3s) |
+| **Erosion exhausted** | All 5 erosion steps applied without fill | **After step 5** (~5.8s). Auto-escalates as `BreakEvenBreach` |
+| **Market expiry** | `MarketRotation` while Leg 1 Filled, Leg 2 incomplete | **At rotation** — last-resort FOK before state reset |
 
-**Price-improvement chase flow**: Once an emergency is triggered, the evaluator tracks two fields: `emergency_first_post_ms` (timestamp of initial post, starts the deadline clock) and `emergency_posted_price` (current resting order price). On each Polymarket book update, the evaluator checks: (1) Has `emergency_deadline_ms` elapsed since first post? → FOK at `best_ask` (`sim_was_taker=true`). (2) Is `best_ask - 1 tick > emergency_posted_price`? → cancel and repost at the improved price (price-chase). (3) Neither? → hold current order, preserve FIFO queue priority. Binance tick events are skipped during emergency mode (only Polymarket book changes matter for exit pricing).
+**Price-improvement chase flow**: The evaluator tracks `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). On each Polymarket book update:
+1. `emergency_deadline_ms` elapsed? → FOK at `best_ask` (`sim_was_taker=true`)
+2. `best_ask - 1 tick` better than posted price? → cancel and repost (price-chase)
+3. Neither? → hold current order, preserve FIFO queue priority
 
-**Simulation model**: Emergency fills wait the full deadline window. If `best_ask <= posted_price` at any point → maker fill (zero fee). If deadline expires without fill → taker FOK at `best_ask` (taker fee applies). The `sim_was_taker` flag propagates to the executor for fee treatment.
+Binance ticks are skipped during emergency mode (`hedge_book_changed` gate) — only Polymarket book changes matter.
 
-**Live executor**: The evaluator signals whether to FOK or price-chase via the `sim_was_taker` flag. `sim_was_taker=true` (deadline expired) → cancel existing + direct FOK at `best_ask`. `sim_was_taker=false` (price-chase) → cancel existing + aggressive post-only at the evaluator-computed price. If the CLOB rejects the post-only (price would cross spread), the executor falls back to a FOK.
-
-FOK fallback size capped at `min(remaining_position, ask_depth_within_2_ticks)`.
+**Live executor emergency cancel**: Same fire-and-confirm pattern as erosion. If the cancel is not confirmed (order filled mid-cancel), the executor skips the replacement and sends `CancelResult`. Engine restores state, User WS MATCHED confirms the fill → trade complete.
 
 ### Favorable Taker (Sim + Live)
 
-When the opposing ask drops strictly below the posted Leg 2 bid, a post-only order would be rejected by the CLOB. Instead of leaving Leg 1 unhedged, the bot market-takes at the ask price via FOK. The taker fee is acceptable insurance vs the risk of an open position.
+When the opposing ask drops strictly below the posted Leg 2 bid, a post-only order would be rejected by the CLOB. The bot market-takes at the ask price. Taker fee is acceptable insurance vs an open position.
 
-- **Sim mode**: `advance_simulation()` detects `ask < posted_price` on each book update (all direction branches: Up → `poly_no_book`, Down → `poly_yes_book`, None → `poly_book`). Fills at the ask price with `ExitReason::FavorableTaker`.
-- **Live mode**: When `handle_leg2_erosion()` receives a `Rejected` response from the CLOB, it calls `attempt_favorable_exit()` which first tries an aggressive post-only at `best_ask - 1 tick`, then falls back to FOK if rejected. The CLOB fills at the actual best ask (which is below the limit), giving automatic price improvement.
-- **Tracking**: `favorable_taker_fills` counter in `SimulationState`, `MarketSummary`, `SessionSummary`, and `LiveExecutor` diagnostics. `[FAVORABLE TAKER]` / `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram trade completions.
+- **Sim mode**: `advance_simulation()` detects `ask < posted_price` on book update. Fills at ask with `ExitReason::FavorableTaker`.
+- **Live mode**: `handle_leg2_erosion()` receives `Rejected` → `attempt_favorable_exit()`: aggressive post-only at `best_ask - 1 tick` first, FOK fallback if rejected.
+- **Tracking**: `favorable_taker_fills` counter. `[FAVORABLE TAKER]` / `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram.
+
+### CLOB Auto-Cancel (Heartbeat Failure)
+
+If the CLOB cancels all orders (heartbeat failure, admin action), User WS sends `"order"` events with status `CANCELED`. The engine handles these:
+- **Leg 1 CANCELED**: Reset `leg1_state = None`, clear `cancelled_leg1_info`. Slot freed for next spike.
+- **Leg 2 CANCELED**: Reset `leg2_state = None`, clear `prev_leg2_order`. Erosion continues — `evaluate_leg2()` will generate a new signal on the next iteration.
+
+### Unmatched Event Buffer (`pending_fills`)
+
+When a `TradeStatusUpdate` arrives but `order_id` doesn't match either `leg1_state` or `leg2_state`, the event is buffered in `pending_fills` (VecDeque, capacity 8). This catches two race conditions:
+
+1. **FOK fills before OrderPosted**: User WS MATCHED arrives before the executor's `OrderPosted` feedback updates the provisional ID. The event is buffered, then replayed when `on_order_posted()` sets the real ID.
+
+2. **Cancel-then-fill race**: Engine clears state for a cancel. MATCHED event arrives for the now-cleared order ID. Event buffered. `CancelResult { was_cancelled: false }` restores the state. `replay_pending_fills()` finds the match → `Filled`.
+
+Buffer is cleared on `on_trade_complete()` and `MarketRotation`.
 
 ### Trade Completion
 
-Both legs Filled → reset `leg1_state`, `leg2_state`, `erosion` to None. `cumulative_used` persists (capital cap enforced across multiple trades per market). Reset on market rotation.
+Both legs `Filled` (detected in the main engine loop) → `record_live_trade()` writes to QuestDB → `on_trade_complete()` resets all state:
+- `leg1_state`, `leg2_state` → `None`
+- `erosion` → `None`
+- `cancelled_leg1_info`, `prev_leg2_order` → `None`
+- `pending_fills` → cleared
+- `cancel_leg1_on_feedback` → `false`
+- `cumulative_used` persists (capital cap per market window, reset on rotation)
 
 ---
 

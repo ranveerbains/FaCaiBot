@@ -313,8 +313,8 @@ Once `emergency_submitted = true`, the engine posts an aggressive post-only limi
 
 The evaluator communicates intent via the `sim_was_taker` flag on `TradeSignal`:
 
-- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `best_ask`)
-- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick`
+- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `best_ask`). FOK retries internally until accepted — never sends `OrderFailed` to engine
+- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick` (also retries internally)
 
 ### Simulation model
 

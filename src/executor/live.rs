@@ -490,39 +490,52 @@ impl LiveExecutor {
         signal: &TradeSignal,
         exit_reason: crate::types::order::ExitReason,
     ) {
-        let order = OrderRequest::emergency_fok(
-            signal.token_id.clone(),
-            signal.side,
-            signal.price,
-            signal.size,
-        );
+        // Retry until the CLOB accepts the FOK. After Leg 1 fills we hold a
+        // directional position — Leg 2 *must* fill. The ~1.2s HTTP round-trip
+        // per attempt is the natural rate limiter.
+        loop {
+            let order = OrderRequest::emergency_fok(
+                signal.token_id.clone(),
+                signal.side,
+                signal.price,
+                signal.size,
+            );
 
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                info!(
-                    order_id = %resp.order_id,
-                    status = ?resp.status,
-                    reason = ?exit_reason,
-                    "Leg 2 emergency: FOK fallback placed"
-                );
-                self.active_leg2_order_id = Some(resp.order_id.clone());
-                self.emergency_foks += 1;
-                self.orders_placed += 1;
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Rejected {
+                        warn!(
+                            order_id = %resp.order_id,
+                            reason = ?exit_reason,
+                            "Leg 2 emergency: FOK rejected — retrying"
+                        );
+                        self.orders_failed += 1;
+                        continue;
+                    }
 
-                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                    is_leg2: true,
-                    order_id: resp.order_id,
-                    price: signal.price,
-                    size: signal.size,
-                });
-            }
-            Err(e) => {
-                error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — POSITION EXPOSED");
-                self.orders_failed += 1;
+                    info!(
+                        order_id = %resp.order_id,
+                        status = ?resp.status,
+                        reason = ?exit_reason,
+                        "Leg 2 emergency: FOK fallback placed"
+                    );
+                    self.active_leg2_order_id = Some(resp.order_id.clone());
+                    self.emergency_foks += 1;
+                    self.orders_placed += 1;
 
-                let _ = self
-                    .feedback_tx
-                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: true,
+                        order_id: resp.order_id,
+                        price: signal.price,
+                        size: signal.size,
+                    });
+                    break;
+                }
+                Err(e) => {
+                    error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
+                    self.orders_failed += 1;
+                    continue;
+                }
             }
         }
     }
@@ -535,36 +548,53 @@ impl LiveExecutor {
         exit_reason: crate::types::order::ExitReason,
         price: Decimal,
     ) {
-        let order =
-            OrderRequest::emergency_fok(signal.token_id.clone(), signal.side, price, signal.size);
+        // Retry until the CLOB accepts the FOK — same rationale as
+        // emergency_fok_fallback(). We must exit the position.
+        loop {
+            let order = OrderRequest::emergency_fok(
+                signal.token_id.clone(),
+                signal.side,
+                price,
+                signal.size,
+            );
 
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                info!(
-                    order_id = %resp.order_id,
-                    status = ?resp.status,
-                    %price,
-                    reason = ?exit_reason,
-                    "Leg 2 emergency: FOK at price placed"
-                );
-                self.active_leg2_order_id = Some(resp.order_id.clone());
-                self.emergency_foks += 1;
-                self.orders_placed += 1;
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Rejected {
+                        warn!(
+                            order_id = %resp.order_id,
+                            %price,
+                            reason = ?exit_reason,
+                            "Leg 2 emergency: FOK at price rejected — retrying"
+                        );
+                        self.orders_failed += 1;
+                        continue;
+                    }
 
-                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                    is_leg2: true,
-                    order_id: resp.order_id,
-                    price,
-                    size: signal.size,
-                });
-            }
-            Err(e) => {
-                error!(error = %e, "Leg 2 emergency: FOK FALLBACK FAILED — POSITION EXPOSED");
-                self.orders_failed += 1;
+                    info!(
+                        order_id = %resp.order_id,
+                        status = ?resp.status,
+                        %price,
+                        reason = ?exit_reason,
+                        "Leg 2 emergency: FOK at price placed"
+                    );
+                    self.active_leg2_order_id = Some(resp.order_id.clone());
+                    self.emergency_foks += 1;
+                    self.orders_placed += 1;
 
-                let _ = self
-                    .feedback_tx
-                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: true,
+                        order_id: resp.order_id,
+                        price,
+                        size: signal.size,
+                    });
+                    break;
+                }
+                Err(e) => {
+                    error!(error = %e, %price, "Leg 2 emergency: FOK at price FAILED — retrying");
+                    self.orders_failed += 1;
+                    continue;
+                }
             }
         }
     }

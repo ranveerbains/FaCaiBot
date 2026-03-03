@@ -162,9 +162,12 @@ async fn polybalance_inner() -> Result<String> {
         .await
         .context("failed to parse value response")?;
 
+    // API returns `[{"user":"...","value":N}]` — extract from first array element.
     let total_value = value_resp
-        .as_f64()
-        .or_else(|| value_resp.get("value").and_then(|v| v.as_f64()))
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("value"))
+        .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
     Ok(format!(
@@ -290,10 +293,10 @@ async fn redeem_inner() -> Result<String> {
 
 // ─── Auto-Redeem Background Task ────────────────────────────────────────────
 
-/// Runs every 30 minutes, redeems resolved positions, notifies via Telegram.
+/// Runs every 15 minutes, redeems resolved positions, notifies via Telegram.
 /// Failures are graceful — logged and retried next cycle.
 pub async fn auto_redeem_loop(tls_connector: TlsConnector, bot_token: String, chat_id: String) {
-    const INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
+    const INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(INTERVAL_SECS)).await;
