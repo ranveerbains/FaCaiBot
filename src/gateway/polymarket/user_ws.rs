@@ -184,8 +184,8 @@ pub(super) fn build_user_auth_msg(api_key: &str, secret: &str, passphrase: &str)
 /// Parse a raw JSON frame from the Polymarket User WS.
 ///
 /// Events of interest:
-/// - `"trade"` → `IngestorEvent::TradeStatusUpdate`
-/// - `"order"` → log at info level (placements, cancellations)
+/// - `"order"` → `IngestorEvent::TradeStatusUpdate` (hex order hash matches engine state)
+/// - `"trade"` → debug-logged only (UUID trade IDs never match stored order hashes)
 pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_str(json).context("User WS JSON parse error")?;
@@ -203,23 +203,18 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
             .unwrap_or("");
 
         match event_type {
-            "trade" => match parse_trade_event(event) {
-                Ok(ev) => {
-                    info!(
-                        order_id = %match &ev {
-                            IngestorEvent::TradeStatusUpdate { order_id, .. } => order_id.as_str(),
-                            _ => "?",
-                        },
-                        "User WS: trade status update"
-                    );
-                    if tx.try_send(ev).is_err() {
-                        warn!("channel full — TradeStatusUpdate dropped");
-                    }
-                }
-                Err(e) => {
-                    debug!(error = %e, "User WS trade event parse error");
-                }
-            },
+            "trade" => {
+                // "trade" events carry UUID trade IDs (e.g. "7d3508f8-...")
+                // which never match stored hex order hashes. Log only — do NOT
+                // forward to the engine (would pollute the pending_fills buffer).
+                let trade_id = event
+                    .get("id")
+                    .or_else(|| event.get("order_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let status_str = event.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                debug!(trade_id, status = status_str, "User WS: trade event (ignored)");
+            }
             "order" => {
                 let order_id = event
                     .get("id")
@@ -259,6 +254,11 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
 ///
 /// Expected trade status strings (from CLOB): MATCHED, MINED, CONFIRMED,
 /// RETRYING, FAILED.
+///
+/// Note: No longer called in production — "trade" events are debug-logged only
+/// because their UUID trade IDs never match stored hex order hashes. Kept for
+/// tests.
+#[cfg(test)]
 pub(super) fn parse_trade_event(event: &serde_json::Value) -> Result<IngestorEvent> {
     let order_id = event
         .get("order_id")

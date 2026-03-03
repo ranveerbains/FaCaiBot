@@ -78,6 +78,19 @@ struct LiveTradeMeta {
     exit_reason: Option<ExitReason>,
 }
 
+// ─── Saved Leg 1 info for cancel confirmation tracking ──────────────────────
+
+/// State saved before clearing Leg 1 for a cancel. Restored if the CLOB reports
+/// the cancel was NOT confirmed (order had already filled).
+#[derive(Debug, Clone)]
+struct CancelledLeg1 {
+    order_id: String,
+    price: Decimal,
+    size: Decimal,
+    signal: Option<TradeSignal>,
+    direction: Option<Direction>,
+}
+
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
 
 /// EMA alpha for avg_book_depth smoothing (0.1).
@@ -209,7 +222,7 @@ pub struct StrategyEngine {
 
     /// Saved Leg 1 order info after pre-clearing state for a cancel.
     /// Restored if CancelResult reports the cancel was not confirmed.
-    cancelled_leg1_info: Option<(String, Decimal, Decimal)>,
+    cancelled_leg1_info: Option<CancelledLeg1>,
 
     /// Saved previous Leg 2 order info before evaluate_leg2() overwrites
     /// with a provisional ID. Restored if CancelResult reports not confirmed.
@@ -607,6 +620,14 @@ impl StrategyEngine {
                 match &self.state.leg1_state {
                     OrderState::Posted { order_id, price, size, .. } => {
                         self.diag_spike_sustain_cancel += 1;
+                        // Save signal+direction before clearing — needed if cancel not confirmed.
+                        let saved = CancelledLeg1 {
+                            order_id: order_id.clone(),
+                            price: *price,
+                            size: *size,
+                            signal: self.pending_leg1_signal.clone(),
+                            direction: self.leg1_direction,
+                        };
                         if Self::is_provisional_order_id(order_id) {
                             // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
                             info!(
@@ -614,14 +635,14 @@ impl StrategyEngine {
                                 "spike FAILED — deferring cancel to feedback (provisional ID)"
                             );
                             self.cancel_leg1_on_feedback = true;
+                            self.cancelled_leg1_info = Some(saved);
                         } else {
-                            // Save order info before clearing — restored if cancel not confirmed.
-                            self.cancelled_leg1_info = Some((order_id.clone(), *price, *size));
                             // Real CLOB ID is available — cancel immediately.
                             info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
                             self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
                                 order_id: order_id.clone(),
                             });
+                            self.cancelled_leg1_info = Some(saved);
                         }
                         self.state.leg1_state = OrderState::None;
                         self.pending_leg1_signal = None;
@@ -1400,8 +1421,14 @@ impl StrategyEngine {
                     timeout_ms = self.leg1.leg1_timeout_ms,
                     "Leg 1 stale — cancelling unfilled order"
                 );
-                // Save order info before clearing — restored if cancel not confirmed.
-                self.cancelled_leg1_info = Some((order_id.clone(), *price, *size));
+                // Save order info + signal + direction before clearing — restored if cancel not confirmed.
+                self.cancelled_leg1_info = Some(CancelledLeg1 {
+                    order_id: order_id.clone(),
+                    price: *price,
+                    size: *size,
+                    signal: self.pending_leg1_signal.clone(),
+                    direction: self.leg1_direction,
+                });
                 let cmd = Some(ExecutorCommand::CancelLeg1 {
                     order_id: order_id.clone(),
                 });
@@ -1431,6 +1458,12 @@ impl StrategyEngine {
         // Now we have the real CLOB ID — cancel it instead of resurrecting state.
         if !is_leg2 && self.cancel_leg1_on_feedback {
             self.cancel_leg1_on_feedback = false;
+            // Update saved info with the real CLOB ID so on_cancel_result() can match.
+            if let Some(ref mut saved) = self.cancelled_leg1_info {
+                saved.order_id = order_id.clone();
+                saved.price = price;
+                saved.size = size;
+            }
             info!(%order_id, "deferred cancel: cancelling real CLOB order");
             return Some(ExecutorCommand::CancelLeg1 { order_id });
             // leg1_state stays None — do NOT resurrect.
@@ -1488,16 +1521,23 @@ impl StrategyEngine {
 
         let now_ms = now_epoch_ms();
         if !is_leg2 {
-            if let Some((saved_id, price, size)) = self.cancelled_leg1_info.take()
-                && saved_id == order_id
+            if let Some(saved) = self.cancelled_leg1_info.take()
+                && saved.order_id == order_id
                 && matches!(self.state.leg1_state, OrderState::None)
             {
                 self.state.leg1_state = OrderState::Posted {
-                    order_id: saved_id,
-                    price,
-                    size,
+                    order_id: saved.order_id,
+                    price: saved.price,
+                    size: saved.size,
                     timestamp_ms: now_ms,
                 };
+                // Restore signal and direction so on_trade_complete() can build Telegram message.
+                if self.pending_leg1_signal.is_none() {
+                    self.pending_leg1_signal = saved.signal;
+                }
+                if self.leg1_direction.is_none() {
+                    self.leg1_direction = saved.direction;
+                }
             }
         } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
             && saved_id == order_id
@@ -2492,12 +2532,18 @@ impl StrategyEngine {
     }
 
     /// Reset Leg 1 state to `None` and clear associated tracking fields.
-    /// Saves order info for cancel confirmation tracking (non-provisional IDs only).
+    /// Saves order info + signal + direction for cancel confirmation tracking (non-provisional IDs only).
     pub fn reset_leg1_state(&mut self) {
         if let OrderState::Posted { ref order_id, price, size, .. } = self.state.leg1_state
             && !Self::is_provisional_order_id(order_id)
         {
-            self.cancelled_leg1_info = Some((order_id.clone(), price, size));
+            self.cancelled_leg1_info = Some(CancelledLeg1 {
+                order_id: order_id.clone(),
+                price,
+                size,
+                signal: self.pending_leg1_signal.clone(),
+                direction: self.leg1_direction,
+            });
         }
         self.state.leg1_state = OrderState::None;
         self.pending_leg1_signal = None;
@@ -3717,5 +3763,81 @@ mod tests {
         engine.on_event(IngestorEvent::Shutdown);
         engine.on_event(IngestorEvent::DrainAndRestart);
         assert!(engine.has_no_open_position());
+    }
+
+    // ── Cancel-not-confirmed signal restoration ──────────────────────────
+
+    #[test]
+    fn test_staleness_cancel_saves_signal_and_direction() {
+        let mut engine = make_engine_with_market(600);
+        set_book(&mut engine, "0.495", "0.505");
+        inject_spike(&mut engine, Direction::Up);
+
+        let signal = engine.evaluate().expect("should generate Leg 1 signal");
+        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
+        assert!(engine.pending_leg1_signal.is_some());
+        assert_eq!(engine.leg1_direction, Some(Direction::Up));
+
+        // Simulate real CLOB ID arriving (staleness skips provisional IDs).
+        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size);
+        assert!(engine.pending_leg1_signal.is_some());
+
+        // Force staleness: set timestamp far in the past so elapsed > timeout.
+        if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {
+            *timestamp_ms = 1000; // far in the past
+        }
+        engine.leg1.leg1_timeout_ms = 0;
+        let cancel_cmd = engine.check_leg1_staleness();
+        assert!(cancel_cmd.is_some(), "should return CancelLeg1");
+
+        // Signal and direction should be cleared from active state...
+        assert!(engine.pending_leg1_signal.is_none());
+        assert!(engine.leg1_direction.is_none());
+
+        // ...but saved in cancelled_leg1_info.
+        let saved = engine.cancelled_leg1_info.as_ref().expect("should have saved info");
+        assert_eq!(saved.order_id, "real-id-1");
+        assert!(saved.signal.is_some(), "signal should be saved");
+        assert_eq!(saved.direction, Some(Direction::Up), "direction should be saved");
+    }
+
+    #[test]
+    fn test_cancel_not_confirmed_restores_signal_and_direction() {
+        let mut engine = make_engine_with_market(600);
+        set_book(&mut engine, "0.495", "0.505");
+        inject_spike(&mut engine, Direction::Up);
+
+        let signal = engine.evaluate().expect("should generate Leg 1 signal");
+        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
+
+        // Simulate real CLOB ID arriving.
+        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size);
+
+        // Force staleness: set timestamp far in the past so elapsed > timeout.
+        if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {
+            *timestamp_ms = 1000; // far in the past
+        }
+        engine.leg1.leg1_timeout_ms = 0;
+        let _cancel_cmd = engine.check_leg1_staleness();
+        assert!(engine.pending_leg1_signal.is_none(), "signal cleared after staleness");
+        assert!(engine.leg1_direction.is_none(), "direction cleared after staleness");
+
+        // Cancel NOT confirmed — order had already filled.
+        engine.on_cancel_result("real-id-2".into(), false, false);
+
+        // State should be fully restored.
+        assert!(
+            matches!(engine.state.leg1_state, OrderState::Posted { ref order_id, .. } if order_id == "real-id-2"),
+            "leg1_state should be restored to Posted"
+        );
+        assert!(
+            engine.pending_leg1_signal.is_some(),
+            "pending_leg1_signal should be restored"
+        );
+        assert_eq!(
+            engine.leg1_direction,
+            Some(Direction::Up),
+            "leg1_direction should be restored"
+        );
     }
 }
