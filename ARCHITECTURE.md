@@ -28,8 +28,8 @@ Three-layer lock-free pipeline connected by crossbeam SPSC bounded(8192) channel
 ```
 Ingestor (gateway/)        Engine (engine/)           Executor (executor/)
 ─────────────────          ──────────────             ─────────────────────
-Dedicated OS thread        tokio task                 tokio task
-CPU-pinned core 0          Manual runtime (2 workers)  Manual runtime (2 workers)
+Dedicated OS thread        spawn_blocking thread      tokio task (worker thread)
+CPU-pinned core 0          (off worker pool)          Manual runtime (2 workers)
                            Pinned cores 1-2            Pinned cores 1-2
 
 Binance SBE WS ──┐
@@ -108,7 +108,7 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 | Leg 2 erosion | Cancel previous resting order → repost at eroded price |
 | Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first, FOK fallback) |
 | Leg 2 emergency | Cancel resting → aggressive post-only at `best_ask - 1 tick` → FOK fallback if rejected → Telegram critical alert |
-| Market rotation | `cancel_all()` → reset state → pre-warm SDK caches (`tick_size`, `neg_risk`) from CLOB → `caches_warm = true` (signals blocked until warm) |
+| Market rotation | `cancel_all()` → reset state → pre-warm SDK caches (`tick_size`, `neg_risk`, `fee_rate_bps`) from CLOB → `caches_warm = true` (signals blocked until warm) |
 
 On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`.
 
@@ -196,7 +196,7 @@ Each erosion step cancels the previous unfilled order before posting the new one
 
 **Skip guard**: Before reposting, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new erosion target. If so, the cancel-and-repost is skipped — preserving a favorable position (e.g. from a favorable exit post-only). This prevents erosion from overwriting a good price with a worse one.
 
-**Leg 1 staleness timeout**: If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms), the engine cancels it and frees the slot for the next spike. In sim mode this rarely fires (instant fills); in live mode it prevents indefinite blocking on stale orders.
+**Leg 1 staleness timeout**: If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. In live mode, the timer skips provisional order IDs (`"sim-..."`) — it starts when `on_order_posted()` resets `timestamp_ms` with the real CLOB ID, so the ~1.2s CLOB round-trip doesn't count against the timeout. In sim mode, `advance_simulation()` handles staleness directly (no CLOB round-trip).
 
 ### Emergency Triggers (price-improvement chase with hard deadline)
 
@@ -401,25 +401,33 @@ Opportunity alerts and trade completions are gated by `NotifyFlags::trades_enabl
 
 ### Bot Control (Inbound)
 
-Bidirectional Telegram control via `getUpdates` long-polling (30s timeout). Enabled when `TELEGRAM_ALLOWED_USER_ID` is set. Runs as a separate tokio task — zero overhead on the hot path.
+Bidirectional Telegram control via `getUpdates` long-polling (30s timeout, 45s outer timeout to detect dropped connections). Enabled when `TELEGRAM_ALLOWED_USER_ID` is set. Runs as a separate tokio task — zero overhead on the hot path.
 
 | Command | Action |
 |---------|--------|
 | `/trades on\|off` | Toggle opportunity + trade-completed notifications |
 | `/summary on\|off` | Toggle market summary notifications |
-| `/stop` | Drain mode → graceful shutdown (exit 0, no systemd restart) |
+| `/diag on\|off` | Toggle 60s diagnostic forwarding to Telegram |
+| `/stop` | Pause trading — block new entries, keep connections alive for `/balance`, `/status`, etc. |
+| `/resume` | Resume trading after `/stop` pause |
+| `/shutdown` | Graceful shutdown — drain open position, exit (exit 0, no systemd restart) |
 | `/set <param> <value>` | Validate + write config.toml → drain → restart (exit 42) |
 | `/config [section]` | Show all params, or just one section (e.g. `/config risk`) |
-| `/status` | Uptime, mode, current market, leg states, trade counters, toggle states |
+| `/status` | Uptime, mode, current market, leg states, trade counters, toggle states. Shows `[PAUSED]` when stopped |
+| `/balance` | Wallet USDC.e + POL balance on Polygon |
+| `/polybalance` | Polymarket positions and total value |
+| `/redeem` | Redeem resolved positions to USDC.e |
 | `/help` | List commands with usage |
 
 **Security**: Every message verified against `TELEGRAM_ALLOWED_USER_ID` + `TELEGRAM_CHAT_ID`. 2s rate limit between commands. `/set` uses a strict allowlist of 27 params with min/max ranges. No shell execution.
 
 **Notification toggles**: `AtomicBool` flags (`Relaxed` ordering) shared between the command listener and `TelegramReporter`. One CPU instruction per check — zero hot-path impact.
 
-### Drain Mode
+### Pause vs Shutdown
 
-The bot never abandons an open position. `/stop` and `/set` both trigger drain mode before exiting:
+**`/stop` (pause)**: Sets `engine.paused = true`, blocking new Leg 1 entries. Cancels any unfilled Leg 1 (with provisional ID race safety via `cancel_leg1_on_feedback`). Existing Leg 2 continues through erosion/emergency. The bot stays alive — `/balance`, `/status`, `/redeem`, `/polybalance` all remain functional. Use `/resume` to unpause.
+
+**`/shutdown` (full exit)**: Triggers drain mode then exits. The bot never abandons an open position:
 
 | Current State | Behavior |
 |---|---|
@@ -430,13 +438,13 @@ The bot never abandons an open position. `/stop` and `/set` both trigger drain m
 Drain progress is published via `tokio::sync::watch<DrainStatus>` (Idle → Draining → Complete). The command listener watches the channel and sends real-time Telegram updates:
 
 ```
-User: /stop
-Bot:  "Stopping bot..."
-Bot:  "Drain mode activated (stop) — Leg 2 in progress, waiting for position to close"
-Bot:  "Bot stopped. Exiting."
+User: /shutdown
+Bot:  "Shutting down..."
+Bot:  "Drain mode activated (shutdown) — Leg 2 in progress, waiting for position to close"
+Bot:  "Position closed. Bot stopped."
 ```
 
-**Exit codes**: `/stop` exits with code 0 (success — systemd does not restart). `/set` exits with code 42 (on-failure — systemd restarts in 5s with new config).
+**Exit codes**: `/shutdown` exits with code 0 (success — systemd does not restart). `/set` exits with code 42 (on-failure — systemd restarts in 5s with new config).
 
 ### Control Architecture (`src/control/`)
 
@@ -449,7 +457,7 @@ src/control/
 └── types.rs            # NotifyFlags, BotStatus, DrainStatus
 ```
 
-**Data flow**: Commands inject `IngestorEvent::Shutdown` or `IngestorEvent::DrainAndRestart` into the existing ingestor channel. The engine handles these in its main loop — sets `draining = true`, publishes `DrainStatus` updates, and breaks when the position resolves.
+**Data flow**: Commands inject `IngestorEvent` variants into the ingestor channel: `PauseTrading` (from `/stop`), `ResumeTrading` (from `/resume`), `Shutdown` (from `/shutdown`), or `DrainAndRestart` (from `/set`). The engine handles these in its main loop — pause sets `paused = true`, shutdown sets `draining = true` and publishes `DrainStatus` updates.
 
 ---
 
@@ -512,7 +520,7 @@ OrderRequest
 - `cancel_order(id)` → `sdk.cancel_order(id).await` → `DELETE /order`
 - `cancel_all()` → `sdk.cancel_all_orders().await` → `DELETE /cancel-all`
 
-**SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size(token_id)` and `sdk.neg_risk(token_id)` for both YES and NO tokens, populating the SDK's internal `DashMap` caches with real CLOB values. A `caches_warm: bool` field gates all order placement — if any pre-warm fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation succeeds. This eliminates the ~150ms first-order latency from auto-fetch while guaranteeing correctness (no hardcoded values that could cause "invalid signature" or 400 errors).
+**SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size(token_id)`, `sdk.neg_risk(token_id)`, and `sdk.fee_rate_bps(token_id)` for both YES and NO tokens, populating the SDK's internal `DashMap` caches with real CLOB values. A `caches_warm: bool` field gates all order placement — if any pre-warm fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation succeeds. This eliminates the ~150ms first-order latency from auto-fetch while guaranteeing correctness (no hardcoded values that could cause "invalid signature" or 400 errors).
 
 `signing.rs` contains only `build_signer()` — hex private key parsing to `PrivateKeySigner`.
 
@@ -523,7 +531,7 @@ OrderRequest
 ### Runtime Optimizations
 
 - **jemalloc**: Global allocator (`tikv-jemallocator`) eliminates glibc malloc latency spikes. Conditional on `cfg(not(target_env = "msvc"))` — active on both macOS (local dev) and Linux (production)
-- **Manual tokio runtime**: 2 worker threads pinned to cores 1-2 via `on_thread_start` + `core_affinity`. Replaces `#[tokio::main]` for explicit core control. Core 0 reserved for ingestor (dedicated OS thread)
+- **Manual tokio runtime**: 2 worker threads pinned to cores 1-2 via `on_thread_start` + `core_affinity`. Engine loop runs on `tokio::task::spawn_blocking` (off worker pool) to prevent thread starvation — the live executor blocks one worker with synchronous `crossbeam recv()`, so the engine must not also block a worker. Core 0 reserved for ingestor (dedicated OS thread)
 - **Release profile**: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip=true`. Production builds add `RUSTFLAGS="-C target-cpu=native"` for AVX-512 on c7i
 
 ### Stage 1: Local Simulation
@@ -567,7 +575,7 @@ sudo systemctl enable --now facaibot
 isolcpus=0,1 nohz_full=0,1 rcu_nocbs=0,1 intel_pstate=disable processor.max_cstate=1 idle=poll
 ```
 
-**systemd restart policy**: `Restart=on-failure` with `RestartSec=5s`. Exit 0 (`/stop`) = success → no restart. Exit 42 (`/set` config change) = failure → restart in 5s with new config. Crashes = failure → restart in 5s.
+**systemd restart policy**: `Restart=on-failure` with `RestartSec=5s`. Exit 0 (`/shutdown`) = success → no restart. Exit 42 (`/set` config change) = failure → restart in 5s with new config. Crashes = failure → restart in 5s.
 
 See `README.md` for step-by-step instructions and `deploy/` for all scripts.
 

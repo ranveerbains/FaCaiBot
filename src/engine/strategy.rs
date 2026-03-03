@@ -1319,6 +1319,11 @@ impl StrategyEngine {
 
     /// Check if Leg 1 has been posted too long without filling.
     /// Returns a `CancelLeg1` command if timed out, or `None`.
+    ///
+    /// Skips the check while the order ID is still provisional (`"sim-..."`),
+    /// because the CLOB round-trip (~1.2s) would consume the timeout before
+    /// the order even reaches the book. The timer starts when
+    /// `on_order_posted()` resets `timestamp_ms` with the real CLOB ID.
     pub fn check_leg1_staleness(&mut self) -> Option<ExecutorCommand> {
         let now_ms = now_epoch_ms();
         if let OrderState::Posted {
@@ -1327,21 +1332,20 @@ impl StrategyEngine {
             ..
         } = &self.state.leg1_state
         {
+            // Order still in transit to the CLOB — don't count transit time as resting time.
+            if Self::is_provisional_order_id(order_id) {
+                return None;
+            }
+
             if now_ms.saturating_sub(*timestamp_ms) > self.leg1.leg1_timeout_ms {
                 info!(
                     elapsed_ms = now_ms.saturating_sub(*timestamp_ms),
                     timeout_ms = self.leg1.leg1_timeout_ms,
                     "Leg 1 stale — cancelling unfilled order"
                 );
-                let cmd = if Self::is_provisional_order_id(order_id) {
-                    // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
-                    self.cancel_leg1_on_feedback = true;
-                    None
-                } else {
-                    Some(ExecutorCommand::CancelLeg1 {
-                        order_id: order_id.clone(),
-                    })
-                };
+                let cmd = Some(ExecutorCommand::CancelLeg1 {
+                    order_id: order_id.clone(),
+                });
                 self.state.leg1_state = OrderState::None;
                 self.pending_leg1_signal = None;
                 self.leg1_direction = None;

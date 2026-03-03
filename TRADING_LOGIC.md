@@ -165,9 +165,11 @@ Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 s
 
 ### Leg 1 staleness timeout
 
-If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms), the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
+If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
 
-In sim mode, this rarely fires (instant fills). In live mode, the engine checks staleness on each event loop iteration and sends a `CancelLeg1` command to the executor.
+**Sim mode:** Checked in `advance_simulation()` before fill check. Rarely fires (instant fills). Uses the provisional `timestamp_ms` from `evaluate()`, which is correct since there's no CLOB round-trip.
+
+**Live mode:** `check_leg1_staleness()` runs each engine loop iteration. It **skips provisional order IDs** (`"sim-..."`) — the CLOB round-trip (~1.2s) would consume the entire timeout before the order reaches the book. The timer starts when `on_order_posted()` resets `timestamp_ms` with the real CLOB ID. This ensures the full `leg1_timeout_ms` is actual book resting time. If `SpikeFailed` or staleness fires while the ID is still provisional, a `cancel_leg1_on_feedback` flag defers the cancel until the real CLOB ID arrives via `ExecutorFeedback::OrderPosted`.
 
 ---
 
@@ -572,6 +574,14 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 
 **Safety:** Same race semantics as existing Leg 1 staleness timeout. User WS fill overrides state regardless.
 
+### Provisional order ID race (live)
+
+**Scenario:** `evaluate()` sets `leg1_state = Posted { order_id: "sim-leg1-{ts}" }` immediately (self-gating). The real CLOB ID arrives ~1.2s later via `ExecutorFeedback::OrderPosted`. During this window, `SpikeFailed` or staleness timeout could try to cancel using the provisional ID.
+
+**Handle:** If the order ID is provisional when a cancel is needed, the engine sets `cancel_leg1_on_feedback = true` instead of sending a `CancelLeg1` command. When `on_order_posted()` receives the real CLOB ID, it checks this flag and immediately returns `Some(CancelLeg1)` with the real ID. The state is NOT resurrected — `leg1_state` stays `None`.
+
+**Safety:** Prevents (1) sending invalid provisional IDs to the CLOB, (2) ghost orders from `on_order_posted()` resurrecting a cancelled trade. The flag is cleared in `on_order_failed()`, `on_trade_complete()`, and `MarketRotation`.
+
 ### Spike during existing trade
 
 The `ActiveTrade` guard rejects the spike, incrementing `rej_busy`. The spike is consumed (cleared) and cannot be re-evaluated. The diagnostic counter tracks how many valid-book spikes were lost to executor busyness, informing parameter tuning.
@@ -666,7 +676,7 @@ Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero f
 | **Heartbeat** | Not needed | 5s POST to `/heartbeat` |
 | **MarketRotation** | Force-close open, lock for resolution | `cancel_all()` CLOB orders |
 | **Trade detection** | `advance_simulation()` sees both filled | Main loop checks both legs Filled |
-| **Leg 1 timeout** | In `advance_simulation()` (rarely fires) | `CancelLeg1` command via CLOB cancel |
+| **Leg 1 timeout** | In `advance_simulation()` (rarely fires — instant fills) | `check_leg1_staleness()` skips provisional IDs — timer starts from real CLOB confirmation |
 | **Order signing** | N/A (no real orders) | SDK handles EIP-712 signing, fee rate caching, L2 HMAC auth |
 
 ### Key simulation simplifications

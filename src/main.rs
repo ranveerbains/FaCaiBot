@@ -211,7 +211,7 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    let engine_handle = tokio::spawn(async move {
+    let engine_handle = tokio::task::spawn_blocking(move || {
         let mut engine = StrategyEngine::new(&engine_config);
 
         // Attach the Telegram reporter to the engine in live mode.

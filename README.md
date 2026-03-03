@@ -155,10 +155,16 @@ Set `TELEGRAM_ALLOWED_USER_ID` in `.env` to enable remote control — no SSH nee
 | `/set <param> <value>` | Update config + restart (e.g. `/set spike_detection.multiplier 4.0`) |
 | `/trades on\|off` | Toggle trade notifications |
 | `/summary on\|off` | Toggle market summary notifications |
-| `/stop` | Graceful shutdown (drains open position first) |
+| `/diag on\|off` | Toggle 60s diagnostic forwarding |
+| `/stop` | Pause trading (keeps connections alive for `/balance`, `/status`, etc.) |
+| `/resume` | Resume trading after `/stop` |
+| `/shutdown` | Graceful shutdown (drains open position first) |
+| `/balance` | Wallet USDC.e + POL balance |
+| `/polybalance` | Polymarket positions and value |
+| `/redeem` | Redeem resolved positions to USDC.e |
 | `/help` | List all commands |
 
-`/stop` and `/set` never abandon open positions — they wait for the current trade to resolve first.
+`/shutdown` and `/set` never abandon open positions — they wait for the current trade to resolve first.
 
 ---
 
