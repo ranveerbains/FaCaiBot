@@ -245,7 +245,9 @@ impl PolymarketGateway {
     /// Cancel an open order by its ID.
     ///
     /// Uses the SDK's authenticated `cancel_order` method (DELETE `/order`).
-    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+    /// Returns `true` if the order was confirmed cancelled, `false` if it was
+    /// not in the `canceled` list (may have filled before the cancel reached CLOB).
+    pub async fn cancel_order(&self, order_id: &str) -> Result<bool> {
         info!(order_id, "cancelling order via SDK");
 
         let sdk = self
@@ -258,8 +260,9 @@ impl PolymarketGateway {
             .await
             .map_err(|e| anyhow!("cancel_order failed: {e}"))?;
 
-        debug!(order_id, ?resp.canceled, "cancel_order response");
-        Ok(())
+        let was_cancelled = resp.canceled.iter().any(|id| id == order_id);
+        debug!(order_id, was_cancelled, "cancel_order response");
+        Ok(was_cancelled)
     }
 
     /// Cancel all open orders.

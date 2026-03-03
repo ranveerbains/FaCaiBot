@@ -226,8 +226,22 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
                     .or_else(|| event.get("order_id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
-                let status = event.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                info!(order_id, status, "User WS: order event");
+                let status_str = event.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                info!(order_id, status = status_str, "User WS: order event");
+
+                // Forward actionable order status changes to the engine.
+                // "order" events carry the correct hex order hash (matching
+                // what the engine stores), unlike "trade" events which use
+                // a UUID trade ID.
+                if let Ok(status) = parse_trade_status(status_str) {
+                    let ev = IngestorEvent::TradeStatusUpdate {
+                        order_id: order_id.to_string(),
+                        status,
+                    };
+                    if tx.try_send(ev).is_err() {
+                        warn!("channel full — order TradeStatusUpdate dropped");
+                    }
+                }
             }
             "" => {
                 debug!("User WS: received frame with no event_type — likely ack");
@@ -271,6 +285,7 @@ pub(super) fn parse_trade_status(s: &str) -> Result<TradeStatus> {
         "CONFIRMED" => Ok(TradeStatus::Confirmed),
         "RETRYING" => Ok(TradeStatus::Retrying),
         "FAILED" => Ok(TradeStatus::Failed),
+        "CANCELED" | "CANCELLED" => Ok(TradeStatus::Canceled),
         other => Err(anyhow!("unknown trade status: '{}'", other)),
     }
 }
@@ -309,6 +324,24 @@ mod tests {
     fn test_parse_trade_status_case_insensitive() {
         let status = parse_trade_status("matched").expect("lowercase parse");
         assert_eq!(status, TradeStatus::Matched);
+    }
+
+    #[test]
+    fn test_parse_trade_status_canceled() {
+        let status = parse_trade_status("CANCELED").expect("parse failed");
+        assert_eq!(status, TradeStatus::Canceled);
+    }
+
+    #[test]
+    fn test_parse_trade_status_cancelled_british() {
+        let status = parse_trade_status("CANCELLED").expect("parse failed");
+        assert_eq!(status, TradeStatus::Canceled);
+    }
+
+    #[test]
+    fn test_parse_trade_status_canceled_lowercase() {
+        let status = parse_trade_status("canceled").expect("lowercase parse");
+        assert_eq!(status, TradeStatus::Canceled);
     }
 
     #[test]

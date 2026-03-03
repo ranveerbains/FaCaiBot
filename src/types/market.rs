@@ -32,6 +32,8 @@ pub enum TradeStatus {
     Retrying,
     /// Trade failed permanently (terminal) — log and evaluate re-entry.
     Failed,
+    /// Order cancelled by CLOB (heartbeat failure, user cancel, or admin action).
+    Canceled,
 }
 
 // ─── Order State ─────────────────────────────────────────────────────────────

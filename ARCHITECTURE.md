@@ -76,13 +76,15 @@ evaluate_leg2()      → Leg 2 erosion/emergency signal (self-gates after emitti
 
 In live mode, the CLOB is the fill authority. Fills arrive via the authenticated User WebSocket as `TradeStatusUpdate` events. The engine matches these against posted order IDs to transition `OrderState::Posted → Filled`.
 
-A reverse `ExecutorFeedback` channel (executor → engine) sends real CLOB order IDs back after placement, so the engine can match User WS fill events to the correct leg.
+A reverse `ExecutorFeedback` channel (executor → engine) sends real CLOB order IDs back after placement, so the engine can match User WS fill events to the correct leg. Additionally, `CancelResult` feedback reports whether each cancel was confirmed by the CLOB — if not confirmed (order may have filled), the engine restores the Posted state so User WS events can still match.
+
+**User WS event types**: The Polymarket User WS sends two event types for fills: `"order"` events (carrying the hex order hash, e.g. `0x13828d75...`) and `"trade"` events (carrying a UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate`, because their `id` field matches the hex order hash format stored by the engine from `ExecutorFeedback::OrderPosted`. `"trade"` events are logged but their UUIDs never match any stored order ID — they are harmlessly ignored. Actionable statuses (MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED) are forwarded; non-actionable statuses (LIVE, etc.) are silently skipped.
 
 **Speculative posting**: Leg 1 is posted to the CLOB immediately on `SpikeCandidate` (gaining ~300ms queue priority). If `SpikeFailed` arrives and the order hasn't filled yet, a `CancelLeg1` is sent to the executor. If the order already filled before `SpikeFailed`, Leg 2 proceeds normally.
 
 ```
-drain feedback_rx    → apply ExecutorFeedback::OrderPosted / OrderFailed
-                       (updates OrderState with real CLOB order IDs)
+drain feedback_rx    → apply ExecutorFeedback::OrderPosted / OrderFailed / CancelResult
+                       (updates OrderState with real CLOB order IDs, restores state on unconfirmed cancels)
 on_event()           → update book/price state + match User WS fills
                        SpikeCandidate/SpikeConfirmed/SpikeFailed handling
 take_spike_cancel()  → drain CancelLeg1 from SpikeFailed
@@ -105,9 +107,9 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 |--------|--------|
 | Leg 1 | Post-only GTC → feedback `OrderPosted` to engine |
 | Leg 1 rejected | CLOB returns `Rejected` → feedback `OrderFailed` to engine |
-| Leg 2 erosion | Cancel previous resting order → repost at eroded price |
+| Leg 2 erosion | Cancel previous resting order → if cancel confirmed, repost at eroded price; if cancel NOT confirmed (may have filled), send `CancelResult` feedback and skip replacement |
 | Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first, FOK fallback) |
-| Leg 2 emergency | Cancel resting → aggressive post-only at `best_ask - 1 tick` → FOK fallback if rejected → Telegram critical alert |
+| Leg 2 emergency | Cancel resting → if cancel confirmed, place emergency order; if cancel NOT confirmed, send `CancelResult` feedback and skip replacement → Telegram critical alert |
 | Market rotation | `cancel_all()` → reset state → pre-warm SDK caches (`tick_size`, `neg_risk`, `fee_rate_bps`) from CLOB → `caches_warm = true` (signals blocked until warm) |
 
 On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`.
@@ -168,7 +170,7 @@ Normal `BinanceTick` events only update `binance_price` — they never trigger s
 
 ### Leg 2: Hedge
 
-Triggered when Leg 1 fills. In live mode, fills arrive via User WS `TradeStatusUpdate` (matched by CLOB order ID from `ExecutorFeedback`). In sim mode, `advance_simulation()` transitions `Posted → Filled` internally — but only after `SpikeConfirmed` clears the speculative fill gate.
+Triggered when Leg 1 fills. In live mode, fills arrive via User WS `"order"` events forwarded as `TradeStatusUpdate` (matched by hex order hash from `ExecutorFeedback`). `"trade"` events carry UUID trade IDs that don't match stored order hashes and are harmlessly ignored. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally — but only after `SpikeConfirmed` clears the speculative fill gate.
 
 **Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)`
 
@@ -468,7 +470,7 @@ src/control/
 | Endpoint | Purpose |
 |----------|---------|
 | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | Public book/price/tick events |
-| `wss://ws-subscriptions-clob.polymarket.com/ws/user` | Authenticated fill tracking (live) |
+| `wss://ws-subscriptions-clob.polymarket.com/ws/user` | Authenticated fill tracking (live). Two event types: `"order"` (hex hash — forwarded to engine) and `"trade"` (UUID — ignored for matching) |
 | `https://clob.polymarket.com/order` | Order submission (via SDK — EIP-712 signing, fee rate, tick size) |
 | `https://clob.polymarket.com/heartbeat` | Keep-alive (5s, live) |
 | `https://gamma-api.polymarket.com/events` | Market discovery |
@@ -517,7 +519,7 @@ OrderRequest
 ```
 
 **Cancel flow**:
-- `cancel_order(id)` → `sdk.cancel_order(id).await` → `DELETE /order`
+- `cancel_order(id) → Result<bool>` → `sdk.cancel_order(id).await` → `DELETE /order` → returns `true` if order was in `canceled` list, `false` if it was not (may have filled before cancel reached CLOB)
 - `cancel_all()` → `sdk.cancel_all_orders().await` → `DELETE /cancel-all`
 
 **SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size(token_id)`, `sdk.neg_risk(token_id)`, and `sdk.fee_rate_bps(token_id)` for both YES and NO tokens, populating the SDK's internal `DashMap` caches with real CLOB values. A `caches_warm: bool` field gates all order placement — if any pre-warm fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation succeeds. This eliminates the ~150ms first-order latency from auto-fetch while guaranteeing correctness (no hardcoded values that could cause "invalid signature" or 400 errors).

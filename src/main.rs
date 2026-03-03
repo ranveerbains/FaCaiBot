@@ -254,6 +254,13 @@ async fn async_main() -> Result<()> {
                     ExecutorFeedback::OrderFailed { is_leg2 } => {
                         engine.on_order_failed(is_leg2);
                     }
+                    ExecutorFeedback::CancelResult {
+                        order_id,
+                        was_cancelled,
+                        is_leg2,
+                    } => {
+                        engine.on_cancel_result(order_id, was_cancelled, is_leg2);
+                    }
                     ExecutorFeedback::DiagSnapshot {
                         placed,
                         cancelled,

@@ -105,8 +105,18 @@ impl LiveExecutor {
                 }
                 ExecutorCommand::CancelLeg1 { order_id } => {
                     info!(%order_id, "cancelling stale Leg 1 order");
-                    if let Err(e) = self.poly.cancel_order(&order_id).await {
-                        warn!(%order_id, error = %e, "failed to cancel stale Leg 1");
+                    match self.poly.cancel_order(&order_id).await {
+                        Ok(was_cancelled) => {
+                            let _ =
+                                self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                                    order_id,
+                                    was_cancelled,
+                                    is_leg2: false,
+                                });
+                        }
+                        Err(e) => {
+                            warn!(%order_id, error = %e, "failed to cancel stale Leg 1");
+                        }
                     }
                 }
             }
@@ -211,10 +221,28 @@ impl LiveExecutor {
         // Cancel existing Leg 2 order if one is resting.
         if let Some(ref prev_order_id) = self.active_leg2_order_id {
             info!(order_id = %prev_order_id, "Leg 2 erosion: cancelling previous order");
-            if let Err(e) = self.poly.cancel_order(prev_order_id).await {
-                warn!(error = %e, "Leg 2 erosion: cancel failed (may already be filled)");
+            match self.poly.cancel_order(prev_order_id).await {
+                Ok(true) => {
+                    self.orders_cancelled += 1;
+                }
+                Ok(false) => {
+                    warn!(
+                        order_id = %prev_order_id,
+                        "Leg 2 cancel NOT confirmed — order may have filled, skipping replacement"
+                    );
+                    let _ =
+                        self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                            order_id: prev_order_id.clone(),
+                            was_cancelled: false,
+                            is_leg2: true,
+                        });
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Leg 2 erosion: cancel failed — posting replacement anyway");
+                    self.orders_cancelled += 1;
+                }
             }
-            self.orders_cancelled += 1;
         }
 
         // Post new Leg 2 order at the erosion-adjusted price.
@@ -368,10 +396,28 @@ impl LiveExecutor {
         // Cancel any existing Leg 2 resting order first.
         if let Some(ref prev_order_id) = self.active_leg2_order_id {
             info!(order_id = %prev_order_id, "Leg 2 emergency: cancelling previous resting order");
-            if let Err(e) = self.poly.cancel_order(prev_order_id).await {
-                warn!(error = %e, "Leg 2 emergency: cancel failed");
+            match self.poly.cancel_order(prev_order_id).await {
+                Ok(true) => {
+                    self.orders_cancelled += 1;
+                }
+                Ok(false) => {
+                    warn!(
+                        order_id = %prev_order_id,
+                        "Leg 2 emergency cancel NOT confirmed — order may have filled, skipping replacement"
+                    );
+                    let _ =
+                        self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                            order_id: prev_order_id.clone(),
+                            was_cancelled: false,
+                            is_leg2: true,
+                        });
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Leg 2 emergency: cancel failed — proceeding with replacement");
+                    self.orders_cancelled += 1;
+                }
             }
-            self.orders_cancelled += 1;
         }
 
         if signal.sim_was_taker {

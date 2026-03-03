@@ -207,6 +207,18 @@ pub struct StrategyEngine {
     /// when the order_id is still provisional ("sim-...").
     pub cancel_leg1_on_feedback: bool,
 
+    /// Saved Leg 1 order info after pre-clearing state for a cancel.
+    /// Restored if CancelResult reports the cancel was not confirmed.
+    cancelled_leg1_info: Option<(String, Decimal, Decimal)>,
+
+    /// Saved previous Leg 2 order info before evaluate_leg2() overwrites
+    /// with a provisional ID. Restored if CancelResult reports not confirmed.
+    prev_leg2_order: Option<(String, Decimal, Decimal)>,
+
+    /// Buffer for TradeStatusUpdate events that arrived before OrderPosted
+    /// feedback. Replayed after on_order_posted() or on_cancel_result().
+    pending_fills: std::collections::VecDeque<(String, TradeStatus)>,
+
     /// Epoch ms when the engine was created (for uptime calculation).
     start_ms: u64,
 
@@ -283,6 +295,9 @@ impl StrategyEngine {
             draining: false,
             paused: false,
             cancel_leg1_on_feedback: false,
+            cancelled_leg1_info: None,
+            prev_leg2_order: None,
+            pending_fills: std::collections::VecDeque::with_capacity(4),
             start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
                 max_spread,
@@ -590,7 +605,7 @@ impl StrategyEngine {
                 self.diag_spike_failures += 1;
 
                 match &self.state.leg1_state {
-                    OrderState::Posted { order_id, .. } => {
+                    OrderState::Posted { order_id, price, size, .. } => {
                         self.diag_spike_sustain_cancel += 1;
                         if Self::is_provisional_order_id(order_id) {
                             // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
@@ -600,6 +615,8 @@ impl StrategyEngine {
                             );
                             self.cancel_leg1_on_feedback = true;
                         } else {
+                            // Save order info before clearing — restored if cancel not confirmed.
+                            self.cancelled_leg1_info = Some((order_id.clone(), *price, *size));
                             // Real CLOB ID is available — cancel immediately.
                             info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
                             self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
@@ -715,6 +732,9 @@ impl StrategyEngine {
                 self.pending_spike_cancel = None;
                 self.speculative_awaiting_sustain = false;
                 self.cancel_leg1_on_feedback = false;
+                self.cancelled_leg1_info = None;
+                self.prev_leg2_order = None;
+                self.pending_fills.clear();
                 self.in_cutoff_window = false;
                 self.diag_markets_rotated += 1;
                 // Reset per-market live reporting state.
@@ -773,6 +793,13 @@ impl StrategyEngine {
                             warn!(%order_id, "Leg 1 FAILED — resetting to None");
                             self.state.leg1_state = OrderState::None;
                         }
+                        TradeStatus::Canceled => {
+                            warn!(%order_id, "Leg 1 CANCELED by CLOB — resetting");
+                            self.state.leg1_state = OrderState::None;
+                            self.pending_leg1_signal = None;
+                            self.speculative_awaiting_sustain = false;
+                            self.cancelled_leg1_info = None;
+                        }
                         TradeStatus::Retrying => {
                             debug!(%order_id, "Leg 1 RETRYING");
                         }
@@ -804,11 +831,28 @@ impl StrategyEngine {
                             warn!(%order_id, "Leg 2 FAILED — re-entry via evaluate_leg2");
                             self.state.leg2_state = OrderState::None;
                         }
+                        TradeStatus::Canceled => {
+                            warn!(%order_id, "Leg 2 CANCELED by CLOB — resetting for re-evaluation");
+                            self.state.leg2_state = OrderState::None;
+                            self.prev_leg2_order = None;
+                        }
                         TradeStatus::Retrying => {
                             debug!(%order_id, "Leg 2 RETRYING");
                         }
                     }
                 }
+
+                // Buffer unmatched TradeStatusUpdate events (may arrive before
+                // OrderPosted feedback or after a cancel cleared state).
+                if !is_leg1 && !is_leg2 {
+                    if self.pending_fills.len() < 8 {
+                        warn!(%order_id, ?status, "TradeStatusUpdate unmatched — buffering");
+                        self.pending_fills.push_back((order_id, status));
+                    } else {
+                        warn!(%order_id, ?status, "TradeStatusUpdate unmatched AND buffer full — DROPPED");
+                    }
+                }
+
                 self.state.last_update_ms = now_ms;
             }
 
@@ -1057,6 +1101,13 @@ impl StrategyEngine {
         // ── Apply mutations based on decision type ────────────────────────
         let (price, size) = (decision.price(), decision.size());
         let is_emergency = decision.is_emergency();
+
+        // Save current Leg 2 order before overwriting with provisional ID.
+        if let OrderState::Posted { ref order_id, price: p, size: s, .. } = self.state.leg2_state
+            && !order_id.starts_with("sim-")
+        {
+            self.prev_leg2_order = Some((order_id.clone(), p, s));
+        }
 
         if is_emergency {
             let (reason, was_taker) = match &decision {
@@ -1333,8 +1384,9 @@ impl StrategyEngine {
         let now_ms = now_epoch_ms();
         if let OrderState::Posted {
             order_id,
+            price,
+            size,
             timestamp_ms,
-            ..
         } = &self.state.leg1_state
         {
             // Order still in transit to the CLOB — don't count transit time as resting time.
@@ -1348,6 +1400,8 @@ impl StrategyEngine {
                     timeout_ms = self.leg1.leg1_timeout_ms,
                     "Leg 1 stale — cancelling unfilled order"
                 );
+                // Save order info before clearing — restored if cancel not confirmed.
+                self.cancelled_leg1_info = Some((order_id.clone(), *price, *size));
                 let cmd = Some(ExecutorCommand::CancelLeg1 {
                     order_id: order_id.clone(),
                 });
@@ -1394,6 +1448,7 @@ impl StrategyEngine {
             size,
             timestamp_ms: now_ms,
         };
+        self.replay_pending_fills(now_ms);
         None
     }
 
@@ -1412,6 +1467,136 @@ impl StrategyEngine {
             self.state.leg1_state = OrderState::None;
         }
         warn!(is_leg2, "order placement failed — leg state reset to None");
+    }
+
+    /// Called when a `CancelResult` feedback arrives from the executor.
+    /// If the cancel was confirmed, clears saved info. If NOT confirmed (order
+    /// may have filled), restores the Posted state so User WS events can match.
+    pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool) {
+        if was_cancelled {
+            if is_leg2 {
+                self.prev_leg2_order = None;
+            } else {
+                self.cancelled_leg1_info = None;
+            }
+            debug!(%order_id, is_leg2, "cancel confirmed by CLOB");
+            return;
+        }
+
+        // NOT cancelled — order may have filled. Restore state so User WS events match.
+        warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
+
+        let now_ms = now_epoch_ms();
+        if !is_leg2 {
+            if let Some((saved_id, price, size)) = self.cancelled_leg1_info.take()
+                && saved_id == order_id
+                && matches!(self.state.leg1_state, OrderState::None)
+            {
+                self.state.leg1_state = OrderState::Posted {
+                    order_id: saved_id,
+                    price,
+                    size,
+                    timestamp_ms: now_ms,
+                };
+            }
+        } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
+            && saved_id == order_id
+        {
+            let is_provisional = matches!(
+                &self.state.leg2_state,
+                OrderState::Posted { order_id: oid, .. } if oid.starts_with("sim-")
+            );
+            if is_provisional || matches!(self.state.leg2_state, OrderState::None) {
+                self.state.leg2_state = OrderState::Posted {
+                    order_id: saved_id,
+                    price,
+                    size,
+                    timestamp_ms: now_ms,
+                };
+            }
+        }
+
+        self.replay_pending_fills(now_ms);
+    }
+
+    /// Replay buffered TradeStatusUpdate events that didn't match any leg when
+    /// they first arrived. Called after state changes (OrderPosted, CancelResult)
+    /// that may make previously-unmatched events matchable.
+    fn replay_pending_fills(&mut self, now_ms: u64) {
+        if self.pending_fills.is_empty() {
+            return;
+        }
+
+        let fills: Vec<(String, TradeStatus)> = self.pending_fills.drain(..).collect();
+        for (order_id, status) in fills {
+            let is_leg1 = matches!(
+                &self.state.leg1_state,
+                OrderState::Posted { order_id: oid, .. } if *oid == order_id
+            );
+            let is_leg2 = matches!(
+                &self.state.leg2_state,
+                OrderState::Posted { order_id: oid, .. } if *oid == order_id
+            );
+
+            if is_leg1 {
+                info!(%order_id, ?status, "replaying buffered fill for Leg 1");
+                let (price, size) = match &self.state.leg1_state {
+                    OrderState::Posted { price, size, .. } => (*price, *size),
+                    _ => unreachable!(),
+                };
+                match status {
+                    TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                        self.state.leg1_state = OrderState::Filled {
+                            order_id,
+                            price,
+                            size,
+                            fill_timestamp_ms: now_ms,
+                        };
+                        self.init_erosion(price, size, now_ms);
+                        self.live_trade_meta = LiveTradeMeta::default();
+                    }
+                    TradeStatus::Failed => {
+                        self.state.leg1_state = OrderState::None;
+                    }
+                    TradeStatus::Canceled => {
+                        self.state.leg1_state = OrderState::None;
+                        self.cancelled_leg1_info = None;
+                    }
+                    TradeStatus::Retrying => {}
+                }
+            } else if is_leg2 {
+                info!(%order_id, ?status, "replaying buffered fill for Leg 2");
+                let (price, size) = match &self.state.leg2_state {
+                    OrderState::Posted { price, size, .. } => (*price, *size),
+                    _ => unreachable!(),
+                };
+                match status {
+                    TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                        self.state.leg2_state = OrderState::Filled {
+                            order_id,
+                            price,
+                            size,
+                            fill_timestamp_ms: now_ms,
+                        };
+                        self.erosion = None;
+                        self.last_erosion_signal_ms = 0;
+                    }
+                    TradeStatus::Failed => {
+                        self.state.leg2_state = OrderState::None;
+                    }
+                    TradeStatus::Canceled => {
+                        self.state.leg2_state = OrderState::None;
+                        self.prev_leg2_order = None;
+                    }
+                    TradeStatus::Retrying => {}
+                }
+            } else {
+                // Still unmatched after replay — re-buffer.
+                if self.pending_fills.len() < 8 {
+                    self.pending_fills.push_back((order_id, status));
+                }
+            }
+        }
     }
 
     /// Record a completed live trade to QuestDB's `executed_trades` table.
@@ -1591,6 +1776,9 @@ impl StrategyEngine {
         self.pending_spike_cancel = None;
         self.speculative_awaiting_sustain = false;
         self.cancel_leg1_on_feedback = false;
+        self.cancelled_leg1_info = None;
+        self.prev_leg2_order = None;
+        self.pending_fills.clear();
         // cumulative_used is NOT reset — capital stays allocated within this market.
     }
 
@@ -2304,7 +2492,13 @@ impl StrategyEngine {
     }
 
     /// Reset Leg 1 state to `None` and clear associated tracking fields.
+    /// Saves order info for cancel confirmation tracking (non-provisional IDs only).
     pub fn reset_leg1_state(&mut self) {
+        if let OrderState::Posted { ref order_id, price, size, .. } = self.state.leg1_state
+            && !Self::is_provisional_order_id(order_id)
+        {
+            self.cancelled_leg1_info = Some((order_id.clone(), price, size));
+        }
         self.state.leg1_state = OrderState::None;
         self.pending_leg1_signal = None;
         self.leg1_direction = None;

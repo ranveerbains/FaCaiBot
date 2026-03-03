@@ -316,6 +316,13 @@ pub enum ExecutorFeedback {
     },
     /// Order placement failed — reset the leg state to `OrderState::None`.
     OrderFailed { is_leg2: bool },
+    /// Cancel response from CLOB. `was_cancelled = false` means the order may
+    /// have filled before the cancel reached the CLOB.
+    CancelResult {
+        order_id: String,
+        was_cancelled: bool,
+        is_leg2: bool,
+    },
     /// Periodic diagnostic snapshot from the live executor (sent every 60s).
     /// Forwarded to the engine so it can be included in the Telegram diagnostic.
     DiagSnapshot {
