@@ -845,8 +845,7 @@ impl StrategyEngine {
                                 size,
                                 fill_timestamp_ms: now_ms,
                             };
-                            self.erosion = None;
-                            self.last_erosion_signal_ms = 0;
+                            // erosion cleared by on_trade_complete() after Telegram + recording
                         }
                         TradeStatus::Failed => {
                             warn!(%order_id, "Leg 2 FAILED — re-entry via evaluate_leg2");
@@ -1629,8 +1628,7 @@ impl StrategyEngine {
                             size,
                             fill_timestamp_ms: now_ms,
                         };
-                        self.erosion = None;
-                        self.last_erosion_signal_ms = 0;
+                        // erosion cleared by on_trade_complete() after Telegram + recording
                     }
                     TradeStatus::Failed => {
                         self.state.leg2_state = OrderState::None;
