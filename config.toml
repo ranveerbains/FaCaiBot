@@ -11,7 +11,7 @@ atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
 # Minimum spike magnitude in bps (0.0125 = 1.25 bps)
-min_magnitude_pct = 0.015
+min_magnitude_pct = 0.02
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
