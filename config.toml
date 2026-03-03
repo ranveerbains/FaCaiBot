@@ -11,7 +11,7 @@ atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
 # Minimum spike magnitude in bps (0.0125 = 1.25 bps)
-min_magnitude_pct = 0.02
+min_magnitude_pct = 0.015
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
@@ -29,7 +29,7 @@ stale_book_ms = 1000
 # Block entry if YES mid > this or < (1 - this)
 max_price_skew = 0.85
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 1000
+leg1_timeout_ms = 1500
 
 [capital]
 # Maximum USDC per leg per trade

@@ -290,15 +290,25 @@ async fn redeem_inner() -> Result<String> {
 
 // ─── Auto-Redeem Background Task ────────────────────────────────────────────
 
-/// Runs every 24 hours, redeems resolved positions, notifies via Telegram.
-/// Never panics — fully fire-and-forget.
+/// Runs every 30 minutes, redeems resolved positions, notifies via Telegram.
+/// Failures are graceful — logged and retried next cycle.
 pub async fn auto_redeem_loop(tls_connector: TlsConnector, bot_token: String, chat_id: String) {
+    const INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
+
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(INTERVAL_SECS)).await;
 
         let result = handle_redeem().await;
-        let msg = format!("Auto-redeem: {result}");
 
+        // Only notify when something was actually redeemed (skip "0 redeemed, 0 skipped" noise).
+        let is_noop = result.contains("No positions found")
+            || result.contains("No condition IDs")
+            || result.starts_with("Redemption complete: 0 redeemed, 0 skipped");
+        if is_noop {
+            continue;
+        }
+
+        let msg = format!("Auto-redeem: {result}");
         if let Err(e) = post_telegram_message(&tls_connector, &bot_token, &chat_id, &msg).await {
             warn!(error = %e, "failed to send auto-redeem notification");
         }

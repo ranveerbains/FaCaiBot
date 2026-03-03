@@ -123,8 +123,17 @@ impl TelegramCommandListener {
         let mut last_command_ms: u64 = 0;
 
         loop {
-            match poll_updates(&tls_connector, &bot_token, &mut last_update_id).await {
-                Ok(messages) => {
+            // Wrap the long-poll in a timeout. The Telegram long-poll is 30s,
+            // so we allow 45s total (30s poll + 15s for TLS handshake/network).
+            // Without this, a silently dropped connection hangs the listener forever.
+            let poll_result = tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                poll_updates(&tls_connector, &bot_token, &mut last_update_id),
+            )
+            .await;
+
+            match poll_result {
+                Ok(Ok(messages)) => {
                     for msg in messages {
                         let reply = handle_message(
                             &msg,
@@ -147,9 +156,12 @@ impl TelegramCommandListener {
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(error = %e, "getUpdates failed — retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(_) => {
+                    warn!("getUpdates timed out (>45s) — connection likely dropped, retrying");
                 }
             }
         }
