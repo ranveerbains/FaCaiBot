@@ -122,6 +122,18 @@ impl TelegramCommandListener {
         let mut last_update_id: i64 = 0;
         let mut last_command_ms: u64 = 0;
 
+        // Flush stale messages from previous sessions.
+        // Fetch all pending updates, record the latest ID, but don't process them.
+        if let Ok(stale) = poll_updates(&tls_connector, &bot_token, &mut last_update_id).await {
+            if !stale.is_empty() {
+                info!(
+                    count = stale.len(),
+                    "flushed {} stale message(s) from previous session",
+                    stale.len()
+                );
+            }
+        }
+
         loop {
             // Wrap the long-poll in a timeout. The Telegram long-poll is 30s,
             // so we allow 45s total (30s poll + 15s for TLS handshake/network).

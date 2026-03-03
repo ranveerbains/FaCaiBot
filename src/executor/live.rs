@@ -84,7 +84,11 @@ impl LiveExecutor {
         info!("LiveExecutor: starting receive loop");
         self.reporter.send_live_startup_message();
 
-        while let Ok(cmd) = rx.recv() {
+        loop {
+            let cmd = match tokio::task::block_in_place(|| rx.recv()) {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            };
             match cmd {
                 ExecutorCommand::Signal(signal) => {
                     self.handle_signal(signal).await;

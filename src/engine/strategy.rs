@@ -177,6 +177,7 @@ pub struct StrategyEngine {
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_spread: u64,  // SpreadWide
     diag_rej_depth: u64,   // InsufficientDepth
+    diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
     diag_leg1_fills: u64,
@@ -262,6 +263,7 @@ impl StrategyEngine {
             diag_rej_skew: 0,
             diag_rej_spread: 0,
             diag_rej_depth: 0,
+            diag_rej_paused: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
             diag_leg1_fills: 0,
@@ -922,6 +924,7 @@ impl StrategyEngine {
         // Drain/pause mode: block new Leg 1 entries.
         if self.draining || self.paused {
             self.state.spike_detected = false;
+            self.diag_rej_paused += 1;
             return None;
         }
 
@@ -1162,6 +1165,7 @@ impl StrategyEngine {
             markets = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
             spikes_cut = self.diag_spikes_dropped_cutoff,
+            rej_paused = self.diag_rej_paused,
             rej_busy = self.diag_rej_busy,
             rej_no_book = self.diag_rej_no_book,
             rej_stale = self.diag_rej_stale,
@@ -1245,7 +1249,7 @@ impl StrategyEngine {
              Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}\n\
              \n\
              <b>Leg 1 Rejections</b>\n\
-             Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
+             Paused: {paused}  Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
              Spread: {spread}  Depth: {depth}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
@@ -1260,6 +1264,7 @@ impl StrategyEngine {
             spikes = self.diag_spikes_received,
             spike_fail = self.diag_spike_failures,
             spikes_cut = self.diag_spikes_dropped_cutoff,
+            paused = self.diag_rej_paused,
             busy = self.diag_rej_busy,
             no_book = self.diag_rej_no_book,
             stale = self.diag_rej_stale,
