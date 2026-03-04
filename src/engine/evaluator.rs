@@ -662,9 +662,17 @@ impl Leg2Evaluator {
                     );
                     return None;
                 }
+                // Determine exit reason: favorable if pair cost < $1.00, else exhaustion.
+                let pair_cost = leg1_price + price;
+                let exit_reason = if pair_cost < Decimal::ONE {
+                    ExitReason::FavorableTaker
+                } else {
+                    ExitReason::ErosionExhausted
+                };
                 warn!(
                     %price, %fok_size, steps = snap.steps_applied,
-                    "erosion exhausted — escalating to ErosionExhausted emergency"
+                    %pair_cost, ?exit_reason,
+                    "erosion exhausted — escalating to emergency"
                 );
                 let signal = make_leg2_signal(
                     &hedge_token_id,
@@ -684,7 +692,7 @@ impl Leg2Evaluator {
                     atr,
                     false,
                     Some(hedge_book.clone()),
-                    Some(ExitReason::ErosionExhausted),
+                    Some(exit_reason),
                 );
                 return Some(Leg2Decision::Emergency {
                     signal,
@@ -1258,7 +1266,8 @@ mod tests {
         );
         assert!(result.as_ref().unwrap().is_emergency());
         let sig = result.unwrap().into_signal();
-        assert_eq!(sig.exit_reason, Some(ExitReason::ErosionExhausted));
+        // pair_cost = 0.50 (leg1) + 0.48 (post-only) = 0.98 < $1.00 → favorable
+        assert_eq!(sig.exit_reason, Some(ExitReason::FavorableTaker));
         // Price should be post-only: 0.49 - 0.01 = 0.48
         assert_eq!(sig.price, Decimal::new(48, 2));
     }

@@ -34,16 +34,16 @@ const MAX_FOK_RETRIES: u32 = 10;
 /// Adjusts `size` so that `price * size` has at most 2 decimal places,
 /// as required by the Polymarket CLOB for Buy FOK orders (maker_amount).
 fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
-    let maker = price * size;
-    if maker == maker.round_dp(2) {
-        return size;
+    let tick = Decimal::new(1, 2); // 0.01
+    let mut s = (size / tick).floor() * tick; // truncate size to 2dp
+    while s > Decimal::ZERO {
+        let maker = price * s;
+        if maker == maker.round_dp(2) {
+            return s;
+        }
+        s -= tick;
     }
-    // Floor maker_amount to 2dp, recompute size, then truncate size to 2dp.
-    // Double-truncation guarantees the final maker_amount has <=2dp.
-    let safe_maker = (maker * Decimal::ONE_HUNDRED).floor() / Decimal::ONE_HUNDRED;
-    let adjusted = safe_maker / price;
-    let truncated = (adjusted * Decimal::ONE_HUNDRED).floor() / Decimal::ONE_HUNDRED;
-    truncated.max(Decimal::ZERO)
+    Decimal::ZERO
 }
 
 /// Live executor that submits real orders to the Polymarket CLOB.

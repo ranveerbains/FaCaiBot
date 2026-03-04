@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::reporting::telegram::TelegramReporter;
 use crate::types::market::{
     DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState, PriceLevel,
-    TradeStatus,
+    SpikeInfo, TradeStatus,
 };
 use crate::types::order::{ExecutorCommand, ExitReason, ProfitTier, Side, TradeSignal};
 use crate::types::simulation::{MarketSummary, SessionSummary, SimFill, SimTrade};
@@ -89,6 +89,7 @@ struct CancelledLeg1 {
     size: Decimal,
     signal: Option<TradeSignal>,
     direction: Option<Direction>,
+    spike: Option<SpikeInfo>,
 }
 
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
@@ -641,13 +642,14 @@ impl StrategyEngine {
                 match &self.state.leg1_state {
                     OrderState::Posted { order_id, price, size, .. } => {
                         self.diag_spike_sustain_cancel += 1;
-                        // Save signal+direction before clearing — needed if cancel not confirmed.
+                        // Save signal+direction+spike before clearing — needed if cancel not confirmed.
                         let saved = CancelledLeg1 {
                             order_id: order_id.clone(),
                             price: *price,
                             size: *size,
                             signal: self.pending_leg1_signal.clone(),
                             direction: self.leg1_direction,
+                            spike: self.state.last_spike,
                         };
                         if Self::is_provisional_order_id(order_id) {
                             // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
@@ -1181,7 +1183,7 @@ impl StrategyEngine {
                 exit_reason: reason,
                 emergency_maker: reason.is_some() && !was_taker,
                 adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
-                favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)) && was_taker,
+                favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
             };
             if let Some(e) = self.erosion.as_mut() {
                 if !e.emergency_submitted {
@@ -1461,13 +1463,14 @@ impl StrategyEngine {
                     timeout_ms = self.leg1.leg1_timeout_ms,
                     "Leg 1 stale — cancelling unfilled order"
                 );
-                // Save order info + signal + direction before clearing — restored if cancel not confirmed.
+                // Save order info + signal + direction + spike before clearing — restored if cancel not confirmed.
                 self.cancelled_leg1_info = Some(CancelledLeg1 {
                     order_id: order_id.clone(),
                     price: *price,
                     size: *size,
                     signal: self.pending_leg1_signal.clone(),
                     direction: self.leg1_direction,
+                    spike: self.state.last_spike,
                 });
                 let cmd = Some(ExecutorCommand::CancelLeg1 {
                     order_id: order_id.clone(),
@@ -1577,6 +1580,9 @@ impl StrategyEngine {
                 }
                 if self.leg1_direction.is_none() {
                     self.leg1_direction = saved.direction;
+                }
+                if self.state.last_spike.is_none() {
+                    self.state.last_spike = saved.spike;
                 }
             }
         } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
@@ -2584,6 +2590,7 @@ impl StrategyEngine {
                 size,
                 signal: self.pending_leg1_signal.clone(),
                 direction: self.leg1_direction,
+                spike: self.state.last_spike,
             });
         }
         self.state.leg1_state = OrderState::None;
@@ -3800,10 +3807,11 @@ mod tests {
             "erosion exhausted should trigger emergency signal"
         );
         let sig = emergency.unwrap();
+        // pair_cost = 0.20 (leg1) + 0.78 (post-only) = 0.98 < $1.00 → favorable
         assert_eq!(
             sig.exit_reason,
-            Some(ExitReason::ErosionExhausted),
-            "exhaustion emergency should have ErosionExhausted exit reason"
+            Some(ExitReason::FavorableTaker),
+            "exhaustion emergency with favorable pair cost should have FavorableTaker exit reason"
         );
         assert!(
             engine.erosion.as_ref().unwrap().emergency_submitted,
@@ -3900,6 +3908,7 @@ mod tests {
         assert_eq!(saved.order_id, "real-id-1");
         assert!(saved.signal.is_some(), "signal should be saved");
         assert_eq!(saved.direction, Some(Direction::Up), "direction should be saved");
+        assert!(saved.spike.is_some(), "spike should be saved");
     }
 
     #[test]
@@ -3940,5 +3949,6 @@ mod tests {
             Some(Direction::Up),
             "leg1_direction should be restored"
         );
+        assert!(engine.state.last_spike.is_some(), "last_spike should be restored");
     }
 }

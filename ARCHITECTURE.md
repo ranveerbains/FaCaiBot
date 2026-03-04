@@ -465,7 +465,7 @@ Four independent exit paths. All use a **price-improvement chase with hard deadl
 |---------|-----------|--------|
 | **Adverse movement** | Binance reversal > `adverse_threshold` (0.1%) from Binance price at Leg 1 fill | **Immediate** — zero grace period |
 | **Break-even breach** | Pair cost (leg1 + opposing ask) > $1.00 | **After first erosion step** (~3s) |
-| **Erosion exhausted** | All 5 erosion steps applied without fill | **After step 5** (~5.8s). Auto-escalates as `ErosionExhausted` |
+| **Erosion exhausted** | All 5 erosion steps applied without fill | **After step 5** (~5.8s). Exit reason: `FavorableTaker` if `leg1_price + post_only_price < $1.00`, else `ErosionExhausted` |
 | **Market expiry** | `MarketRotation` while Leg 1 Filled, Leg 2 incomplete | **At rotation** — last-resort FOK before state reset |
 
 **Price-improvement chase flow**: The evaluator tracks `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). On each Polymarket book update:
@@ -479,11 +479,16 @@ Binance ticks are skipped during emergency mode (`hedge_book_changed` gate) — 
 
 ### Favorable Taker (Sim + Live)
 
-When the opposing ask drops strictly below the posted Leg 2 bid, a post-only order would be rejected by the CLOB. The bot market-takes at the ask price. Taker fee is acceptable insurance vs an open position.
+`ExitReason::FavorableTaker` covers two paths where the pair cost is below $1.00 at exit time:
 
-- **Sim mode**: `advance_simulation()` detects `ask < posted_price` on book update. Fills at ask with `ExitReason::FavorableTaker`.
-- **Live mode**: `handle_leg2_erosion()` receives `Rejected` → `attempt_favorable_exit()`: aggressive post-only at `best_ask - 1 tick` first, FOK fallback if rejected.
-- **Tracking**: `favorable_taker_fills` counter. `[FAVORABLE TAKER]` / `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram.
+1. **Crosses-book rejection**: The opposing ask drops strictly below the posted Leg 2 bid — a post-only order would be rejected. The bot market-takes at the ask price. Taker fee is acceptable insurance vs an open position.
+   - Sim mode: `advance_simulation()` detects `ask < posted_price` on book update.
+   - Live mode: `handle_leg2_erosion()` receives `Rejected` → `attempt_favorable_exit()`: aggressive post-only at `best_ask - 1 tick` first, FOK fallback if rejected.
+
+2. **Erosion exhaustion with favorable cost**: After all 5 erosion steps, if `leg1_price + post_only_price < $1.00`, the emergency escalates as `FavorableTaker` rather than `ErosionExhausted`. Same price-improvement chase with FOK deadline, but Telegram shows `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` instead of `[EMERGENCY POST-ONLY]`.
+
+- **`favorable_taker` meta flag**: Set whenever `ExitReason::FavorableTaker` — regardless of whether the exit is post-only or taker. Combined with `emergency_maker` to produce the correct Telegram tag.
+- **Tracking**: `diag_emg_favorable` counter. `[FAVORABLE TAKER]` / `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram.
 
 ### CLOB Auto-Cancel (Heartbeat Failure)
 
