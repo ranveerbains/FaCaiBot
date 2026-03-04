@@ -82,7 +82,7 @@ Three feedback types flow from executor → engine via the `ExecutorFeedback` ch
 |----------|------|---------------|
 | `OrderPosted { order_id, price, size, is_leg2, fill_method, already_filled }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. For Leg 2: apply `fill_method` metadata to `LiveTradeMeta` (favorable exit tags). If `already_filled` (FOK returned `Filled` synchronously), transition directly to `OrderState::Filled` and trigger trade completion — do NOT wait for User WS MATCHED. Replay `pending_fills` buffer |
 | `OrderFailed { is_leg2 }` | CLOB rejected or network error (non-emergency only — emergency FOKs retry internally, never send this) | Reset leg state to `None`. If `cancel_leg1_on_feedback` is set, clear the flag (nothing to cancel) |
-| `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, set `leg1_cancel_race = true` on `LiveTradeMeta` (Leg 1 only), replay `pending_fills` buffer |
+| `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, replay `pending_fills` buffer (which sends opportunity alert + increments `live_market_signals` for Leg 1 fills), then set `leg1_cancel_race = true` on `LiveTradeMeta` AFTER replay (so it survives the `LiveTradeMeta::default()` reset inside replay) |
 
 **User WS event routing**: The Polymarket User WS sends two event types: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate` — their `id` field matches the hex hash stored from `OrderPosted` feedback. `"trade"` UUIDs never match and are harmlessly ignored. Actionable statuses forwarded: MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED. Non-actionable statuses (LIVE) are silently skipped by `parse_trade_status()`.
 
@@ -413,7 +413,7 @@ Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows
 3. Executor sends cancel to CLOB, receives response, sends `CancelResult` feedback
 4. Engine `on_cancel_result()`:
    - `was_cancelled = true`: order was actually on the book and is now gone. Clear `cancelled_leg1_info`. Slot freed.
-   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Set `leg1_cancel_race = true` on `LiveTradeMeta` — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
+   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Replay `pending_fills` buffer (sends opportunity alert + increments `live_market_signals` for Leg 1 fills). Set `leg1_cancel_race = true` on `LiveTradeMeta` AFTER replay (so it survives the `LiveTradeMeta::default()` reset inside replay) — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. If the MATCHED was buffered, replay transitions to `Filled` immediately; otherwise the User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
 
 **Why not just ignore the CancelResult?** Without restore, the MATCHED event arrives to `leg1_state = None` → unmatched → the fill is silently lost. The bot has an untracked position with no hedge.
 
@@ -506,9 +506,23 @@ When a `TradeStatusUpdate` arrives but `order_id` doesn't match either `leg1_sta
 
 1. **Post-only fills before OrderPosted**: User WS MATCHED arrives before the executor's `OrderPosted` feedback updates the provisional ID. The event is buffered, then replayed when `on_order_posted()` sets the real ID. Note: FOK orders that return `Filled` synchronously bypass this — the `already_filled` flag on `OrderPosted` transitions directly to `Filled` without waiting for User WS.
 
-2. **Cancel-then-fill race**: Engine clears state for a cancel. MATCHED event arrives for the now-cleared order ID. Event buffered. `CancelResult { was_cancelled: false }` restores the state (and sets `leg1_cancel_race = true` for Leg 1). `replay_pending_fills()` finds the match → `Filled`.
+2. **Cancel-then-fill race**: Engine clears state for a cancel. MATCHED event arrives for the now-cleared order ID. Event buffered. `CancelResult { was_cancelled: false }` restores the state. `replay_pending_fills()` finds the match → `Filled` (also sends opportunity alert + increments `live_market_signals` for Leg 1). `leg1_cancel_race` set AFTER replay so it survives `LiveTradeMeta::default()` reset.
 
 Buffer is cleared on `on_trade_complete()` and `MarketRotation`.
+
+### Deferred Partial Fill Alerts (`pending_partial_fills`)
+
+The CLOB can split a large fill across multiple rapid MATCHED events (~3ms apart). To avoid false "PARTIAL FILL" alerts on fully-filled orders, partial fill detection is deferred:
+
+1. **On MATCHED with `size_matched < original_size`**: Instead of alerting immediately, the engine stores a `PendingPartialFill { leg, size_matched, original_size }` keyed by `order_id` in `pending_partial_fills` (HashMap).
+
+2. **On subsequent MATCHED for the same `order_id`**: Updates the cumulative `size_matched`. If now fully filled, the entry is removed silently. If still partial, re-inserted to wait for MINED.
+
+3. **On MINED/CONFIRMED**: Final `size_matched` is authoritative. If still below `original_size`, the Telegram alert fires. Otherwise resolved silently.
+
+4. **FAILED/CANCELED/RETRYING**: Entry discarded — other handlers deal with these statuses.
+
+This applies at all 4 partial-fill-check sites (Leg 1 and Leg 2, both in `on_event()` and `replay_pending_fills()`). The map is cleared on `MarketRotation` but NOT on `on_trade_complete()` — deferred checks must survive trade reset to catch MINED events that arrive after.
 
 ### Trade Completion
 

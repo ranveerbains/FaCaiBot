@@ -36,6 +36,18 @@ use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
 };
 
+// ─── Deferred partial fill tracking ──────────────────────────────────────────
+
+/// Tracks orders with partial `size_matched` at MATCHED time.
+/// Resolved when MINED/CONFIRMED arrives with the final cumulative size.
+/// Prevents false "PARTIAL FILL" alerts when the CLOB splits a fill across
+/// multiple rapid MATCHED events (~3ms apart).
+struct PendingPartialFill {
+    leg: &'static str,
+    size_matched: Decimal,
+    original_size: Decimal,
+}
+
 // ─── Spike diagnostic snapshot (stored from SpikeDiagnostic event) ───────────
 
 /// Lightweight copy of spike detector diagnostics for Telegram forwarding.
@@ -179,6 +191,7 @@ pub struct StrategyEngine {
     /// Telegram reporter for live mode. `None` in simulation mode.
     reporter: Option<TelegramReporter>,
     /// Leg 2 metadata for the current live trade (reset on Leg 1 fill).
+    /// Note: `leg1_cancel_race` is set AFTER `replay_pending_fills()` so it survives the reset.
     live_trade_meta: LiveTradeMeta,
     /// Completed trades for the current market window (cleared on rotation).
     live_market_trades: Vec<SimTrade>,
@@ -243,6 +256,11 @@ pub struct StrategyEngine {
     /// Buffer for TradeStatusUpdate events that arrived before OrderPosted
     /// feedback. Replayed after on_order_posted() or on_cancel_result().
     pending_fills: std::collections::VecDeque<(String, TradeStatus, Option<Decimal>, Option<Decimal>)>,
+
+    /// Deferred partial fill checks — keyed by order_id.
+    /// Inserted on first MATCHED with `size_matched < original_size`,
+    /// resolved on subsequent MATCHED (if now fully filled) or MINED/CONFIRMED.
+    pending_partial_fills: std::collections::HashMap<String, PendingPartialFill>,
 
     /// Epoch ms when the engine was created (for uptime calculation).
     start_ms: u64,
@@ -325,6 +343,7 @@ impl StrategyEngine {
             cancelled_leg1_info: None,
             prev_leg2_order: None,
             pending_fills: std::collections::VecDeque::with_capacity(4),
+            pending_partial_fills: std::collections::HashMap::new(),
             start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
                 max_spread,
@@ -814,6 +833,7 @@ impl StrategyEngine {
                 self.cancelled_leg1_info = None;
                 self.prev_leg2_order = None;
                 self.pending_fills.clear();
+                self.pending_partial_fills.clear();
                 self.in_cutoff_window = false;
                 self.diag_markets_rotated += 1;
                 // Reset per-market live reporting state.
@@ -836,13 +856,13 @@ impl StrategyEngine {
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                             info!(%order_id, %price, %size, status = ?status, "Leg 1 fill confirmed");
-                            // Partial fill detection (monitoring only).
+                            // Partial fill detection — defer alert to MINED/CONFIRMED.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
                                 if matched < original {
-                                    warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 1");
-                                    if let Some(reporter) = self.reporter.as_ref() {
-                                        reporter.send_partial_fill_alert("Leg 1", &order_id, matched, original);
-                                    }
+                                    warn!(%order_id, %matched, %original, "partial fill on Leg 1 — deferring alert to MINED");
+                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                        leg: "Leg 1", size_matched: matched, original_size: original,
+                                    });
                                 }
                             }
                             self.state.leg1_state = OrderState::Filled {
@@ -906,13 +926,13 @@ impl StrategyEngine {
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                             info!(%order_id, %price, %size, status = ?status, "Leg 2 fill — pair complete");
-                            // Partial fill detection (monitoring only).
+                            // Partial fill detection — defer alert to MINED/CONFIRMED.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
                                 if matched < original {
-                                    warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 2");
-                                    if let Some(reporter) = self.reporter.as_ref() {
-                                        reporter.send_partial_fill_alert("Leg 2", &order_id, matched, original);
-                                    }
+                                    warn!(%order_id, %matched, %original, "partial fill on Leg 2 — deferring alert to MINED");
+                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                        leg: "Leg 2", size_matched: matched, original_size: original,
+                                    });
                                 }
                             }
                             self.state.leg2_state = OrderState::Filled {
@@ -941,7 +961,45 @@ impl StrategyEngine {
                 // Buffer unmatched TradeStatusUpdate events (may arrive before
                 // OrderPosted feedback or after a cancel cleared state).
                 if !is_leg1 && !is_leg2 {
-                    if self.pending_fills.len() < 8 {
+                    // Check if this event resolves a deferred partial fill check.
+                    if let Some(mut pending) = self.pending_partial_fills.remove(&order_id) {
+                        match status {
+                            TradeStatus::Matched => {
+                                // Another MATCHED — update cumulative size.
+                                if let Some(matched) = size_matched {
+                                    pending.size_matched = matched;
+                                }
+                                if pending.size_matched >= pending.original_size {
+                                    // Fully filled now — no alert needed.
+                                    info!(%order_id, "deferred partial fill resolved — fully filled");
+                                } else {
+                                    // Still partial — re-insert and wait for MINED.
+                                    self.pending_partial_fills.insert(order_id, pending);
+                                }
+                            }
+                            TradeStatus::Mined | TradeStatus::Confirmed => {
+                                // Terminal status — final size_matched is authoritative.
+                                let final_matched = size_matched.unwrap_or(pending.size_matched);
+                                if final_matched < pending.original_size {
+                                    warn!(
+                                        %order_id, matched = %final_matched, original = %pending.original_size,
+                                        "PARTIAL FILL confirmed at {}", if status == TradeStatus::Mined { "MINED" } else { "CONFIRMED" }
+                                    );
+                                    if let Some(reporter) = self.reporter.as_ref() {
+                                        reporter.send_partial_fill_alert(
+                                            pending.leg, &order_id, final_matched, pending.original_size,
+                                        );
+                                    }
+                                } else {
+                                    info!(%order_id, "deferred partial fill resolved at MINED — fully filled");
+                                }
+                            }
+                            _ => {
+                                // FAILED/CANCELED/RETRYING — discard, other handlers deal with these.
+                            }
+                        }
+                        self.state.last_update_ms = now_ms;
+                    } else if self.pending_fills.len() < 8 {
                         warn!(%order_id, ?status, "TradeStatusUpdate unmatched — buffering");
                         self.pending_fills.push_back((order_id, status, size_matched, original_size));
                     } else {
@@ -1656,14 +1714,14 @@ impl StrategyEngine {
         }
 
         // NOT cancelled — order may have filled. Restore state so User WS events match.
-        warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
-
         let now_ms = now_epoch_ms();
+        let mut leg1_restored = false;
         if !is_leg2 {
             if let Some(saved) = self.cancelled_leg1_info.take()
                 && saved.order_id == order_id
                 && matches!(self.state.leg1_state, OrderState::None)
             {
+                warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
                 self.state.leg1_state = OrderState::Posted {
                     order_id: saved.order_id,
                     price: saved.price,
@@ -1680,8 +1738,9 @@ impl StrategyEngine {
                 if self.state.last_spike.is_none() {
                     self.state.last_spike = saved.spike;
                 }
-                // Bug 2: track that Leg 1 filled via cancel-not-confirmed path.
-                self.live_trade_meta.leg1_cancel_race = true;
+                leg1_restored = true;
+            } else {
+                debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
             }
         } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
             && saved_id == order_id
@@ -1691,6 +1750,7 @@ impl StrategyEngine {
                 OrderState::Posted { order_id: oid, .. } if oid.starts_with("sim-")
             );
             if is_provisional || matches!(self.state.leg2_state, OrderState::None) {
+                warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
                 self.state.leg2_state = OrderState::Posted {
                     order_id: saved_id,
                     price,
@@ -1698,9 +1758,16 @@ impl StrategyEngine {
                     timestamp_ms: now_ms,
                 };
             }
+        } else {
+            debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
         }
 
         self.replay_pending_fills(now_ms);
+
+        // Set cancel-race flag AFTER replay so it survives LiveTradeMeta::default() reset.
+        if leg1_restored {
+            self.live_trade_meta.leg1_cancel_race = true;
+        }
     }
 
     /// Replay buffered TradeStatusUpdate events that didn't match any leg when
@@ -1732,10 +1799,10 @@ impl StrategyEngine {
                     TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                         if let (Some(matched), Some(original)) = (size_matched, original_size) {
                             if matched < original {
-                                warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 1 (replay)");
-                                if let Some(reporter) = self.reporter.as_ref() {
-                                    reporter.send_partial_fill_alert("Leg 1", &order_id, matched, original);
-                                }
+                                warn!(%order_id, %matched, %original, "partial fill on Leg 1 (replay) — deferring alert to MINED");
+                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                    leg: "Leg 1", size_matched: matched, original_size: original,
+                                });
                             }
                         }
                         self.state.leg1_state = OrderState::Filled {
@@ -1746,6 +1813,28 @@ impl StrategyEngine {
                         };
                         self.init_erosion(price, size, now_ms);
                         self.live_trade_meta = LiveTradeMeta::default();
+
+                        // Send opportunity alert for replayed Leg 1 fill (e.g. cancel-race).
+                        if let (Some(reporter), Some(signal)) = (
+                            self.reporter.clone(),
+                            self.pending_leg1_signal.clone(),
+                        ) {
+                            let book = signal
+                                .book_snapshot
+                                .clone()
+                                .or_else(|| self.state.poly_book.clone())
+                                .unwrap_or_else(|| OrderBook {
+                                    asset_id: signal.token_id.clone(),
+                                    bids: vec![],
+                                    asks: vec![],
+                                    timestamp_ms: now_ms,
+                                });
+                            reporter.send_opportunity_alert(&signal, price, size, &book);
+                            self.live_market_signals += 1;
+                            if signal.bot_contested {
+                                self.live_market_walls += 1;
+                            }
+                        }
                     }
                     TradeStatus::Failed => {
                         self.state.leg1_state = OrderState::None;
@@ -1766,10 +1855,10 @@ impl StrategyEngine {
                     TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                         if let (Some(matched), Some(original)) = (size_matched, original_size) {
                             if matched < original {
-                                warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 2 (replay)");
-                                if let Some(reporter) = self.reporter.as_ref() {
-                                    reporter.send_partial_fill_alert("Leg 2", &order_id, matched, original);
-                                }
+                                warn!(%order_id, %matched, %original, "partial fill on Leg 2 (replay) — deferring alert to MINED");
+                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                    leg: "Leg 2", size_matched: matched, original_size: original,
+                                });
                             }
                         }
                         self.state.leg2_state = OrderState::Filled {
@@ -2409,11 +2498,13 @@ impl StrategyEngine {
         let mut taker_fees_paid = Decimal::ZERO;
         let mut gross_market_pnl = Decimal::ZERO;
         let mut net_market_pnl = Decimal::ZERO;
+        let mut capital_locked = Decimal::ZERO;
         for t in &trades {
             allocation_used += t.alloc_amount;
             taker_fees_paid += t.taker_fee;
             gross_market_pnl += t.gross_profit;
             net_market_pnl += t.net_profit;
+            capital_locked += t.pair_cost * t.leg1.size;
         }
 
         let summary = MarketSummary {
@@ -2431,11 +2522,11 @@ impl StrategyEngine {
             favorable_taker_fills,
             trades,
             allocation_used,
-            allocation_cap: Decimal::ZERO,
+            allocation_cap: self.leg1.max_alloc_per_trade,
             taker_fees_paid,
             gross_market_pnl,
             net_market_pnl,
-            capital_locked: Decimal::ZERO,
+            capital_locked,
         };
 
         reporter.send_market_summary(&summary);

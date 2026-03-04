@@ -265,23 +265,30 @@ async fn redeem_inner() -> Result<String> {
             .send()
             .await
         {
-            Ok(pending) => match pending.get_receipt().await {
-                Ok(receipt) => {
-                    if receipt.status() {
+            Ok(pending) => {
+                let _tx_hash = *pending.tx_hash();
+                match pending.get_receipt().await {
+                    Ok(receipt) => {
+                        if receipt.status() {
+                            redeemed += 1;
+                        } else {
+                            skipped += 1;
+                            errors.push(format!(
+                                "{}: tx reverted (market not resolved?)",
+                                short_id(cid_hex)
+                            ));
+                        }
+                    }
+                    Err(e) if e.to_string().contains("null response") => {
+                        // Tx was broadcast — RPC just lost the receipt. Count as success.
                         redeemed += 1;
-                    } else {
+                    }
+                    Err(e) => {
                         skipped += 1;
-                        errors.push(format!(
-                            "{}: tx reverted (market not resolved?)",
-                            short_id(cid_hex)
-                        ));
+                        errors.push(format!("{}: receipt error: {e}", short_id(cid_hex)));
                     }
                 }
-                Err(e) => {
-                    skipped += 1;
-                    errors.push(format!("{}: receipt error: {e}", short_id(cid_hex)));
-                }
-            },
+            }
             Err(e) => {
                 skipped += 1;
                 errors.push(format!("{}: {e}", short_id(cid_hex)));
