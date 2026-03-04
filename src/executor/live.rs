@@ -369,42 +369,53 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 2 favorable exit: post-only first, FOK fallback ──────────
+    // ─── Leg 2 favorable exit: walk-down post-only, FOK fallback ──────
+
+    /// Walk-down offsets in ticks: 1, 2, 4, 8 (exponential).
+    /// Each attempt is ~100ms (CLOB HTTP round-trip). First successful
+    /// placement rests as maker for the remaining erosion window (~5.8s).
+    const WALKDOWN_OFFSETS: [u32; 4] = [1, 2, 4, 8];
 
     async fn attempt_favorable_exit(&mut self, signal: &TradeSignal) {
-        // Try aggressive post-only first — the ask has dropped, so posting
-        // just below it should fill as maker with zero fee.
-        let post_only_price = round_to_tick(signal.price - signal.tick_size, signal.tick_size);
-        if post_only_price * signal.size < Decimal::ONE {
-            warn!(%post_only_price, size = %signal.size, "below $1 minimum — skipping favorable exit");
-            self.orders_failed += 1;
-            self.active_leg2_order_id = None;
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            return;
-        }
-        let order = OrderRequest::aggressive_post_only(
-            signal.token_id.clone(),
-            signal.side,
-            post_only_price,
-            signal.size,
-        );
+        // Walk down with exponential tick offsets to find a valid maker price.
+        for (i, &offset) in Self::WALKDOWN_OFFSETS.iter().enumerate() {
+            let tick_offset = signal.tick_size * Decimal::from(offset);
+            let post_only_price = round_to_tick(signal.price - tick_offset, signal.tick_size);
 
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                if resp.status == OrderStatus::Rejected {
-                    // Post-only rejected — ask moved, FOK fallback.
-                    warn!(
-                        price = %post_only_price,
-                        "Leg 2 favorable exit: post-only REJECTED — FOK fallback"
-                    );
-                    self.favorable_exit_fok_fallback(signal).await;
-                } else {
+            // Guard: price must be positive and meet $1 notional minimum.
+            if post_only_price <= Decimal::ZERO {
+                warn!(attempt = i + 1, %post_only_price, "walk-down price non-positive — skipping to FOK");
+                break;
+            }
+            if post_only_price * signal.size < Decimal::ONE {
+                warn!(attempt = i + 1, %post_only_price, size = %signal.size, "walk-down below $1 minimum — skipping to FOK");
+                break;
+            }
+
+            let order = OrderRequest::aggressive_post_only(
+                signal.token_id.clone(),
+                signal.side,
+                post_only_price,
+                signal.size,
+            );
+
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Rejected {
+                        // Still crosses — try next offset.
+                        warn!(
+                            attempt = i + 1,
+                            price = %post_only_price,
+                            "Leg 2 favorable walk-down: post-only REJECTED — trying deeper"
+                        );
+                        continue;
+                    }
+                    // Accepted — order rests as maker.
                     info!(
+                        attempt = i + 1,
                         order_id = %resp.order_id,
                         price = %post_only_price,
-                        "Leg 2 favorable exit: post-only accepted"
+                        "Leg 2 favorable walk-down: post-only accepted"
                     );
                     self.active_leg2_order_id = Some(resp.order_id.clone());
                     self.emergency_maker_posts += 1;
@@ -418,13 +429,33 @@ impl LiveExecutor {
                         fill_method: Some(FillMethod::FavorableMaker),
                         already_filled: false,
                     });
+                    return;
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("crosses book") {
+                        // Same as rejection — try deeper offset.
+                        warn!(
+                            attempt = i + 1,
+                            price = %post_only_price,
+                            "Leg 2 favorable walk-down: 'crosses book' — trying deeper"
+                        );
+                        continue;
+                    }
+                    // Non-crossing error — skip remaining attempts, go to FOK.
+                    error!(
+                        attempt = i + 1,
+                        error = %e,
+                        "Leg 2 favorable walk-down: placement FAILED — skipping to FOK"
+                    );
+                    break;
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Leg 2 favorable exit: post-only FAILED — FOK fallback");
-                self.favorable_exit_fok_fallback(signal).await;
-            }
         }
+
+        // All walk-down attempts crossed or failed — FOK fallback.
+        warn!("Leg 2 favorable walk-down: all post-only attempts exhausted — FOK fallback");
+        self.favorable_exit_fok_fallback(signal).await;
     }
 
     async fn favorable_exit_fok_fallback(&mut self, signal: &TradeSignal) {

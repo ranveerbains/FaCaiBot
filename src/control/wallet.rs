@@ -27,8 +27,6 @@ const POLYGON_RPC_FALLBACK: &str = "https://rpc.ankr.com/polygon";
 /// Polymarket data API base URL.
 const DATA_API: &str = "https://data-api.polymarket.com";
 
-/// Polymarket CLOB API base URL (market resolution check).
-const CLOB_API: &str = "https://clob.polymarket.com";
 
 // ─── Solidity Interfaces ─────────────────────────────────────────────────────
 
@@ -187,10 +185,10 @@ async fn polybalance_inner() -> Result<String> {
 
 /// `/redeem` — Manually trigger redemption of resolved positions.
 pub async fn handle_redeem() -> String {
-    match tokio::time::timeout(Duration::from_secs(60), redeem_inner()).await {
+    match tokio::time::timeout(Duration::from_secs(120), redeem_inner()).await {
         Ok(Ok(msg)) => msg,
         Ok(Err(e)) => format!("Redemption failed: {e}"),
-        Err(_) => "Redemption timed out (60s).".into(),
+        Err(_) => "Redemption timed out (120s).".into(),
     }
 }
 
@@ -254,24 +252,6 @@ async fn redeem_inner() -> Result<String> {
     let mut errors: Vec<String> = Vec::new();
 
     for cid_hex in &condition_ids {
-        // Check if market is resolved before attempting redemption.
-        let market_url = format!("{CLOB_API}/market/{cid_hex}");
-        let is_resolved = match client.get(&market_url).send().await {
-            Ok(resp) => resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("closed")?.as_bool())
-                .unwrap_or(false),
-            Err(_) => false, // If we can't check, skip — don't waste gas on unresolved markets.
-        };
-
-        if !is_resolved {
-            skipped += 1;
-            errors.push(format!("{}: market not resolved", short_id(cid_hex)));
-            continue;
-        }
-
         let condition_id: FixedBytes<32> = match cid_hex.parse() {
             Ok(id) => id,
             Err(e) => {
@@ -289,14 +269,14 @@ async fn redeem_inner() -> Result<String> {
             Ok(pending) => {
                 let tx_hash = *pending.tx_hash();
                 // Per-tx receipt timeout — don't let slow RPC starve remaining positions.
-                match tokio::time::timeout(Duration::from_secs(15), pending.get_receipt()).await {
+                match tokio::time::timeout(Duration::from_secs(8), pending.get_receipt()).await {
                     Ok(Ok(receipt)) => {
                         if receipt.status() {
                             redeemed += 1;
                         } else {
                             skipped += 1;
                             errors.push(format!(
-                                "{}: tx reverted",
+                                "{}: tx reverted (market not resolved?)",
                                 short_id(cid_hex)
                             ));
                         }
@@ -311,7 +291,7 @@ async fn redeem_inner() -> Result<String> {
                     }
                     Err(_) => {
                         skipped += 1;
-                        warn!(tx = %tx_hash, "receipt poll timed out for resolved market");
+                        warn!(tx = %tx_hash, "receipt poll timed out");
                         errors.push(format!("{}: receipt timed out", short_id(cid_hex)));
                     }
                 }
