@@ -293,7 +293,7 @@ Emergency exits use a **price-improvement chase with hard deadline** strategy to
 
 Once `emergency_submitted = true`, the engine posts an aggressive post-only limit at `best_ask - 1 tick` and records `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). From that point, on each Polymarket book update:
 
-1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2500ms) → FOK at `best_ask` (guaranteed fill, taker fee)
+1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2500ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
 2. **Price improvement check**: If `best_ask - 1 tick > emergency_posted_price` → cancel and repost at the improved price (price-chase)
 3. **No change**: Hold current order — preserve FIFO queue priority (no blind reposts)
 
@@ -313,7 +313,7 @@ Once `emergency_submitted = true`, the engine posts an aggressive post-only limi
 
 The evaluator communicates intent via the `sim_was_taker` flag on `TradeSignal`:
 
-- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `best_ask`). FOK retries internally until accepted — never sends `OrderFailed` to engine
+- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `round_to_tick(best_ask, tick)`). FOK retries on liquidity errors ("couldn't be fully filled") but aborts immediately on SDK validation errors ("decimal places", "Validation"). Zero-size FOKs (from `clob_safe_fok_size()` returning 0) are aborted with `OrderFailed` before any CLOB call
 - `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick` (also retries internally)
 
 ### Simulation model
@@ -332,7 +332,7 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 **Simulation:** `advance_simulation()` detects `ask < posted_price` on each book update across all direction branches. Fills at the ask price with `ExitReason::FavorableTaker`.
 
-**Live:** When the CLOB rejects a post-only erosion order (price would cross), the executor calls `attempt_favorable_exit()` — first tries aggressive post-only at `best_ask - 1 tick`, then FOK fallback if rejected. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement.
+**Live:** When the CLOB rejects a post-only erosion order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` — first checks that `price × size >= $1` (CLOB minimum for marketable orders; below $1, the attempt is skipped with `OrderFailed` and erosion continues), then tries aggressive post-only at `best_ask - 1 tick` (sends `fill_method=FavorableMaker` on `OrderPosted`), then FOK fallback if rejected (sends `fill_method=FavorableTaker` + `already_filled` if sync fill). The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `emergency_maker`) even though it dispatched a normal erosion signal — the executor autonomously converted to a favorable exit.
 
 **Tracking:** `favorable_taker_fills` counter across all reporting contexts. Telegram tags: `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]`.
 
@@ -344,7 +344,9 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 **Simulation:** `advance_simulation()` detects both legs Filled after Leg 2 fill.
 
-**Live:** The main engine loop checks after processing each event — if both `leg1_state` and `leg2_state` are Filled, calls `on_trade_complete()`.
+**Live:** Two detection paths:
+1. **User WS fill**: The main engine loop checks after processing each event — if both `leg1_state` and `leg2_state` are Filled, calls `on_trade_complete()`.
+2. **Sync FOK fill**: When `OrderPosted` feedback has `already_filled=true` (FOK returned `Filled` synchronously from REST), the engine transitions Leg 2 directly to `OrderState::Filled` in `on_order_posted()`. The main loop detects both legs filled immediately in the feedback drain iteration and triggers `on_trade_complete()`. This prevents the double-fill bug where the engine keeps evaluating and dispatching additional FOK signals while waiting for a User WS MATCHED event that never arrives for synchronous FOK fills.
 
 ### State reset
 
@@ -387,6 +389,8 @@ If Leg 1 is Filled but Leg 2 incomplete when rotation arrives, the engine builds
 **Drainage order:**
 1. Drain `rotation_emergency_buffer` → send emergency signals to executor
 2. Send `MarketRotation` → executor resets
+
+**Telegram alert (live mode):** When `leg1_filled && !leg2_filled` at rotation, the engine sends a `fire_critical()` Telegram alert with position details (direction, entry price, size, whether a FOK was submitted). This ensures abandoned positions are never silent — you always know when a trade was open at market expiry.
 
 ### Engine state reset on rotation
 
@@ -581,6 +585,14 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 **Handle:** If the order ID is provisional when a cancel is needed, the engine sets `cancel_leg1_on_feedback = true` instead of sending a `CancelLeg1` command. When `on_order_posted()` receives the real CLOB ID, it checks this flag and immediately returns `Some(CancelLeg1)` with the real ID. The state is NOT resurrected — `leg1_state` stays `None`.
 
 **Safety:** Prevents (1) sending invalid provisional IDs to the CLOB, (2) ghost orders from `on_order_posted()` resurrecting a cancelled trade. The flag is cleared in `on_order_failed()`, `on_trade_complete()`, and `MarketRotation`.
+
+### Emergency signal stacking (live)
+
+**Scenario:** Engine evaluates every ~2-50ms, executor takes ~1-2s per CLOB call. Between erosion exhaustion and deadline FOK, multiple emergency signals queue in the executor channel. A later signal cancels a FOK that was already filled by an earlier signal → cancel not confirmed → engine restores "Posted" state → no User WS MATCHED arrives → trade stuck.
+
+**Handle:** `emergency_signal_in_flight` flag on the engine. Set when an emergency signal is dispatched, cleared on any executor feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete, rotation). `evaluate_leg2()` returns None while the flag is set. Additionally, the executor sets `active_leg2_order_id = None` (instead of `Some(...)`) when a FOK returns `Filled` — even if a stale signal sneaks through, it can't cancel a filled order.
+
+**Safety:** Two-layer defense: Layer A (engine) prevents most stacking; Layer B (executor) prevents damage from any that slip through.
 
 ### Spike during existing trade
 

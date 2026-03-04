@@ -26,7 +26,7 @@ use crate::types::market::{
     DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState, PriceLevel,
     SpikeInfo, TradeStatus,
 };
-use crate::types::order::{ExecutorCommand, ExitReason, ProfitTier, Side, TradeSignal};
+use crate::types::order::{ExecutorCommand, ExitReason, FillMethod, ProfitTier, Side, TradeSignal};
 use crate::types::simulation::{MarketSummary, SessionSummary, SimFill, SimTrade};
 use crate::utils::time::epoch_ms as now_epoch_ms;
 
@@ -76,6 +76,8 @@ struct LiveTradeMeta {
     adverse_movement: bool,
     favorable_taker: bool,
     exit_reason: Option<ExitReason>,
+    /// `true` if Leg 1 filled via the cancel-not-confirmed replay path.
+    leg1_cancel_race: bool,
 }
 
 // ─── Saved Leg 1 info for cancel confirmation tracking ──────────────────────
@@ -240,7 +242,7 @@ pub struct StrategyEngine {
 
     /// Buffer for TradeStatusUpdate events that arrived before OrderPosted
     /// feedback. Replayed after on_order_posted() or on_cancel_result().
-    pending_fills: std::collections::VecDeque<(String, TradeStatus)>,
+    pending_fills: std::collections::VecDeque<(String, TradeStatus, Option<Decimal>, Option<Decimal>)>,
 
     /// Epoch ms when the engine was created (for uptime calculation).
     start_ms: u64,
@@ -821,7 +823,7 @@ impl StrategyEngine {
             }
 
             // ── Trade status update (fill tracking via User WS) ───────────
-            IngestorEvent::TradeStatusUpdate { order_id, status } => {
+            IngestorEvent::TradeStatusUpdate { order_id, status, size_matched, original_size } => {
                 let is_leg1 = match &self.state.leg1_state {
                     OrderState::Posted { order_id: oid, .. } => *oid == order_id,
                     _ => false,
@@ -834,6 +836,15 @@ impl StrategyEngine {
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                             info!(%order_id, %price, %size, status = ?status, "Leg 1 fill confirmed");
+                            // Partial fill detection (monitoring only).
+                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                                if matched < original {
+                                    warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 1");
+                                    if let Some(reporter) = self.reporter.as_ref() {
+                                        reporter.send_partial_fill_alert("Leg 1", &order_id, matched, original);
+                                    }
+                                }
+                            }
                             self.state.leg1_state = OrderState::Filled {
                                 order_id: order_id.clone(),
                                 price,
@@ -895,6 +906,15 @@ impl StrategyEngine {
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                             info!(%order_id, %price, %size, status = ?status, "Leg 2 fill — pair complete");
+                            // Partial fill detection (monitoring only).
+                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                                if matched < original {
+                                    warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 2");
+                                    if let Some(reporter) = self.reporter.as_ref() {
+                                        reporter.send_partial_fill_alert("Leg 2", &order_id, matched, original);
+                                    }
+                                }
+                            }
                             self.state.leg2_state = OrderState::Filled {
                                 order_id: order_id.clone(),
                                 price,
@@ -923,7 +943,7 @@ impl StrategyEngine {
                 if !is_leg1 && !is_leg2 {
                     if self.pending_fills.len() < 8 {
                         warn!(%order_id, ?status, "TradeStatusUpdate unmatched — buffering");
-                        self.pending_fills.push_back((order_id, status));
+                        self.pending_fills.push_back((order_id, status, size_matched, original_size));
                     } else {
                         warn!(%order_id, ?status, "TradeStatusUpdate unmatched AND buffer full — DROPPED");
                     }
@@ -1211,12 +1231,15 @@ impl StrategyEngine {
                 None => self.diag_emg_adverse += 1, // fallback
             }
             // Track for live mode trade-completed Telegram message.
+            // Preserve leg1_cancel_race — it was set on Leg 1 fill, before Leg 2 emergency.
+            let cancel_race = self.live_trade_meta.leg1_cancel_race;
             self.live_trade_meta = LiveTradeMeta {
                 leg2_was_taker: was_taker,
                 exit_reason: reason,
                 emergency_maker: reason.is_some() && !was_taker,
                 adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
+                leg1_cancel_race: cancel_race,
             };
             if let Some(e) = self.erosion.as_mut() {
                 if !e.emergency_submitted {
@@ -1530,6 +1553,8 @@ impl StrategyEngine {
         order_id: String,
         price: Decimal,
         size: Decimal,
+        fill_method: Option<FillMethod>,
+        already_filled: bool,
     ) -> Option<ExecutorCommand> {
         // Deferred cancel: SpikeFailed/staleness arrived while ID was provisional.
         // Now we have the real CLOB ID — cancel it instead of resurrecting state.
@@ -1549,7 +1574,37 @@ impl StrategyEngine {
         let now_ms = now_epoch_ms();
         if is_leg2 {
             self.emergency_signal_in_flight = false;
+
+            // Bug 1 fix: executor-initiated favorable exits set live_trade_meta
+            // so Telegram shows the correct tag.
+            match fill_method {
+                Some(FillMethod::FavorableMaker) => {
+                    self.live_trade_meta.favorable_taker = true;
+                    self.live_trade_meta.emergency_maker = true;
+                }
+                Some(FillMethod::FavorableTaker) => {
+                    self.live_trade_meta.favorable_taker = true;
+                    self.live_trade_meta.leg2_was_taker = true;
+                }
+                None => {}
+            }
+
+            // Bug 3 fix: FOK returned Filled synchronously from REST API.
+            // Transition directly to Filled state — don't wait for User WS MATCHED.
+            if already_filled {
+                info!(%order_id, %price, %size, "FOK already filled — direct transition to Filled");
+                self.state.leg2_state = OrderState::Filled {
+                    order_id,
+                    price,
+                    size,
+                    fill_timestamp_ms: now_ms,
+                };
+                // Don't replay pending fills — go straight to trade completion
+                // (checked by main loop after feedback drain).
+                return None;
+            }
         }
+
         let leg = if is_leg2 {
             &mut self.state.leg2_state
         } else {
@@ -1625,6 +1680,8 @@ impl StrategyEngine {
                 if self.state.last_spike.is_none() {
                     self.state.last_spike = saved.spike;
                 }
+                // Bug 2: track that Leg 1 filled via cancel-not-confirmed path.
+                self.live_trade_meta.leg1_cancel_race = true;
             }
         } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
             && saved_id == order_id
@@ -1654,8 +1711,8 @@ impl StrategyEngine {
             return;
         }
 
-        let fills: Vec<(String, TradeStatus)> = self.pending_fills.drain(..).collect();
-        for (order_id, status) in fills {
+        let fills: Vec<(String, TradeStatus, Option<Decimal>, Option<Decimal>)> = self.pending_fills.drain(..).collect();
+        for (order_id, status, size_matched, original_size) in fills {
             let is_leg1 = matches!(
                 &self.state.leg1_state,
                 OrderState::Posted { order_id: oid, .. } if *oid == order_id
@@ -1673,6 +1730,14 @@ impl StrategyEngine {
                 };
                 match status {
                     TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                            if matched < original {
+                                warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 1 (replay)");
+                                if let Some(reporter) = self.reporter.as_ref() {
+                                    reporter.send_partial_fill_alert("Leg 1", &order_id, matched, original);
+                                }
+                            }
+                        }
                         self.state.leg1_state = OrderState::Filled {
                             order_id,
                             price,
@@ -1699,6 +1764,14 @@ impl StrategyEngine {
                 };
                 match status {
                     TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                            if matched < original {
+                                warn!(%order_id, %matched, %original, "PARTIAL FILL on Leg 2 (replay)");
+                                if let Some(reporter) = self.reporter.as_ref() {
+                                    reporter.send_partial_fill_alert("Leg 2", &order_id, matched, original);
+                                }
+                            }
+                        }
                         self.state.leg2_state = OrderState::Filled {
                             order_id,
                             price,
@@ -1719,7 +1792,7 @@ impl StrategyEngine {
             } else {
                 // Still unmatched after replay — re-buffer.
                 if self.pending_fills.len() < 8 {
-                    self.pending_fills.push_back((order_id, status));
+                    self.pending_fills.push_back((order_id, status, size_matched, original_size));
                 }
             }
         }
@@ -2591,6 +2664,7 @@ impl StrategyEngine {
             emergency_maker: self.live_trade_meta.emergency_maker,
             exit_reason: self.live_trade_meta.exit_reason,
             spike_magnitude: erosion.spike_info.magnitude,
+            leg1_cancel_race: self.live_trade_meta.leg1_cancel_race,
             open_timestamp_ms: l1_ts,
             close_timestamp_ms: now_ms,
         })
@@ -3026,6 +3100,8 @@ mod tests {
         engine.on_event(IngestorEvent::TradeStatusUpdate {
             order_id: "ord1".to_string(),
             status: TradeStatus::Matched,
+            size_matched: None,
+            original_size: None,
         });
 
         assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
@@ -3677,7 +3753,7 @@ mod tests {
         );
 
         // Simulate real CLOB ID arriving via feedback.
-        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0));
+        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0), None, false);
         assert!(cancel_cmd.is_some(), "should return CancelLeg1 for deferred cancel");
         match cancel_cmd.unwrap() {
             ExecutorCommand::CancelLeg1 { order_id } => {
@@ -3930,7 +4006,7 @@ mod tests {
         assert_eq!(engine.leg1_direction, Some(Direction::Up));
 
         // Simulate real CLOB ID arriving (staleness skips provisional IDs).
-        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size);
+        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size, None, false);
         assert!(engine.pending_leg1_signal.is_some());
 
         // Force staleness: set timestamp far in the past so elapsed > timeout.
@@ -3963,7 +4039,7 @@ mod tests {
         assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
 
         // Simulate real CLOB ID arriving.
-        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size);
+        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size, None, false);
 
         // Force staleness: set timestamp far in the past so elapsed > timeout.
         if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {

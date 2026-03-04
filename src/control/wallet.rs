@@ -1,5 +1,7 @@
 //! Wallet management: balance checks, Polymarket positions, and CTF token redemption.
 
+use std::time::Duration;
+
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -91,9 +93,10 @@ fn short_id(id: &str) -> String {
 
 /// `/balance` — Show EOA wallet USDC.e + POL balance on Polygon.
 pub async fn handle_balance() -> String {
-    match balance_inner().await {
-        Ok(msg) => msg,
-        Err(e) => format!("Balance check failed: {e}"),
+    match tokio::time::timeout(Duration::from_secs(10), balance_inner()).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => format!("Balance check failed: {e}"),
+        Err(_) => "Balance check timed out (10s).".into(),
     }
 }
 
@@ -128,9 +131,10 @@ async fn balance_inner() -> Result<String> {
 
 /// `/polybalance` — Show Polymarket positions and total value.
 pub async fn handle_polybalance() -> String {
-    match polybalance_inner().await {
-        Ok(msg) => msg,
-        Err(e) => format!("Polybalance check failed: {e}"),
+    match tokio::time::timeout(Duration::from_secs(10), polybalance_inner()).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => format!("Polybalance check failed: {e}"),
+        Err(_) => "Polybalance check timed out (10s).".into(),
     }
 }
 
@@ -180,9 +184,10 @@ async fn polybalance_inner() -> Result<String> {
 
 /// `/redeem` — Manually trigger redemption of resolved positions.
 pub async fn handle_redeem() -> String {
-    match redeem_inner().await {
-        Ok(msg) => msg,
-        Err(e) => format!("Redemption failed: {e}"),
+    match tokio::time::timeout(Duration::from_secs(60), redeem_inner()).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => format!("Redemption failed: {e}"),
+        Err(_) => "Redemption timed out (60s).".into(),
     }
 }
 
@@ -227,9 +232,13 @@ async fn redeem_inner() -> Result<String> {
         return Ok("No condition IDs found in positions — nothing to redeem.".into());
     }
 
-    // Build signing provider.
+    // Build signing provider with cached nonce management (prevents "nonce too low" on rapid txs).
+    // ProviderBuilder::new() includes SimpleNonceManager which queries the RPC every send —
+    // between rapid sequential txs, the RPC returns the same nonce. CachedNonceManager
+    // tracks nonces locally and increments after each submission, overriding the default.
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
+        .with_cached_nonce_management()
         .wallet(wallet)
         .connect_http(rpc_url.parse().context("invalid RPC URL")?);
     let ctf = ICTF::new(CTF, &provider);

@@ -14,6 +14,8 @@ use crossbeam_channel::Sender;
 use fastwebsockets::{Frame, OpCode};
 use tracing::{debug, info, warn};
 
+use rust_decimal::Decimal;
+
 use crate::types::IngestorEvent;
 use crate::types::market::{DataSource, TradeStatus};
 
@@ -224,6 +226,16 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
                 let status_str = event.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 info!(order_id, status = status_str, "User WS: order event");
 
+                // Parse optional size fields for partial fill detection.
+                let size_matched = event
+                    .get("size_matched")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+                let original_size = event
+                    .get("original_size")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+
                 // Forward actionable order status changes to the engine.
                 // "order" events carry the correct hex order hash (matching
                 // what the engine stores), unlike "trade" events which use
@@ -232,6 +244,8 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
                     let ev = IngestorEvent::TradeStatusUpdate {
                         order_id: order_id.to_string(),
                         status,
+                        size_matched,
+                        original_size,
                     };
                     if tx.try_send(ev).is_err() {
                         warn!("channel full — order TradeStatusUpdate dropped");

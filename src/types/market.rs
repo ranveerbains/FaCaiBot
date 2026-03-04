@@ -329,6 +329,10 @@ pub enum IngestorEvent {
     TradeStatusUpdate {
         order_id: String,
         status: TradeStatus,
+        /// Shares matched so far (from User WS `size_matched` field).
+        size_matched: Option<Decimal>,
+        /// Original order size at placement (from User WS `original_size` field).
+        original_size: Option<Decimal>,
     },
 
     // ── Binance ──────────────────────────────────────────────────────────

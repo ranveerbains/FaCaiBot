@@ -428,6 +428,7 @@ impl ColdStorage {
             .column_bool("leg2_was_partial", leg2_was_partial)?
             .column_bool("favorable_taker", trade.favorable_taker)?
             .column_bool("emergency_maker", trade.emergency_maker)?
+            .column_bool("leg1_cancel_race", trade.leg1_cancel_race)?
             .column_f64(
                 "spike_magnitude",
                 trade.spike_magnitude.try_into().unwrap_or(0.0),

@@ -155,6 +155,8 @@ impl TelegramCommandListener {
                             &notify_flags,
                             &ingestor_tx,
                             &status_rx,
+                            &tls_connector,
+                            &bot_token,
                         )
                         .await;
                         if let Some(reply_text) = reply {
@@ -196,6 +198,8 @@ async fn handle_message(
     notify_flags: &Arc<NotifyFlags>,
     ingestor_tx: &Sender<IngestorEvent>,
     status_rx: &watch::Receiver<BotStatus>,
+    tls_connector: &TlsConnector,
+    bot_token: &str,
 ) -> Option<String> {
     let from_id = msg.from.as_ref().map(|f| f.id).unwrap_or(0);
     let msg_chat_id = msg.chat.id.to_string();
@@ -242,9 +246,22 @@ async fn handle_message(
             let status = status_rx.borrow().clone();
             handlers::handle_status(&status)
         }
-        "balance" => wallet::handle_balance().await,
-        "polybalance" => wallet::handle_polybalance().await,
-        "redeem" => wallet::handle_redeem().await,
+        "balance" | "polybalance" | "redeem" => {
+            let tls = tls_connector.clone();
+            let token = bot_token.to_string();
+            let chat = chat_id.to_string();
+            let cmd_owned = cmd.to_string();
+            tokio::spawn(async move {
+                let reply = match cmd_owned.as_str() {
+                    "balance" => wallet::handle_balance().await,
+                    "polybalance" => wallet::handle_polybalance().await,
+                    "redeem" => wallet::handle_redeem().await,
+                    _ => return,
+                };
+                let _ = post_telegram_message(&tls, &token, &chat, &reply).await;
+            });
+            return None;
+        }
         "help" => handlers::handle_help(),
         _ => format!("Unknown command: /{cmd}. Send /help for usage."),
     };

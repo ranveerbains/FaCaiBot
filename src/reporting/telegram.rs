@@ -177,6 +177,35 @@ impl TelegramReporter {
         self.fire_critical(text);
     }
 
+    /// Critical alert — partial fill detected on a GTC order.
+    /// Monitoring only: the bot still assumes full fills. Alerts the operator
+    /// so they can take manual action if needed.
+    pub fn send_partial_fill_alert(
+        &self,
+        leg: &str,
+        order_id: &str,
+        matched: Decimal,
+        original: Decimal,
+    ) {
+        let pct = if original.is_zero() {
+            Decimal::ZERO
+        } else {
+            (matched / original) * Decimal::new(100, 0)
+        };
+        let text = format!(
+            "<b>PARTIAL FILL DETECTED</b>\n\n\
+            {leg}: {matched:.2} / {original:.2} shares ({pct:.1}% filled)\n\
+            Order: <code>{oid}</code>\n\n\
+            Bot assumes full fill — manual review may be needed.",
+            leg = leg,
+            matched = matched,
+            original = original,
+            pct = pct,
+            oid = order_id,
+        );
+        self.fire_critical(text);
+    }
+
     /// Tier 3 — session summary (sent hourly and on graceful shutdown).
     pub fn send_session_summary(&self, summary: &SessionSummary) {
         let text = formatter::format_session_summary(summary);
@@ -566,11 +595,17 @@ mod formatter {
             )
         };
 
+        let l1_tag = if trade.leg1_cancel_race {
+            " [FILLED MID-CANCEL]"
+        } else {
+            ""
+        };
+
         format!(
             "<b>--- TRADE COMPLETED ---</b>\n\n\
             Market: {market}\n\
             \n\
-            Leg 1: Buy {l1_side}  <code>${l1_price:.2}</code> \u{00d7} {l1_size:.2}sh = <code>${l1_total:.2}</code>\n\
+            Leg 1: Buy {l1_side}  <code>${l1_price:.2}</code> \u{00d7} {l1_size:.2}sh = <code>${l1_total:.2}</code>{l1_tag}\n\
             {leg2}\n\
             \n\
             Pair: <code>${pair:.3}</code>/sh \u{00d7} {l1_size:.2}sh = <code>${total_cost:.2}</code>\n\
@@ -580,6 +615,7 @@ mod formatter {
             l1_price = trade.leg1.price,
             l1_size = trade.leg1.size,
             l1_total = trade.leg1.price * trade.leg1.size,
+            l1_tag = l1_tag,
             leg2 = leg2_str,
             pair = trade.pair_cost,
             total_cost = total_cost_usdc,

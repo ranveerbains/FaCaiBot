@@ -244,11 +244,26 @@ async fn async_main() -> Result<()> {
                         order_id,
                         price,
                         size,
+                        fill_method,
+                        already_filled,
                     } => {
                         if let Some(cancel_cmd) =
-                            engine.on_order_posted(is_leg2, order_id, price, size)
+                            engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled)
                         {
                             let _ = executor_tx.send(cancel_cmd);
+                        }
+                        // Bug 3 fix: if FOK returned Filled synchronously, leg2 is
+                        // already in Filled state. Trigger trade completion now.
+                        if is_leg2 && already_filled
+                            && matches!(engine.state().leg1_state, OrderState::Filled { .. })
+                            && matches!(engine.state().leg2_state, OrderState::Filled { .. })
+                        {
+                            if let Some(ref mut c) = cold
+                                && let Err(e) = engine.record_live_trade(c)
+                            {
+                                warn!(error = %e, "failed to record live trade to QuestDB (FOK already_filled)");
+                            }
+                            engine.on_trade_complete();
                         }
                     }
                     ExecutorFeedback::OrderFailed { is_leg2 } => {

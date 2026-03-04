@@ -80,9 +80,9 @@ Three feedback types flow from executor → engine via the `ExecutorFeedback` ch
 
 | Feedback | When | Engine action |
 |----------|------|---------------|
-| `OrderPosted { order_id, price, size, is_leg2 }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. Replay `pending_fills` buffer |
+| `OrderPosted { order_id, price, size, is_leg2, fill_method, already_filled }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. For Leg 2: apply `fill_method` metadata to `LiveTradeMeta` (favorable exit tags). If `already_filled` (FOK returned `Filled` synchronously), transition directly to `OrderState::Filled` and trigger trade completion — do NOT wait for User WS MATCHED. Replay `pending_fills` buffer |
 | `OrderFailed { is_leg2 }` | CLOB rejected or network error (non-emergency only — emergency FOKs retry internally, never send this) | Reset leg state to `None`. If `cancel_leg1_on_feedback` is set, clear the flag (nothing to cancel) |
-| `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, replay `pending_fills` buffer |
+| `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, set `leg1_cancel_race = true` on `LiveTradeMeta` (Leg 1 only), replay `pending_fills` buffer |
 
 **User WS event routing**: The Polymarket User WS sends two event types: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate` — their `id` field matches the hex hash stored from `OrderPosted` feedback. `"trade"` UUIDs never match and are harmlessly ignored. Actionable statuses forwarded: MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED. Non-actionable statuses (LIVE) are silently skipped by `parse_trade_status()`.
 
@@ -93,9 +93,12 @@ Engine loop (one iteration per IngestorEvent):
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. DRAIN FEEDBACK (non-blocking)                                │
 │    while feedback_rx.try_recv():                                │
-│      OrderPosted  → set real CLOB ID, replay pending_fills      │
+│      OrderPosted  → set real CLOB ID, apply fill_method meta,   │
+│                     if already_filled: direct Filled + complete  │
+│                     else: replay pending_fills                   │
 │      OrderFailed  → reset leg to None                           │
 │      CancelResult → restore or clear saved order info           │
+│                     (Leg 1 not-confirmed: set leg1_cancel_race) │
 │      DiagSnapshot → store for Telegram forwarding               │
 │                                                                 │
 │ 2. CONTROL EVENTS                                               │
@@ -124,10 +127,11 @@ Engine loop (one iteration per IngestorEvent):
 
 **Key differences from sim**:
 - `advance_simulation()` never runs — no speculative fill gate needed (CLOB is fill authority)
-- Emergency signals are NOT filtered — the executor places FOK orders on the CLOB
-- Trade completion detected in the main loop (both `leg1_state` and `leg2_state` are `Filled`)
+- Emergency signals are gated by `emergency_signal_in_flight` — only one emergency signal in the executor channel at a time (cleared on feedback). Prevents stale signals from cancelling already-filled FOKs
+- Trade completion detected in the main loop (both `leg1_state` and `leg2_state` are `Filled`), OR immediately when `already_filled` FOK feedback transitions Leg 2 directly to `Filled`
 - Feedback is drained before `on_event()` — CLOB round-trip (~1.2s) completes before User WS notification (~1.5-2s), so order IDs are typically set before fill events arrive
 - Cancel operations are fire-and-confirm — the executor checks the CLOB DELETE response and sends `CancelResult` feedback so the engine can detect orders that filled before the cancel
+- `OrderPosted` carries `fill_method` (executor-initiated favorable exit metadata) and `already_filled` (sync FOK fill detection). The engine applies these to `LiveTradeMeta` for Telegram tags and immediate trade completion
 
 ### LiveExecutor (`executor/live.rs`)
 
@@ -139,14 +143,14 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 | Leg 1 rejected | CLOB returns `Rejected` → feedback `OrderFailed` to engine |
 | CancelLeg1 | Send cancel → `CancelResult { was_cancelled }` feedback to engine |
 | Leg 2 erosion | Cancel previous → confirmed: repost at eroded price. NOT confirmed: `CancelResult` feedback, skip replacement |
-| Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first, FOK fallback) |
+| Leg 2 erosion rejected | Post-only rejected (ask < bid) → attempt favorable exit (post-only first with `fill_method=FavorableMaker`, FOK fallback with `fill_method=FavorableTaker`). FOK feedback includes `already_filled=true` when REST returns `Filled` synchronously |
 | Leg 2 emergency | Cancel resting → confirmed: place emergency order. NOT confirmed: `CancelResult` feedback, skip replacement |
 | Leg 2 emergency rejected | Post-only rejected → FOK fallback at `best_ask + 1 tick` (retries internally until CLOB accepts — never sends `OrderFailed`) |
 | Market rotation | `cancel_all()` → reset state → pre-warm SDK caches → `caches_warm = true` |
 
 On network error during cancel, the executor cannot determine state — it proceeds with the replacement (cancel counted, no `CancelResult` sent). The User WS is the final authority: if the old order filled, the MATCHED event will arrive and be matched by the engine.
 
-On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`. **Exception**: Emergency FOK orders (`emergency_fok_fallback` and `emergency_fok_at_price`) retry up to `MAX_FOK_RETRIES` (10) before sending `OrderFailed`. FOK sizes are sanitized via `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB maker_amount precision requirement). After Leg 1 fills, the position must be hedged; the ~1.2s HTTP round-trip per attempt is the natural rate limiter. **"Crosses book" errors**: If a Leg 2 erosion post-only order fails with a "crosses book" error (SDK returns this as `Err`, not `Ok(Rejected)`), the executor routes to `attempt_favorable_exit()` instead of sending `OrderFailed` — the favorable pricing is preserved.
+On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engine resets the leg state to `None`. **Exception**: Emergency FOK orders (`emergency_fok_fallback` and `emergency_fok_at_price`) retry up to `MAX_FOK_RETRIES` (10) before sending `OrderFailed`. Non-transient SDK errors (e.g., "decimal places", "Validation") abort retries immediately — only liquidity errors ("couldn't be fully filled") keep retrying. FOK sizes are sanitized via `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB maker_amount precision requirement); if `clob_safe_fok_size()` returns zero, the order is aborted with `OrderFailed` instead of sending invalid orders. After Leg 1 fills, the position must be hedged; the ~1.2s HTTP round-trip per attempt is the natural rate limiter. **Filled FOK tracking**: When a FOK returns `OrderStatus::Filled`, the executor sets `active_leg2_order_id = None` instead of storing the order ID — this prevents subsequent stale signals from cancelling an already-filled order. **Sync FOK fill detection**: All FOK `OrderPosted` feedback includes `already_filled: resp.status == OrderStatus::Filled`. When the engine receives this, it transitions Leg 2 directly to `OrderState::Filled` and triggers immediate trade completion — bypassing the User WS wait that previously caused the double-fill bug (engine kept evaluating and dispatching additional FOK signals for an already-filled position). **$1 minimum notional**: Before attempting favorable exits, the executor checks `price × size >= $1` (CLOB minimum for marketable orders). Below $1, the attempt is skipped with `OrderFailed` and erosion continues at a different price. **"Crosses book" errors**: If a Leg 2 erosion post-only order fails with a "crosses book" error (SDK returns this as `Err`, not `Ok(Rejected)`), the executor routes to `attempt_favorable_exit()` instead of sending `OrderFailed` — the favorable pricing is preserved. **Fill method tagging**: `OrderPosted` includes `fill_method: Option<FillMethod>` — `FavorableMaker` for aggressive post-only favorable exits, `FavorableTaker` for FOK favorable exits. The engine sets `LiveTradeMeta` flags from this so Telegram shows the correct `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tag even when the executor (not the engine) initiated the favorable exit.
 
 ---
 
@@ -409,7 +413,7 @@ Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows
 3. Executor sends cancel to CLOB, receives response, sends `CancelResult` feedback
 4. Engine `on_cancel_result()`:
    - `was_cancelled = true`: order was actually on the book and is now gone. Clear `cancelled_leg1_info`. Slot freed.
-   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
+   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Set `leg1_cancel_race = true` on `LiveTradeMeta` — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
 
 **Why not just ignore the CancelResult?** Without restore, the MATCHED event arrives to `leg1_state = None` → unmatched → the fill is silently lost. The bot has an untracked position with no hedge.
 
@@ -469,7 +473,7 @@ Four independent exit paths. All use a **price-improvement chase with hard deadl
 | **Market expiry** | `MarketRotation` while Leg 1 Filled, Leg 2 incomplete | **At rotation** — last-resort FOK before state reset |
 
 **Price-improvement chase flow**: The evaluator tracks `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). On each Polymarket book update:
-1. `emergency_deadline_ms` elapsed? → FOK at `best_ask` (`sim_was_taker=true`). **FOK dedup**: Once a deadline FOK is emitted (`fok_emitted=true` on `ErosionState`), subsequent evaluation cycles return `None` — the executor's internal retry loop handles persistence
+1. `emergency_deadline_ms` elapsed? → FOK at `round_to_tick(best_ask, tick)` (`sim_was_taker=true`). The price is rounded to tick size to prevent SDK "decimal places" validation errors from raw book prices. **FOK dedup**: Once a deadline FOK is emitted (`fok_emitted=true` on `ErosionState`), subsequent evaluation cycles return `None` — the executor's internal retry loop handles persistence. **Signal stacking prevention**: The engine's `emergency_signal_in_flight` flag gates `evaluate_leg2()` while an emergency signal is in the executor channel, preventing multiple signals from queueing up
 2. `best_ask - 1 tick` better than posted price? → cancel and repost (price-chase)
 3. Neither? → hold current order, preserve FIFO queue priority
 
@@ -483,12 +487,12 @@ Binance ticks are skipped during emergency mode (`hedge_book_changed` gate) — 
 
 1. **Crosses-book rejection**: The opposing ask drops strictly below the posted Leg 2 bid — a post-only order would be rejected. The bot market-takes at the ask price. Taker fee is acceptable insurance vs an open position.
    - Sim mode: `advance_simulation()` detects `ask < posted_price` on book update.
-   - Live mode: `handle_leg2_erosion()` receives `Rejected` → `attempt_favorable_exit()`: aggressive post-only at `best_ask - 1 tick` first, FOK fallback if rejected.
+   - Live mode: `handle_leg2_erosion()` receives `Rejected` or "crosses book" error → `attempt_favorable_exit()`: aggressive post-only at `best_ask - 1 tick` first (sends `fill_method=FavorableMaker`), FOK fallback if rejected (sends `fill_method=FavorableTaker` + `already_filled` if sync fill). The `FillMethod` metadata on `OrderPosted` feedback ensures the engine's `LiveTradeMeta` gets the correct `favorable_taker`/`emergency_maker` flags even though the engine dispatched a normal erosion signal (the executor autonomously converted it to a favorable exit).
 
 2. **Erosion exhaustion with favorable cost**: After all 5 erosion steps, if `leg1_price + post_only_price < $1.00`, the emergency escalates as `FavorableTaker` rather than `ErosionExhausted`. Same price-improvement chase with FOK deadline, but Telegram shows `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` instead of `[EMERGENCY POST-ONLY]`.
 
-- **`favorable_taker` meta flag**: Set whenever `ExitReason::FavorableTaker` — regardless of whether the exit is post-only or taker. Combined with `emergency_maker` to produce the correct Telegram tag.
-- **Tracking**: `diag_emg_favorable` counter. `[FAVORABLE TAKER]` / `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram.
+- **`favorable_taker` meta flag**: Set from two sources: (a) engine sets it when `ExitReason::FavorableTaker` on emergency dispatch; (b) engine sets it from `fill_method` on `OrderPosted` feedback when executor autonomously triggers a favorable exit. Combined with `emergency_maker` to produce the correct Telegram tag.
+- **Tracking**: `diag_emg_favorable` counter. `[FAVORABLE POST-ONLY]` / `[FAVORABLE FOK FALLBACK]` tags in Telegram.
 
 ### CLOB Auto-Cancel (Heartbeat Failure)
 
@@ -500,15 +504,15 @@ If the CLOB cancels all orders (heartbeat failure, admin action), User WS sends 
 
 When a `TradeStatusUpdate` arrives but `order_id` doesn't match either `leg1_state` or `leg2_state`, the event is buffered in `pending_fills` (VecDeque, capacity 8). This catches two race conditions:
 
-1. **FOK fills before OrderPosted**: User WS MATCHED arrives before the executor's `OrderPosted` feedback updates the provisional ID. The event is buffered, then replayed when `on_order_posted()` sets the real ID.
+1. **Post-only fills before OrderPosted**: User WS MATCHED arrives before the executor's `OrderPosted` feedback updates the provisional ID. The event is buffered, then replayed when `on_order_posted()` sets the real ID. Note: FOK orders that return `Filled` synchronously bypass this — the `already_filled` flag on `OrderPosted` transitions directly to `Filled` without waiting for User WS.
 
-2. **Cancel-then-fill race**: Engine clears state for a cancel. MATCHED event arrives for the now-cleared order ID. Event buffered. `CancelResult { was_cancelled: false }` restores the state. `replay_pending_fills()` finds the match → `Filled`.
+2. **Cancel-then-fill race**: Engine clears state for a cancel. MATCHED event arrives for the now-cleared order ID. Event buffered. `CancelResult { was_cancelled: false }` restores the state (and sets `leg1_cancel_race = true` for Leg 1). `replay_pending_fills()` finds the match → `Filled`.
 
 Buffer is cleared on `on_trade_complete()` and `MarketRotation`.
 
 ### Trade Completion
 
-Both legs `Filled` (detected in the main engine loop) → `record_live_trade()` writes to QuestDB → `on_trade_complete()` resets all state:
+Both legs `Filled` → `record_live_trade()` writes to QuestDB → `on_trade_complete()` resets all state. Detected in two places: (1) the main engine loop after processing each event (User WS fills), and (2) immediately after `OrderPosted` feedback with `already_filled=true` (synchronous FOK fills — the engine transitions Leg 2 to `Filled` and triggers completion in the same feedback drain iteration, preventing duplicate FOK signals).
 - `leg1_state`, `leg2_state` → `None`
 - `erosion` → `None`
 - `cancelled_leg1_info`, `prev_leg2_order` → `None`
@@ -554,7 +558,7 @@ Minimum allocation is $1 regardless of tier. `max_alloc_per_trade` is the sole c
 - **Instant switch on expiry**: When `remaining_ms == 0`, emits the pre-warmed `MarketRotation` + book events immediately (zero gap). Market WS resubscribes to new token IDs in parallel
 - **Fallback**: If pre-warming failed (Market B not yet on Gamma, REST error, etc.), falls back to immediate Gamma poll within 5s of expiry
 - **`MarketRotation`** uses blocking `send()` (not `try_send()`) to guarantee delivery. Book events use `try_send()` (expendable — WS will provide updates)
-- **Rotation emergency**: If Leg 1 is Filled but Leg 2 is incomplete when rotation arrives, the engine builds an emergency FOK signal at the opposing ask BEFORE resetting state. The main loop sends this signal to the executor before `ExecutorCommand::MarketRotation`, so the position is hedged (or best-effort attempted) instead of force-closed at full loss. Exit reason: `ExitReason::MarketExpiry`
+- **Rotation emergency**: If Leg 1 is Filled but Leg 2 is incomplete when rotation arrives, the engine builds an emergency FOK signal at the opposing ask BEFORE resetting state. The main loop sends this signal to the executor before `ExecutorCommand::MarketRotation`, so the position is hedged (or best-effort attempted) instead of force-closed at full loss. Exit reason: `ExitReason::MarketExpiry`. In live mode, a `fire_critical()` Telegram alert is sent with position details (direction, price, size, whether a FOK was submitted) so abandoned positions are never silent
 - **Cutoff window**: After `entry_cutoff_secs` (`entry_cutoff_secs` before expiry), no new Leg 1 entries are allowed (spikes dropped, evaluate() blocked). However, existing open positions continue their Leg 2 erosion cascade and emergency exit paths unimpeded until rotation
 
 ```
@@ -569,7 +573,7 @@ Timeline:
 
 - **UMA Optimistic Oracle**: Proposer submits outcome → 2-hour challenge period → resolved
 - Capital locked between expiry and resolution (~2h minimum)
-- Redeem via `redeemPositions()` on CTF contract. EOA pays POL gas (capped at `MAX_GAS_PRICE` 100 gwei)
+- Redeem via `redeemPositions()` on CTF contract. EOA pays POL gas (capped at `MAX_GAS_PRICE` 100 gwei). Uses `CachedNonceManager` for sequential transactions (prevents "nonce too low" on rapid redeems)
 
 ---
 
@@ -659,6 +663,7 @@ All execution state lives in-memory (no database on the hot path). QuestDB is us
 - `exit_reason` (symbol): `NormalErosion`, `AdverseMovement`, `BreakEvenBreach`, `ErosionExhausted`, `MarketExpiry`, `FavorableTaker` — loss attribution
 - `spike_magnitude` (f64): spike quality vs. outcome correlation
 - `favorable_taker`, `emergency_maker` (bool): exit type flags
+- `leg1_cancel_race` (bool): `true` if Leg 1 filled mid-cancel (cancel-not-confirmed replay path)
 
 See `queries.sql` for 15 analytics queries (7 operational + 8 tuning). Tuning queries map loss causes directly to config parameters:
 
@@ -679,7 +684,7 @@ See `queries.sql` for 15 analytics queries (7 operational + 8 tuning). Tuning qu
 Four tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
 
 1. **Opportunity Alert**: Per signal — spike info, confidence, allocation, Leg 1 entry, Leg 2 target
-2. **Trade Completed**: Per trade — "Buy YES"/"Buy NO" labels, pair cost, profit (USDC), erosion steps
+2. **Trade Completed**: Per trade — "Buy YES"/"Buy NO" labels, pair cost, profit (USDC), erosion steps. Leg 1 line shows `[FILLED MID-CANCEL]` when `leg1_cancel_race=true`. Leg 2 line shows `[FAVORABLE POST-ONLY]`, `[FAVORABLE FOK FALLBACK]`, `[ADVERSE POST-ONLY]`, `[ADVERSE FOK FALLBACK]`, `[EMERGENCY POST-ONLY]`, or `[FOK FALLBACK]` based on `LiveTradeMeta` flags
 3. **Market Summary**: Per 5-min expiry — fill rate, trades, PnL
 4. **Session Summary**: Hourly + shutdown — aggregate stats, win rate, balance
 
@@ -706,6 +711,8 @@ Bidirectional Telegram control via `getUpdates` long-polling (30s timeout, 45s o
 | `/polybalance` | Polymarket positions and total value |
 | `/redeem` | Redeem resolved positions to USDC.e |
 | `/help` | List commands with usage |
+
+**Wallet commands (`/balance`, `/polybalance`, `/redeem`)**: Spawned as independent `tokio::spawn` tasks — the listener loop continues polling for new messages immediately. Each spawned task sends its own Telegram reply directly. Prevents slow Polygon RPC or on-chain tx confirmation from blocking other commands. Defense-in-depth timeouts: 10s for `/balance` and `/polybalance`, 60s for `/redeem` (on-chain txs are slow). `/redeem` uses `CachedNonceManager` (local nonce tracking) to prevent "nonce too low" errors when redeeming multiple positions sequentially — the default `SimpleNonceManager` queries the RPC for each send, which returns stale nonces between rapid transactions.
 
 **Security**: Every message verified against `TELEGRAM_ALLOWED_USER_ID` + `TELEGRAM_CHAT_ID`. 2s rate limit between commands. `/set` uses a strict allowlist of 27 params with min/max ranges. No shell execution.
 
@@ -739,9 +746,10 @@ Bot:  "Position closed. Bot stopped."
 ```
 src/control/
 ├── mod.rs              # Module declarations
-├── listener.rs         # TelegramCommandListener: getUpdates polling, auth, dispatch
+├── listener.rs         # TelegramCommandListener: getUpdates polling, auth, dispatch. Wallet commands spawned as independent tasks (non-blocking)
 ├── handlers.rs         # Command handlers (pure logic, returns reply strings)
 ├── config_editor.rs    # TOML read/write, param allowlist with min/max ranges
+├── wallet.rs           # /balance, /polybalance, /redeem — Polygon RPC + CTF contract calls. CachedNonceManager for sequential txs. Timeouts: 10s balance, 60s redeem
 └── types.rs            # NotifyFlags, BotStatus, DrainStatus
 ```
 

@@ -154,6 +154,9 @@ pub struct SimTrade {
     pub exit_reason: Option<ExitReason>,
     /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
     pub spike_magnitude: Decimal,
+    /// `true` if Leg 1 was supposed to be cancelled but filled mid-cancel
+    /// (cancel-not-confirmed replay path in live mode).
+    pub leg1_cancel_race: bool,
 
     // ── Timestamps ───────────────────────────────────────────────────────
     /// Epoch ms when the trade was opened (Leg 1 fill).
@@ -665,6 +668,7 @@ impl SimulationState {
             emergency_maker: pos.emergency_maker,
             exit_reason: pos.exit_reason,
             spike_magnitude: pos.spike_magnitude,
+            leg1_cancel_race: false,
             open_timestamp_ms: pos.leg1.timestamp_ms,
             close_timestamp_ms,
         };

@@ -307,6 +307,19 @@ pub enum OrderStatus {
     Rejected,
 }
 
+// ─── Fill Method ────────────────────────────────────────────────────────
+
+/// How the executor actually filled a Leg 2 order. Set when the executor
+/// autonomously converts a normal erosion signal into a favorable exit
+/// (e.g., "crosses book" → aggressive post-only or FOK fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillMethod {
+    /// "crosses book" → aggressive post-only filled as maker (zero fee).
+    FavorableMaker,
+    /// "crosses book" → FOK fallback filled as taker.
+    FavorableTaker,
+}
+
 // ─── Executor Feedback ──────────────────────────────────────────────────
 
 /// Feedback from the live executor to the engine (reverse channel).
@@ -322,6 +335,14 @@ pub enum ExecutorFeedback {
         order_id: String,
         price: Decimal,
         size: Decimal,
+        /// How the executor filled this order. `None` for normal post-only orders.
+        /// `Some` when the executor autonomously converted to a favorable exit.
+        fill_method: Option<FillMethod>,
+        /// `true` when a FOK order returned `Filled` synchronously from the REST API.
+        /// The engine should skip waiting for User WS MATCHED and transition directly
+        /// to `Filled` state. Prevents the double-fill bug where the engine keeps
+        /// evaluating and dispatching more FOK signals.
+        already_filled: bool,
     },
     /// Order placement failed — reset the leg state to `OrderState::None`.
     OrderFailed { is_leg2: bool },

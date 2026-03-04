@@ -22,7 +22,7 @@ use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
 use crate::types::market::Direction;
 use crate::types::order::{
-    ExecutorCommand, ExecutorFeedback, OrderRequest, OrderStatus, TradeSignal,
+    ExecutorCommand, ExecutorFeedback, FillMethod, OrderRequest, OrderStatus, TradeSignal,
 };
 
 use super::fill_engine::round_to_tick;
@@ -239,6 +239,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: signal.price,
                         size: signal.size,
+                        fill_method: None,
+                        already_filled: false,
                     });
 
                     self.log_signal_to_cold(signal, "submitted");
@@ -319,6 +321,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: signal.price,
                         size: signal.size,
+                        fill_method: None,
+                        already_filled: false,
                     });
                 }
             }
@@ -391,6 +395,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: post_only_price,
                         size: signal.size,
+                        fill_method: Some(FillMethod::FavorableMaker),
+                        already_filled: false,
                     });
                 }
             }
@@ -458,6 +464,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: signal.price,
                         size: signal.size,
+                        fill_method: Some(FillMethod::FavorableTaker),
+                        already_filled: resp.status == OrderStatus::Filled,
                     });
                 }
             }
@@ -558,6 +566,8 @@ impl LiveExecutor {
                             order_id: resp.order_id,
                             price: signal.price,
                             size: signal.size,
+                            fill_method: None,
+                            already_filled: false,
                         });
                     }
                 }
@@ -631,6 +641,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: signal.price,
                         size: safe_size,
+                        fill_method: None,
+                        already_filled: resp.status == OrderStatus::Filled,
                     });
                     return;
                 }
@@ -721,6 +733,8 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price,
                         size: safe_size,
+                        fill_method: None,
+                        already_filled: resp.status == OrderStatus::Filled,
                     });
                     return;
                 }
