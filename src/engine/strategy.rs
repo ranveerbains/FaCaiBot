@@ -1894,7 +1894,6 @@ impl StrategyEngine {
             self.erosion = Some(ErosionState::new(
                 now_ms,
                 fill_price,
-                fill_size,
                 tier,
                 initial_profit_target,
                 spike.direction,
@@ -2623,7 +2622,6 @@ impl StrategyEngine {
             uptime_secs,
             mode: mode_str.to_string(),
             current_market: self.state.active_condition_id.clone(),
-            market_end_ms: self.state.market_end_timestamp_ms,
             leg1_state: leg1_str,
             leg2_state: leg2_str,
             spikes_received: self.diag_spikes_received,
@@ -2910,7 +2908,6 @@ mod tests {
         let mut e = ErosionState::new(
             now_ms,
             leg1_price,
-            Decimal::new(100, 0),
             ProfitTier::High,
             ProfitTier::High.target_pct(),
             Direction::Up,
@@ -2946,7 +2943,6 @@ mod tests {
         let mut e = ErosionState::new(
             now_ms,
             Decimal::new(48, 2),
-            Decimal::new(100, 0),
             ProfitTier::High,
             ProfitTier::High.target_pct(),
             Direction::Up,
@@ -3219,7 +3215,6 @@ mod tests {
             .as_ref()
             .expect("erosion should be initialized");
         assert_eq!(erosion.leg1_fill_price, Decimal::new(50, 2));
-        assert_eq!(erosion.leg1_fill_size, Decimal::new(100, 0));
         assert_eq!(erosion.leg1_fill_ms, now_ms);
         assert!(erosion.confidence > Decimal::ZERO);
     }

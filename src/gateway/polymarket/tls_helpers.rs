@@ -10,7 +10,6 @@ use hyper::header::{CONNECTION, UPGRADE};
 use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use rustls::ClientConfig as TlsClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -64,14 +63,7 @@ pub(super) async fn tls_connect(url: &str) -> Result<WebSocket<TokioIo<Upgraded>
     Ok(ws)
 }
 
-/// Build a standard `rustls::ClientConfig` with the system CA roots.
-pub(super) fn build_tls_config() -> Result<TlsClientConfig> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Ok(TlsClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
-}
+use crate::utils::tls::build_tls_config;
 
 // ─── HTTP helpers (for REST calls) ────────────────────────────────────────────
 
@@ -136,18 +128,4 @@ pub(super) async fn http_get(url: &str) -> Result<Vec<u8>> {
     Ok(body.to_vec())
 }
 
-// ─── fastwebsockets executor adapter ─────────────────────────────────────────
-
-/// Minimal hyper executor that spawns futures onto the current tokio runtime.
-/// Required by `fastwebsockets::handshake::client`.
-pub(super) struct SpawnExecutor;
-
-impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
-where
-    Fut: std::future::Future + Send + 'static,
-    Fut::Output: Send + 'static,
-{
-    fn execute(&self, fut: Fut) {
-        tokio::task::spawn(fut);
-    }
-}
+use crate::utils::tls::SpawnExecutor;

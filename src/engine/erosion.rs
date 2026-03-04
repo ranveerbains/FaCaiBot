@@ -13,8 +13,8 @@ use crate::types::order::{ExitReason, ProfitTier};
 
 /// Triangle weights for 5 erosion steps: [5, 4, 3, 2, 1].
 /// Step 1 = 33.3% of margin, step 5 = 6.7%.
-const EROSION_WEIGHTS: [u32; 5] = [5, 4, 3, 2, 1];
-const EROSION_WEIGHT_SUM: u32 = 15;
+pub(crate) const EROSION_WEIGHTS: [u32; 5] = [5, 4, 3, 2, 1];
+pub(crate) const EROSION_WEIGHT_SUM: u32 = 15;
 
 /// Maximum number of erosion steps. After this, the cascade is exhausted.
 pub(crate) const MAX_EROSION_STEPS: u32 = EROSION_WEIGHTS.len() as u32;
@@ -28,8 +28,6 @@ pub(crate) struct ErosionState {
     pub initial_profit_target: Decimal,
     pub steps_applied: u32,
     pub leg1_fill_price: Decimal,
-    #[allow(dead_code)] // stored for QuestDB trade recording
-    pub leg1_fill_size: Decimal,
     pub tier: ProfitTier,
     pub direction: Direction,
     pub spike_info: SpikeInfo,
@@ -51,7 +49,6 @@ impl ErosionState {
     pub fn new(
         leg1_fill_ms: u64,
         leg1_fill_price: Decimal,
-        leg1_fill_size: Decimal,
         tier: ProfitTier,
         initial_profit_target: Decimal,
         direction: Direction,
@@ -64,7 +61,6 @@ impl ErosionState {
             initial_profit_target,
             steps_applied: 0,
             leg1_fill_price,
-            leg1_fill_size,
             tier,
             direction,
             spike_info,
@@ -174,7 +170,6 @@ mod tests {
         let mut e = ErosionState::new(
             0,
             Decimal::new(50, 2),
-            Decimal::new(100, 0),
             ProfitTier::High,
             Decimal::new(25, 3), // 0.025 initial profit target
             Direction::Up,
@@ -225,7 +220,6 @@ mod tests {
         let e = ErosionState::new(
             0,
             Decimal::new(50, 2),
-            Decimal::new(100, 0),
             ProfitTier::High,
             Decimal::new(25, 3),
             Direction::Up,

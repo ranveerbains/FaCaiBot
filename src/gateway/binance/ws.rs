@@ -38,7 +38,6 @@ use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -503,15 +502,7 @@ fn parse_sbe_best_bid_ask(body: &[u8], block_length: usize) -> Result<BinanceTic
     })
 }
 
-// ─── TLS configuration ──────────────────────────────────────────────────────
-
-fn build_tls_config() -> Result<ClientConfig> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Ok(ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
-}
+use crate::utils::tls::build_tls_config;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -523,21 +514,7 @@ pub(super) fn is_stale(event_ts_ms: u64, now_ms: u64, threshold_ms: u64) -> bool
 
 pub(super) use crate::utils::time::epoch_ms as now_epoch_ms;
 
-// ─── fastwebsockets executor adapter ─────────────────────────────────────────
-
-/// Minimal `hyper::rt::Executor` that spawns onto the current tokio runtime.
-/// Required by `fastwebsockets::handshake::client`.
-struct SpawnExecutor;
-
-impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
-where
-    Fut: std::future::Future + Send + 'static,
-    Fut::Output: Send + 'static,
-{
-    fn execute(&self, fut: Fut) {
-        tokio::task::spawn(fut);
-    }
-}
+use crate::utils::tls::SpawnExecutor;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

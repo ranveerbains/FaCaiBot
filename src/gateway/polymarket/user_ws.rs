@@ -250,33 +250,6 @@ pub(super) fn handle_user_message(json: &str, tx: &Sender<IngestorEvent>) -> Res
     Ok(())
 }
 
-/// Parse a `trade` event from the User WS into a `TradeStatusUpdate`.
-///
-/// Expected trade status strings (from CLOB): MATCHED, MINED, CONFIRMED,
-/// RETRYING, FAILED.
-///
-/// Note: No longer called in production — "trade" events are debug-logged only
-/// because their UUID trade IDs never match stored hex order hashes. Kept for
-/// tests.
-#[cfg(test)]
-pub(super) fn parse_trade_event(event: &serde_json::Value) -> Result<IngestorEvent> {
-    let order_id = event
-        .get("order_id")
-        .or_else(|| event.get("id"))
-        .and_then(|v| v.as_str())
-        .context("trade event missing order_id")?
-        .to_string();
-
-    let status_str = event
-        .get("status")
-        .and_then(|v| v.as_str())
-        .context("trade event missing status")?;
-
-    let status = parse_trade_status(status_str)?;
-
-    Ok(IngestorEvent::TradeStatusUpdate { order_id, status })
-}
-
 /// Map a CLOB status string to `TradeStatus`.
 pub(super) fn parse_trade_status(s: &str) -> Result<TradeStatus> {
     match s.to_uppercase().as_str() {
@@ -367,20 +340,4 @@ mod tests {
         assert_eq!(auth["passphrase"], "my-passphrase");
     }
 
-    #[test]
-    fn test_parse_trade_event() {
-        let json = serde_json::json!({
-            "event_type": "trade",
-            "order_id": "ord_abc123",
-            "status": "MATCHED"
-        });
-
-        match parse_trade_event(&json).expect("parse failed") {
-            IngestorEvent::TradeStatusUpdate { order_id, status } => {
-                assert_eq!(order_id, "ord_abc123");
-                assert_eq!(status, TradeStatus::Matched);
-            }
-            other => panic!("wrong variant: {:?}", other),
-        }
-    }
 }

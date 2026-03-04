@@ -27,8 +27,8 @@ pub(crate) fn opposite_side(side: Side) -> Side {
     }
 }
 
-/// Round a price to the nearest tick_size multiple.
-/// Same logic as `confidence.rs::round_to_tick()`.
+/// Rounds to nearest tick_size multiple. Note: confidence.rs::round_to_tick()
+/// uses floor rounding for order pricing.
 pub(crate) fn round_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     if tick.is_zero() {
         return price;

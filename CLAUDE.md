@@ -10,7 +10,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets
 cargo build              # Build (debug)
 cargo build --release    # Build (release — LTO, single codegen unit)
 cargo run                # Run the bot
-cargo test               # Run all tests (148 tests)
+cargo test               # Run all tests (147 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -97,7 +97,8 @@ src/
 │   └── simulation.rs              # SimulationState, SimPosition, SimTrade
 └── utils/
     ├── signing.rs                 # build_signer() helper (hex private key → PrivateKeySigner)
-    └── time.rs                    # epoch_ms() — single source of truth for millisecond timestamps
+    ├── time.rs                    # epoch_ms() — single source of truth for millisecond timestamps
+    └── tls.rs                     # Shared TLS config (build_tls_config) + SpawnExecutor for fastwebsockets
 ```
 
 ## Key Conventions

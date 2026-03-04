@@ -194,6 +194,7 @@ impl LiveExecutor {
     // ─── Leg 1: post-only GTC entry ────────────────────────────────────
 
     async fn handle_leg1(&mut self, signal: &TradeSignal) {
+        self.active_leg2_order_id = None; // New trade — clear any stale Leg 2 ID from previous trade
         info!(
             side = ?signal.side,
             token = %signal.token_id,
@@ -265,6 +266,7 @@ impl LiveExecutor {
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
                     self.orders_cancelled += 1;
+                    self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
                 }
                 Ok(false) => {
                     warn!(
@@ -452,6 +454,7 @@ impl LiveExecutor {
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
                     self.orders_cancelled += 1;
+                    self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
                 }
                 Ok(false) => {
                     warn!(
@@ -599,6 +602,7 @@ impl LiveExecutor {
             reason = ?exit_reason,
             "Leg 2 emergency: FOK exhausted max retries — sending OrderFailed"
         );
+        self.active_leg2_order_id = None; // All retries failed — clear stale ID
         let _ = self
             .feedback_tx
             .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -670,6 +674,7 @@ impl LiveExecutor {
             reason = ?exit_reason,
             "Leg 2 emergency: FOK at price exhausted max retries — sending OrderFailed"
         );
+        self.active_leg2_order_id = None; // All retries failed — clear stale ID
         let _ = self
             .feedback_tx
             .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });

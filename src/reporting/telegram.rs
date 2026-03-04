@@ -59,12 +59,8 @@ impl TelegramReporter {
     /// Panics if the TLS root certificate store cannot be built (should not
     /// happen with bundled webpki-roots).
     pub fn new(bot_token: String, chat_id: String) -> Self {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let tls_config = crate::utils::tls::build_tls_config()
+            .expect("failed to build TLS config");
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
         Self {
@@ -309,12 +305,8 @@ const TELEGRAM_PORT: u16 = 443;
 
 /// Build a TLS connector for Telegram API calls.
 pub(crate) fn build_tls_connector() -> TlsConnector {
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let tls_config = crate::utils::tls::build_tls_config()
+        .expect("failed to build TLS config");
     TlsConnector::from(Arc::new(tls_config))
 }
 

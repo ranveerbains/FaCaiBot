@@ -19,11 +19,7 @@ use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeI
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::{compute_confidence, round_to_tick};
-use super::erosion::{ErosionSnap, ErosionState};
-
-/// Triangle weights for erosion steps — mirrors `erosion.rs` constants.
-const EROSION_WEIGHTS: [u32; 5] = [5, 4, 3, 2, 1];
-const EROSION_WEIGHT_SUM: u32 = 15;
+use super::erosion::{EROSION_WEIGHTS, EROSION_WEIGHT_SUM, ErosionSnap, ErosionState};
 
 /// Cumulative erosion after `steps` steps, given `total_margin` (initial profit target).
 fn cumulative_erosion_for(total_margin: Decimal, steps: u32) -> Decimal {

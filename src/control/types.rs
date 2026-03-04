@@ -44,8 +44,6 @@ pub struct BotStatus {
     pub uptime_secs: u64,
     pub mode: String,
     pub current_market: Option<String>,
-    #[allow(dead_code)] // reserved for future /status display
-    pub market_end_ms: u64,
     pub leg1_state: String,
     pub leg2_state: String,
     pub spikes_received: u64,
@@ -63,7 +61,6 @@ impl Default for BotStatus {
             uptime_secs: 0,
             mode: "simulation".into(),
             current_market: None,
-            market_end_ms: 0,
             leg1_state: "None".into(),
             leg2_state: "None".into(),
             spikes_received: 0,
