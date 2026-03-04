@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -33,6 +34,8 @@ pub struct MarketInfo {
     pub no_token_id: String,
     /// Market expiry (epoch ms).
     pub end_timestamp_ms: u64,
+    /// Minimum tick size (price increment) from CLOB. Defaults to `0.01` on fetch failure.
+    pub tick_size: rust_decimal::Decimal,
 }
 
 /// Long-running market rotation manager.
@@ -95,13 +98,17 @@ pub(super) async fn run_market_rotation(
                         );
 
                         match discover_market_after(market.end_timestamp_ms).await {
-                            Ok(info) => {
+                            Ok(mut info) => {
                                 let next_remaining =
                                     info.end_timestamp_ms.saturating_sub(now_ms);
+
+                                // Fetch real tick_size from CLOB during pre-warm.
+                                info.tick_size = fetch_tick_size(&info.yes_token_id).await;
                                 info!(
                                     condition_id = %info.condition_id,
                                     end_ts_ms = info.end_timestamp_ms,
                                     remaining_secs = next_remaining / 1000,
+                                    tick_size = %info.tick_size,
                                     "pre-warmed next market discovered"
                                 );
 
@@ -217,6 +224,7 @@ fn emit_rotation_events(
         yes_token_id: info.yes_token_id.clone(),
         no_token_id: info.no_token_id.clone(),
         end_timestamp_ms: info.end_timestamp_ms,
+        tick_size: info.tick_size,
     };
 
     // MarketRotation is critical — use send() to block rather than drop.
@@ -252,7 +260,7 @@ pub(super) async fn poll_gamma_and_emit(
     current_market: &mut Option<MarketInfo>,
 ) {
     match discover_next_market().await {
-        Ok(info) => {
+        Ok(mut info) => {
             let now_ms = now_epoch_ms();
             let remaining_ms = info.end_timestamp_ms.saturating_sub(now_ms);
             info!(
@@ -261,6 +269,10 @@ pub(super) async fn poll_gamma_and_emit(
                 remaining_secs = remaining_ms / 1000,
                 "Gamma API: discovered next market"
             );
+
+            // Fetch real tick_size from CLOB before emitting rotation.
+            info.tick_size = fetch_tick_size(&info.yes_token_id).await;
+            info!(tick_size = %info.tick_size, "fetched tick_size from CLOB");
 
             // Emit rotation immediately for new markets that have time remaining.
             let already_emitted = last_emitted_condition_id
@@ -337,6 +349,44 @@ async fn discover_market_after(after_ms: u64) -> Result<MarketInfo> {
         std::str::from_utf8(&response_bytes).context("Gamma API response is not valid UTF-8")?;
 
     parse_gamma_events_response_after(body_str, after_ms)
+}
+
+/// Fetch the tick size for a token from the CLOB REST API.
+///
+/// `GET /tick-size?token_id={token_id}` — public endpoint, no auth required.
+/// Returns `minimum_tick_size` as a `Decimal`. Defaults to `0.01` on any failure.
+async fn fetch_tick_size(token_id: &str) -> Decimal {
+    let default = Decimal::new(1, 2); // 0.01
+    let url = format!("{CLOB_BASE_URL}/tick-size?token_id={token_id}");
+    let body = match http_get(&url).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "fetch_tick_size failed — defaulting to 0.01");
+            return default;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "fetch_tick_size JSON parse failed — defaulting to 0.01");
+            return default;
+        }
+    };
+    // Response: { "minimum_tick_size": 0.01 }
+    // The value can be a number or a string — handle both.
+    let tick_str = parsed
+        .get("minimum_tick_size")
+        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_f64().map(|f| f.to_string())));
+    match tick_str {
+        Some(s) => s.parse::<Decimal>().unwrap_or_else(|e| {
+            warn!(raw = %s, error = %e, "fetch_tick_size parse Decimal failed — defaulting to 0.01");
+            default
+        }),
+        None => {
+            warn!("fetch_tick_size: missing minimum_tick_size field — defaulting to 0.01");
+            default
+        }
+    }
 }
 
 /// Fetch the order book for a token via the CLOB REST API.
@@ -484,6 +534,7 @@ fn parse_gamma_events_response_after(body: &str, skip_before_ms: u64) -> Result<
                 yes_token_id: token_ids[0].clone(),
                 no_token_id: token_ids[1].clone(),
                 end_timestamp_ms: end_ms,
+                tick_size: Decimal::new(1, 2), // placeholder — overwritten by fetch_tick_size()
             };
 
             // Keep the soonest-expiring market.

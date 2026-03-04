@@ -207,6 +207,12 @@ pub enum ExecutorCommand {
     },
     /// Cancel a stale Leg 1 order that wasn't filled in time.
     CancelLeg1 { order_id: String },
+    /// Tick size changed mid-market — update SDK cache for both tokens.
+    TickSizeChanged {
+        yes_token_id: String,
+        no_token_id: String,
+        new_tick_size: Decimal,
+    },
 }
 
 // ─── Order Request ───────────────────────────────────────────────────────────

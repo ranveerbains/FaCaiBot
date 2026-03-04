@@ -138,6 +138,28 @@ impl LiveExecutor {
                         }
                     }
                 }
+                ExecutorCommand::TickSizeChanged {
+                    yes_token_id,
+                    no_token_id,
+                    new_tick_size,
+                } => {
+                    if let Some(sdk) = self.poly.sdk_client() {
+                        use polymarket_client_sdk::clob::types::TickSize;
+                        match TickSize::try_from(new_tick_size) {
+                            Ok(tick) => {
+                                for token_id_str in [&yes_token_id, &no_token_id] {
+                                    if let Ok(id) = U256::from_str(token_id_str) {
+                                        sdk.set_tick_size(id, tick);
+                                    }
+                                }
+                                info!(%new_tick_size, "SDK tick_size cache updated for both tokens");
+                            }
+                            Err(e) => {
+                                warn!(%new_tick_size, error = %e, "failed to convert Decimal to TickSize — SDK cache NOT updated");
+                            }
+                        }
+                    }
+                }
             }
             self.check_diagnostic();
         }

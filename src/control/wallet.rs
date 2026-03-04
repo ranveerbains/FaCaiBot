@@ -171,7 +171,7 @@ async fn polybalance_inner() -> Result<String> {
         .unwrap_or(0.0);
 
     Ok(format!(
-        "Wallet: {addr}\nPositions: {count}\nTotal value: ${value:.2}",
+        "Wallet: {addr}\nPositions: {count}\nMarket value: ${value:.2}",
         addr = address,
         count = position_count,
         value = total_value,

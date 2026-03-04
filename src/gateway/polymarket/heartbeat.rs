@@ -108,11 +108,14 @@ pub(super) async fn run_heartbeat(
             }
             Err(e) => {
                 consecutive_failures += 1;
-                // Reset heartbeat_id on error — server will issue a new session.
-                heartbeat_id = None;
+
+                // The CLOB returns the correct heartbeat_id in the 400 body.
+                // Extract it for immediate recovery instead of waiting for session expiry.
+                heartbeat_id = extract_heartbeat_id_from_error(&e);
 
                 warn!(
                     error = %e,
+                    recovered_id = ?heartbeat_id,
                     consecutive_failures,
                     "heartbeat failed"
                 );
@@ -134,6 +137,21 @@ pub(super) async fn run_heartbeat(
             }
         }
     }
+}
+
+/// Extract `heartbeat_id` from a CLOB 400 error response body.
+///
+/// When the CLOB rejects a heartbeat with "Invalid Heartbeat ID", the 400 response
+/// body contains the correct `heartbeat_id` to use:
+/// `{"error":"Invalid Heartbeat ID","heartbeat_id":"<uuid>"}`
+///
+/// The SDK wraps this body in its `Status` error type's `message` field.
+fn extract_heartbeat_id_from_error(e: &impl std::fmt::Display) -> Option<Uuid> {
+    let msg = e.to_string();
+    let json_start = msg.rfind('{')?;
+    let parsed: serde_json::Value = serde_json::from_str(&msg[json_start..]).ok()?;
+    let id_str = parsed.get("heartbeat_id")?.as_str()?;
+    id_str.parse().ok()
 }
 
 // ─── Matching engine restart guard ───────────────────────────────────────────

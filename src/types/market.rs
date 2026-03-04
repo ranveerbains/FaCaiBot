@@ -368,6 +368,7 @@ pub enum IngestorEvent {
         yes_token_id: String,
         no_token_id: String,
         end_timestamp_ms: u64,
+        tick_size: Decimal,
     },
 
     /// Result of a heartbeat POST to the CLOB.

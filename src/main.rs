@@ -399,11 +399,7 @@ async fn async_main() -> Result<()> {
                 ..
             } = event
             {
-                Some((
-                    condition_id.clone(),
-                    yes_token_id.clone(),
-                    no_token_id.clone(),
-                ))
+                Some((condition_id.clone(), yes_token_id.clone(), no_token_id.clone()))
             } else {
                 None
             };
@@ -527,6 +523,13 @@ async fn async_main() -> Result<()> {
                 && let Err(e) = executor_tx.send(cancel_cmd)
             {
                 error!(error = %e, "failed to send spike cancel to executor");
+            }
+
+            // Drain tick size change (forward to executor to update SDK cache).
+            if let Some(tick_cmd) = engine.take_tick_size_change()
+                && let Err(e) = executor_tx.send(tick_cmd)
+            {
+                error!(error = %e, "failed to send tick size change to executor");
             }
 
             // Check for stale Leg 1 orders (applies in both sim and live modes).

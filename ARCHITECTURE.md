@@ -545,6 +545,7 @@ Minimum allocation is $1 regardless of tier. `max_alloc_per_trade` is the sole c
   - `discover_market_after(current_end_ms)` queries Gamma for markets ending **after** the current one, skipping the still-active Market A to find Market B
   - Pre-fetches YES and NO order books for Market B via REST
   - Caches `MarketInfo` + books in memory, ready for instant switch
+- **Tick size fetch**: After Gamma discovery (both poll and prewarm paths), `fetch_tick_size()` calls `GET /tick-size?token_id={yes_id}` to get the real CLOB tick size. Defaults to `0.01` on failure. The value is included in `IngestorEvent::MarketRotation { tick_size }` and the engine sets `state.tick_size` from it. Mid-market tick_size changes (price >0.96 or <0.04) are handled separately by the `tick_size_change` WS event
 - **Instant switch on expiry**: When `remaining_ms == 0`, emits the pre-warmed `MarketRotation` + book events immediately (zero gap). Market WS resubscribes to new token IDs in parallel
 - **Fallback**: If pre-warming failed (Market B not yet on Gamma, REST error, etc.), falls back to immediate Gamma poll within 5s of expiry
 - **`MarketRotation`** uses blocking `send()` (not `try_send()`) to guarantee delivery. Book events use `try_send()` (expendable — WS will provide updates)

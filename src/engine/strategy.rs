@@ -137,6 +137,10 @@ pub struct StrategyEngine {
     /// Drained by main loop after on_event().
     pending_spike_cancel: Option<ExecutorCommand>,
 
+    /// Tick size change command to forward to executor (SDK cache update).
+    /// Drained by main loop after on_event().
+    pending_tick_size_cmd: Option<ExecutorCommand>,
+
     /// Gates sim Leg 1 fills until `SpikeConfirmed` clears it.
     /// Set `true` on `SpikeCandidate`, cleared on `SpikeConfirmed` or `SpikeFailed`.
     speculative_awaiting_sustain: bool,
@@ -265,6 +269,7 @@ impl StrategyEngine {
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
             pending_spike_cancel: None,
+            pending_tick_size_cmd: None,
             speculative_awaiting_sustain: false,
             hedge_book_changed: false,
             last_spike_diag: None,
@@ -546,8 +551,24 @@ impl StrategyEngine {
                 old_tick_size,
                 new_tick_size,
             } => {
-                info!(%asset_id, %old_tick_size, %new_tick_size, "tick size changed");
-                self.state.tick_size = new_tick_size;
+                let matches_active = self.state.active_yes_token_id.as_deref() == Some(&asset_id)
+                    || self.state.active_no_token_id.as_deref() == Some(&asset_id);
+                if matches_active {
+                    info!(%asset_id, %old_tick_size, %new_tick_size, "tick size changed — updating engine + SDK cache");
+                    self.state.tick_size = new_tick_size;
+                    if let (Some(yes_id), Some(no_id)) = (
+                        self.state.active_yes_token_id.clone(),
+                        self.state.active_no_token_id.clone(),
+                    ) {
+                        self.pending_tick_size_cmd = Some(ExecutorCommand::TickSizeChanged {
+                            yes_token_id: yes_id,
+                            no_token_id: no_id,
+                            new_tick_size,
+                        });
+                    }
+                } else {
+                    info!(%asset_id, %old_tick_size, %new_tick_size, "tick size changed for non-active asset — ignored");
+                }
                 self.state.last_update_ms = now_ms;
             }
 
@@ -672,8 +693,9 @@ impl StrategyEngine {
                 yes_token_id,
                 no_token_id,
                 end_timestamp_ms,
+                tick_size,
             } => {
-                info!(%condition_id, %yes_token_id, %no_token_id, end_timestamp_ms, "market rotated");
+                info!(%condition_id, %yes_token_id, %no_token_id, end_timestamp_ms, %tick_size, "market rotated");
 
                 // ── Rotation emergency: protect open Leg 1 positions ─────
                 // If Leg 1 is filled but Leg 2 hasn't completed, build an
@@ -736,6 +758,7 @@ impl StrategyEngine {
                 self.state.active_yes_token_id = Some(yes_token_id);
                 self.state.active_no_token_id = Some(no_token_id);
                 self.state.market_end_timestamp_ms = end_timestamp_ms;
+                self.state.tick_size = tick_size;
                 self.state.poly_book = None;
                 self.state.poly_yes_book = None;
                 self.state.poly_no_book = None;
@@ -751,6 +774,7 @@ impl StrategyEngine {
                 self.leg1_direction = None;
                 self.pending_leg1_signal = None;
                 self.pending_spike_cancel = None;
+                self.pending_tick_size_cmd = None;
                 self.speculative_awaiting_sustain = false;
                 self.cancel_leg1_on_feedback = false;
                 self.cancelled_leg1_info = None;
@@ -1211,6 +1235,12 @@ impl StrategyEngine {
     /// Called by the main loop after `on_event()` to send `CancelLeg1` to the executor.
     pub fn take_spike_cancel(&mut self) -> Option<ExecutorCommand> {
         self.pending_spike_cancel.take()
+    }
+
+    /// Take the pending tick size change command (if any).
+    /// Called by the main loop after `on_event()` to forward to the executor.
+    pub fn take_tick_size_change(&mut self) -> Option<ExecutorCommand> {
+        self.pending_tick_size_cmd.take()
     }
 
     // ─── Rotation emergency drain ─────────────────────────────────────
@@ -1823,6 +1853,7 @@ impl StrategyEngine {
         self.leg1_direction = None;
         self.pending_leg1_signal = None;
         self.pending_spike_cancel = None;
+        self.pending_tick_size_cmd = None;
         self.speculative_awaiting_sustain = false;
         self.cancel_leg1_on_feedback = false;
         self.cancelled_leg1_info = None;
@@ -2629,6 +2660,7 @@ mod tests {
             yes_token_id: "yes".to_string(),
             no_token_id: "no".to_string(),
             end_timestamp_ms: now_epoch_ms() + secs_remaining * 1_000,
+            tick_size: Decimal::new(1, 2),
         });
         engine.state.available_capital = TEST_FIXED_ALLOC;
         engine
@@ -2679,6 +2711,7 @@ mod tests {
             yes_token_id: "new_yes".to_string(),
             no_token_id: "new_no".to_string(),
             end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 2),
         });
         assert_eq!(engine.state.cumulative_used, Decimal::ZERO);
         assert!(!engine.state.spike_detected);
@@ -2689,18 +2722,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_market_rotation_sets_tick_size() {
+        let mut engine = make_engine_with_market(600);
+        // Default from make_engine_with_market is 0.01.
+        assert_eq!(engine.state.tick_size, Decimal::new(1, 2));
+
+        // Rotate with a different tick_size.
+        engine.on_event(IngestorEvent::MarketRotation {
+            condition_id: "new_cond".to_string(),
+            yes_token_id: "new_yes".to_string(),
+            no_token_id: "new_no".to_string(),
+            end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 3), // 0.001
+        });
+        assert_eq!(
+            engine.state.tick_size,
+            Decimal::new(1, 3),
+            "tick_size should be set from MarketRotation event"
+        );
+    }
+
     // ── on_event: TickSizeChange ──────────────────────────────────────────
 
     #[test]
-    fn test_tick_size_change_updates() {
+    fn test_tick_size_change_updates_active_asset() {
         let mut engine = StrategyEngine::new(&Config::test_defaults());
+        // Set active tokens so the asset_id filter matches.
+        engine.state.active_yes_token_id = Some("yes_tok".to_string());
+        engine.state.active_no_token_id = Some("no_tok".to_string());
+
         let new_tick = Decimal::new(1, 3);
         engine.on_event(IngestorEvent::PolymarketTickSizeChange {
-            asset_id: "tok".to_string(),
+            asset_id: "yes_tok".to_string(),
             old_tick_size: Decimal::new(1, 2),
             new_tick_size: new_tick,
         });
         assert_eq!(engine.state.tick_size, new_tick);
+        // Should produce a pending tick_size command for the executor.
+        let cmd = engine.take_tick_size_change();
+        assert!(cmd.is_some());
+        match cmd.unwrap() {
+            ExecutorCommand::TickSizeChanged {
+                yes_token_id,
+                no_token_id,
+                new_tick_size: ts,
+            } => {
+                assert_eq!(yes_token_id, "yes_tok");
+                assert_eq!(no_token_id, "no_tok");
+                assert_eq!(ts, new_tick);
+            }
+            _ => panic!("expected TickSizeChanged"),
+        }
+    }
+
+    #[test]
+    fn test_tick_size_change_ignores_non_active_asset() {
+        let mut engine = StrategyEngine::new(&Config::test_defaults());
+        engine.state.active_yes_token_id = Some("yes_tok".to_string());
+        engine.state.active_no_token_id = Some("no_tok".to_string());
+        let old_tick = engine.state.tick_size;
+
+        engine.on_event(IngestorEvent::PolymarketTickSizeChange {
+            asset_id: "other_tok".to_string(),
+            old_tick_size: Decimal::new(1, 2),
+            new_tick_size: Decimal::new(1, 3),
+        });
+        // tick_size should NOT change.
+        assert_eq!(engine.state.tick_size, old_tick);
+        // No pending command.
+        assert!(engine.take_tick_size_change().is_none());
     }
 
     // ── on_event: BinanceTick (normal) ────────────────────────────────────
@@ -3180,6 +3271,7 @@ mod tests {
             yes_token_id: "new_yes".to_string(),
             no_token_id: "new_no".to_string(),
             end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 2),
         });
 
         let emergencies = engine.take_rotation_emergencies();
@@ -3217,6 +3309,7 @@ mod tests {
             yes_token_id: "new_yes".to_string(),
             no_token_id: "new_no".to_string(),
             end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 2),
         });
 
         let emergencies = engine.take_rotation_emergencies();
@@ -3267,6 +3360,7 @@ mod tests {
             yes_token_id: "new_yes".to_string(),
             no_token_id: "new_no".to_string(),
             end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 2),
         });
 
         let emergencies = engine.take_rotation_emergencies();
@@ -3291,6 +3385,7 @@ mod tests {
             yes_token_id: "new_yes".to_string(),
             no_token_id: "new_no".to_string(),
             end_timestamp_ms: now_epoch_ms() + 900_000,
+            tick_size: Decimal::new(1, 2),
         });
 
         let emergencies = engine.take_rotation_emergencies();

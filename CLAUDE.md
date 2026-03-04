@@ -10,7 +10,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets
 cargo build              # Build (debug)
 cargo build --release    # Build (release — LTO, single codegen unit)
 cargo run                # Run the bot
-cargo test               # Run all tests (146 tests)
+cargo test               # Run all tests (148 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -117,6 +117,7 @@ src/
 - **User WS fill detection (live)**: The Polymarket User WS sends two event types for fills: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `IngestorEvent::TradeStatusUpdate` — their hex hash matches the format stored by the engine from `ExecutorFeedback::OrderPosted`. `"trade"` UUIDs never match any stored order ID and are harmlessly ignored. Actionable statuses (MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED) are forwarded via `parse_trade_status()`; non-actionable statuses (LIVE, etc.) are silently skipped. This covers all order types: Leg 1 entry, Leg 2 erosion, Leg 2 emergency, and Leg 2 favorable exits
 - **Fire-and-confirm cancels**: All cancel operations return `Result<bool>` from the CLOB. The executor sends `CancelResult { was_cancelled, is_leg2 }` feedback to the engine. If the cancel was NOT confirmed (order may have filled before the cancel reached the CLOB), the engine restores the order's Posted state from saved info (`cancelled_leg1_info` / `prev_leg2_order`) so User WS MATCHED events can still match. For Leg 2 erosion/emergency, the executor also skips posting the replacement order when the cancel is not confirmed. Unmatched `TradeStatusUpdate` events are buffered (up to 8) and replayed when state changes (OrderPosted, CancelResult) make them matchable
 - **Provisional order ID race safety**: Speculative posting creates a provisional `"sim-leg1-{ts}"` ID. If `SpikeFailed` or staleness fires before the real CLOB ID arrives, a `cancel_leg1_on_feedback` flag defers the cancel until `on_order_posted()` receives the real ID — preventing ghost orders and invalid CLOB cancel requests
+- **Tick size sync**: At rotation, `rotation.rs` fetches `GET /tick-size?token_id={yes_id}` from the CLOB and includes it in `IngestorEvent::MarketRotation { tick_size }`. The engine sets `state.tick_size` from this value. Mid-market changes are handled by `tick_size_change` WS events. Default `0.01` on fetch failure
 - **SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size()`, `sdk.neg_risk()`, and `sdk.fee_rate_bps()` for both tokens — populating the SDK's `DashMap` caches with real CLOB values. `caches_warm: bool` gates all order placement: if any fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation. Eliminates the ~150ms first-order latency penalty from auto-fetch while guaranteeing correctness (no hardcoded values)
 - **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions

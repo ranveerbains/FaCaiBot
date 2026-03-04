@@ -258,6 +258,10 @@ impl SimulationExecutor {
                     ExecutorCommand::CancelLeg1 { order_id } => {
                         debug!(%order_id, "SimExecutor: Leg 1 cancel (handled by engine)");
                     }
+                    ExecutorCommand::TickSizeChanged { new_tick_size, .. } => {
+                        self.tick_size = new_tick_size;
+                        debug!(%new_tick_size, "SimExecutor: tick_size updated");
+                    }
                 }
 
                 // 60-second session diagnostic (cumulative, same source as Telegram).
