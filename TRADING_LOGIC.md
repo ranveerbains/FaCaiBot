@@ -594,6 +594,21 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 
 **Safety:** Two-layer defense: Layer A (engine) prevents most stacking; Layer B (executor) prevents damage from any that slip through.
 
+### Stale Leg 2 command contamination (live)
+
+**Scenario:** While the executor processes a favorable exit (3 sequential HTTP calls, ~3.6s total), the engine's erosion timer fires and queues a SECOND erosion command. Trade 1 completes and resets. The stale command executes, fills, and `on_order_posted()` blindly sets `leg2_state = Filled` with stale data. When Trade 2's Leg 1 fills, both legs appear Filled → wrong trade completion with mismatched sizes.
+
+**Handle:** Three-layer defense:
+- **Layer A (root cause):** `leg2_command_pending` flag gates `evaluate_leg2()` while ANY Leg 2 command is in the executor pipeline. Set on dispatch (live mode only), cleared on any Leg 2 feedback (OrderPosted, OrderFailed, CancelResult). Prevents new erosion/emergency commands from queuing during multi-step executor operations.
+- **Layer B (stale feedback guard):** `on_order_posted()` and `on_order_failed()` check if `leg1_state` is `Filled` before processing Leg 2 feedback. If the trade has already been reset (leg1 is `None`), the feedback is silently discarded with a warning log.
+- **Layer C (executor):** `active_leg2_order_id = None` on filled FOK prevents stale cancel of already-filled orders.
+
+### Balance exhaustion (live)
+
+**Scenario:** "Not enough balance / allowance" errors during Leg 2 placement cause the executor to burn 30+ futile FOK retries across erosion steps and emergency rounds.
+
+**Handle:** `balance_exhausted` flag on `LiveExecutor`. Set on first "balance"/"allowance" error during Leg 2 erosion placement. All subsequent Leg 2 commands (erosion, emergency) immediately return `OrderFailed` without calling CLOB. Cleared on `MarketRotation`. FOK retry loops also abort immediately on "balance"/"allowance" errors (added to non-transient error list alongside "decimal places" and "Validation"). Executor sends `BalanceExhausted` feedback → engine fires `fire_critical()` Telegram alert with Leg 1 position details.
+
 ### Spike during existing trade
 
 The `ActiveTrade` guard rejects the spike, incrementing `rej_busy`. The spike is consumed (cleared) and cannot be re-evaluated. The diagnostic counter tracks how many valid-book spikes were lost to executor busyness, informing parameter tuning.

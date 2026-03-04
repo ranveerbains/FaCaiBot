@@ -64,6 +64,11 @@ pub struct LiveExecutor {
     /// Current active Leg 2 order ID on the CLOB. `None` if no Leg 2 posted.
     active_leg2_order_id: Option<String>,
 
+    /// Set `true` when a "not enough balance" / "allowance" error is detected
+    /// during Leg 2 placement. All subsequent Leg 2 commands are immediately
+    /// rejected with `OrderFailed` until cleared on `MarketRotation`.
+    balance_exhausted: bool,
+
     // ── Diagnostics (cumulative, logged every 60s) ──────────────────
     orders_placed: u64,
     orders_cancelled: u64,
@@ -88,6 +93,7 @@ impl LiveExecutor {
             cold,
             caches_warm: false,
             active_leg2_order_id: None,
+            balance_exhausted: false,
             orders_placed: 0,
             orders_cancelled: 0,
             orders_failed: 0,
@@ -184,6 +190,11 @@ impl LiveExecutor {
 
         if !signal.is_leg2 {
             self.handle_leg1(&signal).await;
+        } else if self.balance_exhausted {
+            warn!("Leg 2 signal REJECTED — balance exhausted, waiting for rotation");
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
         } else if signal.exit_reason.is_some() {
             self.handle_leg2_emergency(&signal).await;
         } else {
@@ -340,6 +351,15 @@ impl LiveExecutor {
                     error!(error = %e, "Leg 2 erosion: order placement FAILED");
                     self.orders_failed += 1;
                     self.active_leg2_order_id = None;
+
+                    // Detect balance errors — stop all Leg 2 attempts until rotation
+                    if err_msg.contains("balance") || err_msg.contains("allowance") {
+                        error!("Leg 2: insufficient balance — halting all attempts until rotation");
+                        self.balance_exhausted = true;
+                        let _ = self
+                            .feedback_tx
+                            .try_send(ExecutorFeedback::BalanceExhausted);
+                    }
 
                     let _ = self
                         .feedback_tx
@@ -649,7 +669,11 @@ impl LiveExecutor {
                 Err(e) => {
                     let err_msg = e.to_string();
                     self.orders_failed += 1;
-                    if err_msg.contains("decimal places") || err_msg.contains("Validation") {
+                    if err_msg.contains("decimal places")
+                        || err_msg.contains("Validation")
+                        || err_msg.contains("balance")
+                        || err_msg.contains("allowance")
+                    {
                         error!(error = %e, "FOK non-transient error — aborting retries");
                         break;
                     }
@@ -741,7 +765,11 @@ impl LiveExecutor {
                 Err(e) => {
                     let err_msg = e.to_string();
                     self.orders_failed += 1;
-                    if err_msg.contains("decimal places") || err_msg.contains("Validation") {
+                    if err_msg.contains("decimal places")
+                        || err_msg.contains("Validation")
+                        || err_msg.contains("balance")
+                        || err_msg.contains("allowance")
+                    {
                         error!(error = %e, "FOK at price non-transient error — aborting retries");
                         break;
                     }
@@ -781,6 +809,7 @@ impl LiveExecutor {
         }
 
         self.active_leg2_order_id = None;
+        self.balance_exhausted = false;
 
         // Reset warm flag — block trading until pre-warm succeeds.
         self.caches_warm = false;

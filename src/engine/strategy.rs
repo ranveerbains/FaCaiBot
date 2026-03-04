@@ -170,6 +170,12 @@ pub struct StrategyEngine {
     /// Gates `evaluate_leg2()` to prevent signal stacking in the executor channel.
     emergency_signal_in_flight: bool,
 
+    /// Set `true` when ANY Leg 2 command is dispatched to the executor (erosion or emergency).
+    /// Cleared on ANY Leg 2 feedback (OrderPosted, OrderFailed, CancelResult for leg2).
+    /// Prevents stale erosion commands from queuing while the executor is still processing
+    /// a previous Leg 2 command (e.g., favorable exit takes ~3.6s for 3 HTTP calls).
+    leg2_command_pending: bool,
+
     /// Latest spike detector diagnostics (received via `SpikeDiagnostic` event).
     last_spike_diag: Option<SpikeDiagData>,
 
@@ -299,6 +305,7 @@ impl StrategyEngine {
             speculative_awaiting_sustain: false,
             hedge_book_changed: false,
             emergency_signal_in_flight: false,
+            leg2_command_pending: false,
             last_spike_diag: None,
             last_live_diag: None,
             engine_diag_ready: false,
@@ -829,6 +836,7 @@ impl StrategyEngine {
                 self.pending_tick_size_cmd = None;
                 self.speculative_awaiting_sustain = false;
                 self.emergency_signal_in_flight = false;
+                self.leg2_command_pending = false;
                 self.cancel_leg1_on_feedback = false;
                 self.cancelled_leg1_info = None;
                 self.prev_leg2_order = None;
@@ -1185,6 +1193,9 @@ impl StrategyEngine {
         if self.emergency_signal_in_flight {
             return None;
         }
+        if self.leg2_command_pending {
+            return None;
+        }
         let now_ms = now_epoch_ms();
 
         // During emergency exit, only Polymarket book changes matter for
@@ -1316,6 +1327,9 @@ impl StrategyEngine {
             }
             self.last_erosion_signal_ms = now_ms;
             self.emergency_signal_in_flight = true;
+            if self.reporter.is_some() {
+                self.leg2_command_pending = true;
+            }
             self.state.leg2_state = OrderState::Posted {
                 order_id: format!("sim-leg2-emergency-{}", now_ms),
                 price,
@@ -1335,6 +1349,9 @@ impl StrategyEngine {
                 }
             }
             self.last_erosion_signal_ms = now_ms;
+            if self.reporter.is_some() {
+                self.leg2_command_pending = true;
+            }
             self.state.leg2_state = OrderState::Posted {
                 order_id: format!("sim-leg2-erosion-{}", now_ms),
                 price,
@@ -1629,9 +1646,20 @@ impl StrategyEngine {
             // leg1_state stays None — do NOT resurrect.
         }
 
+        // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
+        // has been reset (e.g., stale erosion command processed after trade completed).
+        if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
+            warn!(%order_id, %price, %size,
+                "ignoring stale Leg 2 OrderPosted — no active Leg 1 fill");
+            self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
+            return None;
+        }
+
         let now_ms = now_epoch_ms();
         if is_leg2 {
             self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
 
             // Bug 1 fix: executor-initiated favorable exits set live_trade_meta
             // so Telegram shows the correct tag.
@@ -1687,13 +1715,43 @@ impl StrategyEngine {
             info!("deferred cancel: order placement failed — flag cleared (no cancel needed)");
             return;
         }
+        // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
+        // has been reset (e.g., stale erosion command processed after trade completed).
+        if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
+            warn!(is_leg2, "ignoring stale Leg 2 OrderFailed — no active Leg 1 fill");
+            self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
+            return;
+        }
         if is_leg2 {
             self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
             self.state.leg2_state = OrderState::None;
         } else {
             self.state.leg1_state = OrderState::None;
         }
         warn!(is_leg2, "order placement failed — leg state reset to None");
+    }
+
+    /// Called when the executor detects "not enough balance / allowance" on a Leg 2
+    /// placement. Sends a critical Telegram alert with position details so the
+    /// operator knows the position is stuck.
+    pub fn on_balance_exhausted(&mut self) {
+        if let Some(ref reporter) = self.reporter {
+            let dir = match self.leg1_direction {
+                Some(Direction::Up) => "YES",
+                Some(Direction::Down) => "NO",
+                None => "?",
+            };
+            let (price, size) = match &self.state.leg1_state {
+                OrderState::Filled { price, size, .. } => (price.to_string(), size.to_string()),
+                _ => ("?".into(), "?".into()),
+            };
+            reporter.fire_critical(format!(
+                "BALANCE EXHAUSTED\nLeg 1: {} @ {} ({})\nLeg 2: HALTED — insufficient balance/allowance\nWaiting for rotation",
+                dir, price, size,
+            ));
+        }
     }
 
     /// Called when a `CancelResult` feedback arrives from the executor.
@@ -1702,6 +1760,7 @@ impl StrategyEngine {
     pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool) {
         if is_leg2 {
             self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
         }
         if was_cancelled {
             if is_leg2 {
@@ -2065,6 +2124,7 @@ impl StrategyEngine {
         self.pending_tick_size_cmd = None;
         self.speculative_awaiting_sustain = false;
         self.emergency_signal_in_flight = false;
+        self.leg2_command_pending = false;
         self.cancel_leg1_on_feedback = false;
         self.cancelled_leg1_info = None;
         self.prev_leg2_order = None;

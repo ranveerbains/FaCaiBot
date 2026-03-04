@@ -276,6 +276,9 @@ async fn async_main() -> Result<()> {
                     } => {
                         engine.on_cancel_result(order_id, was_cancelled, is_leg2);
                     }
+                    ExecutorFeedback::BalanceExhausted => {
+                        engine.on_balance_exhausted();
+                    }
                     ExecutorFeedback::DiagSnapshot {
                         placed,
                         cancelled,

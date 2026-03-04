@@ -353,6 +353,10 @@ pub enum ExecutorFeedback {
         was_cancelled: bool,
         is_leg2: bool,
     },
+    /// Leg 2 placement failed due to insufficient balance/allowance.
+    /// Executor halts further Leg 2 attempts until rotation. Engine sends
+    /// a critical Telegram alert with position details.
+    BalanceExhausted,
     /// Periodic diagnostic snapshot from the live executor (sent every 60s).
     /// Forwarded to the engine so it can be included in the Telegram diagnostic.
     DiagSnapshot {
