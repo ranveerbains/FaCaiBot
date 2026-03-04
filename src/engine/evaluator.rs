@@ -482,12 +482,13 @@ impl Leg2Evaluator {
                     OrderState::Filled { size, .. } => *size,
                     _ => return None,
                 };
-                warn!(%best_ask, ?exit_reason, elapsed_ms = elapsed,
+                let fok_price = round_to_tick(best_ask, tick);
+                warn!(%best_ask, %fok_price, ?exit_reason, elapsed_ms = elapsed,
                     "emergency deadline reached — FOK taker fallback");
                 let mut signal = make_leg2_signal(
                     &hedge_token_id,
                     state.active_condition_id.as_deref().unwrap_or(""),
-                    best_ask,
+                    fok_price,
                     leg1_size,
                     reference_price,
                     snap.confidence,
@@ -507,7 +508,7 @@ impl Leg2Evaluator {
                 signal.sim_was_taker = true;
                 return Some(Leg2Decision::Emergency {
                     signal,
-                    price: best_ask,
+                    price: fok_price,
                     size: leg1_size,
                 });
             }

@@ -151,6 +151,11 @@ pub struct StrategyEngine {
     /// (Binance ticks can't change the Polymarket book, so re-evaluation is pointless).
     hedge_book_changed: bool,
 
+    /// Set `true` when an emergency Leg 2 signal is dispatched to the executor.
+    /// Cleared on feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete).
+    /// Gates `evaluate_leg2()` to prevent signal stacking in the executor channel.
+    emergency_signal_in_flight: bool,
+
     /// Latest spike detector diagnostics (received via `SpikeDiagnostic` event).
     last_spike_diag: Option<SpikeDiagData>,
 
@@ -273,6 +278,7 @@ impl StrategyEngine {
             pending_tick_size_cmd: None,
             speculative_awaiting_sustain: false,
             hedge_book_changed: false,
+            emergency_signal_in_flight: false,
             last_spike_diag: None,
             last_live_diag: None,
             engine_diag_ready: false,
@@ -755,6 +761,29 @@ impl StrategyEngine {
                     }
                 }
 
+                // ── Telegram alert for abandoned positions ────────────────
+                if leg1_filled && !leg2_filled
+                    && let Some(ref reporter) = self.reporter
+                {
+                    let (l1_price, l1_size) = match &self.state.leg1_state {
+                        OrderState::Filled { price, size, .. } => (*price, *size),
+                        _ => (Decimal::ZERO, Decimal::ZERO),
+                    };
+                    let dir = match self.leg1_direction {
+                        Some(Direction::Up) => "YES",
+                        Some(Direction::Down) => "NO",
+                        None => "?",
+                    };
+                    let has_fok = !self.rotation_emergency_buffer.is_empty();
+                    reporter.fire_critical(format!(
+                        "ROTATION EMERGENCY\nOpen: {} @ {} ({})\nLeg 2: NOT FILLED\nFOK: {}",
+                        dir,
+                        l1_price,
+                        l1_size,
+                        if has_fok { "SUBMITTED" } else { "COULD NOT BUILD" },
+                    ));
+                }
+
                 // ── Reset all state for the new market ───────────────────
                 self.state.active_condition_id = Some(condition_id);
                 self.state.active_yes_token_id = Some(yes_token_id);
@@ -778,6 +807,7 @@ impl StrategyEngine {
                 self.pending_spike_cancel = None;
                 self.pending_tick_size_cmd = None;
                 self.speculative_awaiting_sustain = false;
+                self.emergency_signal_in_flight = false;
                 self.cancel_leg1_on_feedback = false;
                 self.cancelled_leg1_info = None;
                 self.prev_leg2_order = None;
@@ -1074,6 +1104,9 @@ impl StrategyEngine {
     /// - On erosion: advances `erosion.steps_applied` if interval elapsed,
     ///   updates `last_erosion_signal_ms`
     pub fn evaluate_leg2(&mut self) -> Option<TradeSignal> {
+        if self.emergency_signal_in_flight {
+            return None;
+        }
         let now_ms = now_epoch_ms();
 
         // During emergency exit, only Polymarket book changes matter for
@@ -1201,6 +1234,7 @@ impl StrategyEngine {
                 }
             }
             self.last_erosion_signal_ms = now_ms;
+            self.emergency_signal_in_flight = true;
             self.state.leg2_state = OrderState::Posted {
                 order_id: format!("sim-leg2-emergency-{}", now_ms),
                 price,
@@ -1513,6 +1547,9 @@ impl StrategyEngine {
         }
 
         let now_ms = now_epoch_ms();
+        if is_leg2 {
+            self.emergency_signal_in_flight = false;
+        }
         let leg = if is_leg2 {
             &mut self.state.leg2_state
         } else {
@@ -1538,6 +1575,7 @@ impl StrategyEngine {
             return;
         }
         if is_leg2 {
+            self.emergency_signal_in_flight = false;
             self.state.leg2_state = OrderState::None;
         } else {
             self.state.leg1_state = OrderState::None;
@@ -1549,6 +1587,9 @@ impl StrategyEngine {
     /// If the cancel was confirmed, clears saved info. If NOT confirmed (order
     /// may have filled), restores the Posted state so User WS events can match.
     pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool) {
+        if is_leg2 {
+            self.emergency_signal_in_flight = false;
+        }
         if was_cancelled {
             if is_leg2 {
                 self.prev_leg2_order = None;
@@ -1861,6 +1902,7 @@ impl StrategyEngine {
         self.pending_spike_cancel = None;
         self.pending_tick_size_cmd = None;
         self.speculative_awaiting_sustain = false;
+        self.emergency_signal_in_flight = false;
         self.cancel_leg1_on_feedback = false;
         self.cancelled_leg1_info = None;
         self.prev_leg2_order = None;

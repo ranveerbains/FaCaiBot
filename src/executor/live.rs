@@ -351,6 +351,15 @@ impl LiveExecutor {
         // Try aggressive post-only first — the ask has dropped, so posting
         // just below it should fill as maker with zero fee.
         let post_only_price = round_to_tick(signal.price - signal.tick_size, signal.tick_size);
+        if post_only_price * signal.size < Decimal::ONE {
+            warn!(%post_only_price, size = %signal.size, "below $1 minimum — skipping favorable exit");
+            self.orders_failed += 1;
+            self.active_leg2_order_id = None;
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
         let order = OrderRequest::aggressive_post_only(
             signal.token_id.clone(),
             signal.side,
@@ -394,6 +403,24 @@ impl LiveExecutor {
 
     async fn favorable_exit_fok_fallback(&mut self, signal: &TradeSignal) {
         let safe_size = clob_safe_fok_size(signal.price, signal.size);
+        if safe_size.is_zero() {
+            error!(price = %signal.price, size = %signal.size, "favorable FOK size zero — aborting");
+            self.orders_failed += 1;
+            self.active_leg2_order_id = None;
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
+        if signal.price * safe_size < Decimal::ONE {
+            warn!(price = %signal.price, size = %safe_size, "favorable FOK below $1 minimum — aborting");
+            self.orders_failed += 1;
+            self.active_leg2_order_id = None;
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
         let order = OrderRequest::emergency_fok(
             signal.token_id.clone(),
             signal.side,
@@ -417,7 +444,12 @@ impl LiveExecutor {
                         price = %signal.price,
                         "Leg 2 favorable exit: FOK fallback filled"
                     );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
+                    // Don't track filled FOKs — prevents stale cancel by next signal
+                    if resp.status == OrderStatus::Filled {
+                        self.active_leg2_order_id = None;
+                    } else {
+                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                    }
                     self.favorable_taker_fills += 1;
                     self.orders_placed += 1;
 
@@ -427,8 +459,6 @@ impl LiveExecutor {
                         price: signal.price,
                         size: signal.size,
                     });
-
-                    info!(price = %signal.price, size = %signal.size, "Leg 2 favorable exit: FOK fallback filled");
                 }
             }
             Err(e) => {
@@ -551,6 +581,15 @@ impl LiveExecutor {
         // per attempt is the natural rate limiter. Max retries prevent infinite
         // loops on non-transient errors (e.g., decimal precision violations).
         let safe_size = clob_safe_fok_size(signal.price, signal.size);
+        if safe_size.is_zero() {
+            error!(price = %signal.price, size = %signal.size, "FOK size zero — aborting");
+            self.orders_failed += 1;
+            self.active_leg2_order_id = None;
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
         for attempt in 1..=MAX_FOK_RETRIES {
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
@@ -578,7 +617,12 @@ impl LiveExecutor {
                         reason = ?exit_reason,
                         "Leg 2 emergency: FOK fallback placed"
                     );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
+                    // Don't track filled FOKs — prevents stale cancel by next signal
+                    if resp.status == OrderStatus::Filled {
+                        self.active_leg2_order_id = None;
+                    } else {
+                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                    }
                     self.emergency_foks += 1;
                     self.orders_placed += 1;
 
@@ -591,8 +635,13 @@ impl LiveExecutor {
                     return;
                 }
                 Err(e) => {
-                    error!(error = %e, attempt, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
+                    let err_msg = e.to_string();
                     self.orders_failed += 1;
+                    if err_msg.contains("decimal places") || err_msg.contains("Validation") {
+                        error!(error = %e, "FOK non-transient error — aborting retries");
+                        break;
+                    }
+                    error!(error = %e, attempt, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
                     continue;
                 }
             }
@@ -620,6 +669,15 @@ impl LiveExecutor {
         // emergency_fok_fallback(). We must exit the position. Max retries
         // prevent infinite loops on non-transient errors.
         let safe_size = clob_safe_fok_size(price, signal.size);
+        if safe_size.is_zero() {
+            error!(%price, size = %signal.size, "FOK at price size zero — aborting");
+            self.orders_failed += 1;
+            self.active_leg2_order_id = None;
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
         for attempt in 1..=MAX_FOK_RETRIES {
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
@@ -649,7 +707,12 @@ impl LiveExecutor {
                         reason = ?exit_reason,
                         "Leg 2 emergency: FOK at price placed"
                     );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
+                    // Don't track filled FOKs — prevents stale cancel by next signal
+                    if resp.status == OrderStatus::Filled {
+                        self.active_leg2_order_id = None;
+                    } else {
+                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                    }
                     self.emergency_foks += 1;
                     self.orders_placed += 1;
 
@@ -662,8 +725,13 @@ impl LiveExecutor {
                     return;
                 }
                 Err(e) => {
-                    error!(error = %e, %price, attempt, "Leg 2 emergency: FOK at price FAILED — retrying");
+                    let err_msg = e.to_string();
                     self.orders_failed += 1;
+                    if err_msg.contains("decimal places") || err_msg.contains("Validation") {
+                        error!(error = %e, "FOK at price non-transient error — aborting retries");
+                        break;
+                    }
+                    error!(error = %e, %price, attempt, "Leg 2 emergency: FOK at price FAILED — retrying");
                     continue;
                 }
             }

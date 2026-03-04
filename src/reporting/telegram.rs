@@ -219,7 +219,7 @@ impl TelegramReporter {
 
     /// Fire a message unconditionally (never dropped). Spaces critical messages
     /// at least 1.5s apart so they don't pile up on Telegram.
-    fn fire_critical(&self, text: String) {
+    pub fn fire_critical(&self, text: String) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
