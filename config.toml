@@ -21,7 +21,7 @@ max_spread = 0.02
 # Minimum book depth as fraction of trade size
 depth_min_pct = 0.20
 # No entries within this many seconds of market expiry
-entry_cutoff_secs = 40
+entry_cutoff_secs = 25
 # Max age (ms) of Binance SBE event before discard
 binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
@@ -31,7 +31,7 @@ max_price_skew = 0.85
 # Cancel unfilled Leg 1 after this many ms
 leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
-rotation_quiet_ms = 30000
+rotation_quiet_ms = 20000
 
 [capital]
 # Maximum USDC per leg per trade
