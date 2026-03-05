@@ -42,6 +42,9 @@ pub struct SimFill {
     /// Taker fee paid. `Decimal::ZERO` for maker fills.
     /// Formula (when taker): `shares * 0.25 * (price * (1 - price))^2`.
     pub taker_fee: Decimal,
+    /// Estimated maker rebate earned. `Decimal::ZERO` for taker fills.
+    /// Approximation: 20% of fee-equivalent (same formula as taker fee).
+    pub maker_rebate: Decimal,
 }
 
 impl SimFill {
@@ -56,6 +59,14 @@ impl SimFill {
         let factor = Decimal::new(25, 2); // 0.25
         let inner = price * (one - price);
         size * factor * inner * inner
+    }
+
+    /// Estimated maker rebate for a fill at this price and size.
+    /// Approximation: 20% of fee-equivalent (same formula as taker fee).
+    /// Actual rebate depends on daily pool distribution; this is an upper-bound estimate.
+    pub fn compute_maker_rebate(price: Decimal, size: Decimal) -> Decimal {
+        let fee_equivalent = Self::compute_taker_fee(price, size);
+        fee_equivalent * Decimal::new(20, 2) // × 0.20
     }
 }
 
@@ -130,7 +141,9 @@ pub struct SimTrade {
     pub gross_profit: Decimal,
     /// Taker fee paid on Leg 2 in USDC (0 in normal flow; non-zero only for emergency taker).
     pub taker_fee: Decimal,
-    /// `gross_profit - taker_fee` in USDC.
+    /// Estimated maker rebate earned on this trade (sum of both legs' maker rebates).
+    pub maker_rebate: Decimal,
+    /// `gross_profit - taker_fee + maker_rebate` in USDC.
     pub net_profit: Decimal,
     /// `net_profit / (pair_cost * size) * 100` — return on capital deployed.
     pub profit_pct: Decimal,
@@ -212,6 +225,8 @@ pub struct MarketSummary {
     pub allocation_cap: Decimal,
     /// Taker fees paid in this market.
     pub taker_fees_paid: Decimal,
+    /// Estimated maker rebates earned in this market.
+    pub maker_rebates_earned: Decimal,
     /// Gross PnL for this market (sum of gross_profit).
     pub gross_market_pnl: Decimal,
     /// Net PnL for this market (sum of net_profit).
@@ -621,7 +636,7 @@ impl SimulationState {
 
         let size = pos.leg1.size;
 
-        let (pair_cost, gross_profit, taker_fee, net_profit, profit_pct, leg2_was_taker) =
+        let (pair_cost, gross_profit, taker_fee, maker_rebate, net_profit, profit_pct, leg2_was_taker) =
             if let Some(ref leg2) = pos.leg2 {
                 // pair_cost: per-share price paid for the full YES+NO pair.
                 let pc = pos.leg1.price + leg2.price;
@@ -631,25 +646,29 @@ impl SimulationState {
                 let gp = (one - pc) * size;
                 // taker_fee is already denominated in USDC.
                 let tf = leg2.taker_fee;
+                // maker rebate: sum of both legs' rebates.
+                let mr = pos.leg1.maker_rebate + leg2.maker_rebate;
                 // net profit in USDC.
-                let np = gp - tf;
+                let np = gp - tf + mr;
                 // % return on capital deployed.
                 let pct = if total_cost.is_zero() {
                     Decimal::ZERO
                 } else {
                     np / total_cost * hundred
                 };
-                (pc, gp, tf, np, pct, leg2.was_taker)
+                (pc, gp, tf, mr, np, pct, leg2.was_taker)
             } else {
                 // Unhedged: PnL determined by resolution outcome later.
                 // Pessimistic: treat as full loss of leg1 cost in USDC.
                 let pc = pos.leg1.price; // per-share for reference
                 let gp = -(pos.leg1.price * size); // total USDC spent, as negative
-                (pc, gp, Decimal::ZERO, gp, Decimal::ZERO, false)
+                let mr = pos.leg1.maker_rebate;
+                (pc, gp, Decimal::ZERO, mr, gp + mr, Decimal::ZERO, false)
             };
 
-        // Update running session PnL (USDC).
+        // Update running session PnL (USDC) and maker rebate accumulator.
         self.total_pnl += net_profit;
+        self.total_maker_rebates_earned += maker_rebate;
 
         // Return the cost basis to virtual_balance (net_profit is already in USDC).
         let leg1_cost = pos.leg1.price * size;
@@ -666,6 +685,7 @@ impl SimulationState {
             pair_cost,
             gross_profit,
             taker_fee,
+            maker_rebate,
             net_profit,
             profit_pct,
             resolution: None,
@@ -793,7 +813,7 @@ impl SimulationState {
             Decimal::ZERO
         };
 
-        // Maker rebates estimated as 20% of emergency taker fees paid.
+        // Maker rebates accumulated from per-trade rebate estimates.
         let est_maker_rebates = self.total_maker_rebates_earned;
         let net_pnl = gross_pnl - self.total_taker_fees_paid + est_maker_rebates;
 
@@ -874,12 +894,14 @@ impl SimulationState {
 
         let mut allocation_used = Decimal::ZERO;
         let mut taker_fees_paid = Decimal::ZERO;
+        let mut maker_rebates_earned = Decimal::ZERO;
         let mut gross_market_pnl = Decimal::ZERO;
         let mut net_market_pnl = Decimal::ZERO;
 
         for trade in &trades {
             allocation_used += trade.alloc_amount;
             taker_fees_paid += trade.taker_fee;
+            maker_rebates_earned += trade.maker_rebate;
             gross_market_pnl += trade.gross_profit;
             net_market_pnl += trade.net_profit;
         }
@@ -921,6 +943,7 @@ impl SimulationState {
             allocation_used,
             allocation_cap,
             taker_fees_paid,
+            maker_rebates_earned,
             gross_market_pnl,
             net_market_pnl,
             capital_locked,

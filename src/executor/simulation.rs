@@ -326,6 +326,7 @@ impl SimulationExecutor {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: SimFill::compute_maker_rebate(signal.price, signal.size),
         };
 
         let fill_size = fill.size;
@@ -416,6 +417,11 @@ impl SimulationExecutor {
             Decimal::ZERO
         };
 
+        let maker_rebate = if is_taker {
+            Decimal::ZERO
+        } else {
+            SimFill::compute_maker_rebate(signal.price, leg1_size)
+        };
         let fill = SimFill {
             side: opposite_side(signal.side),
             price: signal.price,
@@ -424,6 +430,7 @@ impl SimulationExecutor {
             was_partial: false,
             was_taker: is_taker,
             taker_fee,
+            maker_rebate,
         };
 
         match signal.exit_reason {
@@ -748,6 +755,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
 
         let idx = state.record_leg1_fill(
@@ -843,6 +851,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         let idx = state.record_leg1_fill(
             leg1_fill,
@@ -862,6 +871,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         state.record_leg2_fill(idx, leg2_fill);
         assert_eq!(state.trades_hedged, 1);
@@ -895,6 +905,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         let idx = state.record_leg1_fill(
             leg1_fill,
@@ -918,6 +929,7 @@ mod tests {
             was_partial: false,
             was_taker: true,
             taker_fee,
+            maker_rebate: Decimal::ZERO,
         };
         state.record_emergency_taker(idx, leg2_fill);
         assert_eq!(state.trades_emergency_taker, 1);
@@ -951,6 +963,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         let idx = state.record_leg1_fill(
             leg1_fill,
@@ -996,6 +1009,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         let idx1 = state.record_leg1_fill(
             fill1_leg1,
@@ -1013,6 +1027,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         state.record_leg2_fill(idx1, fill1_leg2);
         let trade1 = state.close_trade(idx1, now_ms).unwrap();
@@ -1037,6 +1052,7 @@ mod tests {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: Decimal::ZERO,
         };
         let _idx2 = state.record_leg1_fill(
             fill2_leg1,
@@ -1055,6 +1071,7 @@ mod tests {
             was_partial: false,
             was_taker: true,
             taker_fee: fee,
+            maker_rebate: Decimal::ZERO,
         };
         // After trade1 closed, _idx2 is now at index 0.
         state.record_emergency_taker(0, fill2_leg2);

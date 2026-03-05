@@ -11,7 +11,7 @@ Binance spike → Buy directional shares cheap (Leg 1, post-only, $0 fee)
              → Paired position: e.g. $0.48 + $0.495 = $0.975 → pays $1.00 → 2.5% profit
 ```
 
-Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply only to FOK fills: emergency exits (adverse movement, pre-erosion breach, break-even breach, market expiry, whipsaw reversal) and favorable taker fills (opposing ask dropped below posted bid).
+Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply only to FOK fills: emergency exits (adverse movement, pre-erosion breach, break-even breach, market expiry, whipsaw reversal) and favorable taker fills (opposing ask dropped below posted bid). Maker fills earn an estimated rebate of 20% of the fee-equivalent (same formula as taker fee) — computed per fill via `SimFill::compute_maker_rebate()` and included in net PnL calculations and Telegram messages.
 
 **Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. Post-only entry preserves the full spread at the cost of lower fill rate (~30-50%). Unfilled signals cost nothing.
 
@@ -605,7 +605,7 @@ Timeline:
 | **False positive spikes** | Speculative posting with cancel-on-failure: post Leg 1 immediately on ATR+magnitude, cancel if sustain/momentum fails (~300ms). Post-only = zero cost on cancel. Sustain filter (300ms hold above 2×ATR) + momentum ratio (≥65% of peak) + magnitude gate (1.5 bp). Post-fill reversals caught by adverse_threshold. **Whipsaw guard**: opposite spike cancels unfilled Leg 1, or triggers immediate FOK if filled |
 | **Stale book entries** | Post-rotation quiet period (`rotation_quiet_ms`=30000ms) blocks spike entries for 30s after market rotation, preventing trades on stale/repricing books |
 | **Signal flooding** | Self-gating on both success and failure. One trade at a time |
-| **Taker fees** | Both legs post-only ($0 fee). Emergency exits try aggressive post-only first (zero fee); FOK taker only as fallback when post-only would cross spread. Fee: `C × 0.25 × (p×(1-p))²`, max 1.56% at p=0.50 |
+| **Taker fees** | Both legs post-only ($0 fee). Emergency exits try aggressive post-only first (zero fee); FOK taker only as fallback when post-only would cross spread. Fee: `C × 0.25 × (p×(1-p))²`, max 1.56% at p=0.50. Maker fills earn est. rebate: 20% of fee-equivalent |
 | **Competing bots** | Smart outbid walls by 1 tick (capped at break-even). Post-only = unfilled orders cost nothing |
 | **Stale data** | Discard events where `now_ms - timestamp > 500ms` |
 | **Heartbeat failure** (live) | Dedicated async task, 5s interval. 2 consecutive failures → reset executor state + Telegram alert |

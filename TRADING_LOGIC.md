@@ -390,7 +390,8 @@ On completion: `leg1_state`, `leg2_state`, and `erosion` all reset to None. `cum
 
 - **Pair cost** = leg1_price + leg2_price (per share)
 - **Gross profit** = (1.0 - pair_cost) × size
-- **Net profit** = gross_profit - taker_fee (zero for maker fills)
+- **Maker rebate** = sum of both legs' `compute_maker_rebate(price, size)` (= `compute_taker_fee() × 0.20`; zero for taker fills)
+- **Net profit** = gross_profit - taker_fee + maker_rebate
 - **Profit %** = net_profit / (pair_cost × size) × 100
 
 ---
@@ -501,6 +502,7 @@ After market rotation, the Polymarket book takes ~20-30s to fully reprice. Entri
 | `locked_in_resolution` | +cost when position locked for UMA |
 | `total_pnl` | +net_profit on each trade close |
 | `total_taker_fees_paid` | +fee on each taker fill |
+| `total_maker_rebates_earned` | +maker_rebate on each trade close |
 
 ### Live capital
 

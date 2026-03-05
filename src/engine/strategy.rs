@@ -2754,12 +2754,14 @@ impl StrategyEngine {
 
         let mut allocation_used = Decimal::ZERO;
         let mut taker_fees_paid = Decimal::ZERO;
+        let mut maker_rebates_earned = Decimal::ZERO;
         let mut gross_market_pnl = Decimal::ZERO;
         let mut net_market_pnl = Decimal::ZERO;
         let mut capital_locked = Decimal::ZERO;
         for t in &trades {
             allocation_used += t.alloc_amount;
             taker_fees_paid += t.taker_fee;
+            maker_rebates_earned += t.maker_rebate;
             gross_market_pnl += t.gross_profit;
             net_market_pnl += t.net_profit;
             capital_locked += t.pair_cost * t.leg1.size;
@@ -2782,6 +2784,7 @@ impl StrategyEngine {
             allocation_used,
             allocation_cap: self.leg1.max_alloc_per_trade,
             taker_fees_paid,
+            maker_rebates_earned,
             gross_market_pnl,
             net_market_pnl,
             capital_locked,
@@ -2818,6 +2821,7 @@ impl StrategyEngine {
         let mut conf_sum = Decimal::ZERO;
         let mut gross_pnl = Decimal::ZERO;
         let mut taker_fees = Decimal::ZERO;
+        let mut maker_rebates = Decimal::ZERO;
         let mut profit_pct_sum = Decimal::ZERO;
         let mut best_pct = Decimal::MIN;
         let mut best_market = String::new();
@@ -2836,6 +2840,7 @@ impl StrategyEngine {
         for t in trades {
             gross_pnl += t.gross_profit;
             taker_fees += t.taker_fee;
+            maker_rebates += t.maker_rebate;
             conf_sum += t.confidence;
             profit_pct_sum += t.profit_pct;
             if t.bot_contested { walls_outbid += 1; }
@@ -2872,7 +2877,7 @@ impl StrategyEngine {
             worst_pct = Decimal::ZERO;
         }
 
-        let net_pnl = gross_pnl - taker_fees;
+        let net_pnl = gross_pnl - taker_fees + maker_rebates;
         let avg_confidence = if total_trades > 0 {
             conf_sum / Decimal::from(total_trades)
         } else {
@@ -2913,7 +2918,7 @@ impl StrategyEngine {
             avg_confidence,
             gross_pnl,
             emergency_taker_fees: taker_fees,
-            est_maker_rebates: Decimal::ZERO,
+            est_maker_rebates: maker_rebates,
             net_pnl,
             win_rate_pct,
             avg_net_profit_pct,
@@ -2957,7 +2962,15 @@ impl StrategyEngine {
         } else {
             Decimal::ZERO
         };
-        let net_profit = gross_profit - taker_fee;
+        // Leg 1 always maker; Leg 2 maker only if not taker.
+        let leg1_rebate = SimFill::compute_maker_rebate(l1_price, l1_size);
+        let leg2_rebate = if self.live_trade_meta.leg2_was_taker {
+            Decimal::ZERO
+        } else {
+            SimFill::compute_maker_rebate(l2_price, l2_size)
+        };
+        let maker_rebate = leg1_rebate + leg2_rebate;
+        let net_profit = gross_profit - taker_fee + maker_rebate;
         let total_cost = pair_cost * l1_size;
         let profit_pct = if total_cost.is_zero() {
             Decimal::ZERO
@@ -2979,6 +2992,7 @@ impl StrategyEngine {
             was_partial: false,
             was_taker: false,
             taker_fee: Decimal::ZERO,
+            maker_rebate: leg1_rebate,
         };
         let leg2_fill = SimFill {
             side: leg2_side,
@@ -2988,6 +3002,7 @@ impl StrategyEngine {
             was_partial: false,
             was_taker: self.live_trade_meta.leg2_was_taker,
             taker_fee,
+            maker_rebate: leg2_rebate,
         };
 
         Some(SimTrade {
@@ -3001,6 +3016,7 @@ impl StrategyEngine {
             pair_cost,
             gross_profit,
             taker_fee,
+            maker_rebate,
             net_profit,
             profit_pct,
             resolution: None,

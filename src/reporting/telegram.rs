@@ -578,11 +578,17 @@ mod formatter {
             } else {
                 ""
             };
+            let rebate_part = if trade.maker_rebate > Decimal::ZERO {
+                format!(" | Rebate: +${:.4}", trade.maker_rebate)
+            } else {
+                String::new()
+            };
             format!(
-                "Gross: {sg}<code>${gross:.4}</code> | Fee: -${fee:.4} | Net: {sn}<code>${net:.4}</code> ({pct:.2}%)",
+                "Gross: {sg}<code>${gross:.4}</code> | Fee: -${fee:.4}{rebate} | Net: {sn}<code>${net:.4}</code> ({pct:.2}%)",
                 sg = sign_g,
                 gross = trade.gross_profit,
                 fee = trade.taker_fee,
+                rebate = rebate_part,
                 sn = sign_n,
                 net = trade.net_profit,
                 pct = trade.profit_pct,
@@ -593,10 +599,16 @@ mod formatter {
             } else {
                 ""
             };
+            let rebate_part = if trade.maker_rebate > Decimal::ZERO {
+                format!(" (+${:.4} est. rebate)", trade.maker_rebate)
+            } else {
+                String::new()
+            };
             format!(
-                "Profit: {sign}<code>${net:.4}</code> ({pct:.2}%)",
+                "Profit: {sign}<code>${net:.4}</code>{rebate} ({pct:.2}%)",
                 sign = sign,
                 net = trade.net_profit,
+                rebate = rebate_part,
                 pct = trade.profit_pct,
             )
         };
@@ -649,7 +661,16 @@ mod formatter {
             format!("${:.4}", s.taker_fees_paid)
         };
 
-        let net_label = if s.taker_fees_paid.is_zero() {
+        let rebate_label = if s.maker_rebates_earned.is_zero() {
+            String::new()
+        } else {
+            format!(
+                "\nEst. maker rebates: ${:.4}",
+                s.maker_rebates_earned,
+            )
+        };
+
+        let net_label = if s.taker_fees_paid.is_zero() && s.maker_rebates_earned.is_zero() {
             format!("${:.4} (zero fees in normal flow)", s.net_market_pnl)
         } else {
             format!("${:.4}", s.net_market_pnl)
@@ -723,7 +744,7 @@ mod formatter {
             {trade_lines}\n\
             \n\
             Allocation used: ${alloc:.2} / ${cap:.2} ({alloc_pct:.0}%)\n\
-            Taker fees paid: {fee_label}\n\
+            Taker fees paid: {fee_label}{rebate_label}\n\
             Gross market PnL: {gross_sign}${gross:.4}\n\
             Net market PnL: {net_label}\n\
             Capital locked in resolution: ${locked:.2}",
@@ -746,6 +767,7 @@ mod formatter {
             gross_sign = gross_sign,
             gross = s.gross_market_pnl,
             fee_label = taker_fee_label,
+            rebate_label = rebate_label,
             net_label = net_label,
             locked = s.capital_locked,
         )
