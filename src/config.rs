@@ -114,6 +114,9 @@ pub struct ConfidenceConfig {
     pub med_target_pct: f64,
     /// Profit target % for LOW tier (e.g. 0.010 = 1.0%).
     pub low_target_pct: f64,
+    /// Spike magnitude (%) at which spike quality factor = 1.0.
+    /// Spikes at `min_magnitude_pct` score 0; spikes at this value score 1.0.
+    pub spike_strong_pct: f64,
 }
 
 impl Default for ConfidenceConfig {
@@ -124,6 +127,7 @@ impl Default for ConfidenceConfig {
             high_target_pct: 0.025,
             med_target_pct: 0.015,
             low_target_pct: 0.010,
+            spike_strong_pct: 0.015,
         }
     }
 }
@@ -251,6 +255,10 @@ pub struct Config {
     pub med_target_pct: Decimal,
     /// Profit target for LOW tier (from config).
     pub low_target_pct: Decimal,
+    /// Minimum spike magnitude (from spike_detection config), as Decimal.
+    pub min_magnitude_pct: Decimal,
+    /// Spike magnitude at which spike quality factor = 1.0, as Decimal.
+    pub spike_strong_pct: Decimal,
 }
 
 impl Config {
@@ -353,6 +361,10 @@ impl Config {
             .context("confidence.med_target_pct: invalid decimal")?;
         let low_target_pct = Decimal::try_from(bot.confidence.low_target_pct)
             .context("confidence.low_target_pct: invalid decimal")?;
+        let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct)
+            .context("spike_detection.min_magnitude_pct: invalid decimal")?;
+        let spike_strong_pct = Decimal::try_from(bot.confidence.spike_strong_pct)
+            .context("confidence.spike_strong_pct: invalid decimal")?;
 
         let config = Self {
             mode,
@@ -379,6 +391,8 @@ impl Config {
             high_target_pct,
             med_target_pct,
             low_target_pct,
+            min_magnitude_pct,
+            spike_strong_pct,
         };
 
         // ── Validation ───────────────────────────────────────────────
@@ -411,6 +425,8 @@ impl Config {
         let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct).unwrap();
         let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct).unwrap();
         let low_target_pct = Decimal::try_from(bot.confidence.low_target_pct).unwrap();
+        let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct).unwrap();
+        let spike_strong_pct = Decimal::try_from(bot.confidence.spike_strong_pct).unwrap();
 
         Self {
             mode: Mode::Simulation,
@@ -435,6 +451,8 @@ impl Config {
             high_target_pct,
             med_target_pct,
             low_target_pct,
+            min_magnitude_pct,
+            spike_strong_pct,
         }
     }
 }

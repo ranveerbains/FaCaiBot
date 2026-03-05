@@ -92,6 +92,8 @@ pub(crate) struct Leg1Evaluator {
     pub low_target_pct: Decimal,
     pub max_price_skew: Decimal,
     pub leg1_timeout_ms: u64,
+    pub min_magnitude_pct: Decimal,
+    pub spike_strong_pct: Decimal,
 }
 
 impl Leg1Evaluator {
@@ -256,12 +258,12 @@ impl Leg1Evaluator {
         }
 
         // Confidence scoring
-        let atr = state.atr.unwrap_or(Decimal::new(1, 3));
         let total_depth = book.total_bid_depth() + book.total_ask_depth();
         let avg_depth = avg_book_depth.unwrap_or(Decimal::ONE);
         let confidence = compute_confidence(
             spike.magnitude,
-            atr,
+            self.min_magnitude_pct,
+            self.spike_strong_pct,
             total_depth,
             avg_depth,
             time_remaining_secs,
@@ -274,6 +276,10 @@ impl Leg1Evaluator {
             ProfitTier::Med => self.med_alloc_pct,
             ProfitTier::Low => self.low_alloc_pct,
         };
+        // Skip if tier allocation is zero (e.g. LOW tier disabled via config)
+        if tier_pct.is_zero() {
+            return Leg1Outcome::Rejected(Leg1RejectReason::Other);
+        }
         let alloc = (self.max_alloc_per_trade * tier_pct)
             .round_dp(2)
             .max(Decimal::new(1, 2));

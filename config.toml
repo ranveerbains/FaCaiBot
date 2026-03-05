@@ -35,23 +35,25 @@ rotation_quiet_ms = 20000
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 4.5
+max_alloc_per_trade = 9
 # Fraction of max_alloc for each confidence tier
 high_alloc_pct = 1
-med_alloc_pct = 1
-low_alloc_pct = 1
+med_alloc_pct = 0.8
+low_alloc_pct = 0.5
 
 [confidence]
 # Score >= this → HIGH tier (max score 0.8)
 high_threshold = 0.5
 # Score >= this → MED tier, below → LOW
-med_threshold = 0.35
+med_threshold = 0.3
 # Profit target % for HIGH tier
 high_target_pct = 0.04
 # Profit target % for MED tier
 med_target_pct = 0.03
 # Profit target % for LOW tier
-low_target_pct = 0.010
+low_target_pct = 0.02
+# Spike magnitude at which spike quality factor = 1.0 (0.015 = 1.5 bps)
+spike_strong_pct = 0.02
 
 [risk]
 # Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.

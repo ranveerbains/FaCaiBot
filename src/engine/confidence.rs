@@ -1,8 +1,13 @@
 //! Confidence scoring for trade signals.
 //!
-//! Computes a confidence score in [0.0, 0.8] from three factors.
-//! Sustain is excluded — all confirmed spikes already passed the sustain gate,
-//! so it adds a constant offset with no discriminative value.
+//! Computes a confidence score in [0.0, 0.8] from three factors:
+//!
+//! - **f1 (spike quality):** `clamp((magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)`
+//!   Measures how far above the detection floor each spike is. Bigger spikes → more
+//!   Polymarket repricing → higher confidence. Replaces the old `magnitude / ATR` formula
+//!   which produced near-identical scores for all spikes (~0.27–0.29).
+//! - **f2 (depth):** `min(book_depth / avg_depth, 1.0)`
+//! - **f3 (time):** `time_remaining / 300.0`
 
 use rust_decimal::Decimal;
 
@@ -14,32 +19,36 @@ const MARKET_DURATION: Decimal = Decimal::from_parts(300, 0, 0, false, 0); // 30
 /// Compute the 3-factor confidence score in [0.0, 0.8].
 ///
 /// ```text
-/// confidence = 0.4 * min(spike_magnitude / ATR, 1.0)   [spike quality vs recent volatility]
+/// confidence = 0.4 * clamp((spike_magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)
 ///            + 0.2 * min(poly_book_depth / avg_book_depth, 1.0)
 ///            + 0.2 * (time_remaining_secs / 300.0)
 /// ```
 ///
-/// Thresholds: HIGH >= 0.6 | MED >= 0.3 | LOW < 0.3
+/// Thresholds: HIGH >= 0.5 | MED >= 0.30 | LOW < 0.30
 pub fn compute_confidence(
     spike_magnitude: Decimal,
-    atr: Decimal,
+    min_magnitude_pct: Decimal,
+    spike_strong_pct: Decimal,
     poly_book_depth: Decimal,
     avg_book_depth: Decimal,
     time_remaining_secs: u64,
 ) -> Decimal {
-    let f1 = if atr.is_zero() {
+    let range = spike_strong_pct - min_magnitude_pct;
+    let f1 = if range.is_zero() {
         Decimal::ONE
     } else {
-        (spike_magnitude / atr).min(Decimal::ONE)
+        ((spike_magnitude - min_magnitude_pct) / range)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
     };
-    let f3 = if avg_book_depth.is_zero() {
+    let f2 = if avg_book_depth.is_zero() {
         Decimal::ONE
     } else {
         (poly_book_depth / avg_book_depth).min(Decimal::ONE)
     };
-    let f4 = (Decimal::from(time_remaining_secs) / MARKET_DURATION).min(Decimal::ONE);
+    let f3 = (Decimal::from(time_remaining_secs) / MARKET_DURATION).min(Decimal::ONE);
 
-    (WEIGHT_SPIKE * f1 + WEIGHT_DEPTH * f3 + WEIGHT_TIME * f4)
+    (WEIGHT_SPIKE * f1 + WEIGHT_DEPTH * f2 + WEIGHT_TIME * f3)
         .min(Decimal::ONE)
         .max(Decimal::ZERO)
 }
@@ -60,34 +69,46 @@ mod tests {
 
     #[test]
     fn test_confidence_all_max() {
+        // spike at strong ceiling → f1 = 1.0
         let c = compute_confidence(
-            Decimal::new(1, 0), // spike = 1
-            Decimal::new(1, 0), // atr = 1 → f1 = 1.0
+            Decimal::new(15, 3),  // spike = 0.015 (strong ceiling)
+            Decimal::new(10, 3),  // min = 0.010
+            Decimal::new(15, 3),  // strong = 0.015
             Decimal::new(100, 0),
             Decimal::new(100, 0),
             300, // full 5 min
         );
-        // f1=1.0, f3=1.0, f4=1.0 → 0.4 + 0.2 + 0.2 = 0.8
+        // f1=1.0, f2=1.0, f3=1.0 → 0.4 + 0.2 + 0.2 = 0.8
         assert_eq!(c, Decimal::new(8, 1));
     }
 
     #[test]
     fn test_confidence_all_zero() {
-        let c = compute_confidence(Decimal::ZERO, Decimal::ONE, Decimal::ZERO, Decimal::ONE, 0);
-        // f1=0, f3=0, f4=0 → 0.0
+        // spike at minimum floor → f1 = 0.0
+        let c = compute_confidence(
+            Decimal::new(10, 3),  // spike = 0.010 (minimum)
+            Decimal::new(10, 3),  // min = 0.010
+            Decimal::new(15, 3),  // strong = 0.015
+            Decimal::ZERO,
+            Decimal::ONE,
+            0,
+        );
+        // f1=0, f2=0, f3=0 → 0.0
         assert_eq!(c, Decimal::ZERO);
     }
 
     #[test]
     fn test_confidence_clamped() {
+        // spike well above strong ceiling → f1 clamped to 1.0
         let c = compute_confidence(
-            Decimal::new(10, 0), // 10x the ATR → f1 clamped to 1.0
-            Decimal::ONE,
+            Decimal::new(50, 3),  // spike = 0.050 (way above strong)
+            Decimal::new(10, 3),  // min = 0.010
+            Decimal::new(15, 3),  // strong = 0.015
             Decimal::new(500, 0),
             Decimal::new(100, 0),
             1800,
         );
-        // f1=1.0, f3=1.0 (capped), f4=1.0 (capped) → 0.4 + 0.2 + 0.2 = 0.8
+        // f1=1.0 (capped), f2=1.0 (capped), f3=1.0 (capped) → 0.4 + 0.2 + 0.2 = 0.8
         assert_eq!(c, Decimal::new(8, 1));
     }
 

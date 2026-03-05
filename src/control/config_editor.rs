@@ -37,6 +37,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "confidence.high_target_pct", min: 0.001, max: 0.2 },
     ParamSpec { name: "confidence.med_target_pct", min: 0.001, max: 0.2 },
     ParamSpec { name: "confidence.low_target_pct", min: 0.001, max: 0.2 },
+    ParamSpec { name: "confidence.spike_strong_pct", min: 0.005, max: 0.1 },
     // risk
     ParamSpec { name: "risk.adverse_threshold", min: 0.0001, max: 0.05 },
     ParamSpec { name: "risk.erosion_base_interval_ms", min: 500.0, max: 30000.0 },

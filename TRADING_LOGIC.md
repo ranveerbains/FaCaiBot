@@ -127,19 +127,27 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 
 ### Confidence formula
 
-`confidence = 0.4 × min(spike_magnitude / ATR, 1.0) + 0.2 × min(total_book_depth / avg_depth, 1.0) + 0.2 × (time_remaining_secs / 300.0)`
+```
+f1 = clamp((spike_magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)
+f2 = min(total_book_depth / avg_depth, 1.0)
+f3 = time_remaining_secs / 300.0
 
-Max possible: **0.8**. The sustain factor was removed — all confirmed spikes already passed the sustain gate, so it contributed a constant offset with zero discriminative value.
+confidence = 0.4 × f1 + 0.2 × f2 + 0.2 × f3
+```
+
+Max possible: **0.8**. The spike quality factor (f1) measures how far above the detection floor each spike is, using magnitude-relative scoring. Spikes at `min_magnitude_pct` (detection floor) score f1 = 0; spikes at `spike_strong_pct` (config, default 0.015 = 1.5 bps) score f1 = 1.0. This replaces the old `magnitude / ATR` formula which produced near-identical f1 scores (~0.27–0.29) for all spikes due to magnitude/ATR unit mismatch (% vs $).
 
 ### Tier thresholds
 
 | Confidence | Tier | Profit Target | Default `tier_pct` | Example ($20 max) |
 |------------|------|---------------|--------------------|-------------------|
 | >= 0.5 | HIGH | 4% | 100% | $20 |
-| >= 0.35 | MED | 3% | 50% | $10 |
-| < 0.35 | LOW | 1% | 25% | $5 |
+| >= 0.30 | MED | 3% | 50% | $10 |
+| < 0.30 | LOW | 1% | 25% | $5 |
 
 ### Allocation
+
+**Zero-alloc guard:** If `tier_pct == 0` for any tier (e.g. `low_alloc_pct = 0` in config.toml), the signal is rejected immediately with `Leg1RejectReason::Other` before the allocation calculation. This allows disabling entire tiers via config — currently LOW tier is disabled (`low_alloc_pct = 0`) because its 1-tick margin is structurally insufficient to survive repricing.
 
 `alloc = max(round(max_alloc_per_trade × tier_pct), $1)`. The $1 floor ensures we always trade at least the minimum.
 
@@ -301,11 +309,11 @@ Checked after break-even breach, before the erosion interval gate. Distinct from
 
 **Two sub-cases:**
 1. **Leg 1 Posted (unfilled):** Cancel immediately. Reuses the SpikeFailed cancel pattern, including provisional ID deferral (`cancel_leg1_on_feedback`). Resets all Leg 1 state and returns early from the SpikeConfirmed handler.
-2. **Leg 1 Filled:** Set `whipsaw_fok_pending = true`. On the next `evaluate_leg2()` call, `emit_whipsaw_fok()` builds an immediate FOK signal at best ask, bypassing the erosion cascade entirely. The opposite spike invalidated the original thesis — speed of hedge matters more than price optimization.
+2. **Leg 1 Filled:** Log the opposite spike but **do not force an immediate FOK**. The existing emergency exit mechanisms (adverse movement, pre-erosion breach, break-even breach) are better suited to handle this — they evaluate actual book conditions rather than preemptively cancelling a potentially favorable resting Leg 2 order. If the opposite spike truly invalidates the position, adverse movement will trigger within milliseconds.
 
-**Price:** FOK at `round_to_tick(best_ask, tick)` — no post-only chase, no erosion.
+**Exit reason (if triggered by other emergency paths):** `AdverseMovement`, `PreErosionBreach`, `BreakEvenBreach`, etc. — whichever fires first based on actual market conditions.
 
-**Exit reason:** `WhipsawReversal`
+**Note:** `emit_whipsaw_fok()`, `WhipsawReversal` exit reason, and `diag_whipsaw_foks` counter remain in the codebase (referenced by tests and the Leg 1 Posted cancel path) but the Filled Leg 1 path no longer sets `whipsaw_fok_pending`.
 
 ---
 

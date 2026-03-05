@@ -381,6 +381,8 @@ impl StrategyEngine {
                 max_price_skew: Decimal::try_from(config.bot.entry_guards.max_price_skew)
                     .unwrap_or(Decimal::new(9, 1)),
                 leg1_timeout_ms: config.bot.entry_guards.leg1_timeout_ms,
+                min_magnitude_pct: config.min_magnitude_pct,
+                spike_strong_pct: config.spike_strong_pct,
             },
             leg2: Leg2Evaluator {
                 adverse_threshold: config.adverse_threshold,
@@ -719,12 +721,10 @@ impl StrategyEngine {
                                 return; // Skip rest of SpikeConfirmed handling
                             }
                             OrderState::Filled { .. } => {
-                                warn!(
+                                info!(
                                     spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
-                                    "whipsaw — Leg 1 filled, queueing immediate FOK"
+                                    "whipsaw — Leg 1 filled, relying on emergency exits for Leg 2"
                                 );
-                                self.whipsaw_fok_pending = true;
-                                self.diag_whipsaw_foks += 1;
                             }
                             _ => {}
                         }
@@ -2210,7 +2210,6 @@ impl StrategyEngine {
     /// `advance_simulation()` (simulation mode).
     fn init_erosion(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
         if let Some(spike) = self.state.last_spike {
-            let atr = self.state.atr.unwrap_or(Decimal::new(1, 3));
             let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
             let depth = self
                 .state
@@ -2220,7 +2219,8 @@ impl StrategyEngine {
                 .unwrap_or(Decimal::ONE);
             let conf = compute_confidence(
                 spike.magnitude,
-                atr,
+                self.leg1.min_magnitude_pct,
+                self.leg1.spike_strong_pct,
                 depth,
                 self.avg_book_depth.unwrap_or(Decimal::ONE),
                 t_secs,
