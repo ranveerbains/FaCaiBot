@@ -27,10 +27,6 @@ use crate::types::order::{
 
 use super::fill_engine::round_to_tick;
 
-/// Maximum number of FOK retry attempts before giving up. Prevents infinite
-/// loops on non-transient CLOB errors (e.g., decimal precision violations).
-const MAX_FOK_RETRIES: u32 = 10;
-
 /// Adjusts `size` so that `price * size` has at most 2 decimal places,
 /// as required by the Polymarket CLOB for Buy FOK orders (maker_amount).
 fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
@@ -621,25 +617,24 @@ impl LiveExecutor {
         signal: &TradeSignal,
         exit_reason: crate::types::order::ExitReason,
     ) {
-        // Retry until the CLOB accepts the FOK. After Leg 1 fills we hold a
-        // directional position — Leg 2 *must* fill. The ~1.2s HTTP round-trip
-        // per attempt is the natural rate limiter. Max retries prevent infinite
-        // loops on non-transient errors (e.g., decimal precision violations).
-        let safe_size = clob_safe_fok_size(signal.price, signal.size);
-        if safe_size.is_zero() {
-            error!(price = %signal.price, size = %signal.size, "FOK size zero — aborting");
-
-            self.active_leg2_order_id = None;
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            return;
-        }
-        for attempt in 1..=MAX_FOK_RETRIES {
+        // Price-escalating FOK: walk up the book +1 tick per attempt until
+        // filled or $1.00 cap reached. After Leg 1 fills we hold a directional
+        // position — Leg 2 *must* fill. The ~1.2s HTTP round-trip per attempt
+        // is the natural rate limiter. The $1.00 price cap (~23 ticks max from
+        // any starting price) prevents infinite loops.
+        let mut current_price = signal.price;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let safe_size = clob_safe_fok_size(current_price, signal.size);
+            if safe_size.is_zero() {
+                error!(price = %current_price, size = %signal.size, "FOK size zero — aborting");
+                break;
+            }
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
                 signal.side,
-                signal.price,
+                current_price,
                 safe_size,
             );
 
@@ -648,17 +643,23 @@ impl LiveExecutor {
                     if resp.status == OrderStatus::Rejected {
                         warn!(
                             order_id = %resp.order_id,
+                            price = %current_price,
                             reason = ?exit_reason,
                             attempt,
-                            "Leg 2 emergency: FOK rejected — retrying"
+                            "Leg 2 emergency: FOK rejected — escalating price"
                         );
-    
+                        current_price += signal.tick_size;
+                        if current_price > Decimal::ONE {
+                            error!(reason = ?exit_reason, "FOK price exceeded $1.00 cap — aborting");
+                            break;
+                        }
                         continue;
                     }
 
                     info!(
                         order_id = %resp.order_id,
                         status = ?resp.status,
+                        price = %current_price,
                         reason = ?exit_reason,
                         "Leg 2 emergency: FOK fallback placed"
                     );
@@ -669,12 +670,10 @@ impl LiveExecutor {
                         self.active_leg2_order_id = Some(resp.order_id.clone());
                     }
 
-
-
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
-                        price: signal.price,
+                        price: current_price,
                         size: safe_size,
                         fill_method: None,
                         already_filled: resp.status == OrderStatus::Filled,
@@ -692,17 +691,17 @@ impl LiveExecutor {
                         error!(error = %e, "FOK non-transient error — aborting retries");
                         break;
                     }
-                    error!(error = %e, attempt, "Leg 2 emergency: FOK FALLBACK FAILED — retrying");
+                    warn!(error = %e, price = %current_price, attempt, "Leg 2 emergency: FOK FAILED — escalating price");
+                    current_price += signal.tick_size;
+                    if current_price > Decimal::ONE {
+                        error!(reason = ?exit_reason, "FOK price exceeded $1.00 cap — aborting");
+                        break;
+                    }
                     continue;
                 }
             }
         }
-        error!(
-            max_retries = MAX_FOK_RETRIES,
-            reason = ?exit_reason,
-            "Leg 2 emergency: FOK exhausted max retries — sending OrderFailed"
-        );
-        self.active_leg2_order_id = None; // All retries failed — clear stale ID
+        self.active_leg2_order_id = None;
         let _ = self
             .feedback_tx
             .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -716,24 +715,21 @@ impl LiveExecutor {
         exit_reason: crate::types::order::ExitReason,
         price: Decimal,
     ) {
-        // Retry until the CLOB accepts the FOK — same rationale as
-        // emergency_fok_fallback(). We must exit the position. Max retries
-        // prevent infinite loops on non-transient errors.
-        let safe_size = clob_safe_fok_size(price, signal.size);
-        if safe_size.is_zero() {
-            error!(%price, size = %signal.size, "FOK at price size zero — aborting");
-
-            self.active_leg2_order_id = None;
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            return;
-        }
-        for attempt in 1..=MAX_FOK_RETRIES {
+        // Price-escalating FOK — same rationale as emergency_fok_fallback().
+        // We must exit the position. Walks up +1 tick per attempt, capped at $1.00.
+        let mut current_price = price;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let safe_size = clob_safe_fok_size(current_price, signal.size);
+            if safe_size.is_zero() {
+                error!(price = %current_price, size = %signal.size, "FOK at price size zero — aborting");
+                break;
+            }
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
                 signal.side,
-                price,
+                current_price,
                 safe_size,
             );
 
@@ -742,19 +738,23 @@ impl LiveExecutor {
                     if resp.status == OrderStatus::Rejected {
                         warn!(
                             order_id = %resp.order_id,
-                            %price,
+                            price = %current_price,
                             reason = ?exit_reason,
                             attempt,
-                            "Leg 2 emergency: FOK at price rejected — retrying"
+                            "Leg 2 emergency: FOK at price rejected — escalating price"
                         );
-    
+                        current_price += signal.tick_size;
+                        if current_price > Decimal::ONE {
+                            error!(reason = ?exit_reason, "FOK at price exceeded $1.00 cap — aborting");
+                            break;
+                        }
                         continue;
                     }
 
                     info!(
                         order_id = %resp.order_id,
                         status = ?resp.status,
-                        %price,
+                        price = %current_price,
                         reason = ?exit_reason,
                         "Leg 2 emergency: FOK at price placed"
                     );
@@ -765,12 +765,10 @@ impl LiveExecutor {
                         self.active_leg2_order_id = Some(resp.order_id.clone());
                     }
 
-
-
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
-                        price,
+                        price: current_price,
                         size: safe_size,
                         fill_method: None,
                         already_filled: resp.status == OrderStatus::Filled,
@@ -788,18 +786,17 @@ impl LiveExecutor {
                         error!(error = %e, "FOK at price non-transient error — aborting retries");
                         break;
                     }
-                    error!(error = %e, %price, attempt, "Leg 2 emergency: FOK at price FAILED — retrying");
+                    warn!(error = %e, price = %current_price, attempt, "Leg 2 emergency: FOK at price FAILED — escalating price");
+                    current_price += signal.tick_size;
+                    if current_price > Decimal::ONE {
+                        error!(reason = ?exit_reason, "FOK at price exceeded $1.00 cap — aborting");
+                        break;
+                    }
                     continue;
                 }
             }
         }
-        error!(
-            max_retries = MAX_FOK_RETRIES,
-            %price,
-            reason = ?exit_reason,
-            "Leg 2 emergency: FOK at price exhausted max retries — sending OrderFailed"
-        );
-        self.active_leg2_order_id = None; // All retries failed — clear stale ID
+        self.active_leg2_order_id = None;
         let _ = self
             .feedback_tx
             .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });

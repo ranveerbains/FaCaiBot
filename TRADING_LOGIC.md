@@ -337,8 +337,8 @@ Once `emergency_submitted = true`, the engine posts an aggressive post-only limi
 
 The evaluator communicates intent via the `sim_was_taker` flag on `TradeSignal`:
 
-- `sim_was_taker = true` (deadline expired): Cancel existing → direct FOK at `signal.price` (the evaluator set this to `round_to_tick(best_ask, tick)`). FOK retries on liquidity errors ("couldn't be fully filled") but aborts immediately on SDK validation errors ("decimal places", "Validation"). Zero-size FOKs (from `clob_safe_fok_size()` returning 0) are aborted with `OrderFailed` before any CLOB call
-- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick` (also retries internally)
+- `sim_was_taker = true` (deadline expired): Cancel existing → FOK at `signal.price` (the evaluator set this to `round_to_tick(best_ask, tick)`). On liquidity failure (Rejected or non-transient error), price escalates +1 tick per attempt up to `$1.00` cap (~23 ticks max, ~2.3s to sweep). `clob_safe_fok_size()` recomputed each iteration. Aborts immediately on SDK validation errors ("decimal places", "Validation", "balance", "allowance") or zero safe size
+- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick` with same price-escalating sweep
 
 ### Simulation model
 
@@ -655,7 +655,7 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 
 ### Balance exhaustion (live)
 
-**Scenario:** "Not enough balance / allowance" errors during Leg 2 placement cause the executor to burn 30+ futile FOK retries across erosion steps and emergency rounds.
+**Scenario:** "Not enough balance / allowance" errors during Leg 2 placement cause the executor to burn futile FOK attempts across erosion steps and emergency rounds.
 
 **Handle:** `balance_exhausted` flag on `LiveExecutor`. Set on first "balance"/"allowance" error during Leg 2 erosion placement. All subsequent Leg 2 commands (erosion, emergency) immediately return `OrderFailed` without calling CLOB. Cleared on `MarketRotation`. FOK retry loops also abort immediately on "balance"/"allowance" errors (added to non-transient error list alongside "decimal places" and "Validation"). Executor sends `BalanceExhausted` feedback → engine fires `fire_critical()` Telegram alert with Leg 1 position details.
 
