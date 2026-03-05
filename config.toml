@@ -5,12 +5,12 @@ prewarm_lead_secs = 20
 
 [spike_detection]
 # ATR multiplier for spike candidate trigger
-multiplier = 20
+multiplier = 25
 # EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
 atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
-# Minimum spike magnitude in bps (0.0125 = 1.25 bps)
+# Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
 min_magnitude_pct = 0.01
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
@@ -47,13 +47,15 @@ high_threshold = 0.5
 # Score >= this → MED tier, below → LOW
 med_threshold = 0.3
 # Profit target % for HIGH tier
-high_target_pct = 0.04
+high_target_pct = 0.03
 # Profit target % for MED tier
-med_target_pct = 0.03
+med_target_pct = 0.02
 # Profit target % for LOW tier
 low_target_pct = 0.02
-# Spike magnitude at which spike quality factor = 1.0 (0.015 = 1.5 bps)
-spike_strong_pct = 0.02
+# Minimum spike ATR ratio to trade (spikes below → f1 = 0)
+min_spike_atr_ratio = 20
+# Spike ATR ratio at which spike quality factor = 1.0
+strong_spike_atr_ratio = 75
 
 [risk]
 # Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.
@@ -65,6 +67,6 @@ erosion_interval_decay = 0.5
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Hard deadline (ms) from first emergency post to FOK taker fallback
-emergency_deadline_ms = 3000
+emergency_deadline_ms = 2000
 # Pre-erosion breach: pair cost > this before first erosion step triggers emergency
-pre_erosion_breach_threshold = 1.03
+pre_erosion_breach_threshold = 1.02

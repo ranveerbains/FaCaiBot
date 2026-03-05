@@ -2,10 +2,10 @@
 //!
 //! Computes a confidence score in [0.0, 0.8] from three factors:
 //!
-//! - **f1 (spike quality):** `clamp((magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)`
-//!   Measures how far above the detection floor each spike is. Bigger spikes → more
-//!   Polymarket repricing → higher confidence. Replaces the old `magnitude / ATR` formula
-//!   which produced near-identical scores for all spikes (~0.27–0.29).
+//! - **f1 (spike quality):** `clamp((atr_ratio - min_atr_ratio) / (strong_atr_ratio - min_atr_ratio), 0, 1)`
+//!   Measures spike displacement in ATR multiples. Dimensionless — automatically adapts to
+//!   volatility regime. Replaces the old magnitude-based formula which had a unit mismatch
+//!   (magnitudes ~0.01% vs thresholds ~1.5%) producing f1 ≈ 0 for all spikes.
 //! - **f2 (depth):** `min(book_depth / avg_depth, 1.0)`
 //! - **f3 (time):** `time_remaining / 300.0`
 
@@ -19,25 +19,25 @@ const MARKET_DURATION: Decimal = Decimal::from_parts(300, 0, 0, false, 0); // 30
 /// Compute the 3-factor confidence score in [0.0, 0.8].
 ///
 /// ```text
-/// confidence = 0.4 * clamp((spike_magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)
+/// confidence = 0.4 * clamp((atr_ratio - min_atr_ratio) / (strong_atr_ratio - min_atr_ratio), 0, 1)
 ///            + 0.2 * min(poly_book_depth / avg_book_depth, 1.0)
 ///            + 0.2 * (time_remaining_secs / 300.0)
 /// ```
 ///
 /// Thresholds: HIGH >= 0.5 | MED >= 0.30 | LOW < 0.30
 pub fn compute_confidence(
-    spike_magnitude: Decimal,
-    min_magnitude_pct: Decimal,
-    spike_strong_pct: Decimal,
+    atr_ratio: Decimal,
+    min_atr_ratio: Decimal,
+    strong_atr_ratio: Decimal,
     poly_book_depth: Decimal,
     avg_book_depth: Decimal,
     time_remaining_secs: u64,
 ) -> Decimal {
-    let range = spike_strong_pct - min_magnitude_pct;
+    let range = strong_atr_ratio - min_atr_ratio;
     let f1 = if range.is_zero() {
         Decimal::ONE
     } else {
-        ((spike_magnitude - min_magnitude_pct) / range)
+        ((atr_ratio - min_atr_ratio) / range)
             .max(Decimal::ZERO)
             .min(Decimal::ONE)
     };
@@ -69,11 +69,11 @@ mod tests {
 
     #[test]
     fn test_confidence_all_max() {
-        // spike at strong ceiling → f1 = 1.0
+        // atr_ratio at strong ceiling → f1 = 1.0
         let c = compute_confidence(
-            Decimal::new(15, 3),  // spike = 0.015 (strong ceiling)
-            Decimal::new(10, 3),  // min = 0.010
-            Decimal::new(15, 3),  // strong = 0.015
+            Decimal::new(75, 0),  // atr_ratio = 75 (at strong ceiling)
+            Decimal::new(25, 0),  // min = 25
+            Decimal::new(75, 0),  // strong = 75
             Decimal::new(100, 0),
             Decimal::new(100, 0),
             300, // full 5 min
@@ -84,11 +84,11 @@ mod tests {
 
     #[test]
     fn test_confidence_all_zero() {
-        // spike at minimum floor → f1 = 0.0
+        // atr_ratio at minimum floor → f1 = 0.0
         let c = compute_confidence(
-            Decimal::new(10, 3),  // spike = 0.010 (minimum)
-            Decimal::new(10, 3),  // min = 0.010
-            Decimal::new(15, 3),  // strong = 0.015
+            Decimal::new(25, 0),  // atr_ratio = 25 (at floor)
+            Decimal::new(25, 0),  // min = 25
+            Decimal::new(75, 0),  // strong = 75
             Decimal::ZERO,
             Decimal::ONE,
             0,
@@ -99,11 +99,11 @@ mod tests {
 
     #[test]
     fn test_confidence_clamped() {
-        // spike well above strong ceiling → f1 clamped to 1.0
+        // atr_ratio well above strong ceiling → f1 clamped to 1.0
         let c = compute_confidence(
-            Decimal::new(50, 3),  // spike = 0.050 (way above strong)
-            Decimal::new(10, 3),  // min = 0.010
-            Decimal::new(15, 3),  // strong = 0.015
+            Decimal::new(200, 0), // atr_ratio = 200 (way above strong)
+            Decimal::new(25, 0),  // min = 25
+            Decimal::new(75, 0),  // strong = 75
             Decimal::new(500, 0),
             Decimal::new(100, 0),
             1800,

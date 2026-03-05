@@ -169,6 +169,9 @@ pub struct SpikeInfo {
     pub sustained_ms: u64,
     /// Epoch ms when the spike was first detected.
     pub timestamp_ms: u64,
+    /// Spike displacement in ATR multiples (abs_displacement / ema_atr).
+    /// Dimensionless — automatically adapts to volatility regime.
+    pub atr_ratio: Decimal,
 }
 
 // ─── Market State ────────────────────────────────────────────────────────────

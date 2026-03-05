@@ -382,7 +382,8 @@ impl StrategyEngine {
                     .unwrap_or(Decimal::new(9, 1)),
                 leg1_timeout_ms: config.bot.entry_guards.leg1_timeout_ms,
                 min_magnitude_pct: config.min_magnitude_pct,
-                spike_strong_pct: config.spike_strong_pct,
+                min_spike_atr_ratio: config.min_spike_atr_ratio,
+                strong_spike_atr_ratio: config.strong_spike_atr_ratio,
             },
             leg2: Leg2Evaluator {
                 adverse_threshold: config.adverse_threshold,
@@ -1740,6 +1741,10 @@ impl StrategyEngine {
                     self.live_trade_meta.favorable_taker = true;
                     self.live_trade_meta.leg2_was_taker = true;
                 }
+                Some(FillMethod::EmergencyTaker) => {
+                    self.live_trade_meta.leg2_was_taker = true;
+                    self.live_trade_meta.emergency_maker = false;
+                }
                 None => {}
             }
 
@@ -1753,6 +1758,12 @@ impl StrategyEngine {
                     size,
                     fill_timestamp_ms: now_ms,
                 };
+                // Re-evaluate favorable_taker based on actual fill price
+                if let OrderState::Filled { price: l1_price, .. } = &self.state.leg1_state {
+                    if *l1_price + price >= Decimal::ONE {
+                        self.live_trade_meta.favorable_taker = false;
+                    }
+                }
                 // Don't replay pending fills — go straight to trade completion
                 // (checked by main loop after feedback drain).
                 return None;
@@ -1885,6 +1896,18 @@ impl StrategyEngine {
                     size,
                     timestamp_ms: now_ms,
                 };
+                // The original post-only order filled as a maker — not an emergency exit.
+                // Reset live_trade_meta so the trade is correctly classified.
+                let cancel_race = self.live_trade_meta.leg1_cancel_race;
+                self.live_trade_meta = LiveTradeMeta {
+                    leg1_cancel_race: cancel_race,
+                    ..Default::default()
+                };
+                // Also reset erosion emergency state so it doesn't taint subsequent evaluation.
+                if let Some(e) = self.erosion.as_mut() {
+                    e.emergency_submitted = false;
+                    e.exit_reason = None;
+                }
             }
         } else {
             debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
@@ -2218,9 +2241,9 @@ impl StrategyEngine {
                 .map(|b| b.total_bid_depth() + b.total_ask_depth())
                 .unwrap_or(Decimal::ONE);
             let conf = compute_confidence(
-                spike.magnitude,
-                self.leg1.min_magnitude_pct,
-                self.leg1.spike_strong_pct,
+                spike.atr_ratio,
+                self.leg1.min_spike_atr_ratio,
+                self.leg1.strong_spike_atr_ratio,
                 depth,
                 self.avg_book_depth.unwrap_or(Decimal::ONE),
                 t_secs,
@@ -3137,6 +3160,7 @@ mod tests {
             magnitude: Decimal::new(5, 3),
             sustained_ms: 300,
             timestamp_ms: now_epoch_ms() - 200,
+            atr_ratio: Decimal::new(50, 0),
         });
         engine.state.atr = Some(Decimal::new(2, 3));
         engine.state.binance_price = Some(Decimal::new(50_000, 0));
@@ -3354,6 +3378,7 @@ mod tests {
             magnitude: Decimal::new(5, 3),
             sustained_ms: 250,
             timestamp_ms: now_ms,
+            atr_ratio: Decimal::ZERO,
         };
         let leg1_price = Decimal::new(48, 2); // 0.48
         let mut e = ErosionState::new(
@@ -3390,6 +3415,7 @@ mod tests {
             magnitude: Decimal::new(5, 3),
             sustained_ms: 250,
             timestamp_ms: now_ms,
+            atr_ratio: Decimal::ZERO,
         };
         let mut e = ErosionState::new(
             now_ms,
@@ -3422,6 +3448,7 @@ mod tests {
             magnitude: Decimal::new(5, 3),
             sustained_ms: 250,
             timestamp_ms: now_ms - 300,
+            atr_ratio: Decimal::ZERO,
         });
         engine.state.atr = Some(Decimal::new(2, 3));
 

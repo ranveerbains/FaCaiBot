@@ -323,6 +323,8 @@ pub enum FillMethod {
     FavorableMaker,
     /// "crosses book" → FOK fallback filled as taker.
     FavorableTaker,
+    /// Emergency FOK taker fill (deadline FOK or emergency post-only rejected → FOK fallback).
+    EmergencyTaker,
 }
 
 // ─── Executor Feedback ──────────────────────────────────────────────────

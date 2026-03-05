@@ -92,8 +92,10 @@ pub(crate) struct Leg1Evaluator {
     pub low_target_pct: Decimal,
     pub max_price_skew: Decimal,
     pub leg1_timeout_ms: u64,
+    #[allow(dead_code)] // kept as hard floor backstop — checked in spike detector
     pub min_magnitude_pct: Decimal,
-    pub spike_strong_pct: Decimal,
+    pub min_spike_atr_ratio: Decimal,
+    pub strong_spike_atr_ratio: Decimal,
 }
 
 impl Leg1Evaluator {
@@ -261,9 +263,9 @@ impl Leg1Evaluator {
         let total_depth = book.total_bid_depth() + book.total_ask_depth();
         let avg_depth = avg_book_depth.unwrap_or(Decimal::ONE);
         let confidence = compute_confidence(
-            spike.magnitude,
-            self.min_magnitude_pct,
-            self.spike_strong_pct,
+            spike.atr_ratio,
+            self.min_spike_atr_ratio,
+            self.strong_spike_atr_ratio,
             total_depth,
             avg_depth,
             time_remaining_secs,
@@ -490,6 +492,19 @@ impl Leg2Evaluator {
                     _ => return None,
                 };
                 let fok_price = round_to_tick(best_ask, tick);
+                // Re-evaluate exit_reason with actual FOK price (may have diverged from exhaustion snapshot)
+                let exit_reason = {
+                    let pair_cost = snap.leg1_fill_price + fok_price;
+                    if pair_cost < Decimal::ONE {
+                        exit_reason // Still favorable — keep original reason
+                    } else {
+                        // Override stale FavorableTaker — the book moved, this is no longer favorable
+                        match exit_reason {
+                            ExitReason::FavorableTaker => ExitReason::ErosionExhausted,
+                            other => other,
+                        }
+                    }
+                };
                 warn!(%best_ask, %fok_price, ?exit_reason, elapsed_ms = elapsed,
                     "emergency deadline reached — FOK taker fallback");
                 let mut signal = make_leg2_signal(
@@ -1113,6 +1128,7 @@ mod tests {
             magnitude: Decimal::new(5, 3),
             sustained_ms: 200,
             timestamp_ms: 0,
+            atr_ratio: Decimal::ZERO,
         };
         let book = make_book("0.30", "0.32");
         let signal = make_leg2_signal(
@@ -1204,6 +1220,7 @@ mod tests {
                 magnitude: Decimal::new(5, 3),
                 sustained_ms: 300,
                 timestamp_ms: now_ms - 6_000,
+                atr_ratio: Decimal::ZERO,
             },
             leg1_fill_price: Decimal::new(50, 2),
             exit_reason: Some(ExitReason::AdverseMovement),

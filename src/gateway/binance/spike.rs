@@ -241,11 +241,13 @@ impl SpikeDetector {
                         // we recompute here for the confirmed SpikeInfo using
                         // sustain-time displacement (more honest than initial tick).
                         self.diag_confirmed += 1;
+                        let atr_ratio = if self.ema_atr > 1e-12 { abs_displacement / self.ema_atr } else { 0.0 };
                         let spike_info = SpikeInfo {
                             direction: self.spike_direction.unwrap_or(Direction::Up),
                             magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
                             sustained_ms: elapsed,
                             timestamp_ms: spike_start,
+                            atr_ratio: Decimal::from_f64(atr_ratio).unwrap_or(Decimal::ZERO),
                         };
                         info!(
                             direction = ?spike_info.direction,
@@ -309,11 +311,13 @@ impl SpikeDetector {
             self.spike_peak_delta = delta;
             self.diag_candidates_started += 1;
 
+            let atr_ratio = if self.ema_atr > 1e-12 { abs_delta / self.ema_atr } else { 0.0 };
             let spike_info = SpikeInfo {
                 direction: candidate_dir,
                 magnitude: Decimal::from_f64(magnitude).unwrap_or(Decimal::ZERO),
                 sustained_ms: 0,
                 timestamp_ms: now_ms,
+                atr_ratio: Decimal::from_f64(atr_ratio).unwrap_or(Decimal::ZERO),
             };
             debug!(
                 direction = ?candidate_dir,

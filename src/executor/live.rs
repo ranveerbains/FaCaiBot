@@ -675,7 +675,7 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: current_price,
                         size: safe_size,
-                        fill_method: None,
+                        fill_method: Some(FillMethod::EmergencyTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                     });
                     return;
@@ -770,7 +770,7 @@ impl LiveExecutor {
                         order_id: resp.order_id,
                         price: current_price,
                         size: safe_size,
-                        fill_method: None,
+                        fill_method: Some(FillMethod::EmergencyTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                     });
                     return;

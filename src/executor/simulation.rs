@@ -692,6 +692,7 @@ mod tests {
                 magnitude: d("0.005"),
                 sustained_ms: 200,
                 timestamp_ms: 1_000_000,
+                atr_ratio: Decimal::ZERO,
             },
             is_leg2: true,
             leg1_fill_price: Some(leg1_price),

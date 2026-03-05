@@ -69,7 +69,7 @@ The detector uses a **"post then cancel if unconfirmed"** model. Leg 1 is posted
 |---|-------|-----------|-----------------|
 | 1 | **ATR warmup** | 10 samples | Initialization noise |
 | 2 | **Per-tick threshold** | `|delta| > multiplier × ATR` (2x) | Normal volatility |
-| 3 | **Magnitude gate** | `displacement/origin_price >= 0.01%` (1 bp) | Marginal moves too small to trade |
+| 3 | **Magnitude gate** | `displacement/origin_price >= 0.015%` (1.5 bp) | Marginal moves too small to trade |
 
 If all pass → emit `SpikeCandidate` immediately → engine posts speculative Leg 1.
 
@@ -128,26 +128,26 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 ### Confidence formula
 
 ```
-f1 = clamp((spike_magnitude - min_magnitude_pct) / (spike_strong_pct - min_magnitude_pct), 0, 1)
+f1 = clamp((atr_ratio - min_spike_atr_ratio) / (strong_spike_atr_ratio - min_spike_atr_ratio), 0, 1)
 f2 = min(total_book_depth / avg_depth, 1.0)
 f3 = time_remaining_secs / 300.0
 
 confidence = 0.4 × f1 + 0.2 × f2 + 0.2 × f3
 ```
 
-Max possible: **0.8**. The spike quality factor (f1) measures how far above the detection floor each spike is, using magnitude-relative scoring. Spikes at `min_magnitude_pct` (detection floor) score f1 = 0; spikes at `spike_strong_pct` (config, default 0.015 = 1.5 bps) score f1 = 1.0. This replaces the old `magnitude / ATR` formula which produced near-identical f1 scores (~0.27–0.29) for all spikes due to magnitude/ATR unit mismatch (% vs $).
+Max possible: **0.8**. The spike quality factor (f1) uses ATR-relative scoring: `atr_ratio = abs_displacement / ema_atr` (dimensionless, computed in the spike detector). Spikes at `min_spike_atr_ratio` (config, default 25) score f1 = 0; spikes at `strong_spike_atr_ratio` (config, default 75) score f1 = 1.0. The ATR ratio automatically adapts to volatility regime — no unit mismatch possible. `SpikeInfo` carries `atr_ratio` from the spike detector through to the evaluator.
 
 ### Tier thresholds
 
-| Confidence | Tier | Profit Target | Default `tier_pct` | Example ($20 max) |
+| Confidence | Tier | Profit Target | Default `tier_pct` | Example ($9 max) |
 |------------|------|---------------|--------------------|-------------------|
-| >= 0.5 | HIGH | 4% | 100% | $20 |
-| >= 0.30 | MED | 3% | 50% | $10 |
-| < 0.30 | LOW | 1% | 25% | $5 |
+| >= 0.5 | HIGH | 3% | 100% | $9 |
+| >= 0.30 | MED | 2% | 80% | $7.20 |
+| < 0.30 | LOW | 2% | 50% | $4.50 |
 
 ### Allocation
 
-**Zero-alloc guard:** If `tier_pct == 0` for any tier (e.g. `low_alloc_pct = 0` in config.toml), the signal is rejected immediately with `Leg1RejectReason::Other` before the allocation calculation. This allows disabling entire tiers via config — currently LOW tier is disabled (`low_alloc_pct = 0`) because its 1-tick margin is structurally insufficient to survive repricing.
+**Zero-alloc guard:** If `tier_pct == 0` for any tier, the signal is rejected immediately with `Leg1RejectReason::Other` before the allocation calculation. This allows disabling entire tiers via config by setting their `*_alloc_pct = 0`. Currently all tiers are enabled: `high_alloc_pct = 1.0`, `med_alloc_pct = 0.8`, `low_alloc_pct = 0.5`.
 
 `alloc = max(round(max_alloc_per_trade × tier_pct), $1)`. The $1 floor ensures we always trade at least the minimum.
 
@@ -191,27 +191,27 @@ When Leg 1 fills, the engine captures: fill timestamp, fill price, fill size, in
 
 Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15). Early steps give up more margin (higher chance of fill at a good price); later steps give up less:
 
-| Step | Weight | % of margin | HIGH (4%) | MED (3%) | LOW (1%) |
+| Step | Weight | % of margin | HIGH (3%) | MED (2%) | LOW (2%) |
 |------|--------|-------------|-----------|----------|----------|
-| 0 | 5/15 | 33.3% | 1.333% | 1.000% | 0.333% |
-| 1 | 4/15 | 26.7% | 1.067% | 0.800% | 0.267% |
-| 2 | 3/15 | 20.0% | 0.800% | 0.600% | 0.200% |
-| 3 | 2/15 | 13.3% | 0.533% | 0.400% | 0.133% |
-| 4 | 1/15 | 6.7% | 0.267% | 0.200% | 0.067% |
+| 0 | 5/15 | 33.3% | 1.000% | 0.667% | 0.667% |
+| 1 | 4/15 | 26.7% | 0.800% | 0.533% | 0.533% |
+| 2 | 3/15 | 20.0% | 0.600% | 0.400% | 0.400% |
+| 3 | 2/15 | 13.3% | 0.400% | 0.267% | 0.267% |
+| 4 | 1/15 | 6.7% | 0.200% | 0.133% | 0.133% |
 
 After all 5 steps: 100% of margin eroded → price is at break-even.
 
 ### Interval timing — exponential decay
 
-`interval(step) = max(base_ms × decay^step, 200ms)`. Default: base=3000ms, decay=0.5:
+`interval(step) = max(base_ms × decay^step, 200ms)`. Default: base=2000ms, decay=0.5:
 
 | Step | Interval | Cumulative |
 |------|----------|-----------|
-| 0 | 3000ms | 3.0s |
-| 1 | 1500ms | 4.5s |
-| 2 | 750ms | 5.25s |
-| 3 | 375ms | 5.625s |
-| 4 | 200ms | 5.825s |
+| 0 | 2000ms | 2.0s |
+| 1 | 1000ms | 3.0s |
+| 2 | 500ms | 3.5s |
+| 3 | 250ms | 3.75s |
+| 4 | 200ms | 3.95s |
 
 Early steps wait longer (market has time to fill). Later steps fire rapidly (urgency). Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to an `ErosionExhausted` emergency. **Silent step advance guard**: Steps only advance silently when a Leg 2 order is actually resting (`leg2_state == Posted`). If `leg2_state` is `None`, steps advance via the normal evaluation path.
 
@@ -263,7 +263,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 ### 7b. Pre-Erosion Breach
 
-**Trigger:** Pair cost has exceeded `pre_erosion_breach_threshold` ($1.03) BEFORE the first erosion step. Catches fast book repricing (>$0.03 pair cost above $1.00 in <4s) that the regular break-even check misses because it waits for `steps_applied >= 1`.
+**Trigger:** Pair cost has exceeded `pre_erosion_breach_threshold` ($1.02) BEFORE the first erosion step. Catches fast book repricing (>$0.02 pair cost above $1.00 in <4s) that the regular break-even check misses because it waits for `steps_applied >= 1`.
 
 **Gates (all must be true):**
 1. `steps_applied == 0` (no erosion steps yet — mutually exclusive with break-even breach)
@@ -278,7 +278,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 **Trigger:** Pair cost has exceeded $1.00 after first erosion step.
 
 **Gates (all must be true):**
-1. `steps_applied >= 1` (at least one erosion step completed, ~3s after fill — mutually exclusive with pre-erosion breach)
+1. `steps_applied >= 1` (at least one erosion step completed, ~2s after fill — mutually exclusive with pre-erosion breach)
 2. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
 
 **Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
@@ -289,7 +289,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 **Trigger:** `MarketRotation` arrives while Leg 1 is Filled and Leg 2 is not Filled.
 
-Given the entry cutoff (`entry_cutoff_secs`), any Leg 1 fill has at least that time for the erosion cascade (~5.8s total), so this only fires when all other exit paths failed before rotation.
+Given the entry cutoff (`entry_cutoff_secs`), any Leg 1 fill has at least that time for the erosion cascade (~4.0s total), so this only fires when all other exit paths failed before rotation.
 
 Handled in the MarketRotation event handler — the engine builds an emergency FOK signal using the OLD market's token IDs and books BEFORE resetting state. The main loop sends this emergency to the executor before the rotation command, ensuring the position is hedged (or best-effort attempted) before state wipe.
 
@@ -325,7 +325,7 @@ Emergency exits use a **price-improvement chase with hard deadline** strategy to
 
 Once `emergency_submitted = true`, the engine posts an aggressive post-only limit at `best_ask - 1 tick` and records `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). From that point, on each Polymarket book update:
 
-1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2500ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
+1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2000ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The `exit_reason` is re-evaluated at deadline time: if the FOK price makes `pair_cost >= $1.00`, a stale `FavorableTaker` is overridden to `ErosionExhausted` (prevents favorable labeling on losing trades). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
 2. **Price improvement check**: If `best_ask - 1 tick > emergency_posted_price` → cancel and repost at the improved price (price-chase)
 3. **No change**: Hold current order — preserve FIFO queue priority (no blind reposts)
 
@@ -339,7 +339,7 @@ Once `emergency_submitted = true`, the engine posts an aggressive post-only limi
 | T+800ms | ask=0.52 | Book update, no improvement → hold (preserve queue) |
 | T+1200ms | ask=0.54 | Book update, 0.53 > 0.51 → cancel and repost at 0.53 |
 | T+2000ms | ask=0.54 | Book update, no improvement → hold |
-| T+2500ms | — | Deadline expired → FOK at `best_ask` |
+| T+2000ms | — | Deadline expired → FOK at `best_ask` |
 
 ### Live executor flow
 
@@ -364,7 +364,9 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 **Simulation:** `advance_simulation()` detects `ask < posted_price` on each book update across all direction branches. Fills at the ask price with `ExitReason::FavorableTaker`.
 
-**Live:** When the CLOB rejects a post-only erosion order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` which performs a **walk-down**: up to 4 post-only attempts at exponential tick offsets `[1, 2, 4, 8]` from `signal.price` (i.e., `price - 1*tick`, `price - 2*tick`, `price - 4*tick`, `price - 8*tick`). Each attempt is ~100ms (CLOB HTTP round-trip) and checks `price > 0` and `price × size >= $1` before trying. First accepted placement rests as maker (`fill_method=FavorableMaker`). If all 4 cross or fail → FOK fallback at `signal.price` (`fill_method=FavorableTaker` + `already_filled` if sync fill). Non-crossing errors (balance, etc.) skip remaining walk-down attempts and go straight to FOK. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `emergency_maker`) even though it dispatched a normal erosion signal — the executor autonomously converted to a favorable exit.
+**Live:** When the CLOB rejects a post-only erosion order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` which performs a **walk-down**: up to 4 post-only attempts at exponential tick offsets `[1, 2, 4, 8]` from `signal.price` (i.e., `price - 1*tick`, `price - 2*tick`, `price - 4*tick`, `price - 8*tick`). Each attempt is ~100ms (CLOB HTTP round-trip) and checks `price > 0` and `price × size >= $1` before trying. First accepted placement rests as maker (`fill_method=FavorableMaker`). If all 4 cross or fail → FOK fallback at `signal.price` (`fill_method=FavorableTaker` + `already_filled` if sync fill). Non-crossing errors (balance, etc.) skip remaining walk-down attempts and go straight to FOK. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. Emergency FOK paths (`emergency_fok_fallback` and `emergency_fok_at_price`) send `fill_method=EmergencyTaker` — distinct from favorable exits so the engine correctly classifies the trade. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `emergency_maker`, `leg2_was_taker`) even though the executor autonomously converted the signal.
+
+**Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and erosion emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]` when the emergency dispatch happened before the cancel race resolved.
 
 **Tracking:** `favorable_taker_fills` counter across all reporting contexts. Telegram tags: `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]`.
 
