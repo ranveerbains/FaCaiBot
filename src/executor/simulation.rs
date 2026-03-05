@@ -531,6 +531,39 @@ impl SimulationExecutor {
                     );
                 }
             }
+            Some(ExitReason::PreErosionBreach) => {
+                let reason = ExitReason::PreErosionBreach;
+                if is_taker {
+                    info!(
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: pre-erosion breach FOK fallback"
+                    );
+                    self.state.trades_break_even_fok += 1;
+                    self.state.record_emergency_taker(position_idx, fill);
+                } else {
+                    info!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: pre-erosion breach post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(position_idx, fill, &reason);
+                }
+            }
+            Some(ExitReason::WhipsawReversal) => {
+                info!(
+                    token_id = %signal.token_id,
+                    taker_price = %fill.price,
+                    taker_fee = %fill.taker_fee,
+                    position_idx,
+                    "Leg 2: whipsaw reversal FOK"
+                );
+                self.state.trades_deadline_fok += 1;
+                self.state.record_emergency_taker(position_idx, fill);
+            }
             None => {
                 info!(
                     token_id = %signal.token_id,

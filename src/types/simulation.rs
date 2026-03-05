@@ -94,6 +94,10 @@ pub struct SimPosition {
     pub exit_reason: Option<ExitReason>,
     /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
     pub spike_magnitude: Decimal,
+    /// Whether Leg 2 was triggered by pre-erosion breach (fast book move before first step).
+    pub pre_erosion_breach: bool,
+    /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
+    pub whipsaw_reversal: bool,
 }
 
 // ─── Simulated Trade (closed) ────────────────────────────────────────────────
@@ -157,6 +161,10 @@ pub struct SimTrade {
     /// `true` if Leg 1 was supposed to be cancelled but filled mid-cancel
     /// (cancel-not-confirmed replay path in live mode).
     pub leg1_cancel_race: bool,
+    /// Whether Leg 2 was triggered by pre-erosion breach (fast book move before first step).
+    pub pre_erosion_breach: bool,
+    /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
+    pub whipsaw_reversal: bool,
 
     // ── Timestamps ───────────────────────────────────────────────────────
     /// Epoch ms when the trade was opened (Leg 1 fill).
@@ -500,6 +508,8 @@ impl SimulationState {
             emergency_maker: false,
             exit_reason: None,
             spike_magnitude: Decimal::ZERO,
+            pre_erosion_breach: false,
+            whipsaw_reversal: false,
         };
 
         self.open_positions.push(position);
@@ -669,6 +679,8 @@ impl SimulationState {
             exit_reason: pos.exit_reason,
             spike_magnitude: pos.spike_magnitude,
             leg1_cancel_race: false,
+            pre_erosion_breach: pos.pre_erosion_breach,
+            whipsaw_reversal: pos.whipsaw_reversal,
             open_timestamp_ms: pos.leg1.timestamp_ms,
             close_timestamp_ms,
         };

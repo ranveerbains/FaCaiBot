@@ -397,6 +397,7 @@ pub(crate) struct Leg2Evaluator {
     pub erosion_interval_decay: f64,
     pub depth_wall_multiplier: Decimal,
     pub emergency_deadline_ms: u64,
+    pub pre_erosion_breach_threshold: Decimal,
 }
 
 impl Leg2Evaluator {
@@ -593,6 +594,53 @@ impl Leg2Evaluator {
                         false,
                         Some(hedge_book.clone()),
                         Some(ExitReason::AdverseMovement),
+                    );
+                    return Some(Leg2Decision::Emergency {
+                        signal,
+                        price,
+                        size: fok_size,
+                    });
+                }
+            }
+        }
+
+        // ── Pre-erosion breach (before first erosion step) ────────────────
+        // Catches fast book repricing (>$0.02 move in <4s) that the regular
+        // break-even check misses because it waits for steps_applied >= 1.
+        // Mutually exclusive: pre-erosion fires at steps_applied == 0 only,
+        // regular break-even fires at steps_applied >= 1 only.
+        if snap.steps_applied == 0 {
+            if let Some(ask_price) = best_ask_price {
+                if leg1_price + ask_price > self.pre_erosion_breach_threshold {
+                    let price = round_to_tick(ask_price - tick, tick);
+                    let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
+                    if fok_size <= Decimal::ZERO {
+                        warn!(%leg1_price, %ask_price, "pre-erosion breach — no ask depth for emergency");
+                        return None;
+                    }
+                    warn!(
+                        %leg1_price, %ask_price, threshold = %self.pre_erosion_breach_threshold,
+                        %fok_size, %price, "pre-erosion breach — emergency Leg 2"
+                    );
+                    let signal = make_leg2_signal(
+                        &hedge_token_id,
+                        state.active_condition_id.as_deref().unwrap_or(""),
+                        price,
+                        fok_size,
+                        reference_price,
+                        snap.confidence,
+                        snap.tier,
+                        Decimal::ZERO,
+                        snap.direction,
+                        snap.spike_info,
+                        leg1_price,
+                        now_ms,
+                        market_end_ms,
+                        tick,
+                        atr,
+                        false,
+                        Some(hedge_book.clone()),
+                        Some(ExitReason::PreErosionBreach),
                     );
                     return Some(Leg2Decision::Emergency {
                         signal,
@@ -1164,6 +1212,7 @@ mod tests {
             erosion_interval_decay: 0.6,
             depth_wall_multiplier: Decimal::new(4, 0),
             emergency_deadline_ms: 2500,
+            pre_erosion_breach_threshold: Decimal::new(103, 2),
         };
 
         (state, snap, evaluator)

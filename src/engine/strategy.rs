@@ -21,6 +21,7 @@ use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::engine::confidence::round_to_tick;
 use crate::reporting::telegram::TelegramReporter;
 use crate::types::market::{
     DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState, PriceLevel,
@@ -63,19 +64,6 @@ struct SpikeDiagData {
     stale: u64,
 }
 
-// ─── Live executor diagnostic snapshot ───────────────────────────────────────
-
-/// Lightweight copy of live executor diagnostics for Telegram forwarding.
-#[derive(Debug, Clone)]
-struct LiveDiagData {
-    placed: u64,
-    cancelled: u64,
-    failed: u64,
-    emergency_foks: u64,
-    emergency_makers: u64,
-    favorable_takers: u64,
-}
-
 // ─── Per-trade Leg 2 metadata for live mode Telegram reporting ───────────────
 
 /// Tracks Leg 2 exit metadata in live mode so `on_trade_complete()` can build
@@ -87,6 +75,7 @@ struct LiveTradeMeta {
     emergency_maker: bool,
     adverse_movement: bool,
     favorable_taker: bool,
+    pre_erosion_breach: bool,
     exit_reason: Option<ExitReason>,
     /// `true` if Leg 1 filled via the cancel-not-confirmed replay path.
     leg1_cancel_race: bool,
@@ -141,6 +130,18 @@ pub struct StrategyEngine {
     /// Reset to `false` on `MarketRotation`.
     in_cutoff_window: bool,
 
+    /// `true` during the post-rotation quiet period. Set on `MarketRotation`,
+    /// cleared when `rotation_quiet_ms` elapses.
+    in_quiet_period: bool,
+    /// Epoch ms when the current market rotation occurred.
+    rotation_ms: u64,
+    /// Config: quiet period duration after rotation.
+    rotation_quiet_ms: u64,
+
+    /// `true` when opposite spike detected with Leg 1 filled — next evaluate_leg2()
+    /// emits immediate FOK at best ask, bypassing erosion.
+    whipsaw_fok_pending: bool,
+
     /// Stored Leg 1 signal for building confirmed fill signals in advance_simulation().
     pending_leg1_signal: Option<TradeSignal>,
 
@@ -179,9 +180,6 @@ pub struct StrategyEngine {
     /// Latest spike detector diagnostics (received via `SpikeDiagnostic` event).
     last_spike_diag: Option<SpikeDiagData>,
 
-    /// Latest live executor diagnostics (received via `ExecutorFeedback::DiagSnapshot`).
-    last_live_diag: Option<LiveDiagData>,
-
     /// Set `true` when the engine's 60s terminal log fires. Cleared after the
     /// combined Telegram diagnostic is sent (requires both flags to be set).
     engine_diag_ready: bool,
@@ -214,6 +212,10 @@ pub struct StrategyEngine {
     diag_markets_rotated: u64,
     diag_spikes_received: u64,
     diag_spikes_dropped_cutoff: u64,
+    diag_spikes_dropped_quiet: u64,
+    diag_emg_pre_erosion: u64,
+    diag_whipsaw_cancels: u64,
+    diag_whipsaw_foks: u64,
     // Leg 1 rejection distribution — only incremented when spike_detected = true
     diag_rej_busy: u64,    // ActiveTrade: trade already in flight
     diag_rej_no_book: u64, // NoBook / NoBinance: data unavailable
@@ -237,6 +239,7 @@ pub struct StrategyEngine {
     diag_leg1_timeouts: u64,
     diag_spike_sustain_cancel: u64,
     diag_spike_failures: u64,
+    diag_order_failures: u64,
     last_diag_ms: u64,
 
     // ── Drain / pause mode ─────────────────────────────────────────────
@@ -298,6 +301,10 @@ impl StrategyEngine {
             last_erosion_signal_ms: 0,
             leg1_direction: None,
             in_cutoff_window: false,
+            in_quiet_period: false,
+            rotation_ms: 0,
+            rotation_quiet_ms: config.bot.entry_guards.rotation_quiet_ms,
+            whipsaw_fok_pending: false,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
             pending_spike_cancel: None,
@@ -307,7 +314,6 @@ impl StrategyEngine {
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
             last_spike_diag: None,
-            last_live_diag: None,
             engine_diag_ready: false,
             spike_diag_ready: false,
             pending_telegram_diag: None,
@@ -321,6 +327,10 @@ impl StrategyEngine {
             diag_markets_rotated: 0,
             diag_spikes_received: 0,
             diag_spikes_dropped_cutoff: 0,
+            diag_spikes_dropped_quiet: 0,
+            diag_emg_pre_erosion: 0,
+            diag_whipsaw_cancels: 0,
+            diag_whipsaw_foks: 0,
             diag_rej_busy: 0,
             diag_rej_no_book: 0,
             diag_rej_stale: 0,
@@ -343,6 +353,7 @@ impl StrategyEngine {
             diag_leg1_timeouts: 0,
             diag_spike_sustain_cancel: 0,
             diag_spike_failures: 0,
+            diag_order_failures: 0,
             last_diag_ms: 0,
             draining: false,
             paused: false,
@@ -377,6 +388,7 @@ impl StrategyEngine {
                 erosion_interval_decay: config.bot.risk.erosion_interval_decay,
                 depth_wall_multiplier,
                 emergency_deadline_ms: config.bot.risk.emergency_deadline_ms,
+                pre_erosion_breach_threshold: config.pre_erosion_breach_threshold,
             },
         }
     }
@@ -636,6 +648,12 @@ impl StrategyEngine {
             // ── Spike candidate — speculative Leg 1 posting ──────────────
             IngestorEvent::SpikeCandidate(spike) => {
                 self.diag_spikes_received += 1;
+                // Drop spike if within post-rotation quiet period.
+                if self.in_quiet_period {
+                    self.diag_spikes_dropped_quiet += 1;
+                    debug!("spike candidate ignored — within rotation quiet period");
+                    return;
+                }
                 // Drop spike if within entry_cutoff window — no new trades allowed.
                 if self.in_cutoff_window {
                     self.diag_spikes_dropped_cutoff += 1;
@@ -659,6 +677,60 @@ impl StrategyEngine {
                 self.speculative_awaiting_sustain = false;
                 // Update spike info with the confirmed (sustain-time) magnitude.
                 self.state.last_spike = Some(spike);
+
+                // ── Whipsaw guard: opposite spike while Leg 1 is active ──
+                if let Some(leg1_dir) = self.leg1_direction {
+                    if spike.direction != leg1_dir {
+                        match &self.state.leg1_state {
+                            OrderState::Posted { order_id, price, size, .. } => {
+                                self.diag_whipsaw_cancels += 1;
+                                let saved = CancelledLeg1 {
+                                    order_id: order_id.clone(),
+                                    price: *price,
+                                    size: *size,
+                                    signal: self.pending_leg1_signal.clone(),
+                                    direction: self.leg1_direction,
+                                    spike: self.state.last_spike,
+                                };
+                                if Self::is_provisional_order_id(order_id) {
+                                    warn!(
+                                        spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
+                                        %order_id,
+                                        "whipsaw — deferring Leg 1 cancel (provisional ID)"
+                                    );
+                                    self.cancel_leg1_on_feedback = true;
+                                    self.cancelled_leg1_info = Some(saved);
+                                } else {
+                                    warn!(
+                                        spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
+                                        %order_id,
+                                        "whipsaw — cancelling unfilled Leg 1"
+                                    );
+                                    self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
+                                        order_id: order_id.clone(),
+                                    });
+                                    self.cancelled_leg1_info = Some(saved);
+                                }
+                                self.state.leg1_state = OrderState::None;
+                                self.pending_leg1_signal = None;
+                                self.leg1_direction = None;
+                                self.state.spike_detected = false;
+                                self.state.last_spike = None;
+                                return; // Skip rest of SpikeConfirmed handling
+                            }
+                            OrderState::Filled { .. } => {
+                                warn!(
+                                    spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
+                                    "whipsaw — Leg 1 filled, queueing immediate FOK"
+                                );
+                                self.whipsaw_fok_pending = true;
+                                self.diag_whipsaw_foks += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 info!(
                     direction = ?spike.direction,
                     magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
@@ -835,6 +907,7 @@ impl StrategyEngine {
                 self.pending_spike_cancel = None;
                 self.pending_tick_size_cmd = None;
                 self.speculative_awaiting_sustain = false;
+                self.whipsaw_fok_pending = false;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
                 self.cancel_leg1_on_feedback = false;
@@ -843,6 +916,8 @@ impl StrategyEngine {
                 self.pending_fills.clear();
                 self.pending_partial_fills.clear();
                 self.in_cutoff_window = false;
+                self.in_quiet_period = true;
+                self.rotation_ms = now_ms;
                 self.diag_markets_rotated += 1;
                 // Reset per-market live reporting state.
                 self.live_market_trades.clear();
@@ -1116,6 +1191,15 @@ impl StrategyEngine {
                 }
             }
         }
+
+        // ── Rotation quiet period detection (runs on every event) ──────
+        if self.in_quiet_period {
+            let elapsed = now_ms.saturating_sub(self.rotation_ms);
+            if elapsed >= self.rotation_quiet_ms {
+                self.in_quiet_period = false;
+                info!(elapsed_ms = elapsed, "rotation quiet period ended — trading enabled");
+            }
+        }
     }
 
     /// Evaluate current state and optionally emit a **Leg 1** trade signal.
@@ -1129,8 +1213,10 @@ impl StrategyEngine {
     pub fn evaluate(&mut self) -> Option<TradeSignal> {
         // Drain/pause mode: block new Leg 1 entries.
         if self.draining || self.paused {
+            if self.state.spike_detected {
+                self.diag_rej_paused += 1;
+            }
             self.state.spike_detected = false;
-            self.diag_rej_paused += 1;
             return None;
         }
 
@@ -1195,6 +1281,11 @@ impl StrategyEngine {
         }
         if self.leg2_command_pending {
             return None;
+        }
+        // Whipsaw FOK: opposite spike after Leg 1 fill → immediate taker, no erosion.
+        if self.whipsaw_fok_pending {
+            self.whipsaw_fok_pending = false;
+            return self.emit_whipsaw_fok();
         }
         let now_ms = now_epoch_ms();
 
@@ -1297,6 +1388,8 @@ impl StrategyEngine {
                 }
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
+                Some(ExitReason::PreErosionBreach) => self.diag_emg_pre_erosion += 1,
+                Some(ExitReason::WhipsawReversal) => {} // counted in spike handler (diag_whipsaw_foks)
                 None => self.diag_emg_adverse += 1, // fallback
             }
             // Track for live mode trade-completed Telegram message.
@@ -1308,6 +1401,7 @@ impl StrategyEngine {
                 emergency_maker: reason.is_some() && !was_taker,
                 adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
+                pre_erosion_breach: matches!(reason, Some(ExitReason::PreErosionBreach)),
                 leg1_cancel_race: cancel_race,
             };
             if let Some(e) = self.erosion.as_mut() {
@@ -1411,6 +1505,10 @@ impl StrategyEngine {
             markets = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
             spikes_cut = self.diag_spikes_dropped_cutoff,
+            spikes_quiet = self.diag_spikes_dropped_quiet,
+            emg_pre_erosion = self.diag_emg_pre_erosion,
+            whipsaw_cancel = self.diag_whipsaw_cancels,
+            whipsaw_fok = self.diag_whipsaw_foks,
             rej_paused = self.diag_rej_paused,
             rej_busy = self.diag_rej_busy,
             rej_no_book = self.diag_rej_no_book,
@@ -1433,6 +1531,7 @@ impl StrategyEngine {
             leg1_timeout = self.diag_leg1_timeouts,
             sustain_cancel = self.diag_spike_sustain_cancel,
             spike_fail = self.diag_spike_failures,
+            order_fail = self.diag_order_failures,
             "engine 60s"
         );
         self.last_diag_ms = now_ms;
@@ -1470,46 +1569,32 @@ impl StrategyEngine {
             "<b>Spike Detector</b>\n(no data yet)".to_string()
         };
 
-        let live_section = if let Some(ref l) = self.last_live_diag {
-            format!(
-                "\n\n<b>Live Executor</b>\n\
-                 Placed: {placed}  Cancelled: {cancelled}  Failed: {failed}\n\
-                 Emergency FOK: {efok}  Emergency maker: {emkr}  Favorable taker: {ftaker}",
-                placed = l.placed,
-                cancelled = l.cancelled,
-                failed = l.failed,
-                efok = l.emergency_foks,
-                emkr = l.emergency_makers,
-                ftaker = l.favorable_takers,
-            )
-        } else {
-            String::new()
-        };
-
         self.pending_telegram_diag = Some(format!(
             "<b>--- DIAGNOSTICS (60s) ---</b>\n\
              \n\
              {spike}\n\
              \n\
              <b>Engine</b>\n\
-             Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}\n\
+             Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}  Quiet drops: {spikes_quiet}\n\
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
              Spread: {spread}  Depth: {depth}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
-             Signals: {sig}  Fills: {fill}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
+             Signals: {sig}  Fills: {fill}  Failed: {failed}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
              \n\
              <b>Leg 2</b>\n\
              Erosion steps: {erosion}  Fills: {l2_maker} maker / {l2_taker} taker\n\
-             Emergencies — adverse: {emg_adv}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
-             Emergency fills — {emg_mkr} maker / {emg_tkr} taker{live}",
+             Emergencies — adverse: {emg_adv}  pre-erosion: {emg_pre}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
+             Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
+             Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
             spikes = self.diag_spikes_received,
             spike_fail = self.diag_spike_failures,
             spikes_cut = self.diag_spikes_dropped_cutoff,
+            spikes_quiet = self.diag_spikes_dropped_quiet,
             paused = self.diag_rej_paused,
             busy = self.diag_rej_busy,
             no_book = self.diag_rej_no_book,
@@ -1520,6 +1605,7 @@ impl StrategyEngine {
             other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
+            failed = self.diag_order_failures,
             timeout = self.diag_leg1_timeouts,
             sus_cancel = self.diag_spike_sustain_cancel,
             erosion = self.diag_leg2_erosion_steps,
@@ -1529,9 +1615,11 @@ impl StrategyEngine {
             emg_be = self.diag_emg_breakeven,
             emg_exp = self.diag_emg_expiry,
             emg_fav = self.diag_emg_favorable,
+            emg_pre = self.diag_emg_pre_erosion,
             emg_mkr = self.diag_emg_maker,
             emg_tkr = self.diag_emg_taker,
-            live = live_section,
+            whip_cancel = self.diag_whipsaw_cancels,
+            whip_fok = self.diag_whipsaw_foks,
         ));
     }
 
@@ -1543,26 +1631,6 @@ impl StrategyEngine {
     }
 
     // ─── Accessors and Executor callbacks ────────────────────────────────
-
-    /// Store latest live executor diagnostic snapshot for Telegram forwarding.
-    pub fn on_live_diag(
-        &mut self,
-        placed: u64,
-        cancelled: u64,
-        failed: u64,
-        emergency_foks: u64,
-        emergency_makers: u64,
-        favorable_takers: u64,
-    ) {
-        self.last_live_diag = Some(LiveDiagData {
-            placed,
-            cancelled,
-            failed,
-            emergency_foks,
-            emergency_makers,
-            favorable_takers,
-        });
-    }
 
     pub fn state(&self) -> &MarketState {
         &self.state
@@ -1723,6 +1791,7 @@ impl StrategyEngine {
             self.leg2_command_pending = false;
             return;
         }
+        self.diag_order_failures += 1;
         if is_leg2 {
             self.emergency_signal_in_flight = false;
             self.leg2_command_pending = false;
@@ -2123,6 +2192,7 @@ impl StrategyEngine {
         self.pending_spike_cancel = None;
         self.pending_tick_size_cmd = None;
         self.speculative_awaiting_sustain = false;
+        self.whipsaw_fok_pending = false;
         self.emergency_signal_in_flight = false;
         self.leg2_command_pending = false;
         self.cancel_leg1_on_feedback = false;
@@ -2161,12 +2231,16 @@ impl StrategyEngine {
                 self.leg1.med_threshold,
             );
             let initial_profit_target = self.leg1.target_pct_for_tier(tier);
+            // Use leg1_direction (set at signal generation, survives spike overwrites)
+            // instead of spike.direction to prevent YES/NO label swap when an
+            // opposite spike arrives between Leg 1 fill and init_erosion().
+            let direction = self.leg1_direction.unwrap_or(spike.direction);
             self.erosion = Some(ErosionState::new(
                 now_ms,
                 fill_price,
                 tier,
                 initial_profit_target,
-                spike.direction,
+                direction,
                 spike,
                 conf,
                 self.state.binance_price,
@@ -2175,6 +2249,107 @@ impl StrategyEngine {
         } else {
             warn!("Leg 1 filled but no spike info — erosion not initialised");
         }
+    }
+
+    /// Emit an immediate FOK signal at best ask to hedge a whipsaw reversal.
+    /// Called from `evaluate_leg2()` when `whipsaw_fok_pending` is set.
+    /// Bypasses erosion entirely — the opposite spike invalidated the thesis.
+    fn emit_whipsaw_fok(&mut self) -> Option<TradeSignal> {
+        let now_ms = now_epoch_ms();
+        let erosion = self.erosion.as_ref()?;
+        let direction = erosion.direction;
+
+        let hedge_book = match direction {
+            Direction::Up => self
+                .state
+                .poly_no_book
+                .as_ref()
+                .or(self.state.poly_book.as_ref()),
+            Direction::Down => self
+                .state
+                .poly_yes_book
+                .as_ref()
+                .or(self.state.poly_book.as_ref()),
+        }?;
+        let best_ask = hedge_book.best_ask()?.price;
+        let tick = self.state.tick_size;
+        let fok_price = round_to_tick(best_ask, tick);
+
+        let leg1_size = match &self.state.leg1_state {
+            OrderState::Filled { size, .. } => *size,
+            _ => return None,
+        };
+
+        let hedge_token_id = match direction {
+            Direction::Up => self.state.active_no_token_id.as_ref()?.clone(),
+            Direction::Down => self.state.active_yes_token_id.as_ref()?.clone(),
+        };
+
+        let mut signal = make_leg2_signal(
+            &hedge_token_id,
+            self.state.active_condition_id.as_deref().unwrap_or(""),
+            fok_price,
+            leg1_size,
+            self.state.binance_price.unwrap_or(Decimal::ZERO),
+            erosion.confidence,
+            erosion.tier,
+            Decimal::ZERO,
+            direction,
+            erosion.spike_info,
+            erosion.leg1_fill_price,
+            now_ms,
+            self.state.market_end_timestamp_ms,
+            tick,
+            self.state.atr.unwrap_or(Decimal::ZERO),
+            false,
+            Some(hedge_book.clone()),
+            Some(ExitReason::WhipsawReversal),
+        );
+        signal.sim_was_taker = true;
+
+        // Set up emergency dispatch state (mirrors evaluate_leg2 dispatch)
+        let cancel_race = self.live_trade_meta.leg1_cancel_race;
+        self.live_trade_meta = LiveTradeMeta {
+            leg2_was_taker: true,
+            exit_reason: Some(ExitReason::WhipsawReversal),
+            emergency_maker: false,
+            adverse_movement: false,
+            favorable_taker: false,
+            pre_erosion_breach: false,
+            leg1_cancel_race: cancel_race,
+        };
+        if let Some(e) = self.erosion.as_mut() {
+            e.emergency_submitted = true;
+            e.fok_emitted = true;
+            e.emergency_first_post_ms = Some(now_ms);
+            e.emergency_posted_price = Some(fok_price);
+            e.exit_reason = Some(ExitReason::WhipsawReversal);
+        }
+        self.emergency_signal_in_flight = true;
+        if self.reporter.is_some() {
+            self.leg2_command_pending = true;
+        }
+        // Save prev leg2 order for cancel-confirm tracking
+        if let OrderState::Posted {
+            ref order_id,
+            price: p,
+            size: s,
+            ..
+        } = self.state.leg2_state
+        {
+            if !order_id.starts_with("sim-") {
+                self.prev_leg2_order = Some((order_id.clone(), p, s));
+            }
+        }
+        self.state.leg2_state = OrderState::Posted {
+            order_id: format!("sim-leg2-emergency-{}", now_ms),
+            price: fok_price,
+            size: leg1_size,
+            timestamp_ms: now_ms,
+        };
+
+        warn!(%fok_price, %leg1_size, "whipsaw FOK emitted — bypassing erosion");
+        Some(signal)
     }
 
     /// Advance simulation state: simulate Leg 1 and Leg 2 fills based on
@@ -2816,6 +2991,8 @@ impl StrategyEngine {
             exit_reason: self.live_trade_meta.exit_reason,
             spike_magnitude: erosion.spike_info.magnitude,
             leg1_cancel_race: self.live_trade_meta.leg1_cancel_race,
+            pre_erosion_breach: self.live_trade_meta.pre_erosion_breach,
+            whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
             open_timestamp_ms: l1_ts,
             close_timestamp_ms: now_ms,
         })

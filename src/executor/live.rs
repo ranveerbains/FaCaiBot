@@ -69,14 +69,6 @@ pub struct LiveExecutor {
     /// rejected with `OrderFailed` until cleared on `MarketRotation`.
     balance_exhausted: bool,
 
-    // ── Diagnostics (cumulative, logged every 60s) ──────────────────
-    orders_placed: u64,
-    orders_cancelled: u64,
-    orders_failed: u64,
-    emergency_foks: u64,
-    emergency_maker_posts: u64,
-    favorable_taker_fills: u64,
-    last_diag_ms: u64,
 }
 
 impl LiveExecutor {
@@ -94,13 +86,6 @@ impl LiveExecutor {
             caches_warm: false,
             active_leg2_order_id: None,
             balance_exhausted: false,
-            orders_placed: 0,
-            orders_cancelled: 0,
-            orders_failed: 0,
-            emergency_foks: 0,
-            emergency_maker_posts: 0,
-            favorable_taker_fills: 0,
-            last_diag_ms: 0,
         }
     }
 
@@ -167,7 +152,6 @@ impl LiveExecutor {
                     }
                 }
             }
-            self.check_diagnostic();
         }
 
         info!("LiveExecutor: channel disconnected");
@@ -230,7 +214,7 @@ impl LiveExecutor {
                         order_id = %resp.order_id,
                         "Leg 1: post-only REJECTED (would cross spread)"
                     );
-                    self.orders_failed += 1;
+
 
                     let _ = self
                         .feedback_tx
@@ -243,7 +227,7 @@ impl LiveExecutor {
                         status = ?resp.status,
                         "Leg 1: order placed"
                     );
-                    self.orders_placed += 1;
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: false,
@@ -259,7 +243,7 @@ impl LiveExecutor {
             }
             Err(e) => {
                 error!(error = %e, "Leg 1: order placement FAILED");
-                self.orders_failed += 1;
+
 
                 let _ = self
                     .feedback_tx
@@ -278,7 +262,7 @@ impl LiveExecutor {
             info!(order_id = %prev_order_id, "Leg 2 erosion: cancelling previous order");
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
-                    self.orders_cancelled += 1;
+
                     self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
                 }
                 Ok(false) => {
@@ -296,7 +280,7 @@ impl LiveExecutor {
                 }
                 Err(e) => {
                     warn!(error = %e, "Leg 2 erosion: cancel failed — posting replacement anyway");
-                    self.orders_cancelled += 1;
+
                 }
             }
         }
@@ -325,7 +309,7 @@ impl LiveExecutor {
                         "Leg 2 erosion: new order placed"
                     );
                     self.active_leg2_order_id = Some(resp.order_id.clone());
-                    self.orders_placed += 1;
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -349,7 +333,7 @@ impl LiveExecutor {
                     self.attempt_favorable_exit(signal).await;
                 } else {
                     error!(error = %e, "Leg 2 erosion: order placement FAILED");
-                    self.orders_failed += 1;
+
                     self.active_leg2_order_id = None;
 
                     // Detect balance errors — stop all Leg 2 attempts until rotation
@@ -418,8 +402,8 @@ impl LiveExecutor {
                         "Leg 2 favorable walk-down: post-only accepted"
                     );
                     self.active_leg2_order_id = Some(resp.order_id.clone());
-                    self.emergency_maker_posts += 1;
-                    self.orders_placed += 1;
+
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -462,7 +446,7 @@ impl LiveExecutor {
         let safe_size = clob_safe_fok_size(signal.price, signal.size);
         if safe_size.is_zero() {
             error!(price = %signal.price, size = %signal.size, "favorable FOK size zero — aborting");
-            self.orders_failed += 1;
+
             self.active_leg2_order_id = None;
             let _ = self
                 .feedback_tx
@@ -471,7 +455,7 @@ impl LiveExecutor {
         }
         if signal.price * safe_size < Decimal::ONE {
             warn!(price = %signal.price, size = %safe_size, "favorable FOK below $1 minimum — aborting");
-            self.orders_failed += 1;
+
             self.active_leg2_order_id = None;
             let _ = self
                 .feedback_tx
@@ -489,7 +473,7 @@ impl LiveExecutor {
             Ok(resp) => {
                 if resp.status == OrderStatus::Rejected {
                     warn!("Leg 2 favorable exit: FOK also rejected — erosion continues");
-                    self.orders_failed += 1;
+
                     self.active_leg2_order_id = None;
 
                     let _ = self
@@ -507,8 +491,8 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_order_id = Some(resp.order_id.clone());
                     }
-                    self.favorable_taker_fills += 1;
-                    self.orders_placed += 1;
+
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -522,7 +506,7 @@ impl LiveExecutor {
             }
             Err(e) => {
                 error!(error = %e, "Leg 2 favorable exit: FOK FAILED");
-                self.orders_failed += 1;
+
                 self.active_leg2_order_id = None;
 
                 let _ = self
@@ -542,7 +526,7 @@ impl LiveExecutor {
             info!(order_id = %prev_order_id, "Leg 2 emergency: cancelling previous resting order");
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
-                    self.orders_cancelled += 1;
+
                     self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
                 }
                 Ok(false) => {
@@ -560,7 +544,7 @@ impl LiveExecutor {
                 }
                 Err(e) => {
                     warn!(error = %e, "Leg 2 emergency: cancel failed — proceeding with replacement");
-                    self.orders_cancelled += 1;
+
                 }
             }
         }
@@ -609,8 +593,8 @@ impl LiveExecutor {
                             "Leg 2 emergency: price-chase post-only accepted"
                         );
                         self.active_leg2_order_id = Some(resp.order_id.clone());
-                        self.emergency_maker_posts += 1;
-                        self.orders_placed += 1;
+    
+    
 
                         let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                             is_leg2: true,
@@ -644,7 +628,7 @@ impl LiveExecutor {
         let safe_size = clob_safe_fok_size(signal.price, signal.size);
         if safe_size.is_zero() {
             error!(price = %signal.price, size = %signal.size, "FOK size zero — aborting");
-            self.orders_failed += 1;
+
             self.active_leg2_order_id = None;
             let _ = self
                 .feedback_tx
@@ -668,7 +652,7 @@ impl LiveExecutor {
                             attempt,
                             "Leg 2 emergency: FOK rejected — retrying"
                         );
-                        self.orders_failed += 1;
+    
                         continue;
                     }
 
@@ -684,8 +668,8 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_order_id = Some(resp.order_id.clone());
                     }
-                    self.emergency_foks += 1;
-                    self.orders_placed += 1;
+
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -699,7 +683,7 @@ impl LiveExecutor {
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    self.orders_failed += 1;
+
                     if err_msg.contains("decimal places")
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
@@ -738,7 +722,7 @@ impl LiveExecutor {
         let safe_size = clob_safe_fok_size(price, signal.size);
         if safe_size.is_zero() {
             error!(%price, size = %signal.size, "FOK at price size zero — aborting");
-            self.orders_failed += 1;
+
             self.active_leg2_order_id = None;
             let _ = self
                 .feedback_tx
@@ -763,7 +747,7 @@ impl LiveExecutor {
                             attempt,
                             "Leg 2 emergency: FOK at price rejected — retrying"
                         );
-                        self.orders_failed += 1;
+    
                         continue;
                     }
 
@@ -780,8 +764,8 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_order_id = Some(resp.order_id.clone());
                     }
-                    self.emergency_foks += 1;
-                    self.orders_placed += 1;
+
+
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -795,7 +779,7 @@ impl LiveExecutor {
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    self.orders_failed += 1;
+
                     if err_msg.contains("decimal places")
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
@@ -916,36 +900,6 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Diagnostics ────────────────────────────────────────────────────
-
-    fn check_diagnostic(&mut self) {
-        let now_ms = now_epoch_ms();
-        if self.last_diag_ms == 0 {
-            self.last_diag_ms = now_ms;
-            return;
-        }
-        if now_ms.saturating_sub(self.last_diag_ms) < 60_000 {
-            return;
-        }
-        info!(
-            placed = self.orders_placed,
-            cancelled = self.orders_cancelled,
-            failed = self.orders_failed,
-            emergency_fok = self.emergency_foks,
-            emergency_maker = self.emergency_maker_posts,
-            favorable_taker = self.favorable_taker_fills,
-            "live executor 60s"
-        );
-        let _ = self.feedback_tx.try_send(ExecutorFeedback::DiagSnapshot {
-            placed: self.orders_placed,
-            cancelled: self.orders_cancelled,
-            failed: self.orders_failed,
-            emergency_foks: self.emergency_foks,
-            emergency_makers: self.emergency_maker_posts,
-            favorable_takers: self.favorable_taker_fills,
-        });
-        self.last_diag_ms = now_ms;
-    }
 }
 
-use crate::utils::time::epoch_ms as now_epoch_ms;
+

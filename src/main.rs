@@ -279,23 +279,6 @@ async fn async_main() -> Result<()> {
                     ExecutorFeedback::BalanceExhausted => {
                         engine.on_balance_exhausted();
                     }
-                    ExecutorFeedback::DiagSnapshot {
-                        placed,
-                        cancelled,
-                        failed,
-                        emergency_foks,
-                        emergency_makers,
-                        favorable_takers,
-                    } => {
-                        engine.on_live_diag(
-                            placed,
-                            cancelled,
-                            failed,
-                            emergency_foks,
-                            emergency_makers,
-                            favorable_takers,
-                        );
-                    }
                 }
             }
 

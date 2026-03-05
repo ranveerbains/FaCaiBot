@@ -534,7 +534,13 @@ mod formatter {
             } else {
                 String::new()
             };
-            let taker_tag = if trade.adverse_movement_hedge && trade.emergency_maker {
+            let taker_tag = if trade.whipsaw_reversal {
+                " [WHIPSAW FOK]".to_owned()
+            } else if trade.pre_erosion_breach && trade.emergency_maker {
+                " [PRE-EROSION POST-ONLY]".to_owned()
+            } else if trade.pre_erosion_breach {
+                " [PRE-EROSION FOK FALLBACK]".to_owned()
+            } else if trade.adverse_movement_hedge && trade.emergency_maker {
                 " [ADVERSE POST-ONLY]".to_owned()
             } else if trade.adverse_movement_hedge {
                 " [ADVERSE FOK FALLBACK]".to_owned()

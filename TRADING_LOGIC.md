@@ -40,7 +40,7 @@ Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
 
 **Key economics:**
 - Both legs target post-only execution (maker, zero fee)
-- Taker fees apply only to FOK emergency exits — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
+- Taker fees apply only to FOK emergency exits (adverse, pre-erosion breach, break-even breach, erosion exhausted, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
 - Unfilled post-only orders cost nothing — failed signals are free
 
 **One trade at a time.** The engine self-gates after emitting a Leg 1 signal: no new spikes are evaluated until the current trade completes or resets.
@@ -242,7 +242,7 @@ After all price constraints, the evaluator checks if the current resting Leg 2 o
 
 ## 7. Emergency Exits
 
-All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from erosion mode to emergency repost mode (see Section 8).
+All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from erosion mode to emergency repost mode (see Section 8). Exception: `WhipsawReversal` bypasses erosion and emergency repost entirely — it emits an immediate FOK at best ask.
 
 ### 7a. Adverse Movement
 
@@ -253,19 +253,31 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 - **FOK size:** `min(leg1_size, ask_depth_within_2_ticks)` — capped at available liquidity
 - **Exit reason:** `AdverseMovement`
 
-### 7b. Break-Even Breach
+### 7b. Pre-Erosion Breach
+
+**Trigger:** Pair cost has exceeded `pre_erosion_breach_threshold` ($1.03) BEFORE the first erosion step. Catches fast book repricing (>$0.03 pair cost above $1.00 in <4s) that the regular break-even check misses because it waits for `steps_applied >= 1`.
+
+**Gates (all must be true):**
+1. `steps_applied == 0` (no erosion steps yet — mutually exclusive with break-even breach)
+2. `leg1_price + current_opposing_ask > pre_erosion_breach_threshold` (stricter threshold than break-even)
+
+**Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
+
+**Exit reason:** `PreErosionBreach`
+
+### 7c. Break-Even Breach
 
 **Trigger:** Pair cost has exceeded $1.00 after first erosion step.
 
 **Gates (all must be true):**
-1. `steps_applied >= 1` (at least one erosion step completed, ~3s after fill)
+1. `steps_applied >= 1` (at least one erosion step completed, ~3s after fill — mutually exclusive with pre-erosion breach)
 2. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
 
 **Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
 
 **Exit reason:** `BreakEvenBreach`
 
-### 7c. Rotation Emergency (Market Expiry)
+### 7d. Rotation Emergency (Market Expiry)
 
 **Trigger:** `MarketRotation` arrives while Leg 1 is Filled and Leg 2 is not Filled.
 
@@ -275,13 +287,25 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 **Exit reason:** `MarketExpiry`
 
-### 7d. Erosion Exhausted
+### 7e. Erosion Exhausted
 
 **Trigger:** `steps_applied >= MAX_EROSION_STEPS (5)` — the full cascade completed without filling. Profit target is zero (break-even).
 
 Checked after break-even breach, before the erosion interval gate. Distinct from `BreakEvenBreach` — the pair cost may still be favorable (e.g., $0.70 + $0.25 = $0.95 < $1.00). The trigger is step exhaustion, not pair cost exceeding $1.00.
 
 **Exit reason:** `ErosionExhausted`
+
+### 7f. Whipsaw Reversal
+
+**Trigger:** `SpikeConfirmed` arrives with the OPPOSITE direction to `leg1_direction` while Leg 1 is active.
+
+**Two sub-cases:**
+1. **Leg 1 Posted (unfilled):** Cancel immediately. Reuses the SpikeFailed cancel pattern, including provisional ID deferral (`cancel_leg1_on_feedback`). Resets all Leg 1 state and returns early from the SpikeConfirmed handler.
+2. **Leg 1 Filled:** Set `whipsaw_fok_pending = true`. On the next `evaluate_leg2()` call, `emit_whipsaw_fok()` builds an immediate FOK signal at best ask, bypassing the erosion cascade entirely. The opposite spike invalidated the original thesis — speed of hedge matters more than price optimization.
+
+**Price:** FOK at `round_to_tick(best_ask, tick)` — no post-only chase, no erosion.
+
+**Exit reason:** `WhipsawReversal`
 
 ---
 
@@ -370,6 +394,8 @@ T-180s   Cutoff window: no new Leg 1 entries (spikes dropped)
 T-180s   Pre-warm: discover Market B via Gamma API, fetch books
 T-0      Instant switch: emit pre-warmed MarketRotation + books
          Market WS resubscribes to new token IDs in parallel
+         Quiet period starts (rotation_quiet_ms = 30s, no new entries)
+T+30s    Quiet period ends — trading enabled
 ```
 
 ### Market discovery
@@ -394,7 +420,7 @@ If Leg 1 is Filled but Leg 2 incomplete when rotation arrives, the engine builds
 
 ### Engine state reset on rotation
 
-All market-specific state resets: active token IDs updated, books cleared, spike state cleared, leg states cleared, `cumulative_used` reset to 0, `in_cutoff_window` reset to false.
+All market-specific state resets: active token IDs updated, books cleared, spike state cleared, leg states cleared, `cumulative_used` reset to 0, `in_cutoff_window` reset to false, `whipsaw_fok_pending` reset to false, `in_quiet_period` set to true (starts `rotation_quiet_ms` quiet period).
 
 ### Executor cleanup
 
@@ -416,10 +442,34 @@ Checked on every event (not just spikes) — the cutoff is detected promptly reg
 |--------|---------------|
 | New Leg 1 entries | **Blocked** — spikes dropped |
 | Existing Leg 2 erosion | **Continues** — no cutoff check in Leg 2 evaluation |
-| Emergency exits | **Continue** — adverse, break-even, favorable all active |
+| Emergency exits | **Continue** — adverse, pre-erosion, break-even, whipsaw, favorable all active |
 | Market summary | **Sent** — `MarketCutoff` triggers Telegram summary (sim) |
 
 When first entering cutoff with an open position, a log notes "Leg 2 will continue until rotation" — informational only, no special action taken.
+
+---
+
+## 12b. Rotation Quiet Period
+
+### Detection
+
+Checked on every event (not just spikes). When `MarketRotation` fires, `in_quiet_period = true` and `rotation_ms = now_ms`. On each subsequent event, if `now_ms - rotation_ms >= rotation_quiet_ms` (default 30000ms), `in_quiet_period` clears.
+
+### Effects
+
+| Action | During quiet period? |
+|--------|---------------------|
+| New Leg 1 entries | **Blocked** — spike candidates dropped |
+| Existing Leg 2 erosion | N/A — no position exists at rotation start |
+| Emergency exits | N/A |
+
+### Rationale
+
+After market rotation, the Polymarket book takes ~20-30s to fully reprice. Entries during this window have stale reference prices, leading to losses clustering near rotation boundaries. The quiet period prevents this by waiting for market makers to establish fresh liquidity.
+
+### Diagnostic
+
+`diag_spikes_dropped_quiet` counter, visible in `/diag` Telegram output.
 
 ---
 

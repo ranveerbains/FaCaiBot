@@ -58,6 +58,8 @@ pub struct EntryGuardsConfig {
     pub max_price_skew: f64,
     /// Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
     pub leg1_timeout_ms: u64,
+    /// Quiet period (ms) after market rotation — no new Leg 1 entries.
+    pub rotation_quiet_ms: u64,
 }
 
 impl Default for EntryGuardsConfig {
@@ -70,6 +72,7 @@ impl Default for EntryGuardsConfig {
             stale_book_ms: 1000,
             max_price_skew: 0.80,
             leg1_timeout_ms: 5000,
+            rotation_quiet_ms: 30000,
         }
     }
 }
@@ -140,6 +143,9 @@ pub struct RiskConfig {
     /// During this window, the engine only reposts when the book offers a strictly
     /// better price (price-improvement chase). If no fill by deadline, FOK at best_ask.
     pub emergency_deadline_ms: u64,
+    /// Pre-erosion breach threshold: pair cost > this triggers emergency before
+    /// first erosion step. Default 1.03 ($1.03). Must be > 1.00.
+    pub pre_erosion_breach_threshold: f64,
 }
 
 impl Default for RiskConfig {
@@ -150,6 +156,7 @@ impl Default for RiskConfig {
             erosion_interval_decay: 0.6,
             depth_wall_multiplier: 4.0,
             emergency_deadline_ms: 2500,
+            pre_erosion_breach_threshold: 1.03,
         }
     }
 }
@@ -236,6 +243,7 @@ pub struct Config {
     pub med_alloc_pct: Decimal,
     pub low_alloc_pct: Decimal,
     pub adverse_threshold: Decimal,
+    pub pre_erosion_breach_threshold: Decimal,
     pub stale_event_threshold_ms: u64,
     /// Profit target for HIGH tier (from config).
     pub high_target_pct: Decimal,
@@ -336,6 +344,8 @@ impl Config {
             .context("capital.low_alloc_pct: invalid decimal")?;
         let adverse_threshold = Decimal::try_from(bot.risk.adverse_threshold)
             .context("risk.adverse_threshold: invalid decimal")?;
+        let pre_erosion_breach_threshold = Decimal::try_from(bot.risk.pre_erosion_breach_threshold)
+            .context("risk.pre_erosion_breach_threshold: invalid decimal")?;
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct)
             .context("confidence.high_target_pct: invalid decimal")?;
@@ -364,6 +374,7 @@ impl Config {
             med_alloc_pct,
             low_alloc_pct,
             adverse_threshold,
+            pre_erosion_breach_threshold,
             stale_event_threshold_ms,
             high_target_pct,
             med_target_pct,
@@ -395,6 +406,7 @@ impl Config {
         let med_alloc_pct = Decimal::try_from(bot.capital.med_alloc_pct).unwrap();
         let low_alloc_pct = Decimal::try_from(bot.capital.low_alloc_pct).unwrap();
         let adverse_threshold = Decimal::try_from(bot.risk.adverse_threshold).unwrap();
+        let pre_erosion_breach_threshold = Decimal::try_from(bot.risk.pre_erosion_breach_threshold).unwrap();
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct).unwrap();
         let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct).unwrap();
@@ -418,6 +430,7 @@ impl Config {
             med_alloc_pct,
             low_alloc_pct,
             adverse_threshold,
+            pre_erosion_breach_threshold,
             stale_event_threshold_ms,
             high_target_pct,
             med_target_pct,

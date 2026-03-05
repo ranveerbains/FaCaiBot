@@ -24,6 +24,11 @@ pub enum ExitReason {
     /// All erosion steps exhausted without Leg 2 fill. Distinct from
     /// `BreakEvenBreach` — the pair cost may still be favorable.
     ErosionExhausted,
+    /// Opposing ask exceeded pre-erosion threshold before first erosion step.
+    /// Stricter threshold ($1.03) catches fast book moves within the first ~4s.
+    PreErosionBreach,
+    /// Opposite spike detected after Leg 1 fill — immediate FOK hedge, no erosion.
+    WhipsawReversal,
 }
 
 // ─── Side ────────────────────────────────────────────────────────────────────
@@ -357,14 +362,4 @@ pub enum ExecutorFeedback {
     /// Executor halts further Leg 2 attempts until rotation. Engine sends
     /// a critical Telegram alert with position details.
     BalanceExhausted,
-    /// Periodic diagnostic snapshot from the live executor (sent every 60s).
-    /// Forwarded to the engine so it can be included in the Telegram diagnostic.
-    DiagSnapshot {
-        placed: u64,
-        cancelled: u64,
-        failed: u64,
-        emergency_foks: u64,
-        emergency_makers: u64,
-        favorable_takers: u64,
-    },
 }

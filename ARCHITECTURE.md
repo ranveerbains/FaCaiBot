@@ -11,7 +11,7 @@ Binance spike → Buy directional shares cheap (Leg 1, post-only, $0 fee)
              → Paired position: e.g. $0.48 + $0.495 = $0.975 → pays $1.00 → 2.5% profit
 ```
 
-Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply only to FOK fills: emergency exits (adverse movement, break-even breach, market expiry) and favorable taker fills (opposing ask dropped below posted bid).
+Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply only to FOK fills: emergency exits (adverse movement, pre-erosion breach, break-even breach, market expiry, whipsaw reversal) and favorable taker fills (opposing ask dropped below posted bid).
 
 **Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. Post-only entry preserves the full spread at the cost of lower fill rate (~30-50%). Unfilled signals cost nothing.
 
@@ -99,7 +99,6 @@ Engine loop (one iteration per IngestorEvent):
 │      OrderFailed  → reset leg to None                           │
 │      CancelResult → restore or clear saved order info           │
 │                     (Leg 1 not-confirmed: set leg1_cancel_race) │
-│      DiagSnapshot → store for Telegram forwarding               │
 │                                                                 │
 │ 2. CONTROL EVENTS                                               │
 │    Shutdown / DrainAndRestart / PauseTrading / ResumeTrading     │
@@ -602,8 +601,9 @@ Timeline:
 
 | Risk | Mitigation |
 |------|------------|
-| **Legging** | Three independent exit paths, all using **price-improvement chase with hard deadline** (`emergency_deadline_ms`=2500ms): (1) Adverse movement — immediate post-only on Binance reversal >0.1%, price-chase on book improvement, FOK at deadline; (2) Break-even breach — after first erosion step, post-only at `best_ask - 1 tick`, price-chase then FOK; (3) Favorable taker — when opposing ask drops below posted bid, post-only then FOK if rejected. FIFO queue priority preserved (no blind reposts). Triangle-weighted erosion cascade (front-loaded steps, accelerating pace, ~5.8s to break-even) |
-| **False positive spikes** | Speculative posting with cancel-on-failure: post Leg 1 immediately on ATR+magnitude, cancel if sustain/momentum fails (~300ms). Post-only = zero cost on cancel. Sustain filter (300ms hold above 2×ATR) + momentum ratio (≥65% of peak) + magnitude gate (1 bp). Post-fill reversals caught by adverse_threshold |
+| **Legging** | Five independent exit paths, all using **price-improvement chase with hard deadline** (`emergency_deadline_ms`=2500ms): (1) Adverse movement — immediate post-only on Binance reversal >0.1%, price-chase on book improvement, FOK at deadline; (2) Pre-erosion breach — pair cost > `pre_erosion_breach_threshold` ($1.03) before first erosion step, catches fast book repricing within ~4s; (3) Break-even breach — after first erosion step, pair cost > $1.00, post-only at `best_ask - 1 tick`, price-chase then FOK; (4) Favorable taker — when opposing ask drops below posted bid, post-only then FOK if rejected; (5) Whipsaw reversal — opposite spike after Leg 1 fill, immediate FOK at best ask bypassing erosion. FIFO queue priority preserved (no blind reposts). Triangle-weighted erosion cascade (front-loaded steps, accelerating pace, ~5.8s to break-even) |
+| **False positive spikes** | Speculative posting with cancel-on-failure: post Leg 1 immediately on ATR+magnitude, cancel if sustain/momentum fails (~300ms). Post-only = zero cost on cancel. Sustain filter (300ms hold above 2×ATR) + momentum ratio (≥65% of peak) + magnitude gate (1 bp). Post-fill reversals caught by adverse_threshold. **Whipsaw guard**: opposite spike cancels unfilled Leg 1, or triggers immediate FOK if filled |
+| **Stale book entries** | Post-rotation quiet period (`rotation_quiet_ms`=30000ms) blocks spike entries for 30s after market rotation, preventing trades on stale/repricing books |
 | **Signal flooding** | Self-gating on both success and failure. One trade at a time |
 | **Taker fees** | Both legs post-only ($0 fee). Emergency exits try aggressive post-only first (zero fee); FOK taker only as fallback when post-only would cross spread. Fee: `C × 0.25 × (p×(1-p))²`, max 1.56% at p=0.50 |
 | **Competing bots** | Smart outbid walls by 1 tick (capped at break-even). Post-only = unfilled orders cost nothing |
@@ -626,9 +626,9 @@ multiplier, atr_alpha, sustain_ms,
 min_magnitude_pct, momentum_ratio_min
 # NOTE: no spikes emitted for first ~0.5s (10 ticks at 50ms) while ATR warms up
 
-[entry_guards]         # 6 params
+[entry_guards]         # 7 params
 max_spread, depth_min_pct, entry_cutoff_secs, stale_book_ms, max_price_skew,
-leg1_timeout_ms
+leg1_timeout_ms, rotation_quiet_ms
 
 [capital]              # 4 params
 max_alloc_per_trade, high_alloc_pct, med_alloc_pct, low_alloc_pct
@@ -637,11 +637,12 @@ max_alloc_per_trade, high_alloc_pct, med_alloc_pct, low_alloc_pct
 high_threshold, med_threshold,
 high_target_pct, med_target_pct, low_target_pct
 
-[risk]                 # 5 params
+[risk]                 # 6 params
 adverse_threshold,
 erosion_base_interval_ms, erosion_interval_decay,
 depth_wall_multiplier,
-emergency_deadline_ms
+emergency_deadline_ms,
+pre_erosion_breach_threshold
 ```
 
 All have `#[serde(default)]` with production defaults. `Config::test_defaults()` uses `BotConfig::default()` (same defaults as config.toml).
@@ -681,9 +682,11 @@ All execution state lives in-memory (no database on the hot path). QuestDB is us
 ### Tuning Analytics
 
 `simulated_trades` carries full context for outcome correlation:
-- `exit_reason` (symbol): `NormalErosion`, `AdverseMovement`, `BreakEvenBreach`, `ErosionExhausted`, `MarketExpiry`, `FavorableTaker` — loss attribution
+- `exit_reason` (symbol): `NormalErosion`, `AdverseMovement`, `BreakEvenBreach`, `ErosionExhausted`, `MarketExpiry`, `FavorableTaker`, `PreErosionBreach`, `WhipsawReversal` — loss attribution
 - `spike_magnitude` (f64): spike quality vs. outcome correlation
 - `favorable_taker`, `emergency_maker` (bool): exit type flags
+- `pre_erosion_breach` (bool): `true` if Leg 2 triggered by pre-erosion breach (fast book move before first step)
+- `whipsaw_reversal` (bool): `true` if Leg 2 triggered by whipsaw reversal (opposite spike → immediate FOK)
 - `leg1_cancel_race` (bool): `true` if Leg 1 filled mid-cancel (cancel-not-confirmed replay path)
 
 See `queries.sql` for 15 analytics queries (7 operational + 8 tuning). Tuning queries map loss causes directly to config parameters:

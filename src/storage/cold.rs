@@ -301,6 +301,8 @@ impl ColdStorage {
             Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
             Some(ExitReason::MarketExpiry) => "MarketExpiry",
             Some(ExitReason::FavorableTaker) => "FavorableTaker",
+            Some(ExitReason::PreErosionBreach) => "PreErosionBreach",
+            Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
             None => "NormalErosion",
         };
 
@@ -405,6 +407,8 @@ impl ColdStorage {
                     Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
                     Some(ExitReason::MarketExpiry) => "MarketExpiry",
                     Some(ExitReason::FavorableTaker) => "FavorableTaker",
+                    Some(ExitReason::PreErosionBreach) => "PreErosionBreach",
+                    Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
                     None => "NormalErosion",
                 },
             )?

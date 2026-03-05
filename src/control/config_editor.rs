@@ -25,6 +25,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.stale_book_ms", min: 50.0, max: 5000.0 },
     ParamSpec { name: "entry_guards.max_price_skew", min: 0.5, max: 0.99 },
     ParamSpec { name: "entry_guards.leg1_timeout_ms", min: 500.0, max: 30000.0 },
+    ParamSpec { name: "entry_guards.rotation_quiet_ms", min: 0.0, max: 120000.0 },
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
     ParamSpec { name: "capital.high_alloc_pct", min: 0.01, max: 1.0 },
@@ -42,6 +43,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "risk.erosion_interval_decay", min: 0.1, max: 1.0 },
     ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },
     ParamSpec { name: "risk.emergency_deadline_ms", min: 500.0, max: 30000.0 },
+    ParamSpec { name: "risk.pre_erosion_breach_threshold", min: 1.001, max: 1.10 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
 ];
