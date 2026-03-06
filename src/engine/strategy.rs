@@ -2297,26 +2297,34 @@ impl StrategyEngine {
     /// `advance_simulation()` (simulation mode).
     fn init_leg2(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
         if let Some(spike) = self.state.last_spike {
-            let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
-            let depth = self
-                .state
-                .poly_book
-                .as_ref()
-                .map(|b| b.total_bid_depth() + b.total_ask_depth())
-                .unwrap_or(Decimal::ONE);
-            let conf = compute_confidence(
-                spike.atr_ratio,
-                self.leg1.min_spike_atr_ratio,
-                self.leg1.strong_spike_atr_ratio,
-                depth,
-                self.avg_book_depth.unwrap_or(Decimal::ONE),
-                t_secs,
-            );
-            let tier = ProfitTier::from_confidence(
-                conf,
-                self.leg1.high_threshold,
-                self.leg1.med_threshold,
-            );
+            // Use the original signal's confidence and tier (computed at signal time)
+            // rather than recomputing — the allocation was locked in at signal time,
+            // so the summary should reflect the same tier that determined the allocation.
+            let (conf, tier) = if let Some(sig) = &self.pending_leg1_signal {
+                (sig.confidence, sig.profit_target_tier)
+            } else {
+                let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
+                let depth = self
+                    .state
+                    .poly_book
+                    .as_ref()
+                    .map(|b| b.total_bid_depth() + b.total_ask_depth())
+                    .unwrap_or(Decimal::ONE);
+                let c = compute_confidence(
+                    spike.atr_ratio,
+                    self.leg1.min_spike_atr_ratio,
+                    self.leg1.strong_spike_atr_ratio,
+                    depth,
+                    self.avg_book_depth.unwrap_or(Decimal::ONE),
+                    t_secs,
+                );
+                let t = ProfitTier::from_confidence(
+                    c,
+                    self.leg1.high_threshold,
+                    self.leg1.med_threshold,
+                );
+                (c, t)
+            };
             let initial_profit_target = self.leg1.target_pct_for_tier(tier);
             // Use leg1_direction (set at signal generation, survives spike overwrites)
             // instead of spike.direction to prevent YES/NO label swap when an
