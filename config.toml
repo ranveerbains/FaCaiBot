@@ -33,7 +33,7 @@ leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
-trade_cooldown_ms = 5000
+trade_cooldown_ms = 0
 
 [capital]
 # Maximum USDC per leg per trade
@@ -67,4 +67,4 @@ depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.04
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
-phase2_timeout_ms = 2000
+phase2_timeout_ms = 2500
