@@ -4,32 +4,21 @@
 //! the pure guard-checking and signal-building logic extracted from `StrategyEngine`.
 //!
 //! # Design Contract
-//! - **No mutation** of shared state — evaluators only read market/erosion data.
+//! - **No mutation** of shared state — evaluators only read market/hedge data.
 //! - **Mutation stays in `strategy.rs`** — after `evaluate()` / `evaluate_leg2()` return
 //!   `Some(signal)`, the caller is responsible for updating `leg1_state`, `leg2_state`,
-//!   `spike_detected`, `cumulative_used`, and `last_erosion_signal_ms`.
-//! - [`ErosionSnap`] is used to pass borrow-free snapshots of erosion state into the
-//!   evaluator so it can read erosion fields without holding a mutable borrow on the engine.
+//!   `spike_detected`, `cumulative_used`, and `last_hedge_signal_ms`.
+//! - [`HedgeSnap`] is used to pass borrow-free snapshots of hedge state into the
+//!   evaluator so it can read hedge fields without holding a mutable borrow on the engine.
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, info, warn};
 
 use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeInfo};
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::{compute_confidence, round_to_tick};
-use super::erosion::{EROSION_WEIGHTS, EROSION_WEIGHT_SUM, ErosionSnap, ErosionState};
-
-/// Cumulative erosion after `steps` steps, given `total_margin` (initial profit target).
-fn cumulative_erosion_for(total_margin: Decimal, steps: u32) -> Decimal {
-    (0..steps)
-        .map(|s| {
-            let w = EROSION_WEIGHTS.get(s as usize).copied().unwrap_or(1);
-            total_margin * Decimal::from(w) / Decimal::from(EROSION_WEIGHT_SUM)
-        })
-        .sum()
-}
+use super::erosion::{HedgePhase, HedgeSnap};
 
 // ─── Leg 1 outcome types ────────────────────────────────────────────────────
 
@@ -395,37 +384,37 @@ impl Leg1Evaluator {
 
 /// Evaluates whether to emit a Leg 2 hedge signal after Leg 1 fills.
 ///
-/// Handles post-only erosion cascade, adverse movement,
+/// Handles 2-phase hedge (profit target → break-even pursuit), adverse movement,
 /// and break-even breach emergency FOK fills.
 ///
-/// All reads are from borrowed `&MarketState` and `&ErosionSnap`; no mutation occurs here.
+/// All reads are from borrowed `&MarketState` and `&HedgeSnap`; no mutation occurs here.
 pub(crate) struct Leg2Evaluator {
     pub adverse_threshold: Decimal,
-    pub erosion_base_interval_ms: u64,
-    pub erosion_interval_decay: f64,
+    pub phase1_timeout_ms: u64,
     pub depth_wall_multiplier: Decimal,
     pub emergency_deadline_ms: u64,
-    pub pre_erosion_breach_threshold: Decimal,
+    pub phase1_breach_threshold: Decimal,
 }
 
 impl Leg2Evaluator {
     /// Evaluate whether to emit a Leg 2 signal.
     ///
-    /// Returns `Some(TradeSignal)` when action is needed (erosion step, emergency FOK).
+    /// Returns `Some(Leg2Decision)` when action is needed (phase post, transition, emergency).
     ///
     /// # Important
-    /// The caller **must** apply post-signal state mutations depending on signal type:
-    /// - Normal erosion: `last_erosion_signal_ms = now_ms`, `leg2_state = Posted { … }`
-    /// - Emergency FOK: `erosion.emergency_submitted = true`, `leg2_state = Posted { … }`
-    /// - Erosion step advance: `erosion.steps_applied += 1`
+    /// The caller **must** apply post-signal state mutations depending on decision type:
+    /// - `Phase1Post`: `last_hedge_signal_ms = now_ms`, `leg2_state = Posted { … }`
+    /// - `PhaseTransition`: `hedge.phase = Phase2`, `hedge.phase2_posted_price = Some(price)`
+    /// - `Phase2Repost`: `hedge.phase2_posted_price = Some(price)`
+    /// - `Emergency`: `hedge.emergency_submitted = true`, `leg2_state = Posted { … }`
     ///
-    /// The `last_erosion_ms` argument is passed in by the caller (from `self.last_erosion_signal_ms`)
+    /// The `last_hedge_ms` argument is passed in by the caller (from `self.last_hedge_signal_ms`)
     /// to avoid borrow conflicts on the engine struct.
     pub fn evaluate_leg2(
         &self,
         state: &MarketState,
-        snap: &ErosionSnap,
-        last_erosion_ms: u64,
+        snap: &HedgeSnap,
+        _last_hedge_ms: u64,
         now_ms: u64,
     ) -> Option<Leg2Decision> {
         // Gate: Leg 1 must be filled and Leg 2 must not be filled yet.
@@ -483,8 +472,6 @@ impl Leg2Evaluator {
 
             if elapsed >= self.emergency_deadline_ms {
                 if snap.fok_emitted {
-                    // FOK already sent to executor — its internal retry loop handles
-                    // persistence. Don't flood the command channel with duplicates.
                     return None;
                 }
                 let leg1_size = match &state.leg1_state {
@@ -492,15 +479,14 @@ impl Leg2Evaluator {
                     _ => return None,
                 };
                 let fok_price = round_to_tick(best_ask, tick);
-                // Re-evaluate exit_reason with actual FOK price (may have diverged from exhaustion snapshot)
+                // Re-evaluate exit_reason with actual FOK price
                 let exit_reason = {
                     let pair_cost = snap.leg1_fill_price + fok_price;
                     if pair_cost < Decimal::ONE {
-                        exit_reason // Still favorable — keep original reason
+                        exit_reason
                     } else {
-                        // Override stale FavorableTaker — the book moved, this is no longer favorable
                         match exit_reason {
-                            ExitReason::FavorableTaker => ExitReason::ErosionExhausted,
+                            ExitReason::FavorableTaker => ExitReason::BreakEvenBreach,
                             other => other,
                         }
                     }
@@ -625,23 +611,20 @@ impl Leg2Evaluator {
             }
         }
 
-        // ── Pre-erosion breach (before first erosion step) ────────────────
-        // Catches fast book repricing (>$0.02 move in <4s) that the regular
-        // break-even check misses because it waits for steps_applied >= 1.
-        // Mutually exclusive: pre-erosion fires at steps_applied == 0 only,
-        // regular break-even fires at steps_applied >= 1 only.
-        if snap.steps_applied == 0 {
+        // ── Phase 1: Resting at profit target ────────────────────────────
+        if snap.phase == HedgePhase::Phase1 {
+            // Phase 1 breach: pair cost > threshold → transition to Phase 2.
             if let Some(ask_price) = best_ask_price {
-                if leg1_price + ask_price > self.pre_erosion_breach_threshold {
+                if leg1_price + ask_price > self.phase1_breach_threshold {
                     let price = round_to_tick(ask_price - tick, tick);
                     let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
                     if fok_size <= Decimal::ZERO {
-                        warn!(%leg1_price, %ask_price, "pre-erosion breach — no ask depth for emergency");
+                        warn!(%leg1_price, %ask_price, "phase 1 breach — no ask depth for transition");
                         return None;
                     }
                     warn!(
-                        %leg1_price, %ask_price, threshold = %self.pre_erosion_breach_threshold,
-                        %fok_size, %price, "pre-erosion breach — emergency Leg 2"
+                        %leg1_price, %ask_price, threshold = %self.phase1_breach_threshold,
+                        %fok_size, %price, "phase 1 breach — transitioning to phase 2"
                     );
                     let signal = make_leg2_signal(
                         &hedge_token_id,
@@ -661,39 +644,34 @@ impl Leg2Evaluator {
                         atr,
                         false,
                         Some(hedge_book.clone()),
-                        Some(ExitReason::PreErosionBreach),
+                        Some(ExitReason::Phase1Breach),
                     );
-                    return Some(Leg2Decision::Emergency {
+                    return Some(Leg2Decision::PhaseTransition {
                         signal,
                         price,
                         size: fok_size,
+                        reason: TransitionReason::Breach,
                     });
                 }
             }
-        }
 
-        // ── Break-even breach (after first erosion step) ─────────────────
-        // Only fire after at least one erosion step has completed (~3.5s).
-        // This gives the Polymarket book time to react to spike momentum.
-        // Triggers when pair cost (leg1 + opposing ask) exceeded $1.00 — position is losing.
-        // At exactly $1.00 (break-even), the emergency exit often fills WORSE, so strict >.
-        // Uses post-only pricing (best_ask - tick), consistent with all other emergencies.
-        // FOK fallback after emergency_deadline_ms (via price-chase block).
-        if snap.steps_applied >= 1 {
-            if let Some(ask_price) = best_ask_price {
-                if leg1_price + ask_price > Decimal::ONE {
+            // Phase 1 timeout: elapsed since Phase 1 post > phase1_timeout_ms → transition to Phase 2.
+            // Use the actual Leg 2 post time (not Leg 1 fill time) so the CLOB round-trip
+            // doesn't eat into the resting window. Falls back to fill_ms if not yet posted.
+            let phase1_post_ms = match &state.leg2_state {
+                OrderState::Posted { timestamp_ms, .. } => *timestamp_ms,
+                _ => snap.fill_ms,
+            };
+            let elapsed = now_ms.saturating_sub(phase1_post_ms);
+            if elapsed >= self.phase1_timeout_ms {
+                if let Some(ask_price) = best_ask_price {
                     let price = round_to_tick(ask_price - tick, tick);
-                    let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
-                    if fok_size <= Decimal::ZERO {
-                        warn!(%leg1_price, %ask_price, "break-even breach — no ask depth for emergency");
-                        return None;
-                    }
-                    warn!(%leg1_price, %ask_price, %fok_size, %price, "break-even breach emergency Leg 2");
+                    info!(elapsed_ms = elapsed, %price, "phase 1 timeout — transitioning to phase 2");
                     let signal = make_leg2_signal(
                         &hedge_token_id,
                         state.active_condition_id.as_deref().unwrap_or(""),
                         price,
-                        fok_size,
+                        leg1_size,
                         reference_price,
                         snap.confidence,
                         snap.tier,
@@ -707,43 +685,103 @@ impl Leg2Evaluator {
                         atr,
                         false,
                         Some(hedge_book.clone()),
-                        Some(ExitReason::BreakEvenBreach),
+                        None,
                     );
-                    return Some(Leg2Decision::Emergency {
+                    return Some(Leg2Decision::PhaseTransition {
                         signal,
                         price,
-                        size: fok_size,
+                        size: leg1_size,
+                        reason: TransitionReason::Timeout,
                     });
                 }
             }
+
+            // Phase 1 skip guard: if leg2 is already posted at the target, hold position.
+            if let OrderState::Posted {
+                price: posted_price,
+                ..
+            } = &state.leg2_state
+            {
+                if *posted_price <= snap.phase1_target_price {
+                    return None;
+                }
+            }
+
+            // Phase 1 initial post: emit signal at profit target price.
+            // Only reached when leg2_state is None (first post) or posted at worse price.
+            let target_price = snap.phase1_target_price;
+
+            // Don't cross ask (post-only constraint).
+            let mut target_price = if let Some(ask_price) = best_ask_price {
+                if target_price >= ask_price {
+                    round_to_tick(ask_price - tick, tick)
+                } else {
+                    target_price
+                }
+            } else {
+                target_price
+            };
+
+            // Smart outbidding.
+            let bot_contested = wall_on_ask.is_some();
+            if let Some(wall_price) = wall_on_ask {
+                if wall_price <= target_price {
+                    let outbid = round_to_tick(wall_price - tick, tick);
+                    if leg1_price + outbid < Decimal::ONE
+                        && best_ask_price.is_some_and(|a| outbid < a)
+                    {
+                        debug!(%wall_price, %outbid, "Leg 2 phase 1 smart outbid");
+                        target_price = outbid;
+                    }
+                }
+            }
+
+            debug!(
+                %target_price,
+                tier = snap.tier.label(),
+                "Leg 2 phase 1 post signal"
+            );
+
+            let signal = make_leg2_signal(
+                &hedge_token_id,
+                state.active_condition_id.as_deref().unwrap_or(""),
+                target_price,
+                leg1_size,
+                reference_price,
+                snap.confidence,
+                snap.tier,
+                snap.initial_profit_target,
+                snap.direction,
+                snap.spike_info,
+                leg1_price,
+                now_ms,
+                market_end_ms,
+                tick,
+                atr,
+                bot_contested,
+                Some(hedge_book.clone()),
+                None,
+            );
+            return Some(Leg2Decision::Phase1Post {
+                signal,
+                price: target_price,
+                size: leg1_size,
+            });
         }
 
-        // ── Erosion exhausted (all 5 steps applied, profit target = 0) ──
-        // The cascade reached break-even without filling. Escalate to emergency
-        // post-only at top of book. FOK fallback after N reposts (via repost block).
-        if snap.is_exhausted() {
-            if let Some(ask_price) = best_ask_price {
+        // ── Phase 2: Break-even pursuit (ask-1tick) ──────────────────────
+        // Phase 2 entered via PhaseTransition. Now monitor and repost.
+
+        // Immediate BE breach: if ask >= break-even → emergency.
+        if let Some(ask_price) = best_ask_price {
+            if leg1_price + ask_price > Decimal::ONE {
                 let price = round_to_tick(ask_price - tick, tick);
                 let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
                 if fok_size <= Decimal::ZERO {
-                    warn!(
-                        steps = snap.steps_applied,
-                        "erosion exhausted — no ask depth for emergency"
-                    );
+                    warn!(%leg1_price, %ask_price, "phase 2 BE breach — no ask depth for emergency");
                     return None;
                 }
-                // Determine exit reason: favorable if pair cost < $1.00, else exhaustion.
-                let pair_cost = leg1_price + price;
-                let exit_reason = if pair_cost < Decimal::ONE {
-                    ExitReason::FavorableTaker
-                } else {
-                    ExitReason::ErosionExhausted
-                };
-                warn!(
-                    %price, %fok_size, steps = snap.steps_applied,
-                    %pair_cost, ?exit_reason,
-                    "erosion exhausted — escalating to emergency"
-                );
+                warn!(%leg1_price, %ask_price, %fok_size, %price, "phase 2 break-even breach — emergency Leg 2");
                 let signal = make_leg2_signal(
                     &hedge_token_id,
                     state.active_condition_id.as_deref().unwrap_or(""),
@@ -762,7 +800,7 @@ impl Leg2Evaluator {
                     atr,
                     false,
                     Some(hedge_book.clone()),
-                    Some(exit_reason),
+                    Some(ExitReason::BreakEvenBreach),
                 );
                 return Some(Leg2Decision::Emergency {
                     signal,
@@ -772,114 +810,43 @@ impl Leg2Evaluator {
             }
         }
 
-        // ── Erosion timing gate (exponential decay intervals) ────────────
-        let current_interval = ErosionState::interval_for_step(
-            snap.steps_applied,
-            self.erosion_base_interval_ms,
-            self.erosion_interval_decay,
-        );
-        let time_since_last = now_ms.saturating_sub(last_erosion_ms.max(snap.fill_ms));
-        if time_since_last < current_interval && last_erosion_ms > 0 {
-            return None;
-        }
-
-        // ── Determine whether to advance erosion step ─────────────────────
-        let advance_step = last_erosion_ms > 0
-            && now_ms.saturating_sub(last_erosion_ms) >= current_interval
-            && !snap.is_exhausted();
-
-        let current_profit = snap.current_profit_target;
-        let steps_now = snap.steps_applied + if advance_step { 1 } else { 0 };
-        // Re-compute current profit using triangle-weighted cumulative erosion.
-        let current_profit = if advance_step {
-            let total = snap.initial_profit_target;
-            let eroded = cumulative_erosion_for(total, steps_now);
-            (total - eroded).max(Decimal::ZERO)
-        } else {
-            current_profit
-        };
-
-        let target_raw = Decimal::ONE - current_profit - leg1_price;
-        let mut target_price = round_to_tick(target_raw, tick);
-
-        // Don't cross ask (post-only constraint).
+        // Phase 2 price improvement: repost only when book offers strictly better price.
         if let Some(ask_price) = best_ask_price {
-            if target_price >= ask_price {
-                target_price = round_to_tick(ask_price - tick, tick);
-                debug!(%target_price, best_ask = %ask_price, "Leg 2 target adjusted below ask");
-            }
-        }
+            let target_price = round_to_tick(ask_price - tick, tick);
+            let current_posted = snap.phase2_posted_price.unwrap_or(Decimal::ZERO);
 
-        // Break-even floor.
-        let be_floor = round_to_tick(snap.break_even, tick);
-        if target_price > be_floor {
-            debug!(%target_price, %be_floor, "Leg 2 clamped to break-even floor");
-            target_price = be_floor;
-        }
-
-        // Smart outbidding.
-        let bot_contested = wall_on_ask.is_some();
-        if let Some(wall_price) = wall_on_ask {
-            if wall_price <= target_price {
-                let outbid = round_to_tick(wall_price - tick, tick);
-                if leg1_price + outbid < Decimal::ONE
-                    && best_ask_price.map_or(false, |a| outbid < a)
-                {
-                    debug!(%wall_price, %outbid, "Leg 2 smart outbid");
-                    target_price = outbid;
-                }
-            }
-        }
-
-        // ── Skip guard: don't repost if current order is already at or better ──
-        if let OrderState::Posted {
-            price: posted_price,
-            ..
-        } = &state.leg2_state
-        {
-            if *posted_price <= target_price {
-                debug!(
-                    %posted_price, %target_price,
-                    "Leg 2 skip: posted price already at or better than erosion target"
+            if target_price > current_posted {
+                debug!(%target_price, %current_posted, "phase 2 price improvement — reposting");
+                let signal = make_leg2_signal(
+                    &hedge_token_id,
+                    state.active_condition_id.as_deref().unwrap_or(""),
+                    target_price,
+                    leg1_size,
+                    reference_price,
+                    snap.confidence,
+                    snap.tier,
+                    Decimal::ZERO,
+                    snap.direction,
+                    snap.spike_info,
+                    leg1_price,
+                    now_ms,
+                    market_end_ms,
+                    tick,
+                    atr,
+                    false,
+                    Some(hedge_book.clone()),
+                    None,
                 );
-                return None;
+                return Some(Leg2Decision::Phase2Repost {
+                    signal,
+                    price: target_price,
+                    size: leg1_size,
+                });
             }
         }
 
-        debug!(
-            step = steps_now,
-            %target_price,
-            profit_pct = %(current_profit.to_f64().unwrap_or(0.0) * 100.0),
-            tier = snap.tier.label(),
-            "Leg 2 erosion signal"
-        );
-
-        let signal = make_leg2_signal(
-            &hedge_token_id,
-            state.active_condition_id.as_deref().unwrap_or(""),
-            target_price,
-            leg1_size,
-            reference_price,
-            snap.confidence,
-            snap.tier,
-            current_profit,
-            snap.direction,
-            snap.spike_info,
-            leg1_price,
-            now_ms,
-            market_end_ms,
-            tick,
-            atr,
-            bot_contested,
-            Some(hedge_book.clone()),
-            None,
-        );
-        Some(Leg2Decision::Erosion {
-            signal,
-            price: target_price,
-            size: leg1_size,
-            advance_step,
-        })
+        // No improvement — preserve queue priority.
+        None
     }
 }
 
@@ -889,15 +856,26 @@ impl Leg2Evaluator {
 ///
 /// Carries the signal plus enough metadata for the caller to apply the correct
 /// state mutations without re-reading fields.
+#[allow(dead_code)] // reason field on PhaseTransition used for diagnostic logging
 pub(crate) enum Leg2Decision {
-    /// A normal post-only erosion bid.
-    Erosion {
+    /// Initial Phase 1 post at profit target price.
+    Phase1Post {
         signal: TradeSignal,
         price: Decimal,
         size: Decimal,
-        /// `true` if the evaluator determined that `erosion.steps_applied` should be
-        /// incremented by 1 (2s interval elapsed since last signal).
-        advance_step: bool,
+    },
+    /// Transition from Phase 1 to Phase 2: cancel + repost at ask-1tick.
+    PhaseTransition {
+        signal: TradeSignal,
+        price: Decimal,
+        size: Decimal,
+        reason: TransitionReason,
+    },
+    /// Phase 2 improvement repost: book offers better price than current resting order.
+    Phase2Repost {
+        signal: TradeSignal,
+        price: Decimal,
+        size: Decimal,
     },
     /// An emergency FOK fill (deadline, break-even breach, or adverse movement).
     Emergency {
@@ -907,11 +885,22 @@ pub(crate) enum Leg2Decision {
     },
 }
 
+/// Reason for transitioning from Phase 1 to Phase 2.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransitionReason {
+    /// Pair cost exceeded phase1_breach_threshold.
+    Breach,
+    /// Phase 1 timeout elapsed without fill.
+    Timeout,
+}
+
 impl Leg2Decision {
     pub fn into_signal(self) -> TradeSignal {
         match self {
-            Leg2Decision::Erosion { signal, .. } => signal,
-            Leg2Decision::Emergency { signal, .. } => signal,
+            Leg2Decision::Phase1Post { signal, .. }
+            | Leg2Decision::PhaseTransition { signal, .. }
+            | Leg2Decision::Phase2Repost { signal, .. }
+            | Leg2Decision::Emergency { signal, .. } => signal,
         }
     }
 
@@ -921,15 +910,19 @@ impl Leg2Decision {
 
     pub fn price(&self) -> Decimal {
         match self {
-            Leg2Decision::Erosion { price, .. } => *price,
-            Leg2Decision::Emergency { price, .. } => *price,
+            Leg2Decision::Phase1Post { price, .. }
+            | Leg2Decision::PhaseTransition { price, .. }
+            | Leg2Decision::Phase2Repost { price, .. }
+            | Leg2Decision::Emergency { price, .. } => *price,
         }
     }
 
     pub fn size(&self) -> Decimal {
         match self {
-            Leg2Decision::Erosion { size, .. } => *size,
-            Leg2Decision::Emergency { size, .. } => *size,
+            Leg2Decision::Phase1Post { size, .. }
+            | Leg2Decision::PhaseTransition { size, .. }
+            | Leg2Decision::Phase2Repost { size, .. }
+            | Leg2Decision::Emergency { size, .. } => *size,
         }
     }
 }
@@ -1159,12 +1152,12 @@ mod tests {
 
     // ── Emergency repost interval + price tests ─────────────────────────
 
-    /// Build a minimal MarketState + ErosionSnap suitable for emergency repost tests.
+    /// Build a minimal MarketState + HedgeSnap suitable for emergency repost tests.
     /// Direction::Up → hedge token is NO → evaluator reads `poly_no_book`.
     fn make_emergency_test_setup(
         no_book_ask: &str,
         now_ms: u64,
-    ) -> (MarketState, ErosionSnap, Leg2Evaluator) {
+    ) -> (MarketState, HedgeSnap, Leg2Evaluator) {
         use crate::types::market::OrderState;
 
         let tick = Decimal::new(1, 2); // 0.01
@@ -1204,15 +1197,13 @@ mod tests {
             ..MarketState::default()
         };
 
-        let snap = ErosionSnap {
+        let snap = HedgeSnap {
             emergency_submitted: true,
             break_even: Decimal::new(50, 2),
-            current_profit_target: Decimal::ZERO,
             initial_profit_target: Decimal::new(25, 3), // 2.5%
             direction: Direction::Up,
             binance_at_fill: Some(Decimal::new(50_000, 0)),
             fill_ms: now_ms - 5_000,
-            steps_applied: 2,
             tier: ProfitTier::High,
             confidence: Decimal::new(7, 1),
             spike_info: SpikeInfo {
@@ -1227,15 +1218,17 @@ mod tests {
             emergency_first_post_ms: Some(now_ms - 1_000),
             emergency_posted_price: Some(Decimal::new(48, 2)),
             fok_emitted: false,
+            phase: HedgePhase::Phase1,
+            phase1_target_price: Decimal::new(475, 3),
+            phase2_posted_price: None,
         };
 
         let evaluator = Leg2Evaluator {
             adverse_threshold: Decimal::new(3, 3),
-            erosion_base_interval_ms: 4000,
-            erosion_interval_decay: 0.6,
+            phase1_timeout_ms: 2000,
             depth_wall_multiplier: Decimal::new(4, 0),
             emergency_deadline_ms: 2500,
-            pre_erosion_breach_threshold: Decimal::new(103, 2),
+            phase1_breach_threshold: Decimal::new(105, 2),
         };
 
         (state, snap, evaluator)
@@ -1246,8 +1239,8 @@ mod tests {
         let now_ms = 100_000;
         // Posted at 0.48, ask at 0.49 → best_ask - tick = 0.48 == posted → no improvement.
         let (state, snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        let last_erosion_ms = now_ms - 200;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
         assert!(
             result.is_none(),
             "should not repost when price hasn't improved (preserves queue priority)"
@@ -1259,9 +1252,9 @@ mod tests {
         let now_ms = 100_000;
         // Posted at 0.48, ask at 0.52 → best_ask - tick = 0.51 > 0.48 → price improved.
         let (state, snap, evaluator) = make_emergency_test_setup("0.52", now_ms);
-        let last_erosion_ms = now_ms - 200;
+        let last_hedge_ms = now_ms - 200;
         let decision = evaluator
-            .evaluate_leg2(&state, &snap, last_erosion_ms, now_ms)
+            .evaluate_leg2(&state, &snap, last_hedge_ms, now_ms)
             .expect("should emit price-chase repost");
         assert!(decision.is_emergency());
         assert_eq!(
@@ -1283,9 +1276,9 @@ mod tests {
         let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
         // Emergency started 3s ago → past 2.5s deadline.
         snap.emergency_first_post_ms = Some(now_ms - 3_000);
-        let last_erosion_ms = now_ms - 200;
+        let last_hedge_ms = now_ms - 200;
         let decision = evaluator
-            .evaluate_leg2(&state, &snap, last_erosion_ms, now_ms)
+            .evaluate_leg2(&state, &snap, last_hedge_ms, now_ms)
             .expect("should emit FOK at deadline");
         assert!(decision.is_emergency());
         assert_eq!(
@@ -1303,46 +1296,12 @@ mod tests {
         let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
         // Emergency started 1s ago → within 2.5s deadline. Same price → no improvement.
         snap.emergency_first_post_ms = Some(now_ms - 1_000);
-        let last_erosion_ms = now_ms - 200;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
         assert!(
             result.is_none(),
             "should not FOK before deadline when no price improvement"
         );
-    }
-
-    // ── Erosion exhaustion triggers emergency ─────────────────────────
-
-    #[test]
-    fn test_erosion_exhausted_triggers_emergency() {
-        use crate::types::market::OrderState;
-        let now_ms = 100_000;
-
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // Override: NOT in emergency mode, but all 5 steps applied.
-        snap.emergency_submitted = false;
-        snap.steps_applied = 5;
-        snap.current_profit_target = Decimal::ZERO;
-        snap.exit_reason = None;
-        state.leg2_state = OrderState::Posted {
-            order_id: "sim-leg2".into(),
-            price: Decimal::new(48, 2),
-            size: Decimal::new(100, 0),
-            timestamp_ms: now_ms - 1_000,
-        };
-
-        let last_erosion_ms = now_ms - 5_000; // well past any interval
-        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
-        assert!(
-            result.is_some(),
-            "should trigger emergency when erosion exhausted"
-        );
-        assert!(result.as_ref().unwrap().is_emergency());
-        let sig = result.unwrap().into_signal();
-        // pair_cost = 0.50 (leg1) + 0.48 (post-only) = 0.98 < $1.00 → favorable
-        assert_eq!(sig.exit_reason, Some(ExitReason::FavorableTaker));
-        // Price should be post-only: 0.49 - 0.01 = 0.48
-        assert_eq!(sig.price, Decimal::new(48, 2));
     }
 
     // ── Adverse movement uses post-only price ─────────────────────────
@@ -1353,11 +1312,9 @@ mod tests {
         let now_ms = 100_000;
 
         let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // NOT in emergency mode, normal erosion in progress.
+        // NOT in emergency mode, Phase 1 in progress.
         snap.emergency_submitted = false;
-        snap.steps_applied = 1;
         snap.exit_reason = None;
-        snap.current_profit_target = Decimal::new(15, 3);
         // Set Binance fill price and current — adverse movement > 0.3% reversal.
         snap.binance_at_fill = Some(Decimal::new(50_000, 0));
         state.binance_price = Some(Decimal::new(49_800, 0)); // 0.4% drop → adverse
@@ -1368,8 +1325,8 @@ mod tests {
             timestamp_ms: now_ms - 1_000,
         };
 
-        let last_erosion_ms = now_ms - 5_000;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
+        let last_hedge_ms = now_ms - 5_000;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
         assert!(result.is_some(), "adverse should trigger");
         let decision = result.unwrap();
         assert!(decision.is_emergency());
@@ -1381,49 +1338,117 @@ mod tests {
         );
     }
 
-    // ── Steps never advance beyond MAX_EROSION_STEPS ──────────────────
+    // ── Phase 1 breach triggers transition ────────────────────────────
 
     #[test]
-    fn test_advance_step_capped_at_max() {
+    fn test_phase1_breach_triggers_transition() {
+        use crate::types::market::OrderState;
+        let now_ms = 100_000;
+
+        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.56", now_ms);
+        // NOT in emergency mode, Phase 1 in progress.
+        snap.emergency_submitted = false;
+        snap.exit_reason = None;
+        snap.phase = HedgePhase::Phase1;
+        state.leg2_state = OrderState::Posted {
+            order_id: "sim-leg2".into(),
+            price: Decimal::new(475, 3),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 1_000,
+        };
+        // leg1=0.50, ask=0.56 → pair=1.06 > 1.05 threshold → breach
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
+        assert!(result.is_some(), "phase 1 breach should trigger transition");
+        let decision = result.unwrap();
+        assert!(!decision.is_emergency(), "breach should be transition, not emergency");
+        assert!(matches!(decision, Leg2Decision::PhaseTransition { reason: TransitionReason::Breach, .. }));
+        // Price should be post-only: 0.56 - 0.01 = 0.55
+        assert_eq!(decision.price(), Decimal::new(55, 2));
+        let sig = decision.into_signal();
+        assert_eq!(sig.exit_reason, Some(ExitReason::Phase1Breach));
+    }
+
+    // ── Phase 1 timeout triggers transition ───────────────────────────
+
+    #[test]
+    fn test_phase1_timeout_triggers_transition() {
         use crate::types::market::OrderState;
         let now_ms = 100_000;
 
         let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // At step 4 (one below max), advance_step should still be possible.
         snap.emergency_submitted = false;
-        snap.steps_applied = 4;
         snap.exit_reason = None;
-        snap.current_profit_target = Decimal::new(2, 3); // small residual
-        // Posted price must be WORSE (higher) than the erosion target so the
-        // skip guard doesn't suppress the signal.  Target will land at 0.48 after
-        // post-only clamping, so 0.49 > 0.48 → repost is needed.
+        snap.phase = HedgePhase::Phase1;
+        // fill_ms 3s ago → past 2s timeout
+        snap.fill_ms = now_ms - 3_000;
         state.leg2_state = OrderState::Posted {
             order_id: "sim-leg2".into(),
-            price: Decimal::new(49, 2),
+            price: Decimal::new(475, 3),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 2_000,
+        };
+
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
+        assert!(result.is_some(), "timeout should trigger transition");
+        let decision = result.unwrap();
+        assert!(matches!(decision, Leg2Decision::PhaseTransition { reason: TransitionReason::Timeout, .. }));
+    }
+
+    // ── Phase 2 BE breach triggers emergency ──────────────────────────
+
+    #[test]
+    fn test_phase2_be_breach_triggers_emergency() {
+        use crate::types::market::OrderState;
+        let now_ms = 100_000;
+
+        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.51", now_ms);
+        snap.emergency_submitted = false;
+        snap.exit_reason = None;
+        snap.phase = HedgePhase::Phase2;
+        snap.phase2_posted_price = Some(Decimal::new(48, 2));
+        state.leg2_state = OrderState::Posted {
+            order_id: "sim-leg2".into(),
+            price: Decimal::new(48, 2),
             size: Decimal::new(100, 0),
             timestamp_ms: now_ms - 1_000,
         };
+        // leg1=0.50, ask=0.51 → pair=1.01 > $1.00 → BE breach
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
+        assert!(result.is_some(), "BE breach should trigger emergency");
+        let decision = result.unwrap();
+        assert!(decision.is_emergency());
+        let sig = decision.into_signal();
+        assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+    }
 
-        let last_erosion_ms = now_ms - 5_000;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
-        // At step 4, the exhaustion check (>= 5) does NOT fire, so we continue to erosion logic.
-        // But we need steps_applied=4 + advance_step → steps_now=5, which is valid.
-        // The erosion exhaustion block fires BEFORE the timing gate, so steps=4 won't hit it.
-        // steps=4 passes the exhaustion check (4 < 5) and goes to normal erosion.
-        assert!(
-            result.is_some(),
-            "step 4 should produce a normal erosion signal (not emergency)"
-        );
+    // ── Phase 2 price improvement triggers repost ─────────────────────
 
-        // At step 5, the exhaustion check fires and produces an emergency.
-        snap.steps_applied = 5;
-        snap.current_profit_target = Decimal::ZERO;
-        let result2 = evaluator.evaluate_leg2(&state, &snap, last_erosion_ms, now_ms);
-        assert!(result2.is_some());
-        assert!(
-            result2.as_ref().unwrap().is_emergency(),
-            "step 5 should trigger erosion exhaustion emergency"
-        );
+    #[test]
+    fn test_phase2_price_improvement_repost() {
+        use crate::types::market::OrderState;
+        let now_ms = 100_000;
+
+        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
+        snap.emergency_submitted = false;
+        snap.exit_reason = None;
+        snap.phase = HedgePhase::Phase2;
+        snap.phase2_posted_price = Some(Decimal::new(46, 2)); // currently at 0.46
+        state.leg2_state = OrderState::Posted {
+            order_id: "sim-leg2".into(),
+            price: Decimal::new(46, 2),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 1_000,
+        };
+        // ask=0.49 → ask-tick=0.48 > 0.46 → improvement
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
+        assert!(result.is_some(), "price improvement should trigger repost");
+        let decision = result.unwrap();
+        assert!(matches!(decision, Leg2Decision::Phase2Repost { .. }));
+        assert_eq!(decision.price(), Decimal::new(48, 2));
     }
 
 }

@@ -41,11 +41,10 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "confidence.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
     // risk
     ParamSpec { name: "risk.adverse_threshold", min: 0.0001, max: 0.05 },
-    ParamSpec { name: "risk.erosion_base_interval_ms", min: 500.0, max: 30000.0 },
-    ParamSpec { name: "risk.erosion_interval_decay", min: 0.1, max: 1.0 },
+    ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },
     ParamSpec { name: "risk.emergency_deadline_ms", min: 500.0, max: 30000.0 },
-    ParamSpec { name: "risk.pre_erosion_breach_threshold", min: 1.001, max: 1.10 },
+    ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
 ];

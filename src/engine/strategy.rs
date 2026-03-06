@@ -32,7 +32,7 @@ use crate::types::simulation::{MarketSummary, SessionSummary, SimFill, SimTrade}
 use crate::utils::time::epoch_ms as now_epoch_ms;
 
 use super::confidence::compute_confidence;
-use super::erosion::{ConnectivityState, ErosionSnap, ErosionState};
+use super::erosion::{ConnectivityState, HedgePhase, HedgeSnap, HedgeState};
 use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
 };
@@ -75,7 +75,7 @@ struct LiveTradeMeta {
     emergency_maker: bool,
     adverse_movement: bool,
     favorable_taker: bool,
-    pre_erosion_breach: bool,
+    phase1_breach: bool,
     exit_reason: Option<ExitReason>,
     /// `true` if Leg 1 filled via the cancel-not-confirmed replay path.
     leg1_cancel_race: bool,
@@ -116,12 +116,12 @@ const BOOK_DEPTH_ONE_MINUS: Decimal = Decimal::from_parts(9, 0, 0, false, 1);
 /// state and applies post-signal mutations after evaluator calls.
 pub struct StrategyEngine {
     state: MarketState,
-    erosion: Option<ErosionState>,
+    hedge: Option<HedgeState>,
     connectivity: ConnectivityState,
     /// EMA of total poly book depth (alpha=0.1) for depth wall detection.
     avg_book_depth: Option<Decimal>,
-    /// Epoch ms of the last Leg 2 erosion signal emitted.
-    last_erosion_signal_ms: u64,
+    /// Epoch ms of the last Leg 2 hedge signal emitted.
+    last_hedge_signal_ms: u64,
     /// Direction of the active Leg 1 trade. Set by evaluate(), cleared on completion/rotation.
     leg1_direction: Option<Direction>,
 
@@ -139,7 +139,7 @@ pub struct StrategyEngine {
     rotation_quiet_ms: u64,
 
     /// `true` when opposite spike detected with Leg 1 filled — next evaluate_leg2()
-    /// emits immediate FOK at best ask, bypassing erosion.
+    /// emits immediate FOK at best ask, bypassing hedge.
     whipsaw_fok_pending: bool,
 
     /// Stored Leg 1 signal for building confirmed fill signals in advance_simulation().
@@ -171,9 +171,9 @@ pub struct StrategyEngine {
     /// Gates `evaluate_leg2()` to prevent signal stacking in the executor channel.
     emergency_signal_in_flight: bool,
 
-    /// Set `true` when ANY Leg 2 command is dispatched to the executor (erosion or emergency).
+    /// Set `true` when ANY Leg 2 command is dispatched to the executor (hedge or emergency).
     /// Cleared on ANY Leg 2 feedback (OrderPosted, OrderFailed, CancelResult for leg2).
-    /// Prevents stale erosion commands from queuing while the executor is still processing
+    /// Prevents stale hedge commands from queuing while the executor is still processing
     /// a previous Leg 2 command (e.g., favorable exit takes ~3.6s for 3 HTTP calls).
     leg2_command_pending: bool,
 
@@ -213,7 +213,7 @@ pub struct StrategyEngine {
     diag_spikes_received: u64,
     diag_spikes_dropped_cutoff: u64,
     diag_spikes_dropped_quiet: u64,
-    diag_emg_pre_erosion: u64,
+    diag_emg_phase1_breach: u64,
     diag_whipsaw_cancels: u64,
     diag_whipsaw_foks: u64,
     // Leg 1 rejection distribution — only incremented when spike_detected = true
@@ -227,7 +227,8 @@ pub struct StrategyEngine {
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
     diag_leg1_fills: u64,
-    diag_leg2_erosion_steps: u64,
+    diag_leg2_reposts: u64,
+    diag_phase_transitions: u64,
     diag_leg2_fills_maker: u64,
     diag_leg2_fills_taker: u64,
     diag_emg_adverse: u64,
@@ -295,10 +296,10 @@ impl StrategyEngine {
             Decimal::try_from(config.bot.confidence.med_threshold).unwrap_or(Decimal::new(5, 1));
         Self {
             state,
-            erosion: None,
+            hedge: None,
             connectivity: ConnectivityState::default(),
             avg_book_depth: None,
-            last_erosion_signal_ms: 0,
+            last_hedge_signal_ms: 0,
             leg1_direction: None,
             in_cutoff_window: false,
             in_quiet_period: false,
@@ -328,7 +329,7 @@ impl StrategyEngine {
             diag_spikes_received: 0,
             diag_spikes_dropped_cutoff: 0,
             diag_spikes_dropped_quiet: 0,
-            diag_emg_pre_erosion: 0,
+            diag_emg_phase1_breach: 0,
             diag_whipsaw_cancels: 0,
             diag_whipsaw_foks: 0,
             diag_rej_busy: 0,
@@ -341,7 +342,8 @@ impl StrategyEngine {
             diag_rej_other: 0,
             diag_leg1_signals: 0,
             diag_leg1_fills: 0,
-            diag_leg2_erosion_steps: 0,
+            diag_leg2_reposts: 0,
+            diag_phase_transitions: 0,
             diag_leg2_fills_maker: 0,
             diag_leg2_fills_taker: 0,
             diag_emg_adverse: 0,
@@ -387,11 +389,10 @@ impl StrategyEngine {
             },
             leg2: Leg2Evaluator {
                 adverse_threshold: config.adverse_threshold,
-                erosion_base_interval_ms: config.bot.risk.erosion_base_interval_ms,
-                erosion_interval_decay: config.bot.risk.erosion_interval_decay,
+                phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
                 depth_wall_multiplier,
                 emergency_deadline_ms: config.bot.risk.emergency_deadline_ms,
-                pre_erosion_breach_threshold: config.pre_erosion_breach_threshold,
+                phase1_breach_threshold: config.phase1_breach_threshold,
             },
         }
     }
@@ -851,7 +852,7 @@ impl StrategyEngine {
                         } else {
                             warn!(
                                 "rotation emergency: could not build signal \
-                                 (missing erosion/token) — position will be force-closed"
+                                 (missing hedge/token) — position will be force-closed"
                             );
                         }
                     } else {
@@ -900,8 +901,8 @@ impl StrategyEngine {
                 self.state.leg2_state = OrderState::None;
                 self.state.cumulative_used = Decimal::ZERO;
                 self.state.last_update_ms = now_ms;
-                self.erosion = None;
-                self.last_erosion_signal_ms = 0;
+                self.hedge = None;
+                self.last_hedge_signal_ms = 0;
                 self.avg_book_depth = None;
                 self.leg1_direction = None;
                 self.pending_leg1_signal = None;
@@ -955,7 +956,7 @@ impl StrategyEngine {
                                 size,
                                 fill_timestamp_ms: now_ms,
                             };
-                            self.init_erosion(price, size, now_ms);
+                            self.init_leg2(price, size, now_ms);
                             // Reset live trade meta for the new trade.
                             self.live_trade_meta = LiveTradeMeta::default();
 
@@ -1025,7 +1026,7 @@ impl StrategyEngine {
                                 size,
                                 fill_timestamp_ms: now_ms,
                             };
-                            // erosion cleared by on_trade_complete() after Telegram + recording
+                            // hedge cleared by on_trade_complete() after Telegram + recording
                         }
                         TradeStatus::Failed => {
                             warn!(%order_id, "Leg 2 FAILED — re-entry via evaluate_leg2");
@@ -1273,9 +1274,9 @@ impl StrategyEngine {
     /// Delegates guard checking and signal building to [`Leg2Evaluator::evaluate_leg2`].
     /// Applies post-signal state mutations here after a successful evaluation:
     /// - Sets `leg2_state` to `Posted`
-    /// - On emergency: sets `erosion.emergency_submitted = true`
-    /// - On erosion: advances `erosion.steps_applied` if interval elapsed,
-    ///   updates `last_erosion_signal_ms`
+    /// - On emergency: sets `hedge.emergency_submitted = true`
+    /// - On phase transition: sets `hedge.phase` to `Phase2`,
+    ///   updates `last_hedge_signal_ms`
     pub fn evaluate_leg2(&mut self) -> Option<TradeSignal> {
         if self.emergency_signal_in_flight {
             return None;
@@ -1283,7 +1284,7 @@ impl StrategyEngine {
         if self.leg2_command_pending {
             return None;
         }
-        // Whipsaw FOK: opposite spike after Leg 1 fill → immediate taker, no erosion.
+        // Whipsaw FOK: opposite spike after Leg 1 fill → immediate taker, bypasses hedge.
         if self.whipsaw_fok_pending {
             self.whipsaw_fok_pending = false;
             return self.emit_whipsaw_fok();
@@ -1293,9 +1294,9 @@ impl StrategyEngine {
         // During emergency exit, only Polymarket book changes matter for
         // price-improvement checks. Skip evaluation if the hedge book hasn't
         // changed — UNLESS the hard deadline may have expired (time-based).
-        let in_emergency = self.erosion.as_ref().is_some_and(|e| e.emergency_submitted);
+        let in_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
         if in_emergency {
-            let deadline_may_have_expired = self.erosion.as_ref().is_some_and(|e| {
+            let deadline_may_have_expired = self.hedge.as_ref().is_some_and(|e| {
                 e.emergency_first_post_ms
                     .map(|first| now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms)
                     .unwrap_or(false)
@@ -1306,18 +1307,16 @@ impl StrategyEngine {
             self.hedge_book_changed = false;
         }
 
-        // Build borrow-free snapshot of erosion state to pass to evaluator.
-        let snap = match self.erosion.as_ref() {
+        // Build borrow-free snapshot of hedge state to pass to evaluator.
+        let snap = match self.hedge.as_ref() {
             None => return None,
-            Some(e) => ErosionSnap {
+            Some(e) => HedgeSnap {
                 emergency_submitted: e.emergency_submitted,
                 break_even: e.break_even(),
-                current_profit_target: e.current_profit_target(),
                 initial_profit_target: e.initial_profit_target,
                 direction: e.direction,
                 binance_at_fill: e.binance_at_fill,
                 fill_ms: e.leg1_fill_ms,
-                steps_applied: e.steps_applied,
                 tier: e.tier,
                 confidence: e.confidence,
                 spike_info: e.spike_info,
@@ -1326,40 +1325,20 @@ impl StrategyEngine {
                 emergency_first_post_ms: e.emergency_first_post_ms,
                 emergency_posted_price: e.emergency_posted_price,
                 fok_emitted: e.fok_emitted,
+                phase: e.phase,
+                phase1_target_price: e.phase1_target_price,
+                phase2_posted_price: e.phase2_posted_price,
             },
         };
 
-        let last_erosion_ms = self.last_erosion_signal_ms;
+        let last_hedge_ms = self.last_hedge_signal_ms;
         let decision = match self
             .leg2
-            .evaluate_leg2(&self.state, &snap, last_erosion_ms, now_ms)
+            .evaluate_leg2(&self.state, &snap, last_hedge_ms, now_ms)
         {
             Some(d) => d,
             None => {
-                // Evaluator returned None — could be timing gate, skip guard, or missing data.
-                // If the erosion timing gate has passed, silently advance the step to prevent
-                // the cascade from stalling when per-step target increments are smaller than
-                // tick size (e.g. MED tier's 2% margin over 5 steps < $0.01 tick).
-                // Without this, steps_applied never reaches MAX_EROSION_STEPS and the
-                // erosion-exhausted emergency never fires.
-                // Only advance silently when a Leg 2 order is actually resting
-                // on the book. If leg2_state is None (e.g. after OrderFailed reset),
-                // the evaluator will emit a signal at the current step's price on the
-                // next cycle — steps advance via the normal evaluation path instead.
-                let leg2_posted = matches!(self.state.leg2_state, OrderState::Posted { .. });
-                if leg2_posted && last_erosion_ms > 0 && !snap.is_exhausted() {
-                    let interval = ErosionState::interval_for_step(
-                        snap.steps_applied,
-                        self.leg2.erosion_base_interval_ms,
-                        self.leg2.erosion_interval_decay,
-                    );
-                    if now_ms.saturating_sub(last_erosion_ms) >= interval {
-                        if let Some(e) = self.erosion.as_mut() {
-                            e.steps_applied += 1;
-                        }
-                        self.last_erosion_signal_ms = now_ms;
-                    }
-                }
+                // Evaluator returned None — skip guard, no improvement, or missing data.
                 return None;
             }
         };
@@ -1384,12 +1363,10 @@ impl StrategyEngine {
             };
             match reason {
                 Some(ExitReason::AdverseMovement) => self.diag_emg_adverse += 1,
-                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
-                    self.diag_emg_breakeven += 1;
-                }
+                Some(ExitReason::BreakEvenBreach) => self.diag_emg_breakeven += 1,
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
-                Some(ExitReason::PreErosionBreach) => self.diag_emg_pre_erosion += 1,
+                Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
                 Some(ExitReason::WhipsawReversal) => {} // counted in spike handler (diag_whipsaw_foks)
                 None => self.diag_emg_adverse += 1, // fallback
             }
@@ -1402,10 +1379,10 @@ impl StrategyEngine {
                 emergency_maker: reason.is_some() && !was_taker,
                 adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
-                pre_erosion_breach: matches!(reason, Some(ExitReason::PreErosionBreach)),
+                phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
                 leg1_cancel_race: cancel_race,
             };
-            if let Some(e) = self.erosion.as_mut() {
+            if let Some(e) = self.hedge.as_mut() {
                 if !e.emergency_submitted {
                     // First emergency post — record the timestamp for deadline tracking.
                     e.emergency_first_post_ms = Some(now_ms);
@@ -1420,7 +1397,7 @@ impl StrategyEngine {
                     e.fok_emitted = true;
                 }
             }
-            self.last_erosion_signal_ms = now_ms;
+            self.last_hedge_signal_ms = now_ms;
             self.emergency_signal_in_flight = true;
             if self.reporter.is_some() {
                 self.leg2_command_pending = true;
@@ -1432,23 +1409,36 @@ impl StrategyEngine {
                 timestamp_ms: now_ms,
             };
         } else {
-            // Normal erosion path.
-            self.diag_leg2_erosion_steps += 1;
-            if let Leg2Decision::Erosion { advance_step, .. } = &decision {
-                if *advance_step {
-                    if let Some(e) = self.erosion.as_mut() {
-                        if !e.is_exhausted() {
-                            e.steps_applied += 1;
-                        }
-                    }
+            // Non-emergency hedge path: Phase1Post, PhaseTransition, or Phase2Repost.
+            match &decision {
+                Leg2Decision::Phase1Post { .. } => {
+                    // Initial post at profit target — no phase change needed.
+                    self.diag_leg2_reposts += 1;
                 }
+                Leg2Decision::PhaseTransition { .. } => {
+                    // Transition from Phase 1 to Phase 2.
+                    if let Some(e) = self.hedge.as_mut() {
+                        e.phase = HedgePhase::Phase2;
+                        e.phase2_posted_price = Some(price);
+                    }
+                    self.diag_phase_transitions += 1;
+                    self.diag_leg2_reposts += 1;
+                }
+                Leg2Decision::Phase2Repost { .. } => {
+                    // Improvement repost in Phase 2.
+                    if let Some(e) = self.hedge.as_mut() {
+                        e.phase2_posted_price = Some(price);
+                    }
+                    self.diag_leg2_reposts += 1;
+                }
+                _ => {}
             }
-            self.last_erosion_signal_ms = now_ms;
+            self.last_hedge_signal_ms = now_ms;
             if self.reporter.is_some() {
                 self.leg2_command_pending = true;
             }
             self.state.leg2_state = OrderState::Posted {
-                order_id: format!("sim-leg2-erosion-{}", now_ms),
+                order_id: format!("sim-leg2-hedge-{}", now_ms),
                 price,
                 size,
                 timestamp_ms: now_ms,
@@ -1507,7 +1497,7 @@ impl StrategyEngine {
             spikes = self.diag_spikes_received,
             spikes_cut = self.diag_spikes_dropped_cutoff,
             spikes_quiet = self.diag_spikes_dropped_quiet,
-            emg_pre_erosion = self.diag_emg_pre_erosion,
+            emg_phase1_breach = self.diag_emg_phase1_breach,
             whipsaw_cancel = self.diag_whipsaw_cancels,
             whipsaw_fok = self.diag_whipsaw_foks,
             rej_paused = self.diag_rej_paused,
@@ -1520,7 +1510,8 @@ impl StrategyEngine {
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
-            erosion_stp = self.diag_leg2_erosion_steps,
+            reposts = self.diag_leg2_reposts,
+            phase_transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
             emg_adverse = self.diag_emg_adverse,
@@ -1586,8 +1577,8 @@ impl StrategyEngine {
              Signals: {sig}  Fills: {fill}  Failed: {failed}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
              \n\
              <b>Leg 2</b>\n\
-             Erosion steps: {erosion}  Fills: {l2_maker} maker / {l2_taker} taker\n\
-             Emergencies — adverse: {emg_adv}  pre-erosion: {emg_pre}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
+             Reposts: {reposts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
+             Emergencies — adverse: {emg_adv}  phase1-breach: {emg_p1b}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
             spike = spike_section,
@@ -1609,14 +1600,15 @@ impl StrategyEngine {
             failed = self.diag_order_failures,
             timeout = self.diag_leg1_timeouts,
             sus_cancel = self.diag_spike_sustain_cancel,
-            erosion = self.diag_leg2_erosion_steps,
+            reposts = self.diag_leg2_reposts,
+            transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
             emg_adv = self.diag_emg_adverse,
             emg_be = self.diag_emg_breakeven,
             emg_exp = self.diag_emg_expiry,
             emg_fav = self.diag_emg_favorable,
-            emg_pre = self.diag_emg_pre_erosion,
+            emg_p1b = self.diag_emg_phase1_breach,
             emg_mkr = self.diag_emg_maker,
             emg_tkr = self.diag_emg_taker,
             whip_cancel = self.diag_whipsaw_cancels,
@@ -1716,7 +1708,7 @@ impl StrategyEngine {
         }
 
         // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
-        // has been reset (e.g., stale erosion command processed after trade completed).
+        // has been reset (e.g., stale hedge command processed after trade completed).
         if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
             warn!(%order_id, %price, %size,
                 "ignoring stale Leg 2 OrderPosted — no active Leg 1 fill");
@@ -1829,7 +1821,7 @@ impl StrategyEngine {
             size,
             fill_timestamp_ms: now_ms,
         };
-        self.init_erosion(price, size, now_ms);
+        self.init_leg2(price, size, now_ms);
         self.live_trade_meta = LiveTradeMeta::default();
 
         // Send opportunity alert via Telegram in live mode.
@@ -1865,7 +1857,7 @@ impl StrategyEngine {
             return;
         }
         // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
-        // has been reset (e.g., stale erosion command processed after trade completed).
+        // has been reset (e.g., stale hedge command processed after trade completed).
         if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
             warn!(is_leg2, "ignoring stale Leg 2 OrderFailed — no active Leg 1 fill");
             self.emergency_signal_in_flight = false;
@@ -1973,8 +1965,8 @@ impl StrategyEngine {
                     leg1_cancel_race: cancel_race,
                     ..Default::default()
                 };
-                // Also reset erosion emergency state so it doesn't taint subsequent evaluation.
-                if let Some(e) = self.erosion.as_mut() {
+                // Also reset hedge emergency state so it doesn't taint subsequent evaluation.
+                if let Some(e) = self.hedge.as_mut() {
                     e.emergency_submitted = false;
                     e.exit_reason = None;
                 }
@@ -2032,7 +2024,7 @@ impl StrategyEngine {
                             size,
                             fill_timestamp_ms: now_ms,
                         };
-                        self.init_erosion(price, size, now_ms);
+                        self.init_leg2(price, size, now_ms);
                         self.live_trade_meta = LiveTradeMeta::default();
 
                         // Send opportunity alert for replayed Leg 1 fill (e.g. cancel-race).
@@ -2088,7 +2080,7 @@ impl StrategyEngine {
                             size,
                             fill_timestamp_ms: now_ms,
                         };
-                        // erosion cleared by on_trade_complete() after Telegram + recording
+                        // hedge cleared by on_trade_complete() after Telegram + recording
                     }
                     TradeStatus::Failed => {
                         self.state.leg2_state = OrderState::None;
@@ -2112,7 +2104,7 @@ impl StrategyEngine {
     ///
     /// Call this when both legs are `Filled` — right before `on_trade_complete()`
     /// resets state. All required fields are extracted from engine state:
-    /// `leg1_state`, `leg2_state`, `erosion`, `pending_leg1_signal`, `leg1_direction`.
+    /// `leg1_state`, `leg2_state`, `hedge`, `pending_leg1_signal`, `leg1_direction`.
     pub fn record_live_trade(
         &self,
         cold: &mut crate::storage::cold::ColdStorage,
@@ -2145,41 +2137,41 @@ impl StrategyEngine {
         let pair_cost = l1_price + l2_price;
         let gross_profit = (Decimal::ONE - pair_cost) * l1_size;
 
-        // Extract erosion metadata (if available).
+        // Extract hedge metadata (if available).
         let (
             confidence,
             profit_tier,
-            erosion_steps,
+            hedge_phase,
             exit_reason,
             alloc_amount,
             bot_contested,
             emergency_submitted,
             spike_magnitude,
-        ) = match (&self.erosion, &self.pending_leg1_signal) {
-            (Some(ero), Some(sig)) => (
-                ero.confidence,
-                ero.tier.label(),
-                ero.steps_applied,
-                ero.exit_reason,
+        ) = match (&self.hedge, &self.pending_leg1_signal) {
+            (Some(h), Some(sig)) => (
+                h.confidence,
+                h.tier.label(),
+                h.phase as u8,
+                h.exit_reason,
                 sig.alloc_amount,
                 sig.bot_contested,
-                ero.emergency_submitted,
-                ero.spike_info.magnitude,
+                h.emergency_submitted,
+                h.spike_info.magnitude,
             ),
-            (Some(ero), None) => (
-                ero.confidence,
-                ero.tier.label(),
-                ero.steps_applied,
-                ero.exit_reason,
+            (Some(h), None) => (
+                h.confidence,
+                h.tier.label(),
+                h.phase as u8,
+                h.exit_reason,
                 Decimal::ZERO,
                 false,
-                ero.emergency_submitted,
-                ero.spike_info.magnitude,
+                h.emergency_submitted,
+                h.spike_info.magnitude,
             ),
             _ => (
                 Decimal::ZERO,
                 "LOW",
-                0,
+                0u8,
                 None,
                 Decimal::ZERO,
                 false,
@@ -2222,7 +2214,7 @@ impl StrategyEngine {
             confidence,
             profit_tier,
             alloc_amount,
-            erosion_steps,
+            hedge_phase,
             leg2_was_taker,
             adverse_movement,
             bot_contested,
@@ -2278,8 +2270,8 @@ impl StrategyEngine {
 
         self.state.leg1_state = OrderState::None;
         self.state.leg2_state = OrderState::None;
-        self.erosion = None;
-        self.last_erosion_signal_ms = 0;
+        self.hedge = None;
+        self.last_hedge_signal_ms = 0;
         self.leg1_direction = None;
         self.pending_leg1_signal = None;
         self.pending_spike_cancel = None;
@@ -2297,11 +2289,11 @@ impl StrategyEngine {
 
     // ─── Simulation helpers ────────────────────────────────────────────────
 
-    /// Initialize erosion state after a Leg 1 fill.
+    /// Initialize hedge state after a Leg 1 fill.
     ///
     /// Reused by both `TradeStatusUpdate` handler (live mode) and
     /// `advance_simulation()` (simulation mode).
-    fn init_erosion(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
+    fn init_leg2(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
         if let Some(spike) = self.state.last_spike {
             let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
             let depth = self
@@ -2326,9 +2318,14 @@ impl StrategyEngine {
             let initial_profit_target = self.leg1.target_pct_for_tier(tier);
             // Use leg1_direction (set at signal generation, survives spike overwrites)
             // instead of spike.direction to prevent YES/NO label swap when an
-            // opposite spike arrives between Leg 1 fill and init_erosion().
+            // opposite spike arrives between Leg 1 fill and init_leg2().
             let direction = self.leg1_direction.unwrap_or(spike.direction);
-            self.erosion = Some(ErosionState::new(
+            let tick = self.state.tick_size;
+            let phase1_target_price = round_to_tick(
+                Decimal::ONE - initial_profit_target - fill_price,
+                tick,
+            );
+            self.hedge = Some(HedgeState::new(
                 now_ms,
                 fill_price,
                 tier,
@@ -2337,20 +2334,21 @@ impl StrategyEngine {
                 spike,
                 conf,
                 self.state.binance_price,
+                phase1_target_price,
             ));
-            info!(tier = tier.label(), %fill_price, %fill_size, "erosion initialised");
+            info!(tier = tier.label(), %fill_price, %fill_size, %phase1_target_price, "leg2 hedge initialised");
         } else {
-            warn!("Leg 1 filled but no spike info — erosion not initialised");
+            warn!("Leg 1 filled but no spike info — hedge not initialised");
         }
     }
 
     /// Emit an immediate FOK signal at best ask to hedge a whipsaw reversal.
     /// Called from `evaluate_leg2()` when `whipsaw_fok_pending` is set.
-    /// Bypasses erosion entirely — the opposite spike invalidated the thesis.
+    /// Bypasses hedge entirely — the opposite spike invalidated the thesis.
     fn emit_whipsaw_fok(&mut self) -> Option<TradeSignal> {
         let now_ms = now_epoch_ms();
-        let erosion = self.erosion.as_ref()?;
-        let direction = erosion.direction;
+        let hedge = self.hedge.as_ref()?;
+        let direction = hedge.direction;
 
         let hedge_book = match direction {
             Direction::Up => self
@@ -2384,12 +2382,12 @@ impl StrategyEngine {
             fok_price,
             leg1_size,
             self.state.binance_price.unwrap_or(Decimal::ZERO),
-            erosion.confidence,
-            erosion.tier,
+            hedge.confidence,
+            hedge.tier,
             Decimal::ZERO,
             direction,
-            erosion.spike_info,
-            erosion.leg1_fill_price,
+            hedge.spike_info,
+            hedge.leg1_fill_price,
             now_ms,
             self.state.market_end_timestamp_ms,
             tick,
@@ -2408,10 +2406,10 @@ impl StrategyEngine {
             emergency_maker: false,
             adverse_movement: false,
             favorable_taker: false,
-            pre_erosion_breach: false,
+            phase1_breach: false,
             leg1_cancel_race: cancel_race,
         };
-        if let Some(e) = self.erosion.as_mut() {
+        if let Some(e) = self.hedge.as_mut() {
             e.emergency_submitted = true;
             e.fok_emitted = true;
             e.emergency_first_post_ms = Some(now_ms);
@@ -2441,7 +2439,7 @@ impl StrategyEngine {
             timestamp_ms: now_ms,
         };
 
-        warn!(%fok_price, %leg1_size, "whipsaw FOK emitted — bypassing erosion");
+        warn!(%fok_price, %leg1_size, "whipsaw FOK emitted — bypassing hedge");
         Some(signal)
     }
 
@@ -2548,7 +2546,7 @@ impl StrategyEngine {
                     size: fill_size,
                     fill_timestamp_ms: now_ms,
                 };
-                self.init_erosion(fill_price, fill_size, now_ms);
+                self.init_leg2(fill_price, fill_size, now_ms);
             }
         }
 
@@ -2557,7 +2555,7 @@ impl StrategyEngine {
             let posted_price = *price;
             let posted_size = *size;
 
-            let is_emergency = self.erosion.as_ref().is_some_and(|e| e.emergency_submitted);
+            let is_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
 
             // Determine fill outcome: (should_fill, is_favorable_taker, fill_price, sim_was_taker).
             // Emergency fills use deadline-aware model: wait for market to come to our
@@ -2597,7 +2595,7 @@ impl StrategyEngine {
                     (true, false, posted_price, false)
                 } else {
                     // Check hard deadline.
-                    let deadline_passed = self.erosion.as_ref().is_some_and(|e| {
+                    let deadline_passed = self.hedge.as_ref().is_some_and(|e| {
                         e.emergency_first_post_ms
                             .map(|first| {
                                 now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms
@@ -2661,7 +2659,7 @@ impl StrategyEngine {
                     %posted_price, %posted_size, %fill_price, is_emergency, is_favorable_taker, sim_was_taker,
                     "advance_simulation: Leg 2 simulated fill"
                 );
-                // Build signal BEFORE setting Filled state — erosion is still valid.
+                // Build signal BEFORE setting Filled state — hedge is still valid.
                 if let Some(mut sig) =
                     self.build_sim_leg2_fill_signal(fill_price, posted_size, now_ms)
                 {
@@ -2705,8 +2703,8 @@ impl StrategyEngine {
 
             self.state.leg1_state = OrderState::None;
             self.state.leg2_state = OrderState::None;
-            self.erosion = None;
-            self.last_erosion_signal_ms = 0;
+            self.hedge = None;
+            self.last_hedge_signal_ms = 0;
             self.leg1_direction = None;
             // cumulative_used is NOT reset — capital stays allocated within this market.
         }
@@ -2716,19 +2714,19 @@ impl StrategyEngine {
 
     /// Build a Leg 2 fill [`TradeSignal`] for routing to the `SimulationExecutor`.
     ///
-    /// Uses the current erosion state and hedge book to construct a confirmed fill
-    /// signal (`sim_confirmed_fill = true`). Reads `exit_reason` from erosion state
+    /// Uses the current hedge state and hedge book to construct a confirmed fill
+    /// signal (`sim_confirmed_fill = true`). Reads `exit_reason` from hedge state
     /// (set on emergency) so the executor can categorize the exit correctly.
-    /// Returns `None` if erosion state or hedge token ID is unavailable.
+    /// Returns `None` if hedge state or hedge token ID is unavailable.
     fn build_sim_leg2_fill_signal(
         &self,
         price: Decimal,
         size: Decimal,
         now_ms: u64,
     ) -> Option<TradeSignal> {
-        let erosion = self.erosion.as_ref()?;
-        let exit_reason = if erosion.emergency_submitted {
-            erosion.exit_reason
+        let hedge = self.hedge.as_ref()?;
+        let exit_reason = if hedge.emergency_submitted {
+            hedge.exit_reason
         } else {
             None
         };
@@ -2754,12 +2752,12 @@ impl StrategyEngine {
             price,
             size,
             self.state.binance_price.unwrap_or(Decimal::ZERO),
-            erosion.confidence,
-            erosion.tier,
-            erosion.initial_profit_target,
-            erosion.direction,
-            erosion.spike_info,
-            erosion.leg1_fill_price,
+            hedge.confidence,
+            hedge.tier,
+            hedge.initial_profit_target,
+            hedge.direction,
+            hedge.spike_info,
+            hedge.leg1_fill_price,
             now_ms,
             self.state.market_end_timestamp_ms,
             self.state.tick_size,
@@ -2919,7 +2917,7 @@ impl StrategyEngine {
             if t.favorable_taker { favorable_taker += 1; }
             if t.adverse_movement_hedge && t.leg2_was_taker { adverse_fok += 1; }
             match t.exit_reason {
-                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
+                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::Phase1Breach) => {
                     break_even_fok += 1;
                 }
                 Some(ExitReason::MarketExpiry) => timer_fok += 1,
@@ -3012,7 +3010,7 @@ impl StrategyEngine {
 
     /// Build a `SimTrade` from live fill data for Telegram reporting.
     ///
-    /// Returns `None` if required state (erosion or pending signal) is unavailable.
+    /// Returns `None` if required state (hedge or pending signal) is unavailable.
     fn build_live_sim_trade(
         &self,
         l1_price: Decimal,
@@ -3022,7 +3020,7 @@ impl StrategyEngine {
         l2_size: Decimal,
         now_ms: u64,
     ) -> Option<SimTrade> {
-        let erosion = self.erosion.as_ref()?;
+        let hedge = self.hedge.as_ref()?;
         let signal = self.pending_leg1_signal.as_ref()?;
 
         let pair_cost = l1_price + l2_price;
@@ -3048,7 +3046,7 @@ impl StrategyEngine {
             net_profit / total_cost * Decimal::ONE_HUNDRED
         };
 
-        let leg1_side = match erosion.direction {
+        let leg1_side = match hedge.direction {
             Direction::Up => crate::types::order::Side::Buy,
             Direction::Down => crate::types::order::Side::Buy,
         };
@@ -3077,11 +3075,11 @@ impl StrategyEngine {
 
         Some(SimTrade {
             market_id: signal.condition_id.clone(),
-            direction: erosion.direction,
+            direction: hedge.direction,
             leg1: leg1_fill,
             leg2: Some(leg2_fill),
-            confidence: erosion.confidence,
-            profit_target_tier: erosion.tier,
+            confidence: hedge.confidence,
+            profit_target_tier: hedge.tier,
             alloc_amount: signal.alloc_amount,
             pair_cost,
             gross_profit,
@@ -3091,16 +3089,16 @@ impl StrategyEngine {
             profit_pct,
             resolution: None,
             resolution_timestamp_ms: None,
-            erosion_steps: erosion.steps_applied,
+            hedge_phase: hedge.phase as u8,
             leg2_was_taker: self.live_trade_meta.leg2_was_taker,
             adverse_movement_hedge: self.live_trade_meta.adverse_movement,
             bot_contested: signal.bot_contested,
             favorable_taker: self.live_trade_meta.favorable_taker,
             emergency_maker: self.live_trade_meta.emergency_maker,
             exit_reason: self.live_trade_meta.exit_reason,
-            spike_magnitude: erosion.spike_info.magnitude,
+            spike_magnitude: hedge.spike_info.magnitude,
             leg1_cancel_race: self.live_trade_meta.leg1_cancel_race,
-            pre_erosion_breach: self.live_trade_meta.pre_erosion_breach,
+            phase1_breach: self.live_trade_meta.phase1_breach,
             whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
             open_timestamp_ms: l1_ts,
             close_timestamp_ms: now_ms,
@@ -3207,7 +3205,6 @@ impl Default for StrategyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::erosion::MAX_EROSION_STEPS;
     use crate::types::market::{BinanceTick, OrderBook, PriceLevel, SpikeInfo};
 
     const TEST_FIXED_ALLOC: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
@@ -3454,10 +3451,10 @@ mod tests {
         );
     }
 
-    // ── ErosionState ──────────────────────────────────────────────────────
+    // ── HedgeState ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_erosion_high_tier_5_steps_reach_break_even() {
+    fn test_hedge_state_phase_transition() {
         let now_ms = now_epoch_ms();
         let spike = SpikeInfo {
             direction: Direction::Up,
@@ -3467,7 +3464,8 @@ mod tests {
             atr_ratio: Decimal::ZERO,
         };
         let leg1_price = Decimal::new(48, 2); // 0.48
-        let mut e = ErosionState::new(
+        let phase1_target = Decimal::new(495, 3); // 0.495
+        let mut h = HedgeState::new(
             now_ms,
             leg1_price,
             ProfitTier::High,
@@ -3476,25 +3474,24 @@ mod tests {
             spike,
             Decimal::new(85, 2),
             None,
+            phase1_target,
         );
 
-        let be = e.break_even();
+        let be = h.break_even();
         assert_eq!(be, Decimal::new(52, 2)); // 1.0 - 0.48
+        assert_eq!(h.phase, HedgePhase::Phase1);
+        assert_eq!(h.phase1_target_price, phase1_target);
+        assert!(h.phase2_posted_price.is_none());
 
-        let t0 = e.current_leg2_target(); // 1.0 - 0.025 - 0.48 = 0.495
-        assert_eq!(t0, Decimal::new(495, 3));
-
-        e.steps_applied = 1;
-        let t1 = e.current_leg2_target(); // 1.0 - 0.020 - 0.48 = 0.500
-        assert!(t1 > t0, "erosion raises bid");
-
-        e.steps_applied = 5;
-        assert_eq!(e.current_profit_target(), Decimal::ZERO);
-        assert_eq!(e.current_leg2_target(), be);
+        // Transition to Phase 2
+        h.phase = HedgePhase::Phase2;
+        h.phase2_posted_price = Some(Decimal::new(51, 2));
+        assert_eq!(h.phase, HedgePhase::Phase2);
+        assert_eq!(h.phase2_posted_price, Some(Decimal::new(51, 2)));
     }
 
     #[test]
-    fn test_erosion_profit_floors_at_zero() {
+    fn test_hedge_state_break_even() {
         let now_ms = now_epoch_ms();
         let spike = SpikeInfo {
             direction: Direction::Up,
@@ -3503,7 +3500,7 @@ mod tests {
             timestamp_ms: now_ms,
             atr_ratio: Decimal::ZERO,
         };
-        let mut e = ErosionState::new(
+        let h = HedgeState::new(
             now_ms,
             Decimal::new(48, 2),
             ProfitTier::High,
@@ -3512,15 +3509,16 @@ mod tests {
             spike,
             Decimal::ZERO,
             None,
+            Decimal::new(495, 3),
         );
-        e.steps_applied = 20;
-        assert_eq!(e.current_profit_target(), Decimal::ZERO);
+        // break_even = 1.0 - leg1_fill_price = 0.52
+        assert_eq!(h.break_even(), Decimal::new(52, 2));
     }
 
     // ── TradeStatusUpdate fills Leg 1 ─────────────────────────────────────
 
     #[test]
-    fn test_leg1_fill_initialises_erosion() {
+    fn test_leg1_fill_initialises_hedge() {
         let mut engine = make_engine_with_market(600);
         let now_ms = now_epoch_ms();
         engine.state.leg1_state = OrderState::Posted {
@@ -3546,7 +3544,7 @@ mod tests {
         });
 
         assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
-        assert!(engine.erosion.is_some());
+        assert!(engine.hedge.is_some());
     }
 
     // ── HeartbeatStatus ───────────────────────────────────────────────────
@@ -3625,8 +3623,8 @@ mod tests {
         // Simulate trade completion reset.
         engine.state.leg1_state = OrderState::None;
         engine.state.leg2_state = OrderState::None;
-        engine.erosion = None;
-        engine.last_erosion_signal_ms = 0;
+        engine.hedge = None;
+        engine.last_hedge_signal_ms = 0;
 
         inject_spike(&mut engine, Direction::Up);
         let s2 = engine.evaluate();
@@ -3657,7 +3655,7 @@ mod tests {
             matches!(engine.state.leg1_state, OrderState::Filled { .. }),
             "Leg 1 should be Filled when depth exists near bid and delay elapsed"
         );
-        assert!(engine.erosion.is_some(), "erosion should be initialized");
+        assert!(engine.hedge.is_some(), "hedge should be initialized");
     }
 
     // test_advance_simulation_leg1_no_fill_before_delay removed:
@@ -3704,10 +3702,10 @@ mod tests {
         backdate_leg1(&mut engine);
         engine.advance_simulation();
         assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
-        assert!(engine.erosion.is_some());
+        assert!(engine.hedge.is_some());
 
         let s2 = engine.evaluate_leg2();
-        assert!(s2.is_some(), "Leg 2 erosion signal should be generated");
+        assert!(s2.is_some(), "Leg 2 hedge signal should be generated");
         assert!(matches!(engine.state.leg2_state, OrderState::Posted { .. }));
 
         set_book(&mut engine, "0.40", "0.45");
@@ -3721,7 +3719,7 @@ mod tests {
             matches!(engine.state.leg2_state, OrderState::None),
             "leg2 should be reset after trade completion"
         );
-        assert!(engine.erosion.is_none());
+        assert!(engine.hedge.is_none());
         assert!(
             engine.state.cumulative_used > Decimal::ZERO,
             "cumulative_used should persist"
@@ -3767,28 +3765,29 @@ mod tests {
     }
 
     #[test]
-    fn test_init_erosion_helper() {
+    fn test_init_leg2_helper() {
         let mut engine = make_engine_with_market(600);
         set_book(&mut engine, "0.495", "0.505");
         inject_spike(&mut engine, Direction::Up);
         engine.state.atr = Some(Decimal::new(2, 3));
 
         let now_ms = now_epoch_ms();
-        engine.init_erosion(Decimal::new(50, 2), Decimal::new(100, 0), now_ms);
+        engine.init_leg2(Decimal::new(50, 2), Decimal::new(100, 0), now_ms);
 
-        let erosion = engine
-            .erosion
+        let hedge = engine
+            .hedge
             .as_ref()
-            .expect("erosion should be initialized");
-        assert_eq!(erosion.leg1_fill_price, Decimal::new(50, 2));
-        assert_eq!(erosion.leg1_fill_ms, now_ms);
-        assert!(erosion.confidence > Decimal::ZERO);
+            .expect("hedge should be initialized");
+        assert_eq!(hedge.leg1_fill_price, Decimal::new(50, 2));
+        assert_eq!(hedge.leg1_fill_ms, now_ms);
+        assert!(hedge.confidence > Decimal::ZERO);
+        assert_eq!(hedge.phase, HedgePhase::Phase1);
     }
 
     // ── Rotation emergency protection ──────────────────────────────────
 
-    /// Helper: set up an engine with a Leg 1 filled position + erosion state.
-    /// Returns the engine in a state where Leg 1 is Filled and erosion is initialized.
+    /// Helper: set up an engine with a Leg 1 filled position + hedge state.
+    /// Returns the engine in a state where Leg 1 is Filled and hedge is initialized.
     fn engine_with_filled_leg1() -> StrategyEngine {
         let mut engine = make_engine_with_market(600);
         set_book(&mut engine, "0.495", "0.505");
@@ -3803,7 +3802,7 @@ mod tests {
             matches!(engine.state.leg1_state, OrderState::Filled { .. }),
             "Leg 1 should be filled"
         );
-        assert!(engine.erosion.is_some(), "erosion should be initialized");
+        assert!(engine.hedge.is_some(), "hedge should be initialized");
         engine
     }
 
@@ -3884,7 +3883,7 @@ mod tests {
     fn test_rotation_both_legs_filled_no_emergency() {
         let mut engine = engine_with_filled_leg1();
 
-        // Set up NO book and generate a Leg 2 erosion signal.
+        // Set up NO book and generate a Leg 2 hedge signal.
         engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
             asset_id: "no".to_string(),
             bids: vec![PriceLevel {
@@ -3958,7 +3957,7 @@ mod tests {
 
     // ── Emergency post-only vs FOK taker in advance_simulation ──────────
 
-    /// Helper: set up an engine with Leg 1 filled, erosion initialized, Leg 2 posted,
+    /// Helper: set up an engine with Leg 1 filled, hedge initialized, Leg 2 posted,
     /// and emergency_submitted=true. Returns the engine ready for advance_simulation tests.
     fn engine_with_emergency_leg2() -> StrategyEngine {
         let mut engine = engine_with_filled_leg1();
@@ -3977,15 +3976,15 @@ mod tests {
             timestamp_ms: now_epoch_ms(),
         }));
 
-        // Generate a Leg 2 erosion signal to set leg2_state = Posted.
+        // Generate a Leg 2 hedge signal to set leg2_state = Posted.
         let _leg2 = engine.evaluate_leg2();
         assert!(
             matches!(engine.state.leg2_state, OrderState::Posted { .. }),
             "Leg 2 should be Posted after evaluate_leg2"
         );
 
-        // Simulate emergency: set emergency_submitted = true on the erosion state.
-        if let Some(e) = engine.erosion.as_mut() {
+        // Simulate emergency: set emergency_submitted = true on the hedge state.
+        if let Some(e) = engine.hedge.as_mut() {
             e.emergency_submitted = true;
             e.exit_reason = Some(ExitReason::AdverseMovement);
         }
@@ -3998,7 +3997,7 @@ mod tests {
         let mut engine = engine_with_emergency_leg2();
 
         // Set emergency_first_post_ms so deadline hasn't passed yet.
-        if let Some(e) = engine.erosion.as_mut() {
+        if let Some(e) = engine.hedge.as_mut() {
             e.emergency_first_post_ms = Some(now_epoch_ms());
         }
 
@@ -4047,7 +4046,7 @@ mod tests {
         let mut engine = engine_with_emergency_leg2();
 
         // Set emergency_first_post_ms to now — deadline not yet reached.
-        if let Some(e) = engine.erosion.as_mut() {
+        if let Some(e) = engine.hedge.as_mut() {
             e.emergency_first_post_ms = Some(now_epoch_ms());
         }
 
@@ -4090,7 +4089,7 @@ mod tests {
         let mut engine = engine_with_emergency_leg2();
 
         // Set emergency_first_post_ms far in the past → deadline expired.
-        if let Some(e) = engine.erosion.as_mut() {
+        if let Some(e) = engine.hedge.as_mut() {
             e.emergency_first_post_ms = Some(0); // epoch 0 — well past any deadline
         }
 
@@ -4268,17 +4267,12 @@ mod tests {
         );
     }
 
-    // ── Silent step advancement when skip guard fires ─────────────────
+    // ── Phase 1 → Phase 2 transition via timeout ─────────────────────
 
     #[test]
-    fn test_erosion_cascade_advances_when_target_rounds_to_same_tick() {
-        // Regression test: when per-step erosion increments are smaller than
-        // tick size, the skip guard fires (posted price is already optimal).
-        // The step counter must still advance so that erosion-exhausted emergency
-        // eventually fires. Without the fix, the cascade stalls at step 0 forever.
-        //
-        // Setup: leg1=0.20 (YES entry), NO ask=0.79, pair_cost=0.99 < $1.00.
-        // This avoids break-even breach but keeps ask above all erosion targets.
+    fn test_phase1_timeout_triggers_phase_transition() {
+        // Test: after Phase 1 timeout, evaluate_leg2 should emit a
+        // PhaseTransition signal and advance the hedge to Phase 2.
         let mut engine = make_engine_with_market(600);
         set_book(&mut engine, "0.19", "0.21"); // YES: bid=0.19, ask=0.21
         inject_spike(&mut engine, Direction::Up);
@@ -4290,7 +4284,7 @@ mod tests {
         // Sim fill Leg 1.
         engine.advance_simulation();
         assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
-        assert!(engine.erosion.is_some());
+        assert!(engine.hedge.is_some());
 
         // Set up the NO book: ask=0.79 (pair_cost = 0.20 + 0.79 = 0.99 < 1.0).
         engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
@@ -4306,75 +4300,32 @@ mod tests {
             timestamp_ms: now_epoch_ms(),
         }));
 
-        // Step 0: initial post (no erosion applied).
+        // Phase 1: initial post at profit target.
         let initial = engine.evaluate_leg2();
         assert!(
             initial.is_some(),
-            "step 0 should produce initial Leg 2 signal"
+            "Phase 1 should produce initial Leg 2 signal"
         );
         assert!(matches!(engine.state.leg2_state, OrderState::Posted { .. }));
-        let initial_posted = match &engine.state.leg2_state {
-            OrderState::Posted { price, .. } => *price,
-            _ => unreachable!(),
-        };
-        assert_eq!(engine.erosion.as_ref().unwrap().steps_applied, 0);
+        assert_eq!(engine.hedge.as_ref().unwrap().phase, HedgePhase::Phase1);
 
-        // Advance through all 5 erosion steps by backdating the timing gate.
-        let base = engine.leg2.erosion_base_interval_ms;
-        let decay = engine.leg2.erosion_interval_decay;
-
-        for expected_step in 1..=MAX_EROSION_STEPS {
-            let interval = ErosionState::interval_for_step(expected_step - 1, base, decay);
-            engine.last_erosion_signal_ms = now_epoch_ms() - interval - 1;
-
-            // evaluate_leg2 may return None (skip guard) or Some (target changed a tick).
-            // Either way, the step counter must advance.
-            let result = engine.evaluate_leg2();
-
-            let steps = engine.erosion.as_ref().unwrap().steps_applied;
-            assert!(
-                steps >= expected_step,
-                "step should have advanced to at least {expected_step}, got {steps} (signal={:?})",
-                result.is_some()
-            );
-
-            // When skip guard fires, the posted price stays at the initial optimal price.
-            if result.is_none() {
-                let still_posted = match &engine.state.leg2_state {
-                    OrderState::Posted { price, .. } => *price,
-                    _ => panic!("leg2 should still be Posted"),
-                };
-                assert_eq!(
-                    still_posted, initial_posted,
-                    "posted price should stay optimal"
-                );
-            }
+        // Backdate the Leg 2 posted timestamp to trigger Phase 1 timeout.
+        let timeout = engine.leg2.phase1_timeout_ms;
+        if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg2_state {
+            *timestamp_ms = now_epoch_ms() - timeout - 1;
         }
-
-        // After all 5 steps, the cascade is exhausted.
-        assert_eq!(
-            engine.erosion.as_ref().unwrap().steps_applied,
-            MAX_EROSION_STEPS,
-            "all 5 erosion steps should have advanced"
-        );
-
-        // The next evaluate_leg2 should trigger the erosion-exhausted emergency.
         engine.hedge_book_changed = true;
-        let emergency = engine.evaluate_leg2();
+
+        // evaluate_leg2 should trigger phase transition.
+        let transition = engine.evaluate_leg2();
         assert!(
-            emergency.is_some(),
-            "erosion exhausted should trigger emergency signal"
+            transition.is_some(),
+            "Phase 1 timeout should trigger phase transition signal"
         );
-        let sig = emergency.unwrap();
-        // pair_cost = 0.20 (leg1) + 0.78 (post-only) = 0.98 < $1.00 → favorable
         assert_eq!(
-            sig.exit_reason,
-            Some(ExitReason::FavorableTaker),
-            "exhaustion emergency with favorable pair cost should have FavorableTaker exit reason"
-        );
-        assert!(
-            engine.erosion.as_ref().unwrap().emergency_submitted,
-            "emergency_submitted should be true"
+            engine.hedge.as_ref().unwrap().phase,
+            HedgePhase::Phase2,
+            "hedge should be in Phase 2 after timeout"
         );
     }
 
@@ -4544,7 +4495,7 @@ mod tests {
             matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "rest-ord-1"),
             "leg1_state should transition to Filled"
         );
-        assert!(engine.erosion.is_some(), "erosion should be initialised");
+        assert!(engine.hedge.is_some(), "hedge should be initialised");
     }
 
     #[test]
@@ -4568,7 +4519,7 @@ mod tests {
             Decimal::new(100, 0),
         );
 
-        // State unchanged — still Filled, no double init_erosion.
+        // State unchanged — still Filled, no double init_leg2.
         assert!(
             matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "already-filled"),
         );
@@ -4590,7 +4541,7 @@ mod tests {
 
         // State stays None.
         assert!(matches!(engine.state.leg1_state, OrderState::None));
-        assert!(engine.erosion.is_none());
+        assert!(engine.hedge.is_none());
     }
 
     #[test]

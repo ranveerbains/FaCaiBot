@@ -11,7 +11,7 @@ This document covers FaCaiBot's trading logic: signal detection, entry validatio
 3. [Entry Validation (Leg 1 Guards)](#3-entry-validation-leg-1-guards)
 4. [Confidence Scoring & Allocation](#4-confidence-scoring--allocation)
 5. [Leg 1 Execution](#5-leg-1-execution)
-6. [Leg 2 Erosion Cascade](#6-leg-2-erosion-cascade)
+6. [Leg 2 Hedge System (2-Phase)](#6-leg-2-hedge-system-2-phase)
 7. [Emergency Exits](#7-emergency-exits)
 8. [Price-Improvement Chase Strategy](#8-price-improvement-chase-strategy)
 9. [Favorable Taker Exits](#9-favorable-taker-exits)
@@ -40,7 +40,7 @@ Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
 
 **Key economics:**
 - Both legs target post-only execution (maker, zero fee)
-- Taker fees apply only to FOK emergency exits (adverse, pre-erosion breach, break-even breach, erosion exhausted, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
+- Taker fees apply only to FOK emergency exits (adverse, Phase 1 breach, break-even breach, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
 - Unfilled post-only orders cost nothing — failed signals are free
 
 **One trade at a time.** The engine self-gates after emitting a Leg 1 signal: no new spikes are evaluated until the current trade completes or resets.
@@ -167,9 +167,9 @@ Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 s
 
 **Speculative posting**: Leg 1 is posted on `SpikeCandidate` (before sustain confirmation), gaining ~300ms of CLOB queue priority. If `SpikeFailed` arrives before fill, the order is cancelled at zero cost (post-only). If `SpikeFailed` arrives after fill, the fill is valid and Leg 2 proceeds normally.
 
-**Simulation:** The engine acts as the simulated CLOB. On each event loop iteration, it checks post-only validity (bid < ask) and near-ask depth within 2 ticks. If both pass, transitions `leg1_state` from `Posted` to `Filled`, initializes erosion, and emits a confirmed fill signal. **Speculative fill gate**: fills are blocked while `speculative_awaiting_sustain = true` (set on `SpikeCandidate`, cleared on `SpikeConfirmed`). This ensures sim fills only happen after the spike is confirmed (~300ms).
+**Simulation:** The engine acts as the simulated CLOB. On each event loop iteration, it checks post-only validity (bid < ask) and near-ask depth within 2 ticks. If both pass, transitions `leg1_state` from `Posted` to `Filled`, initializes the hedge (`init_leg2()`), and emits a confirmed fill signal. **Speculative fill gate**: fills are blocked while `speculative_awaiting_sustain = true` (set on `SpikeCandidate`, cleared on `SpikeConfirmed`). This ensures sim fills only happen after the spike is confirmed (~300ms).
 
-**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine, then enters a REST fill polling loop (`poll_leg1_fill()`): every 200ms it calls `GET /data/order/{id}` via the SDK's `order()` method. On detecting `Filled` status, it sends `RestFillDetected` feedback — the engine transitions Leg 1 to `Filled` and starts erosion (~200ms deterministic latency). The User WS remains as backup: if the REST poll doesn't detect the fill (network error, order cancelled externally, max polls reached), the User WS `TradeStatusUpdate` with MATCHED status will handle it. If REST detects the fill first, the later User WS event is deduped (`leg1_state` is already `Filled`, not `Posted`). During polling, the executor checks for incoming commands via `rx.try_recv()`: `CancelLeg1` is executed inline, other commands (MarketRotation, etc.) are buffered in `deferred_cmd` and processed in the next `run()` loop iteration.
+**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine, then enters a REST fill polling loop (`poll_leg1_fill()`): every 200ms it calls `GET /data/order/{id}` via the SDK's `order()` method. On detecting `Filled` status, it sends `RestFillDetected` feedback — the engine transitions Leg 1 to `Filled` and starts the hedge system (~200ms deterministic latency). The User WS remains as backup: if the REST poll doesn't detect the fill (network error, order cancelled externally, max polls reached), the User WS `TradeStatusUpdate` with MATCHED status will handle it. If REST detects the fill first, the later User WS event is deduped (`leg1_state` is already `Filled`, not `Posted`). During polling, the executor checks for incoming commands via `rx.try_recv()`: `CancelLeg1` is executed inline, other commands (MarketRotation, etc.) are buffered in `deferred_cmd` and processed in the next `run()` loop iteration.
 
 ### Leg 1 staleness timeout
 
@@ -181,76 +181,65 @@ If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) 
 
 ---
 
-## 6. Leg 2 Erosion Cascade
+## 6. Leg 2 Hedge System (2-Phase)
 
-### Erosion state initialization
+### Hedge state initialization
 
-When Leg 1 fills, the engine captures: fill timestamp, fill price, fill size, initial profit target (from tier), and the Binance mid at fill time (`binance_at_fill`).
+When Leg 1 fills, the engine calls `init_leg2()` which captures: fill timestamp, fill price, fill size, initial profit target (from tier), the Binance mid at fill time (`binance_at_fill`), and computes the Phase 1 target price. The hedge begins in `HedgePhase::Phase1`.
 
-### Step sizing — triangle weights
+### 2-Phase design
 
-Five steps with front-loaded weights `[5, 4, 3, 2, 1]` (sum = 15). Early steps give up more margin (higher chance of fill at a good price); later steps give up less:
+The hedge system uses two phases with a single cancel/repost at the transition — reducing off-book time from the old multi-step erosion cascade (~1s per cancel/repost) to ~200ms total.
 
-| Step | Weight | % of margin | HIGH (3%) | MED (2%) | LOW (2%) |
-|------|--------|-------------|-----------|----------|----------|
-| 0 | 5/15 | 33.3% | 1.000% | 0.667% | 0.667% |
-| 1 | 4/15 | 26.7% | 0.800% | 0.533% | 0.533% |
-| 2 | 3/15 | 20.0% | 0.600% | 0.400% | 0.400% |
-| 3 | 2/15 | 13.3% | 0.400% | 0.267% | 0.267% |
-| 4 | 1/15 | 6.7% | 0.200% | 0.133% | 0.133% |
+**Phase 1 — Profit target rest** (`phase1_timeout_ms`, default 2000ms):
+- Leg 2 is posted at the confidence-scaled profit target price (same as old Step 0)
+- The order rests on the book for up to `phase1_timeout_ms` waiting for a fill
+- If filled during Phase 1 → trade completes at the profit target (best outcome)
+- If `phase1_timeout_ms` elapses without fill → transition to Phase 2
 
-After all 5 steps: 100% of margin eroded → price is at break-even.
+**Phase 2 — Break-even pursuit**:
+- Single cancel/repost at `best_ask - 1 tick` (aggressive maker)
+- Only repost when the book offers a strictly better price (preserves FIFO queue priority)
+- If `leg1_price + ask > $1.00` → break-even breach → emergency exit (Section 7/8)
 
-### Interval timing — exponential decay
+### Phase 1 target price computation
 
-`interval(step) = max(base_ms × decay^step, 200ms)`. Default: base=2000ms, decay=0.5:
+`target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)`
 
-| Step | Interval | Cumulative |
-|------|----------|-----------|
-| 0 | 2000ms | 2.0s |
-| 1 | 1000ms | 3.0s |
-| 2 | 500ms | 3.5s |
-| 3 | 250ms | 3.75s |
-| 4 | 200ms | 3.95s |
+**Constraints applied in order:**
+1. **Don't cross ask:** If target >= best_ask, clamp to `best_ask - tick`
+2. **Smart outbid:** If depth wall detected on the ask side and wall price <= our target, outbid by 1 tick (must keep `leg1_price + outbid < $1.00` and `outbid < ask`)
 
-Early steps wait longer (market has time to fill). Later steps fire rapidly (urgency). Steps are capped at `MAX_EROSION_STEPS` (5). After step 5, the cascade is exhausted and auto-escalates to an `ErosionExhausted` emergency. **Silent step advance guard**: Steps only advance silently when a Leg 2 order is actually resting (`leg2_state == Posted`). If `leg2_state` is `None`, steps advance via the normal evaluation path.
+### Phase 1 skip guard
 
-### Erosion evaluation flow
+If the current resting Leg 2 order is already at a price equal to or better than the Phase 1 target, the evaluator returns None — preserving the favorable position.
 
-On every engine event, if erosion exists and `leg1_state == Filled`:
+### Phase 2 price tracking
+
+`HedgeState.phase2_posted_price` tracks the currently resting Phase 2 price. Reposts only occur when `round_to_tick(best_ask - tick, tick) > phase2_posted_price` — strictly better price available. This preserves FIFO queue priority and avoids unnecessary cancel/repost churn.
+
+### Hedge evaluation flow
+
+On every engine event, if hedge exists and `leg1_state == Filled`:
 
 1. Is emergency already submitted? → price-improvement chase (see Section 8). After `emergency_deadline_ms` → FOK at best_ask
 2. Compute hedge book data (direction-aware)
 3. Check adverse movement (Binance reversal) → emergency post-only
-4. Check break-even breach (opposing ask worsened) → emergency post-only
-5. Check erosion exhausted (steps_applied >= 5) → emergency post-only
-6. Check erosion interval gate (time since last signal)
-7. Determine whether to advance step (capped at MAX_EROSION_STEPS)
-8. Compute new target price
-9. Apply constraints (don't cross ask, break-even floor, smart outbid)
-10. Skip guard: if posted Leg 2 price <= computed target, return None (keep existing order)
-11. Emit erosion signal
-
-### Target price computation
-
-`current_profit = initial_target - cumulative_erosion(steps)`, then `target_price = round_to_tick(1.0 - current_profit - leg1_price, tick)`.
-
-**Constraints applied in order:**
-1. **Don't cross ask:** If target >= best_ask, clamp to `best_ask - tick`
-2. **Break-even floor:** If target > `1.0 - leg1_price`, clamp to break-even
-3. **Smart outbid:** If depth wall detected on the ask side and wall price <= our target, outbid by 1 tick
-
-### Erosion skip guard
-
-After all price constraints, the evaluator checks if the current resting Leg 2 order is already at a price equal to or better than the new target. If so, it returns None — the cancel-and-repost is skipped, preserving a favorable position. This prevents erosion from overwriting a good price with a worse one.
-
-**Monotonically safe:** Erosion lowers the profit target over time, which raises `target_price`. If the posted price is already below the current target, it will be below all future targets too.
+4. **Phase 1 path** (if `phase == Phase1`):
+   - Check Phase 1 breach (pair cost > `phase1_breach_threshold`) → transition to Phase 2
+   - Check Phase 1 timeout (`elapsed >= phase1_timeout_ms`) → transition to Phase 2
+   - Skip guard: if posted price <= target → hold
+   - Emit Phase 1 post signal
+5. **Phase 2 path** (if `phase == Phase2`):
+   - Check break-even breach (pair cost > $1.00) → emergency
+   - Check price improvement → repost at `ask - 1 tick`
+   - No improvement → hold (preserve queue priority)
 
 ---
 
 ## 7. Emergency Exits
 
-All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from erosion mode to emergency repost mode (see Section 8). Exception: `WhipsawReversal` bypasses erosion and emergency repost entirely — it emits an immediate FOK at best ask.
+All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from hedge mode to emergency repost mode (see Section 8). Exception: `WhipsawReversal` bypasses the hedge system and emergency repost entirely — it emits an immediate FOK at best ask.
 
 ### 7a. Adverse Movement
 
@@ -261,24 +250,24 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 - **FOK size:** `min(leg1_size, ask_depth_within_2_ticks)` — capped at available liquidity
 - **Exit reason:** `AdverseMovement`
 
-### 7b. Pre-Erosion Breach
+### 7b. Phase 1 Breach
 
-**Trigger:** Pair cost has exceeded `pre_erosion_breach_threshold` ($1.02) BEFORE the first erosion step. Catches fast book repricing (>$0.02 pair cost above $1.00 in <4s) that the regular break-even check misses because it waits for `steps_applied >= 1`.
+**Trigger:** Pair cost has exceeded `phase1_breach_threshold` ($1.05) during Phase 1. Catches fast book repricing that pushes the pair well above break-even. Rather than waiting for the Phase 1 timeout to expire, this triggers an immediate transition to Phase 2 (break-even pursuit).
 
 **Gates (all must be true):**
-1. `steps_applied == 0` (no erosion steps yet — mutually exclusive with break-even breach)
-2. `leg1_price + current_opposing_ask > pre_erosion_breach_threshold` (stricter threshold than break-even)
+1. `phase == Phase1` (only during Phase 1 — Phase 2 has its own break-even breach check)
+2. `leg1_price + current_opposing_ask > phase1_breach_threshold` (stricter threshold than break-even)
 
-**Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
+**Action:** Transition to Phase 2 — cancel and repost at `best_ask - 1 tick`.
 
-**Exit reason:** `PreErosionBreach`
+**Exit reason:** `Phase1Breach`
 
 ### 7c. Break-Even Breach
 
-**Trigger:** Pair cost has exceeded $1.00 after first erosion step.
+**Trigger:** Pair cost has exceeded $1.00 during Phase 2.
 
 **Gates (all must be true):**
-1. `steps_applied >= 1` (at least one erosion step completed, ~2s after fill — mutually exclusive with pre-erosion breach)
+1. `phase == Phase2` (only during Phase 2 — Phase 1 has its own breach check at a stricter threshold)
 2. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
 
 **Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
@@ -289,29 +278,21 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 **Trigger:** `MarketRotation` arrives while Leg 1 is Filled and Leg 2 is not Filled.
 
-Given the entry cutoff (`entry_cutoff_secs`), any Leg 1 fill has at least that time for the erosion cascade (~4.0s total), so this only fires when all other exit paths failed before rotation.
+Given the entry cutoff (`entry_cutoff_secs`), any Leg 1 fill has at least that time for the 2-phase hedge system, so this only fires when all other exit paths failed before rotation.
 
 Handled in the MarketRotation event handler — the engine builds an emergency FOK signal using the OLD market's token IDs and books BEFORE resetting state. The main loop sends this emergency to the executor before the rotation command, ensuring the position is hedged (or best-effort attempted) before state wipe.
 
 **Exit reason:** `MarketExpiry`
 
-### 7e. Erosion Exhausted
-
-**Trigger:** `steps_applied >= MAX_EROSION_STEPS (5)` — the full cascade completed without filling. Profit target is zero (break-even).
-
-Checked after break-even breach, before the erosion interval gate. Distinct from `BreakEvenBreach` — the pair cost may still be favorable (e.g., $0.70 + $0.25 = $0.95 < $1.00). The trigger is step exhaustion, not pair cost exceeding $1.00.
-
-**Exit reason:** `ErosionExhausted`
-
-### 7f. Whipsaw Reversal
+### 7e. Whipsaw Reversal
 
 **Trigger:** `SpikeConfirmed` arrives with the OPPOSITE direction to `leg1_direction` while Leg 1 is active.
 
 **Two sub-cases:**
 1. **Leg 1 Posted (unfilled):** Cancel immediately. Reuses the SpikeFailed cancel pattern, including provisional ID deferral (`cancel_leg1_on_feedback`). Resets all Leg 1 state and returns early from the SpikeConfirmed handler.
-2. **Leg 1 Filled:** Log the opposite spike but **do not force an immediate FOK**. The existing emergency exit mechanisms (adverse movement, pre-erosion breach, break-even breach) are better suited to handle this — they evaluate actual book conditions rather than preemptively cancelling a potentially favorable resting Leg 2 order. If the opposite spike truly invalidates the position, adverse movement will trigger within milliseconds.
+2. **Leg 1 Filled:** Log the opposite spike but **do not force an immediate FOK**. The existing emergency exit mechanisms (adverse movement, Phase 1 breach, break-even breach) are better suited to handle this — they evaluate actual book conditions rather than preemptively cancelling a potentially favorable resting Leg 2 order. If the opposite spike truly invalidates the position, adverse movement will trigger within milliseconds.
 
-**Exit reason (if triggered by other emergency paths):** `AdverseMovement`, `PreErosionBreach`, `BreakEvenBreach`, etc. — whichever fires first based on actual market conditions.
+**Exit reason (if triggered by other emergency paths):** `AdverseMovement`, `Phase1Breach`, `BreakEvenBreach`, etc. — whichever fires first based on actual market conditions.
 
 **Note:** `emit_whipsaw_fok()`, `WhipsawReversal` exit reason, and `diag_whipsaw_foks` counter remain in the codebase (referenced by tests and the Leg 1 Posted cancel path) but the Filled Leg 1 path no longer sets `whipsaw_fok_pending`.
 
@@ -325,7 +306,7 @@ Emergency exits use a **price-improvement chase with hard deadline** strategy to
 
 Once `emergency_submitted = true`, the engine posts an aggressive post-only limit at `best_ask - 1 tick` and records `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). From that point, on each Polymarket book update:
 
-1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2000ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The `exit_reason` is re-evaluated at deadline time: if the FOK price makes `pair_cost >= $1.00`, a stale `FavorableTaker` is overridden to `ErosionExhausted` (prevents favorable labeling on losing trades). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
+1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2000ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The `exit_reason` is re-evaluated at deadline time: if the FOK price makes `pair_cost >= $1.00`, a stale `FavorableTaker` is overridden to `BreakEvenBreach` (prevents favorable labeling on losing trades). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
 2. **Price improvement check**: If `best_ask - 1 tick > emergency_posted_price` → cancel and repost at the improved price (price-chase)
 3. **No change**: Hold current order — preserve FIFO queue priority (no blind reposts)
 
@@ -360,13 +341,13 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 ## 9. Favorable Taker Exits
 
-**Trigger:** During normal erosion, the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes at the ask — taker fee is acceptable insurance vs the risk of an open position.
+**Trigger:** During normal hedge (Phase 1 or Phase 2), the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes at the ask — taker fee is acceptable insurance vs the risk of an open position.
 
 **Simulation:** `advance_simulation()` detects `ask < posted_price` on each book update across all direction branches. Fills at the ask price with `ExitReason::FavorableTaker`.
 
-**Live:** When the CLOB rejects a post-only erosion order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` which performs a **walk-down**: up to 4 post-only attempts at exponential tick offsets `[1, 2, 4, 8]` from `signal.price` (i.e., `price - 1*tick`, `price - 2*tick`, `price - 4*tick`, `price - 8*tick`). Each attempt is ~100ms (CLOB HTTP round-trip) and checks `price > 0` and `price × size >= $1` before trying. First accepted placement rests as maker (`fill_method=FavorableMaker`). If all 4 cross or fail → FOK fallback at `signal.price` (`fill_method=FavorableTaker` + `already_filled` if sync fill). Non-crossing errors (balance, etc.) skip remaining walk-down attempts and go straight to FOK. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. Emergency FOK paths (`emergency_fok_fallback` and `emergency_fok_at_price`) send `fill_method=EmergencyTaker` — distinct from favorable exits so the engine correctly classifies the trade. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `emergency_maker`, `leg2_was_taker`) even though the executor autonomously converted the signal.
+**Live:** When the CLOB rejects a post-only hedge order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` which performs a **walk-down**: up to 4 post-only attempts at exponential tick offsets `[1, 2, 4, 8]` from `signal.price` (i.e., `price - 1*tick`, `price - 2*tick`, `price - 4*tick`, `price - 8*tick`). Each attempt is ~100ms (CLOB HTTP round-trip) and checks `price > 0` and `price × size >= $1` before trying. First accepted placement rests as maker (`fill_method=FavorableMaker`). If all 4 cross or fail → FOK fallback at `signal.price` (`fill_method=FavorableTaker` + `already_filled` if sync fill). Non-crossing errors (balance, etc.) skip remaining walk-down attempts and go straight to FOK. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. Emergency FOK paths (`emergency_fok_fallback` and `emergency_fok_at_price`) send `fill_method=EmergencyTaker` — distinct from favorable exits so the engine correctly classifies the trade. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `emergency_maker`, `leg2_was_taker`) even though the executor autonomously converted the signal.
 
-**Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and erosion emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]` when the emergency dispatch happened before the cancel race resolved.
+**Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]` when the emergency dispatch happened before the cancel race resolved.
 
 **Tracking:** `favorable_taker_fills` counter across all reporting contexts. Telegram tags: `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]`.
 
@@ -384,7 +365,7 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 ### State reset
 
-On completion: `leg1_state`, `leg2_state`, and `erosion` all reset to None. `cumulative_used` persists (capital stays allocated within this market). After reset, the engine can immediately accept a new spike signal.
+On completion: `leg1_state`, `leg2_state`, and `hedge` all reset to None. `cumulative_used` persists (capital stays allocated within this market). After reset, the engine can immediately accept a new spike signal.
 
 ### PnL computation (simulation)
 
@@ -452,8 +433,8 @@ Checked on every event (not just spikes) — the cutoff is detected promptly reg
 | Action | During cutoff? |
 |--------|---------------|
 | New Leg 1 entries | **Blocked** — spikes dropped |
-| Existing Leg 2 erosion | **Continues** — no cutoff check in Leg 2 evaluation |
-| Emergency exits | **Continue** — adverse, pre-erosion, break-even, whipsaw, favorable all active |
+| Existing Leg 2 hedge | **Continues** — no cutoff check in Leg 2 evaluation |
+| Emergency exits | **Continue** — adverse, Phase 1 breach, break-even, whipsaw, favorable all active |
 | Market summary | **Sent** — `MarketCutoff` triggers Telegram summary (sim) |
 
 When first entering cutoff with an open position, a log notes "Leg 2 will continue until rotation" — informational only, no special action taken.
@@ -471,7 +452,7 @@ Checked on every event (not just spikes). When `MarketRotation` fires, `in_quiet
 | Action | During quiet period? |
 |--------|---------------------|
 | New Leg 1 entries | **Blocked** — spike candidates dropped |
-| Existing Leg 2 erosion | N/A — no position exists at rotation start |
+| Existing Leg 2 hedge | N/A — no position exists at rotation start |
 | Emergency exits | N/A |
 
 ### Rationale
@@ -531,27 +512,30 @@ None ──────────────► Posted ───────�
 - `Posted → None`: CLOB rejection/error OR Leg 1 staleness timeout OR `SpikeFailed` cancel
 - `Filled → None`: Trade completion (both legs done) or MarketRotation
 
-### ErosionState
+### HedgeState
 
 ```
-                init_erosion()
-   None ────────────────────► Active (steps=0, emergency=false)
+                  init_leg2()
+   None ────────────────────► Phase1 (emergency=false)
                                   │
                        ┌──────────┼──────────┐
                        ▼          ▼          ▼
-                 Erosion step  Adverse   Break-even
-                 (steps++)     movement   breach
+                Phase1 breach  Adverse   Phase1 timeout
+                or timeout     movement
                        │          │          │
-                       │          ▼          ▼
-                       │    emergency_submitted = true
-                       │    exit_reason = Some(...)
+                       ▼          │          ▼
+                    Phase2        │     Phase2 (ask-1tick)
+                       │          │          │
+                       ▼          ▼          ▼
+                  BE breach  emergency_submitted = true
+                       │     exit_reason = Some(...)
                        │          │
                        ▼          ▼
                     Leg 2 fill detected
                        │
                        ▼
               on_trade_complete()
-                 erosion = None
+                  hedge = None
 ```
 
 ### SimPosition status
@@ -577,14 +561,15 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
    OR SpikeFailed → cancel Leg 1 if Posted, reset state → STOP
 
 4a. [SIM] advance_simulation() fill check passes (gate cleared) → leg1_state = Filled
-    init_erosion(), emit confirmed fill signal
+    init_leg2(), emit confirmed fill signal
 
 4b. [LIVE] Executor places post-only GTC (at T+0, gains ~300ms queue priority)
     OrderPosted feedback → engine stores order_id
-    REST poll fill (~200ms) or User WS fill → leg1_state = Filled, init_erosion()
+    REST poll fill (~200ms) or User WS fill → leg1_state = Filled, init_leg2()
 
 5. evaluate_leg2() runs on each event:
-   - Normal: emit erosion signal → executor cancel+repost
+   - Phase 1: post at profit target, hold until fill or timeout
+   - Phase 2: post at ask-1tick, repost on improvement only
    - Emergency: set emergency_submitted → post-only first, FOK fallback
 
 6a. [SIM] advance_simulation() Leg 2 fill detected
@@ -612,7 +597,7 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 **Scenario:** CLOB fills an order, but the User WS notification has variable latency (50-100ms typical, can spike to seconds during reconnects).
 
-**Handle:** REST fill polling is the primary detection path: after placing Leg 1, the executor polls `GET /data/order/{id}` every 200ms for deterministic fill detection. On `Filled` status, `RestFillDetected` feedback triggers immediate state transition + erosion init (~200ms latency). The User WS remains as backup — if it arrives first, it processes normally; if it arrives after REST detection, it's deduped (`leg1_state` already `Filled`).
+**Handle:** REST fill polling is the primary detection path: after placing Leg 1, the executor polls `GET /data/order/{id}` every 200ms for deterministic fill detection. On `Filled` status, `RestFillDetected` feedback triggers immediate state transition + hedge init (~200ms latency). The User WS remains as backup — if it arrives first, it processes normally; if it arrives after REST detection, it's deduped (`leg1_state` already `Filled`).
 
 **Safety:** Feedback channel is drained BEFORE `on_event()` in each main loop iteration. `on_rest_fill_detected()` guards on `leg1_state == Posted` with matching `order_id`.
 
@@ -630,7 +615,7 @@ If the hedge book has no ask depth within 2 ticks, the emergency FOK size caps t
 
 ### Double emergency submission
 
-Once `emergency_submitted = true`, the evaluator switches to price-improvement chase mode (not re-triggering). The `exit_reason` is preserved from the original trigger. Reposts only happen on Polymarket book price improvement; otherwise the order holds its FIFO queue position.
+Once `emergency_submitted = true`, the evaluator switches to price-improvement chase mode (not re-triggering). The `exit_reason` is preserved from the original trigger. Reposts only happen on Polymarket book price improvement; otherwise the order holds its FIFO queue position. This applies regardless of which phase triggered the emergency.
 
 ### SpikeFailed races with fill (live)
 
@@ -650,7 +635,7 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 
 ### Emergency signal stacking (live)
 
-**Scenario:** Engine evaluates every ~2-50ms, executor takes ~1-2s per CLOB call. Between erosion exhaustion and deadline FOK, multiple emergency signals queue in the executor channel. A later signal cancels a FOK that was already filled by an earlier signal → cancel not confirmed → engine restores "Posted" state → no User WS MATCHED arrives → trade stuck.
+**Scenario:** Engine evaluates every ~2-50ms, executor takes ~1-2s per CLOB call. During Phase 2 or emergency, multiple signals queue in the executor channel. A later signal cancels a FOK that was already filled by an earlier signal → cancel not confirmed → engine restores "Posted" state → no User WS MATCHED arrives → trade stuck.
 
 **Handle:** `emergency_signal_in_flight` flag on the engine. Set when an emergency signal is dispatched, cleared on any executor feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete, rotation). `evaluate_leg2()` returns None while the flag is set. Additionally, the executor sets `active_leg2_order_id = None` (instead of `Some(...)`) when a FOK returns `Filled` — even if a stale signal sneaks through, it can't cancel a filled order.
 
@@ -658,18 +643,18 @@ Once `emergency_submitted = true`, the evaluator switches to price-improvement c
 
 ### Stale Leg 2 command contamination (live)
 
-**Scenario:** While the executor processes a favorable exit (3 sequential HTTP calls, ~3.6s total), the engine's erosion timer fires and queues a SECOND erosion command. Trade 1 completes and resets. The stale command executes, fills, and `on_order_posted()` blindly sets `leg2_state = Filled` with stale data. When Trade 2's Leg 1 fills, both legs appear Filled → wrong trade completion with mismatched sizes.
+**Scenario:** While the executor processes a favorable exit (3 sequential HTTP calls, ~3.6s total), the engine's hedge evaluator fires and queues a SECOND hedge command. Trade 1 completes and resets. The stale command executes, fills, and `on_order_posted()` blindly sets `leg2_state = Filled` with stale data. When Trade 2's Leg 1 fills, both legs appear Filled → wrong trade completion with mismatched sizes.
 
 **Handle:** Three-layer defense:
-- **Layer A (root cause):** `leg2_command_pending` flag gates `evaluate_leg2()` while ANY Leg 2 command is in the executor pipeline. Set on dispatch (live mode only), cleared on any Leg 2 feedback (OrderPosted, OrderFailed, CancelResult). Prevents new erosion/emergency commands from queuing during multi-step executor operations.
+- **Layer A (root cause):** `leg2_command_pending` flag gates `evaluate_leg2()` while ANY Leg 2 command is in the executor pipeline. Set on dispatch (live mode only), cleared on any Leg 2 feedback (OrderPosted, OrderFailed, CancelResult). Prevents new hedge/emergency commands from queuing during multi-step executor operations.
 - **Layer B (stale feedback guard):** `on_order_posted()` and `on_order_failed()` check if `leg1_state` is `Filled` before processing Leg 2 feedback. If the trade has already been reset (leg1 is `None`), the feedback is silently discarded with a warning log.
 - **Layer C (executor):** `active_leg2_order_id = None` on filled FOK prevents stale cancel of already-filled orders.
 
 ### Balance exhaustion (live)
 
-**Scenario:** "Not enough balance / allowance" errors during Leg 2 placement cause the executor to burn futile FOK attempts across erosion steps and emergency rounds.
+**Scenario:** "Not enough balance / allowance" errors during Leg 2 placement cause the executor to burn futile FOK attempts across hedge phases and emergency rounds.
 
-**Handle:** `balance_exhausted` flag on `LiveExecutor`. Set on first "balance"/"allowance" error during Leg 2 erosion placement. All subsequent Leg 2 commands (erosion, emergency) immediately return `OrderFailed` without calling CLOB. Cleared on `MarketRotation`. FOK retry loops also abort immediately on "balance"/"allowance" errors (added to non-transient error list alongside "decimal places" and "Validation"). Executor sends `BalanceExhausted` feedback → engine fires `fire_critical()` Telegram alert with Leg 1 position details.
+**Handle:** `balance_exhausted` flag on `LiveExecutor`. Set on first "balance"/"allowance" error during Leg 2 hedge placement. All subsequent Leg 2 commands (hedge, emergency) immediately return `OrderFailed` without calling CLOB. Cleared on `MarketRotation`. FOK retry loops also abort immediately on "balance"/"allowance" errors (added to non-transient error list alongside "decimal places" and "Validation"). Executor sends `BalanceExhausted` feedback → engine fires `fire_critical()` Telegram alert with Leg 1 position details.
 
 ### Spike during existing trade
 
@@ -715,28 +700,28 @@ Result: `SpikeConfirmed` — sim fill gate cleared, order has been resting on CL
 
 Sim: gate cleared by SpikeConfirmed, ask=0.505 > bid=0.50, near depth > 0 → fill. Live: CLOB accepts post-only GTC at T+0 (300ms queue priority), User WS notifies fill.
 
-Result: `leg1_state = Filled`, erosion initialized. `binance_at_fill` = 52200, `initial_profit_target` = 0.025 (HIGH).
+Result: `leg1_state = Filled`, hedge initialized (`init_leg2()`). `binance_at_fill` = 52200, `initial_profit_target` = 0.025 (HIGH).
 
-### Step 5: Erosion Step 0 (T+3350ms)
+### Step 5: Phase 1 Post (T+350ms, immediately after fill)
 
-current_profit = 0.025, target = 1.0 - 0.025 - 0.50 = **$0.475**. Emit erosion signal: Buy NO @ $0.475.
+target = 1.0 - 0.025 - 0.50 = **$0.475**. Emit Phase 1 post signal: Buy NO @ $0.475. Order rests on book at profit target.
 
-### Step 6: Erosion Step 1 (T+4850ms)
+### Step 6: Phase 1 Fill (T+1800ms)
 
-Erosion = 0.025 × 5/15 = 0.00833. current_profit = 0.01667. target = 1.0 - 0.01667 - 0.50 = 0.48333 → round to **$0.48**. Emit erosion signal: Buy NO @ $0.48.
+NO book best_ask = 0.475 <= posted 0.475 → fill as maker during Phase 1 (before timeout).
 
-### Step 7: Leg 2 Fill (T+5000ms)
+Alternatively, if not filled by T+2350ms (2000ms after fill): Phase 1 timeout → transition to Phase 2 at `ask - 1 tick`.
 
-NO book best_ask = 0.48 <= posted 0.48 → fill as maker.
+### Step 7: Trade Complete
 
 | | Price | Shares | Cost |
 |---|-------|--------|------|
 | Leg 1 (YES) | $0.50 | 40 | $20.00 |
-| Leg 2 (NO) | $0.48 | 40 | $19.20 |
-| **Pair cost** | $0.98/sh | | |
-| **Gross profit** | | | $0.80 |
+| Leg 2 (NO) | $0.475 | 40 | $19.00 |
+| **Pair cost** | $0.975/sh | | |
+| **Gross profit** | | | $1.00 |
 | **Taker fee** | | | $0.00 |
-| **Net profit** | | | **$0.80 (4.0%)** |
+| **Net profit** | | | **$1.00 (2.56%)** |
 
 ### Alternative: Emergency adverse movement (T+5000ms)
 
@@ -754,6 +739,7 @@ Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero f
 | **Speculative fill gate** | Blocked until `SpikeConfirmed` clears `speculative_awaiting_sustain` | No gate — CLOB decides fill timing |
 | **Leg 1 fill model** | Post-only check: bid < ask AND near depth > 0 (after gate clears) | Real CLOB matching engine |
 | **Leg 2 fill model** | Book-based: ask <= posted → fill | Real CLOB matching engine |
+| **Leg 2 hedge model** | 2-phase: Phase 1 at profit target, Phase 2 at ask-1tick | 2-phase: same logic, real CLOB matching |
 | **Emergency fill model** | Deadline-aware: maker if ask <= posted, taker FOK at deadline | Price-improvement chase, FOK at deadline or CLOB rejection |
 | **Feedback channel** | Not used (engine is fill authority) | Executor → engine order IDs |
 | **Spike cancel** | `SpikeFailed` cancels Posted Leg 1 (no fill ever) | `CancelLeg1` sent to executor; if already filled, no-op |

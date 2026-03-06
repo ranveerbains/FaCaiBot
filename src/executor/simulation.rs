@@ -6,7 +6,7 @@
 //     a `TelegramReporter` (fire-and-forget), and a `ColdStorage` (QuestDB).
 //   - The `run()` method loops on a crossbeam Receiver<TradeSignal>.
 //   - Leg 1 signals simulate a post-only maker fill against the live book.
-//   - Leg 2 signals simulate an erosion-cascade maker fill, or emergency taker.
+//   - Leg 2 signals simulate a hedge maker fill, or emergency taker.
 //   - Market rotation and session shutdown generate Telegram summaries.
 
 use anyhow::Result;
@@ -372,7 +372,7 @@ impl SimulationExecutor {
     /// Handle a Leg 2 signal.
     ///
     /// Two paths based on `sim_confirmed_fill`:
-    /// - `false` (erosion step from `evaluate_leg2()`): just record the step.
+    /// - `false` (hedge post from `evaluate_leg2()`): log and return.
     /// - `true` (from `advance_simulation()`): record confirmed fill, categorize
     ///   by `exit_reason`, close trade, report to Telegram + QuestDB.
     fn handle_leg2(&mut self, signal: &TradeSignal) {
@@ -394,13 +394,12 @@ impl SimulationExecutor {
         };
 
         if !signal.sim_confirmed_fill {
-            // Erosion step only — record step count.
+            // Hedge post only — awaiting fill.
             debug!(
                 token_id = %signal.token_id,
                 our_bid = %signal.price,
-                "Leg 2: erosion step posted — awaiting fill"
+                "Leg 2: hedge post — awaiting fill"
             );
-            self.state.record_erosion_step(position_idx);
             return;
         }
 
@@ -458,13 +457,9 @@ impl SimulationExecutor {
                     );
                 }
             }
-            Some(ExitReason::BreakEvenBreach) | Some(ExitReason::ErosionExhausted) => {
-                let label = if signal.exit_reason == Some(ExitReason::ErosionExhausted) {
-                    "erosion exhausted"
-                } else {
-                    "break-even breach"
-                };
-                let reason_ref = signal.exit_reason.unwrap_or(ExitReason::BreakEvenBreach);
+            Some(ExitReason::BreakEvenBreach) => {
+                let label = "break-even breach";
+                let reason_ref = ExitReason::BreakEvenBreach;
                 if is_taker {
                     info!(
                         token_id = %signal.token_id,
@@ -538,15 +533,15 @@ impl SimulationExecutor {
                     );
                 }
             }
-            Some(ExitReason::PreErosionBreach) => {
-                let reason = ExitReason::PreErosionBreach;
+            Some(ExitReason::Phase1Breach) => {
+                let reason = ExitReason::Phase1Breach;
                 if is_taker {
                     info!(
                         token_id = %signal.token_id,
                         taker_price = %fill.price,
                         taker_fee = %fill.taker_fee,
                         position_idx,
-                        "Leg 2: pre-erosion breach FOK fallback"
+                        "Leg 2: phase 1 breach FOK fallback"
                     );
                     self.state.trades_break_even_fok += 1;
                     self.state.record_emergency_taker(position_idx, fill);
@@ -555,7 +550,7 @@ impl SimulationExecutor {
                         token_id = %signal.token_id,
                         price = %fill.price,
                         position_idx,
-                        "Leg 2: pre-erosion breach post-only (maker)"
+                        "Leg 2: phase 1 breach post-only (maker)"
                     );
                     self.state.record_emergency_maker(position_idx, fill, &reason);
                 }
@@ -576,7 +571,7 @@ impl SimulationExecutor {
                     token_id = %signal.token_id,
                     price = %fill.price,
                     position_idx,
-                    "Leg 2: maker fill (normal erosion cascade)"
+                    "Leg 2: maker fill (normal hedge)"
                 );
                 self.state.record_leg2_fill(position_idx, fill);
             }
@@ -835,7 +830,7 @@ mod tests {
         assert_eq!(state.virtual_balance, Decimal::from(100));
     }
 
-    // ─── 5. Leg 2 maker fill (normal erosion cascade) ────────────────────────
+    // ─── 5. Leg 2 maker fill (normal hedge) ────────────────────────
 
     #[test]
     fn test_leg2_maker_fill() {

@@ -529,17 +529,17 @@ mod formatter {
         let total_cost_usdc = trade.pair_cost * trade.leg1.size;
 
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
-            let erosion_note = if trade.erosion_steps > 0 {
-                format!(" (eroded {}\u{00d7})", trade.erosion_steps)
+            let phase_note = if trade.hedge_phase > 0 {
+                " (PHASE-2)"
             } else {
-                String::new()
+                " (PHASE-1)"
             };
             let taker_tag = if trade.whipsaw_reversal {
                 " [WHIPSAW FOK]".to_owned()
-            } else if trade.pre_erosion_breach && trade.emergency_maker {
-                " [PRE-EROSION POST-ONLY]".to_owned()
-            } else if trade.pre_erosion_breach {
-                " [PRE-EROSION FOK FALLBACK]".to_owned()
+            } else if trade.phase1_breach && trade.emergency_maker {
+                " [PHASE-1 BREACH POST-ONLY]".to_owned()
+            } else if trade.phase1_breach {
+                " [PHASE-1 BREACH FOK FALLBACK]".to_owned()
             } else if trade.adverse_movement_hedge && trade.emergency_maker {
                 " [ADVERSE POST-ONLY]".to_owned()
             } else if trade.adverse_movement_hedge {
@@ -556,12 +556,12 @@ mod formatter {
                 String::new()
             };
             format!(
-                "Leg 2: Buy {side}  <code>${price:.2}</code> \u{00d7} {size:.2}sh{taker}{erosion}",
+                "Leg 2: Buy {side}  <code>${price:.2}</code> \u{00d7} {size:.2}sh{taker}{phase}",
                 side = l2_label,
                 price = leg2.price,
                 size = leg2.size,
                 taker = taker_tag,
-                erosion = erosion_note,
+                phase = phase_note,
             )
         } else {
             "<i>Leg 2: not filled — awaiting resolution</i>".to_owned()

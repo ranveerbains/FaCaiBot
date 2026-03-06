@@ -248,15 +248,15 @@ impl ColdStorage {
     /// - confidence (f64): signal confidence score
     /// - profit_tier (symbol): "HIGH" | "MED" | "LOW"
     /// - alloc_amount (f64): USDC allocated
-    /// - erosion_steps (i64): number of Leg 2 erosion steps before fill
+    /// - hedge_phase (i64): hedge phase at fill (0=Phase1, 1=Phase2)
     /// - leg2_was_taker (bool): true if Leg 2 used emergency FOK
     /// - adverse_movement (bool): true if FOK triggered by adverse Binance movement
     /// - bot_contested (bool): true if a competitor depth wall was detected
     /// - favorable_taker (bool): true if Leg 2 filled via favorable taker crossing
     /// - emergency_maker (bool): true if Leg 2 filled as maker during emergency chase
     /// - spike_magnitude (f64): spike size relative to ATR at entry
-    /// - exit_reason (symbol): "NormalErosion" | "AdverseMovement" | "BreakEvenBreach" |
-    ///                         "MarketExpiry" | "FavorableTaker"
+    /// - exit_reason (symbol): "NormalHedge" | "AdverseMovement" | "BreakEvenBreach" |
+    ///                         "MarketExpiry" | "FavorableTaker" | "Phase1Breach"
     /// - leg1_order_id (symbol): CLOB order ID for Leg 1
     /// - leg2_order_id (symbol): CLOB order ID for Leg 2 ("" if unhedged)
     /// - timestamp (designated timestamp): Leg 1 fill time
@@ -279,7 +279,7 @@ impl ColdStorage {
         confidence: Decimal,
         profit_tier: &str,
         alloc_amount: Decimal,
-        erosion_steps: u32,
+        hedge_phase: u8,
         leg2_was_taker: bool,
         adverse_movement: bool,
         bot_contested: bool,
@@ -298,12 +298,11 @@ impl ColdStorage {
         let exit_reason_str = match exit_reason {
             Some(ExitReason::AdverseMovement) => "AdverseMovement",
             Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
-            Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
             Some(ExitReason::MarketExpiry) => "MarketExpiry",
             Some(ExitReason::FavorableTaker) => "FavorableTaker",
-            Some(ExitReason::PreErosionBreach) => "PreErosionBreach",
+            Some(ExitReason::Phase1Breach) => "Phase1Breach",
             Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
-            None => "NormalErosion",
+            None => "NormalHedge",
         };
 
         self.buffer
@@ -325,7 +324,7 @@ impl ColdStorage {
             .column_f64("profit_pct", profit_pct.try_into().unwrap_or(0.0))?
             .column_f64("confidence", confidence.try_into().unwrap_or(0.0))?
             .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
-            .column_i64("erosion_steps", i64::from(erosion_steps))?
+            .column_i64("hedge_phase", i64::from(hedge_phase))?
             .column_bool("leg2_was_taker", leg2_was_taker)?
             .column_bool("adverse_movement", adverse_movement)?
             .column_bool("bot_contested", bot_contested)?
@@ -358,7 +357,7 @@ impl ColdStorage {
     /// - net_profit (f64), profit_pct (f64)
     /// - resolution (symbol): "YES" | "NO" | "PENDING"
     /// - resolution_ts_ms (i64): epoch ms of UMA resolution (0 if pending)
-    /// - erosion_steps (i64)
+    /// - hedge_phase (i64)
     /// - leg2_was_taker (bool)
     /// - adverse_movement_hedge (bool)
     /// - bot_contested (bool)
@@ -404,12 +403,11 @@ impl ColdStorage {
                 match trade.exit_reason {
                     Some(ExitReason::AdverseMovement) => "AdverseMovement",
                     Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
-                    Some(ExitReason::ErosionExhausted) => "ErosionExhausted",
                     Some(ExitReason::MarketExpiry) => "MarketExpiry",
                     Some(ExitReason::FavorableTaker) => "FavorableTaker",
-                    Some(ExitReason::PreErosionBreach) => "PreErosionBreach",
+                    Some(ExitReason::Phase1Breach) => "Phase1Breach",
                     Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
-                    None => "NormalErosion",
+                    None => "NormalHedge",
                 },
             )?
             .column_f64("leg1_price", trade.leg1.price.try_into().unwrap_or(0.0))?
@@ -424,7 +422,7 @@ impl ColdStorage {
             .column_f64("net_profit", trade.net_profit.try_into().unwrap_or(0.0))?
             .column_f64("profit_pct", trade.profit_pct.try_into().unwrap_or(0.0))?
             .column_i64("resolution_ts_ms", resolution_ts)?
-            .column_i64("erosion_steps", i64::from(trade.erosion_steps))?
+            .column_i64("hedge_phase", i64::from(trade.hedge_phase))?
             .column_bool("leg2_was_taker", trade.leg2_was_taker)?
             .column_bool("adverse_movement_hedge", trade.adverse_movement_hedge)?
             .column_bool("bot_contested", trade.bot_contested)?

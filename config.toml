@@ -47,9 +47,9 @@ high_threshold = 0.5
 # Score >= this → MED tier, below → LOW
 med_threshold = 0.3
 # Profit target % for HIGH tier
-high_target_pct = 0.03
+high_target_pct = 0.04
 # Profit target % for MED tier
-med_target_pct = 0.02
+med_target_pct = 0.03
 # Profit target % for LOW tier
 low_target_pct = 0.02
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
@@ -60,13 +60,11 @@ strong_spike_atr_ratio = 75
 [risk]
 # Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.
 adverse_threshold = 0.001
-# First erosion step interval (ms), decays by erosion_interval_decay each step
-erosion_base_interval_ms = 2000
-# Decay factor for each subsequent erosion interval
-erosion_interval_decay = 0.5
+# Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
+phase1_timeout_ms = 2000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Hard deadline (ms) from first emergency post to FOK taker fallback
 emergency_deadline_ms = 2000
-# Pre-erosion breach: pair cost > this before first erosion step triggers emergency
-pre_erosion_breach_threshold = 1.05
+# Phase 1 breach: pair cost > this triggers transition to Phase 2
+phase1_breach_threshold = 1.05

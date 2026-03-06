@@ -21,12 +21,9 @@ pub enum ExitReason {
     /// Opposing ask dropped below posted bid — market-take at ask price.
     /// Taker fee is acceptable insurance vs leaving Leg 1 unhedged.
     FavorableTaker,
-    /// All erosion steps exhausted without Leg 2 fill. Distinct from
-    /// `BreakEvenBreach` — the pair cost may still be favorable.
-    ErosionExhausted,
-    /// Opposing ask exceeded pre-erosion threshold before first erosion step.
-    /// Stricter threshold ($1.03) catches fast book moves within the first ~4s.
-    PreErosionBreach,
+    /// Phase 1 breach: pair cost exceeded threshold before phase transition.
+    /// Triggers immediate transition to Phase 2 break-even pursuit.
+    Phase1Breach,
     /// Opposite spike detected after Leg 1 fill — immediate FOK hedge, no erosion.
     WhipsawReversal,
 }

@@ -2,7 +2,7 @@
 //!
 //! Handles the full trade lifecycle:
 //! - Leg 1: post-only GTC order on spike signal
-//! - Leg 2 erosion: cancel previous resting order, repost at eroded price
+//! - Leg 2 hedge: cancel previous resting order, repost at new price
 //! - Leg 2 emergency: cancel resting order, place FOK taker order
 //! - Market rotation: cancel all open orders, reset state
 //!
@@ -187,7 +187,7 @@ impl LiveExecutor {
         } else if signal.exit_reason.is_some() {
             self.handle_leg2_emergency(&signal).await;
         } else {
-            self.handle_leg2_erosion(&signal).await;
+            self.handle_leg2_hedge(&signal).await;
         }
     }
 
@@ -349,12 +349,12 @@ impl LiveExecutor {
         info!(%order_id, "REST poll: max polls reached — deferring to staleness/User WS");
     }
 
-    // ─── Leg 2 erosion: cancel previous + repost at new price ──────────
+    // ─── Leg 2 hedge: cancel previous + repost at new price ────────────
 
-    async fn handle_leg2_erosion(&mut self, signal: &TradeSignal) {
+    async fn handle_leg2_hedge(&mut self, signal: &TradeSignal) {
         // Cancel existing Leg 2 order if one is resting.
         if let Some(ref prev_order_id) = self.active_leg2_order_id {
-            info!(order_id = %prev_order_id, "Leg 2 erosion: cancelling previous order");
+            info!(order_id = %prev_order_id, "Leg 2 hedge: cancelling previous order");
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
 
@@ -374,13 +374,13 @@ impl LiveExecutor {
                     return;
                 }
                 Err(e) => {
-                    warn!(error = %e, "Leg 2 erosion: cancel failed — posting replacement anyway");
+                    warn!(error = %e, "Leg 2 hedge: cancel failed — posting replacement anyway");
 
                 }
             }
         }
 
-        // Post new Leg 2 order at the erosion-adjusted price.
+        // Post new Leg 2 order at the hedge price.
         let order = OrderRequest::post_only_gtc(
             signal.token_id.clone(),
             signal.side,
@@ -394,14 +394,14 @@ impl LiveExecutor {
                     // Post-only rejected — ask is below our bid. Attempt favorable exit.
                     warn!(
                         price = %signal.price,
-                        "Leg 2 erosion: post-only REJECTED — attempting favorable exit"
+                        "Leg 2 hedge: post-only REJECTED — attempting favorable exit"
                     );
                     self.attempt_favorable_exit(signal).await;
                 } else {
                     info!(
                         order_id = %resp.order_id,
                         price = %signal.price,
-                        "Leg 2 erosion: new order placed"
+                        "Leg 2 hedge: new order placed"
                     );
                     self.active_leg2_order_id = Some(resp.order_id.clone());
 
@@ -423,11 +423,11 @@ impl LiveExecutor {
                     // This means the ask dropped below our bid — favorable pricing.
                     warn!(
                         error = %e,
-                        "Leg 2 erosion: 'crosses book' error — attempting favorable exit"
+                        "Leg 2 hedge: 'crosses book' error — attempting favorable exit"
                     );
                     self.attempt_favorable_exit(signal).await;
                 } else {
-                    error!(error = %e, "Leg 2 erosion: order placement FAILED");
+                    error!(error = %e, "Leg 2 hedge: order placement FAILED");
 
                     self.active_leg2_order_id = None;
 
@@ -452,7 +452,7 @@ impl LiveExecutor {
 
     /// Walk-down offsets in ticks: 1, 2, 4, 8 (exponential).
     /// Each attempt is ~100ms (CLOB HTTP round-trip). First successful
-    /// placement rests as maker for the remaining erosion window (~5.8s).
+    /// placement rests as maker for the remaining hedge window.
     const WALKDOWN_OFFSETS: [u32; 4] = [1, 2, 4, 8];
 
     async fn attempt_favorable_exit(&mut self, signal: &TradeSignal) {
@@ -567,7 +567,7 @@ impl LiveExecutor {
         match self.poly.place_order(&order).await {
             Ok(resp) => {
                 if resp.status == OrderStatus::Rejected {
-                    warn!("Leg 2 favorable exit: FOK also rejected — erosion continues");
+                    warn!("Leg 2 favorable exit: FOK also rejected — hedge continues");
 
                     self.active_leg2_order_id = None;
 

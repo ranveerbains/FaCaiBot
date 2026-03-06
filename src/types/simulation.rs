@@ -91,8 +91,8 @@ pub struct SimPosition {
     pub leg2: Option<SimFill>,
     /// Current lifecycle status.
     pub status: PositionStatus,
-    /// Number of erosion steps applied to Leg 2 price so far.
-    pub erosion_steps: u32,
+    /// Hedge phase at trade close: 0=Phase1, 1=Phase2.
+    pub hedge_phase: u8,
     /// Whether a competitor depth wall was detected during this trade.
     pub bot_contested: bool,
     /// Whether Leg 2 was triggered by adverse Binance price movement.
@@ -105,8 +105,8 @@ pub struct SimPosition {
     pub exit_reason: Option<ExitReason>,
     /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
     pub spike_magnitude: Decimal,
-    /// Whether Leg 2 was triggered by pre-erosion breach (fast book move before first step).
-    pub pre_erosion_breach: bool,
+    /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
+    pub phase1_breach: bool,
     /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
     pub whipsaw_reversal: bool,
 }
@@ -155,8 +155,8 @@ pub struct SimTrade {
     pub resolution_timestamp_ms: Option<u64>,
 
     // ── Execution metadata ───────────────────────────────────────────────
-    /// Number of erosion steps applied to Leg 2 before fill.
-    pub erosion_steps: u32,
+    /// Hedge phase at trade close: 0=Phase1, 1=Phase2.
+    pub hedge_phase: u8,
     /// Whether Leg 2 executed as an emergency taker (FOK).
     pub leg2_was_taker: bool,
     /// Whether Leg 2 was triggered by adverse Binance price movement.
@@ -174,8 +174,8 @@ pub struct SimTrade {
     /// `true` if Leg 1 was supposed to be cancelled but filled mid-cancel
     /// (cancel-not-confirmed replay path in live mode).
     pub leg1_cancel_race: bool,
-    /// Whether Leg 2 was triggered by pre-erosion breach (fast book move before first step).
-    pub pre_erosion_breach: bool,
+    /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
+    pub phase1_breach: bool,
     /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
     pub whipsaw_reversal: bool,
 
@@ -456,14 +456,6 @@ impl SimulationState {
         self.current_market_walls += 1;
     }
 
-    /// Increment the erosion step counter for an open position.
-    /// Should be called each time the Leg 2 target price is raised.
-    pub fn record_erosion_step(&mut self, position_idx: usize) {
-        if let Some(pos) = self.open_positions.get_mut(position_idx) {
-            pos.erosion_steps += 1;
-        }
-    }
-
     /// Set the spike magnitude on an open position (for QuestDB outcome correlation).
     pub fn set_spike_magnitude(&mut self, position_idx: usize, magnitude: Decimal) {
         if let Some(pos) = self.open_positions.get_mut(position_idx) {
@@ -516,14 +508,14 @@ impl SimulationState {
             leg1: fill,
             leg2: None,
             status: PositionStatus::Open,
-            erosion_steps: 0,
+            hedge_phase: 0,
             bot_contested: false,
             adverse_movement_hedge: false,
             favorable_taker: false,
             emergency_maker: false,
             exit_reason: None,
             spike_magnitude: Decimal::ZERO,
-            pre_erosion_breach: false,
+            phase1_breach: false,
             whipsaw_reversal: false,
         };
 
@@ -690,7 +682,7 @@ impl SimulationState {
             profit_pct,
             resolution: None,
             resolution_timestamp_ms: None,
-            erosion_steps: pos.erosion_steps,
+            hedge_phase: pos.hedge_phase,
             leg2_was_taker,
             adverse_movement_hedge: pos.adverse_movement_hedge,
             bot_contested: pos.bot_contested,
@@ -699,7 +691,7 @@ impl SimulationState {
             exit_reason: pos.exit_reason,
             spike_magnitude: pos.spike_magnitude,
             leg1_cancel_race: false,
-            pre_erosion_breach: pos.pre_erosion_breach,
+            phase1_breach: pos.phase1_breach,
             whipsaw_reversal: pos.whipsaw_reversal,
             open_timestamp_ms: pos.leg1.timestamp_ms,
             close_timestamp_ms,
