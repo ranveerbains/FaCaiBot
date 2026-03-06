@@ -145,24 +145,39 @@ async fn remove_redeemed_ids(redeemed: &[String]) {
 
     let content = match tokio::fs::read_to_string(REDEEMS_FILE).await {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read redeems.txt for cleanup");
+            return;
+        }
     };
 
-    let remaining: Vec<&str> = content
+    // Normalize redeemed IDs to lowercase for safe comparison.
+    let redeemed_lower: Vec<String> = redeemed.iter().map(|s| s.to_lowercase()).collect();
+
+    let remaining: Vec<String> = content
         .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !redeemed.iter().any(|r| r == l))
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !redeemed_lower.contains(&l.to_lowercase()))
         .collect();
 
     let tmp = format!("{REDEEMS_FILE}.tmp");
     if remaining.is_empty() {
         // All redeemed — remove the file entirely.
-        let _ = tokio::fs::remove_file(REDEEMS_FILE).await;
+        if let Err(e) = tokio::fs::remove_file(REDEEMS_FILE).await {
+            tracing::warn!(error = %e, "failed to remove redeems.txt after full redemption");
+        }
         let _ = tokio::fs::remove_file(&tmp).await;
     } else {
         let new_content = remaining.join("\n") + "\n";
-        if tokio::fs::write(&tmp, new_content.as_bytes()).await.is_ok() {
-            let _ = tokio::fs::rename(&tmp, REDEEMS_FILE).await;
+        match tokio::fs::write(&tmp, new_content.as_bytes()).await {
+            Ok(()) => {
+                if let Err(e) = tokio::fs::rename(&tmp, REDEEMS_FILE).await {
+                    tracing::warn!(error = %e, "failed to rename temp file to redeems.txt");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write temp file for redeems.txt cleanup");
+            }
         }
     }
 }

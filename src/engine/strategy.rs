@@ -138,6 +138,14 @@ pub struct StrategyEngine {
     /// Config: quiet period duration after rotation.
     rotation_quiet_ms: u64,
 
+    /// `true` during post-trade cooldown. Set on trade completion,
+    /// cleared when `trade_cooldown_ms` elapses.
+    in_trade_cooldown: bool,
+    /// Epoch ms when the last trade completed.
+    last_trade_complete_ms: u64,
+    /// Config: cooldown duration after trade completion.
+    trade_cooldown_ms: u64,
+
     /// `true` when opposite spike detected with Leg 1 filled — next evaluate_leg2()
     /// emits immediate FOK at best ask, bypassing hedge.
     whipsaw_fok_pending: bool,
@@ -213,6 +221,7 @@ pub struct StrategyEngine {
     diag_spikes_received: u64,
     diag_spikes_dropped_cutoff: u64,
     diag_spikes_dropped_quiet: u64,
+    diag_spikes_dropped_cooldown: u64,
     diag_emg_phase1_breach: u64,
     diag_whipsaw_cancels: u64,
     diag_whipsaw_foks: u64,
@@ -305,6 +314,9 @@ impl StrategyEngine {
             in_quiet_period: false,
             rotation_ms: 0,
             rotation_quiet_ms: config.bot.entry_guards.rotation_quiet_ms,
+            in_trade_cooldown: false,
+            last_trade_complete_ms: 0,
+            trade_cooldown_ms: config.bot.entry_guards.trade_cooldown_ms,
             whipsaw_fok_pending: false,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
@@ -329,6 +341,7 @@ impl StrategyEngine {
             diag_spikes_received: 0,
             diag_spikes_dropped_cutoff: 0,
             diag_spikes_dropped_quiet: 0,
+            diag_spikes_dropped_cooldown: 0,
             diag_emg_phase1_breach: 0,
             diag_whipsaw_cancels: 0,
             diag_whipsaw_foks: 0,
@@ -928,6 +941,7 @@ impl StrategyEngine {
                 self.pending_partial_fills.clear();
                 self.in_cutoff_window = false;
                 self.in_quiet_period = true;
+                self.in_trade_cooldown = false;
                 self.rotation_ms = now_ms;
                 self.diag_markets_rotated += 1;
                 // Reset per-market live reporting state.
@@ -1211,6 +1225,15 @@ impl StrategyEngine {
                 info!(elapsed_ms = elapsed, "rotation quiet period ended — trading enabled");
             }
         }
+
+        // ── Post-trade cooldown timer (runs on every event) ─────────
+        if self.in_trade_cooldown {
+            let elapsed = now_ms.saturating_sub(self.last_trade_complete_ms);
+            if elapsed >= self.trade_cooldown_ms {
+                self.in_trade_cooldown = false;
+                info!(elapsed_ms = elapsed, "trade cooldown ended — trading enabled");
+            }
+        }
     }
 
     /// Evaluate current state and optionally emit a **Leg 1** trade signal.
@@ -1226,6 +1249,15 @@ impl StrategyEngine {
         if self.draining || self.paused {
             if self.state.spike_detected {
                 self.diag_rej_paused += 1;
+            }
+            self.state.spike_detected = false;
+            return None;
+        }
+
+        // Post-trade cooldown: block new Leg 1 entries.
+        if self.in_trade_cooldown {
+            if self.state.spike_detected {
+                self.diag_spikes_dropped_cooldown += 1;
             }
             self.state.spike_detected = false;
             return None;
@@ -1506,6 +1538,7 @@ impl StrategyEngine {
             spikes = self.diag_spikes_received,
             spikes_cut = self.diag_spikes_dropped_cutoff,
             spikes_quiet = self.diag_spikes_dropped_quiet,
+            spikes_cooldown = self.diag_spikes_dropped_cooldown,
             emg_phase1_breach = self.diag_emg_phase1_breach,
             whipsaw_cancel = self.diag_whipsaw_cancels,
             whipsaw_fok = self.diag_whipsaw_foks,
@@ -1576,7 +1609,7 @@ impl StrategyEngine {
              {spike}\n\
              \n\
              <b>Engine</b>\n\
-             Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}  Quiet drops: {spikes_quiet}\n\
+             Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}  Quiet drops: {spikes_quiet}  Cooldown drops: {spikes_cooldown}\n\
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
@@ -1596,6 +1629,7 @@ impl StrategyEngine {
             spike_fail = self.diag_spike_failures,
             spikes_cut = self.diag_spikes_dropped_cutoff,
             spikes_quiet = self.diag_spikes_dropped_quiet,
+            spikes_cooldown = self.diag_spikes_dropped_cooldown,
             paused = self.diag_rej_paused,
             busy = self.diag_rej_busy,
             no_book = self.diag_rej_no_book,
@@ -2276,6 +2310,9 @@ impl StrategyEngine {
                 }
             }
         }
+
+        self.in_trade_cooldown = true;
+        self.last_trade_complete_ms = now_ms;
 
         self.state.leg1_state = OrderState::None;
         self.state.leg2_state = OrderState::None;

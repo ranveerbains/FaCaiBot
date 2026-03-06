@@ -594,6 +594,7 @@ Timeline:
 | **Legging** | Five independent exit paths, all using **price-improvement chase with hard deadline** (`emergency_deadline_ms`=2000ms): (1) Adverse movement — immediate post-only on Binance reversal >0.1%, price-chase on book improvement, FOK at deadline; (2) Phase 1 breach — pair cost > `phase1_breach_threshold` ($1.05) during Phase 1, catches fast book repricing within ~2s; (3) Break-even breach — during Phase 2, pair cost > $1.00, post-only at `best_ask - 1 tick`, price-chase then FOK; (4) Favorable taker — when opposing ask drops below posted bid, post-only then FOK if rejected; (5) Whipsaw reversal — opposite spike after Leg 1 fill, immediate FOK at best ask bypassing hedge phases. FIFO queue priority preserved (no blind reposts). 2-phase hedge system (profit target → aggressive ask-1tick, 1 cancel-replace, ~200ms off-book) |
 | **False positive spikes** | Speculative posting with cancel-on-failure: post Leg 1 immediately on ATR+magnitude, cancel if sustain/momentum fails (~300ms). Post-only = zero cost on cancel. Sustain filter (300ms hold above 2×ATR) + momentum ratio (≥65% of peak) + magnitude gate (1.5 bp). Post-fill reversals caught by adverse_threshold. **Whipsaw guard**: opposite spike cancels unfilled Leg 1, or triggers immediate FOK if filled |
 | **Stale book entries** | Post-rotation quiet period (`rotation_quiet_ms`=30000ms) blocks spike entries for 30s after market rotation, preventing trades on stale/repricing books |
+| **Rapid re-entry** | Post-trade cooldown (`trade_cooldown_ms`=5000ms) blocks new entries for 5s after trade completion, preventing rapid-fire losses on the same market |
 | **Signal flooding** | Self-gating on both success and failure. One trade at a time |
 | **Taker fees** | Both legs post-only ($0 fee). Emergency exits try aggressive post-only first (zero fee); FOK taker only as fallback when post-only would cross spread. Fee: `C × 0.25 × (p×(1-p))²`, max 1.56% at p=0.50. Maker fills earn est. rebate: 20% of fee-equivalent |
 | **Competing bots** | Smart outbid walls by 1 tick (capped at break-even). Post-only = unfilled orders cost nothing |
@@ -616,9 +617,9 @@ multiplier, atr_alpha, sustain_ms,
 min_magnitude_pct, momentum_ratio_min
 # NOTE: no spikes emitted for first ~0.5s (10 ticks at 50ms) while ATR warms up
 
-[entry_guards]         # 7 params
+[entry_guards]         # 8 params
 max_spread, depth_min_pct, entry_cutoff_secs, stale_book_ms, max_price_skew,
-leg1_timeout_ms, rotation_quiet_ms
+leg1_timeout_ms, rotation_quiet_ms, trade_cooldown_ms
 
 [capital]              # 4 params
 max_alloc_per_trade, high_alloc_pct, med_alloc_pct, low_alloc_pct

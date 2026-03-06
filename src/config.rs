@@ -60,6 +60,8 @@ pub struct EntryGuardsConfig {
     pub leg1_timeout_ms: u64,
     /// Quiet period (ms) after market rotation — no new Leg 1 entries.
     pub rotation_quiet_ms: u64,
+    /// Cooldown (ms) after trade completion before allowing new entries.
+    pub trade_cooldown_ms: u64,
 }
 
 impl Default for EntryGuardsConfig {
@@ -73,6 +75,7 @@ impl Default for EntryGuardsConfig {
             max_price_skew: 0.80,
             leg1_timeout_ms: 5000,
             rotation_quiet_ms: 30000,
+            trade_cooldown_ms: 5000,
         }
     }
 }

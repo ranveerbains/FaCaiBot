@@ -412,7 +412,7 @@ If Leg 1 is Filled but Leg 2 incomplete when rotation arrives, the engine builds
 
 ### Engine state reset on rotation
 
-All market-specific state resets: active token IDs updated, books cleared, spike state cleared, leg states cleared, `cumulative_used` reset to 0, `in_cutoff_window` reset to false, `whipsaw_fok_pending` reset to false, `in_quiet_period` set to true (starts `rotation_quiet_ms` quiet period).
+All market-specific state resets: active token IDs updated, books cleared, spike state cleared, leg states cleared, `cumulative_used` reset to 0, `in_cutoff_window` reset to false, `whipsaw_fok_pending` reset to false, `in_quiet_period` set to true (starts `rotation_quiet_ms` quiet period), `in_trade_cooldown` reset to false (new market shouldn't inherit stale cooldown).
 
 ### Executor cleanup
 
@@ -462,6 +462,33 @@ After market rotation, the Polymarket book takes ~20-30s to fully reprice. Entri
 ### Diagnostic
 
 `diag_spikes_dropped_quiet` counter, visible in `/diag` Telegram output.
+
+---
+
+## 12c. Trade Cooldown
+
+### Detection
+
+Checked on every event (in `update_phase()`). When `on_trade_complete()` fires, `in_trade_cooldown = true` and `last_trade_complete_ms = now_ms`. On each subsequent event, if `now_ms - last_trade_complete_ms >= trade_cooldown_ms` (default 5000ms), `in_trade_cooldown` clears.
+
+### Effects
+
+| Action | During cooldown? |
+|--------|-----------------|
+| New Leg 1 entries | **Blocked** — spikes dropped in `evaluate()` |
+| Spike detection | **Continues** — spikes flow through normally, only entry is rejected |
+
+### Rationale
+
+Session analysis showed 6 trades in ~2 minutes on the same market. First 3 won (+$0.97), last 3 lost (-$2.38). The bot re-enters too quickly after completing a trade when the market is still volatile from the previous spike. A 5s cooldown prevents rapid-fire re-entry.
+
+### Reset
+
+Cleared on `MarketRotation` — a new market shouldn't inherit a stale cooldown from the previous market.
+
+### Diagnostic
+
+`diag_spikes_dropped_cooldown` counter, visible in 60s terminal log and `/diag` Telegram output.
 
 ---
 
