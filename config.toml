@@ -27,7 +27,7 @@ binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 1000
 # Block entry if YES mid > this or < (1 - this)
-max_price_skew = 0.90
+max_price_skew = 0.85
 # Cancel unfilled Leg 1 after this many ms
 leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
@@ -45,7 +45,7 @@ low_alloc_pct = 0.5
 # Score >= this → HIGH tier (max score 0.8)
 high_threshold = 0.5
 # Score >= this → MED tier, below → LOW
-med_threshold = 0.3
+med_threshold = 0.35
 # Profit target % for HIGH tier
 high_target_pct = 0.03
 # Profit target % for MED tier
@@ -61,7 +61,7 @@ strong_spike_atr_ratio = 75
 # Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.
 adverse_threshold = 0.001
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 2000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Hard deadline (ms) from first emergency post to FOK taker fallback

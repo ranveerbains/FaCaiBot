@@ -1,0 +1,463 @@
+facaibot, [6/3/26 10:14 PM]
+FaCaiBot live started
+
+Connected to Binance SBE + Polymarket CLOB. Real orders will be placed.
+
+r b, [6/3/26 10:15 PM]
+/balance
+
+facaibot, [6/3/26 10:15 PM]
+Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $280.550509
+POL: 168.6815
+
+facaibot, [6/3/26 10:15 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #9e130
+Spike: DOWN -0.0281% | 0ms sustained
+Confidence: 0.54 (HIGH) | Target: 3.00%
+Capital: $9.00
+
+Leg 1
+Buy NO  $0.55 × 16.36sh = $8.99
+Top of book (outbid wall) | Depth: $80914
+
+Leg 2 target
+Buy YES  $0.42 | Break-even: $0.45
+Est. profit: 3.00% (~$0.4908) | FOK fee: $0.0148/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:15 PM]
+--- TRADE COMPLETED ---
+
+Market: #9e130
+
+Leg 1: Buy NO  $0.55 × 16.36sh = $8.99
+Leg 2: Buy YES  $0.38 × 16.36sh [FAVORABLE POST-ONLY] (PHASE-1)
+
+Pair: $0.930/sh × 16.36sh = $15.21
+Profit: +$1.2407 (+$0.0955 est. rebate) (8.15%)
+
+facaibot, [6/3/26 10:17 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #9e130
+Spike: DOWN -0.0152% | 0ms sustained
+Confidence: 0.39 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy NO  $0.67 × 10.75sh = $7.20
+Top of book (outbid wall) | Depth: $74302
+
+Leg 2 target
+Buy YES  $0.31 | Break-even: $0.33
+Est. profit: 2.00% (~$0.2150) | FOK fee: $0.0114/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:17 PM]
+--- TRADE COMPLETED ---
+
+Market: #9e130
+
+Leg 1: Buy NO  $0.67 × 10.75sh = $7.20
+Leg 2: Buy YES  $0.37 × 10.75sh [EMERGENCY POST-ONLY] (PHASE-2)
+
+Pair: $1.040/sh × 10.75sh = $11.18
+Profit: $-0.3745 (+$0.0554 est. rebate) (-3.34%)
+
+facaibot, [6/3/26 10:20 PM]
+--- MARKET SUMMARY ---
+
+Market: #9e130
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 14:15 - 14:20 UTC
+
+Signals detected: 2
+Leg 1 fills: 2 (100% fill rate)
+Hedged: 2/2 (100%)
+Walls outbid: 2
+Emergency taker fills: 0 (post-only: 2)
+Favorable taker fills: 1
+
+Trade 1: conf=0.54 target=HIGH alloc=$9 → YES@0.550 + NO@0.380 = $0.930/sh × 16.36sh → maker+maker → net +$1.2407 USDC (8.15%)
+Trade 2: conf=0.39 target=MED alloc=$7 → YES@0.670 + NO@0.370 = $1.040/sh × 10.75sh → maker+maker → net $-0.3745 USDC (-3.34%)
+
+Allocation used: $16.20 / $9.00 (180%)
+Taker fees paid: $0.00 (both legs maker)
+Est. maker rebates: $0.1509
+Gross market PnL: +$0.7152
+Net market PnL: $0.8661
+Capital locked in resolution: $26.39
+
+facaibot, [6/3/26 10:22 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #b8c7d
+Spike: UP +0.0156% | 0ms sustained
+Confidence: 0.48 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy YES  $0.48 × 15.00sh = $7.20
+Top of book (outbid wall) | Depth: $74140
+
+Leg 2 target
+Buy NO  $0.50 | Break-even: $0.52
+Est. profit: 2.00% (~$0.3000) | FOK fee: $0.0156/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:22 PM]
+--- TRADE COMPLETED ---
+
+Market: #b8c7d
+
+Leg 1: Buy YES  $0.48 × 15.00sh = $7.20
+Leg 2: Buy NO  $0.56 × 15.00sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.040/sh × 15.00sh = $15.60
+Gross: $-0.6000 | Fee: -$0.2276 | Rebate: +$0.0467 | Net: $-0.7809 (-5.00%)
+
+facaibot, [6/3/26 10:25 PM]
+--- MARKET SUMMARY ---
+
+Market: #b8c7d
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 14:20 - 14:25 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 1 (post-only: 0)
+Favorable taker fills: 0
+
+Trade 1: conf=0.48 target=MED alloc=$7 → YES@0.480 + NO@0.560 = $1.040/sh × 15.00sh → maker+taker → net $-0.7809 USDC (-5.00%)
+
+Allocation used: $7.20 / $9.00 (80%)
+Taker fees paid: $0.2276
+Est. maker rebates: $0.0467
+Gross market PnL: $-0.6000
+Net market PnL: $-0.7809
+Capital locked in resolution: $15.60
+
+facaibot, [6/3/26 10:25 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: DOWN -0.0260% | 0ms sustained
+Confidence: 0.51 (HIGH) | Target: 3.00%
+Capital: $9.00
+
+Leg 1
+Buy NO  $0.75 × 12.00sh = $9.00
+Top of book (outbid wall) | Depth: $88728
+
+Leg 2 target
+Buy YES  $0.22 | Break-even: $0.25
+Est. profit: 3.00% (~$0.3600) | FOK fee: $0.0073/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:25 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy NO  $0.75 × 12.00sh = $9.00
+Leg 2: Buy YES  $0.29 × 12.00sh [EMERGENCY POST-ONLY] (PHASE-2)
+
+Pair: $1.040/sh × 12.00sh = $12.48
+Profit: $-0.4334 (+$0.0465 est. rebate) (-3.47%)
+
+facaibot, [6/3/26 10:26 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: UP +0.0130% | 0ms sustained
+Confidence: 0.47 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy YES  $0.70 × 10.29sh = $7.20
+Top of book (outbid wall) | Depth: $72908
+
+Leg 2 target
+Buy NO  $0.28 | Break-even: $0.30
+Est. profit: 2.00% (~$0.2058) | FOK fee: $0.0101/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:26 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy YES  $0.70 × 10.29sh = $7.20
+Leg 2: Buy NO  $0.29 × 10.29sh (PHASE-2)
+
+Pair: $0.990/sh × 10.29sh = $10.18
+Profit: +$0.1474 (+$0.0445 est. rebate) (1.44%)
+
+facaibot, [6/3/26 10:26 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: UP +0.0178% | 0ms sustained
+Confidence: 0.39 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy YES  $0.75 × 9.60sh = $7.20
+Top of book (outbid wall) | Depth: $74075
+
+Leg 2 target
+Buy NO  $0.23 | Break-even: $0.25
+Est. profit: 2.00% (~$0.1920) | FOK fee: $0.0078/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:26 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy YES  $0.75 × 9.60sh = $7.20
+Leg 2: Buy NO  $0.23 × 9.60sh (PHASE-1)
+
+Pair: $0.980/sh × 9.60sh = $9.40
+Profit: +$0.2239 (+$0.0319 est. rebate) (2.38%)
+
+facaibot, [6/3/26 10:27 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: DOWN -0.0144% | 0ms sustained
+Confidence: 0.40 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy NO  $0.54 × 13.33sh = $7.19
+Top of book (outbid wall) | Depth: $45414
+
+Leg 2 target
+Buy YES  $0.44 | Break-even: $0.46
+Est. profit: 2.00% (~$0.2666) | FOK fee: $0.0151/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:27 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy NO  $0.54 × 13.33sh = $7.19
+Leg 2: Buy YES  $0.51 × 13.33sh [EMERGENCY POST-ONLY] (PHASE-2)
+
+Pair: $1.050/sh × 13.33sh = $13.99
+Profit: $-0.5837 (+$0.0827 est. rebate) (-4.17%)
+
+facaibot, [6/3/26 10:28 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: UP +0.0140% | 0ms sustained
+Confidence: 0.35 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy YES  $0.51 × 14.12sh = $7.20
+Top of book (outbid wall) | Depth: $69015
+
+Leg 2 target
+Buy NO  $0.47 | Break-even: $0.49
+Est. profit: 2.00% (~$0.2824) | FOK fee: $0.0155/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:28 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy YES  $0.51 × 14.12sh = $7.20
+Leg 2: Buy NO  $0.53 × 14.00sh [WHIPSAW FOK] (PHASE-1)
+
+Pair: $1.040/sh × 14.12sh = $14.68
+Gross: $-0.5648 | Fee: -$0.2171 | Rebate: +$0.0440 | Net: $-0.7378 (-5.02%)
+
+facaibot, [6/3/26 10:28 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: UP +0.0122% | 0ms sustained
+Confidence: 0.30 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy YES  $0.58 × 12.41sh = $7.19
+Top of book (outbid wall) | Depth: $69425
+
+Leg 2 target
+Buy NO  $0.40 | Break-even: $0.42
+Est. profit: 2.00% (~$0.2482) | FOK fee: $0.0144/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:28 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy YES  $0.58 × 12.41sh = $7.19
+Leg 2: Buy NO  $0.40 × 12.41sh (PHASE-1)
+
+Pair: $0.980/sh × 12.41sh = $12.16
+Profit: +$0.3207 (+$0.0725 est. rebate) (2.63%)
+
+facaibot, [6/3/26 10:28 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: DOWN -0.0246% | 0ms sustained
+Confidence: 0.44 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy NO  $0.25 × 28.80sh = $7.20
+Top of book (outbid wall) | Depth: $37405
+
+Leg 2 target
+Buy YES  $0.73 | Break-even: $0.75
+Est. profit: 2.00% (~$0.5760) | FOK fee: $0.0097/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:28 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy NO  $0.25 × 28.80sh = $7.20
+Leg 2: Buy YES  $0.84 × 28.75sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.090/sh × 28.80sh = $31.39
+Gross: $-2.5920 | Fee: -$0.1298 | Rebate: +$0.0506 | Net: $-2.6712 (-8.50%)
+
+facaibot, [6/3/26 10:29 PM]
+--- OPPORTUNITY DETECTED ---
+
+Market: #4b215
+Spike: DOWN -0.0135% | 0ms sustained
+Confidence: 0.33 (MED) | Target: 2.00%
+Capital: $7.20
+
+Leg 1
+Buy NO  $0.11 × 65.45sh = $7.19
+Top of book (outbid wall) | Depth: $31618
+
+Leg 2 target
+Buy YES  $0.87 | Break-even: $0.89
+Est. profit: 2.00% (~$1.3090) | FOK fee: $0.0031/sh
+
+Status: Watching for hedge...
+
+facaibot, [6/3/26 10:29 PM]
+--- TRADE COMPLETED ---
+
+Market: #4b215
+
+Leg 1: Buy NO  $0.11 × 65.45sh = $7.19
+Leg 2: Buy YES  $0.90 × 65.40sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.010/sh × 65.45sh = $66.10
+Gross: $-0.6545 | Fee: -$0.1324 | Rebate: +$0.0313 | Net: $-0.7555 (-1.14%)
+
+facaibot, [6/3/26 10:30 PM]
+--- MARKET SUMMARY ---
+
+Market: #4b215
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 14:25 - 14:30 UTC
+
+Signals detected: 8
+Leg 1 fills: 8 (100% fill rate)
+Hedged: 8/8 (100%)
+Walls outbid: 8
+Emergency taker fills: 3 (post-only: 2)
+Favorable taker fills: 0
+
+Trade 1: conf=0.51 target=HIGH alloc=$9 → YES@0.750 + NO@0.290 = $1.040/sh × 12.00sh → maker+maker → net $-0.4334 USDC (-3.47%)
+Trade 2: conf=0.47 target=MED alloc=$7 → YES@0.700 + NO@0.290 = $0.990/sh × 10.29sh → maker+maker → net +$0.1474 USDC (1.44%)
+Trade 3: conf=0.39 target=MED alloc=$7 → YES@0.750 + NO@0.230 = $0.980/sh × 9.60sh → maker+maker → net +$0.2239 USDC (2.38%)
+Trade 4: conf=0.40 target=MED alloc=$7 → YES@0.540 + NO@0.510 = $1.050/sh × 13.33sh → maker+maker → net $-0.5837 USDC (-4.17%)
+Trade 5: conf=0.35 target=MED alloc=$7 → YES@0.510 + NO@0.530 = $1.040/sh × 14.12sh → maker+taker → net $-0.7378 USDC (-5.02%)
+Trade 6: conf=0.30 target=MED alloc=$7 → YES@0.580 + NO@0.400 = $0.980/sh × 12.41sh → maker+maker → net +$0.3207 USDC (2.63%)
+Trade 7: conf=0.44 target=MED alloc=$7 → YES@0.250 + NO@0.840 = $1.090/sh × 28.80sh → maker+taker → net $-2.6712 USDC (-8.50%)
+Trade 8: conf=0.33 target=MED alloc=$7 → YES@0.110 + NO@0.900 = $1.010/sh × 65.45sh → maker+taker → net $-0.7555 USDC (-1.14%)
+
+Allocation used: $59.40 / $9.00 (660%)
+Taker fees paid: $0.4794
+Est. maker rebates: $0.4043
+Gross market PnL: $-4.4147
+Net market PnL: $-4.4897
+Capital locked in resolution: $170.41
+
+facaibot, [6/3/26 10:34 PM]
+--- SESSION SUMMARY (0h 19m) ---
+
+Uptime: 0h 19m
+Markets observed: 5
+
+Fill rate:
+Signals detected: 32
+Leg 1 fills (post-only): 11 (34% fill rate)
+Hedged: 11/11 (100%)
+
+Smart outbidding:
+Depth walls detected: 11
+Walls outbid: 11
+
+Emergency exits (Leg 2):
+Adverse movement FOK: 0
+Break-even breach FOK: 4
+Timer/expiry deadline FOK: 0
+Emergency post-only (maker): 4
+Favorable taker fills: 1
+
+Allocation:
+High confidence (≥0.8, target 2.5%): 2 trades, avg $9
+Medium confidence (≥0.5, target 1.5%): 9 trades, avg $7
+Low confidence (<0.5, target 1.0%): 0 trades, avg $0
+Avg confidence: 0.42
+
+Gross PnL: $-4.299
+Emergency taker fees: $0.707 (4 emergency fill(s))
+Est. maker rebates: $0.602
+Net PnL: $-4.404
+
+Win rate: 36.3% (11/11)
+Average net profit: -1.4% per trade
+Best trade: +8.1% (market #9e130, conf=0.54, both maker)
+Worst trade: -8.5% (market #4b215, conf=0.44)
+
+Unfilled signals: 21
+- 21x post-only bid not matched (normal — zero cost)
+- 0x insufficient liquidity
+- 0x spread too wide
+
+Capital locked in resolution: $0.00
+Virtual balance: $0.000 (started: $0.00)
+
+facaibot, [6/3/26 10:34 PM]
+Shutting down...
+
+facaibot, [6/3/26 10:34 PM]
+No open positions. Bot stopped.
+
+r b, [6/3/26 10:34 PM]
+/shutdown
