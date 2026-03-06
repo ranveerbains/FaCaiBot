@@ -20,8 +20,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-  ec2-user@ec2-54-194-225-11.eu-west-1.compute.amazonaws.com
-  
+  ec2-user@ec2-108-129-137-96.eu-west-1.compute.amazonaws.com
+
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server.
