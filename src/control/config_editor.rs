@@ -12,7 +12,7 @@ struct ParamSpec {
 /// Allowlist of all tunable parameters with valid ranges.
 const ALLOWED_PARAMS: &[ParamSpec] = &[
     // spike_detection
-    ParamSpec { name: "spike_detection.multiplier", min: 1.0, max: 20.0 },
+    ParamSpec { name: "spike_detection.multiplier", min: 1.0, max: 1000.0 },
     ParamSpec { name: "spike_detection.atr_alpha", min: 0.0001, max: 1.0 },
     ParamSpec { name: "spike_detection.sustain_ms", min: 50.0, max: 5000.0 },
     ParamSpec { name: "spike_detection.min_magnitude_pct", min: 0.001, max: 0.5 },
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_validate_out_of_range() {
-        assert!(validate_param("spike_detection.multiplier", "25.0").is_err());
+        assert!(validate_param("spike_detection.multiplier", "1001.0").is_err());
         assert!(validate_param("spike_detection.multiplier", "0.5").is_err());
     }
 

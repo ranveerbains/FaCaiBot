@@ -5,15 +5,15 @@ prewarm_lead_secs = 20
 
 [spike_detection]
 # ATR multiplier for spike candidate trigger
-multiplier = 25
+multiplier = 30
 # EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
 atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
-sustain_ms = 300
+sustain_ms = 400
 # Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
-min_magnitude_pct = 0.012
+min_magnitude_pct = 0.01
 # Minimum displacement/peak ratio at sustain time
-momentum_ratio_min = 0.75
+momentum_ratio_min = 0.8
 
 [entry_guards]
 # Maximum bid-ask spread in dollars
@@ -29,7 +29,7 @@ stale_book_ms = 1000
 # Block entry if YES mid > this or < (1 - this)
 max_price_skew = 0.85
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 2500
+leg1_timeout_ms = 2000
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
@@ -61,7 +61,7 @@ strong_spike_atr_ratio = 75
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2000
+phase1_timeout_ms = 2500
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
