@@ -30,3 +30,6 @@ target
 # Log/output files
 trades.txt
 terminal.txt
+
+# Runtime redemption data
+redeems.txt

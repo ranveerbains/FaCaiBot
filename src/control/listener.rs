@@ -251,11 +251,18 @@ async fn handle_message(
             let token = bot_token.to_string();
             let chat = chat_id.to_string();
             let cmd_owned = cmd.to_string();
+            let args_owned = args.trim().to_string();
             tokio::spawn(async move {
                 let reply = match cmd_owned.as_str() {
                     "balance" => wallet::handle_balance().await,
                     "polybalance" => wallet::handle_polybalance().await,
-                    "redeem" => wallet::handle_redeem().await,
+                    "redeem" => {
+                        if args_owned.is_empty() {
+                            wallet::handle_redeem().await
+                        } else {
+                            wallet::handle_redeem_specific(args_owned).await
+                        }
+                    }
                     _ => return,
                 };
                 let _ = post_telegram_message(&tls, &token, &chat, &reply).await;

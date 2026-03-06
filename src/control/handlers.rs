@@ -193,6 +193,7 @@ pub fn handle_help() -> String {
      /balance — Wallet balance (USDC.e + POL)\n\
      /polybalance — Polymarket positions and value\n\
      /redeem — Redeem resolved positions to USDC.e\n\
+     /redeem <condition_id> — Redeem a specific condition ID\n\
      /help — This message"
         .into()
 }

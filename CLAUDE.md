@@ -115,7 +115,7 @@ src/
 │   ├── listener.rs                # TelegramCommandListener: getUpdates polling, auth, dispatch. Wallet commands spawned as independent tasks
 │   ├── handlers.rs                # Command handlers (pure logic, returns reply strings)
 │   ├── config_editor.rs           # TOML read/write, param allowlist with min/max ranges
-│   └── wallet.rs                  # /balance, /polybalance, /redeem — Polygon RPC + CTF contract. CachedNonceManager for sequential txs. Per-tx receipt timeout (8s)
+│   └── wallet.rs                  # /balance, /polybalance, /redeem — Polygon RPC + CTF contract. CachedNonceManager for sequential txs. Per-tx receipt timeout (8s). Persistent redeems.txt: append_condition_id_sync (engine thread), read/cleanup (async redeem)
 ├── types/
 │   ├── market.rs                  # IngestorEvent (13 variants), MarketState, OrderBook
 │   ├── order.rs                   # TradeSignal, ProfitTier, ExecutorCommand, ExecutorFeedback, FillMethod (3 variants: FavorableMaker, FavorableTaker, EmergencyTaker), Side, ExitReason (6 variants: AdverseMovement, BreakEvenBreach, MarketExpiry, FavorableTaker, Phase1Breach, WhipsawReversal)
@@ -154,6 +154,7 @@ src/
 - **Deferred partial fill alerts**: The CLOB splits large fills across multiple rapid MATCHED events (~3ms apart). Partial fill checks (`size_matched < original_size`) are NOT alerted on MATCHED — instead stored in `pending_partial_fills` (HashMap keyed by order_id). Resolved when subsequent MATCHED shows fully filled (silent) or MINED/CONFIRMED arrives with final size (alert if still partial). Cleared on `MarketRotation` but NOT `on_trade_complete()` — MINED events may arrive after trade reset
 - **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
 - **Maker rebate estimates**: `SimFill::compute_maker_rebate(price, size)` = `compute_taker_fee(price, size) × 0.20` — upper-bound estimate of Polymarket daily maker rebate. `SimFill.maker_rebate` non-zero for maker fills, zero for taker. `SimTrade.maker_rebate` = sum of both legs. Net profit = `gross_profit - taker_fee + maker_rebate`. Accumulated on `SimulationState.total_maker_rebates_earned` and `MarketSummary.maker_rebates_earned`. Shown in Telegram trade completion and market/session summaries
+- **Persistent redemption file (`redeems.txt`)**: Newline-delimited condition IDs persisted for redemption. Written once per market at rotation (if traded) and at shutdown (via `send_live_session_summary`). Read + merged with Data API positions in `redeem_inner()`. Cleanup via atomic write-temp-rename after successful redemption. `/redeem <condition_id>` for targeted single redemption. `append_condition_id_sync()` is sync I/O on engine thread (deduplicates before append)
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
 
 ## Key Documents

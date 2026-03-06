@@ -583,6 +583,7 @@ Timeline:
 - **UMA Optimistic Oracle**: Proposer submits outcome → 2-hour challenge period → resolved
 - Capital locked between expiry and resolution (~2h minimum)
 - Redeem via `redeemPositions()` on CTF contract. EOA pays POL gas (capped at `MAX_GAS_PRICE` 100 gwei). Uses `CachedNonceManager` for sequential transactions (prevents "nonce too low" on rapid redeems). Per-tx receipt timeout (8s) prevents slow RPC confirmations from starving remaining positions. Null RPC receipts (tx broadcast but receipt lost) counted as redeemed. Unresolved markets revert quickly (no pre-check needed — on-chain state is authoritative)
+- **Persistent condition ID tracking**: `redeems.txt` (newline-delimited) stores condition IDs from completed trades. Written at rotation (if market had trades) and at shutdown. Merged with Data API positions during redemption — fixes the Data API returning 0 positions for resolved markets. Cleanup via atomic write-temp-rename after successful redemption. `/redeem <condition_id>` for targeted single-ID redemption (30s timeout)
 
 ---
 
@@ -723,7 +724,8 @@ Bidirectional Telegram control via `getUpdates` long-polling (30s timeout, 45s o
 | `/status` | Uptime, mode, current market, leg states, trade counters, toggle states. Shows `[PAUSED]` when stopped |
 | `/balance` | Wallet USDC.e + POL balance on Polygon |
 | `/polybalance` | Polymarket positions and total value |
-| `/redeem` | Redeem resolved positions to USDC.e |
+| `/redeem` | Redeem resolved positions to USDC.e (merges Data API + persistent file) |
+| `/redeem <condition_id>` | Redeem a specific condition ID (30s timeout) |
 | `/help` | List commands with usage |
 
 **Wallet commands (`/balance`, `/polybalance`, `/redeem`)**: Spawned as independent `tokio::spawn` tasks — the listener loop continues polling for new messages immediately. Each spawned task sends its own Telegram reply directly. Prevents slow Polygon RPC or on-chain tx confirmation from blocking other commands. Defense-in-depth timeouts: 10s for `/balance` and `/polybalance`, 60s for `/redeem` (on-chain txs are slow). `/redeem` uses `CachedNonceManager` (local nonce tracking) to prevent "nonce too low" errors when redeeming multiple positions sequentially — the default `SimpleNonceManager` queries the RPC for each send, which returns stale nonces between rapid transactions.
@@ -763,7 +765,7 @@ src/control/
 ├── listener.rs         # TelegramCommandListener: getUpdates polling, auth, dispatch. Wallet commands spawned as independent tasks (non-blocking)
 ├── handlers.rs         # Command handlers (pure logic, returns reply strings)
 ├── config_editor.rs    # TOML read/write, param allowlist with min/max ranges
-├── wallet.rs           # /balance, /polybalance, /redeem — Polygon RPC + CTF contract calls. CachedNonceManager for sequential txs. Timeouts: 10s balance, 120s redeem (8s per-tx receipt)
+├── wallet.rs           # /balance, /polybalance, /redeem — Polygon RPC + CTF contract calls. CachedNonceManager for sequential txs. Timeouts: 10s balance, 120s redeem (8s per-tx receipt). Persistent redeems.txt management (append/read/cleanup)
 └── types.rs            # NotifyFlags, BotStatus, DrainStatus
 ```
 

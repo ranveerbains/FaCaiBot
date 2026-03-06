@@ -888,6 +888,13 @@ impl StrategyEngine {
                     ));
                 }
 
+                // Persist condition ID for redemption if we traded in this market.
+                if !self.live_market_trades.is_empty()
+                    && let Some(ref cid) = self.state.active_condition_id
+                {
+                    crate::control::wallet::append_condition_id_sync(cid);
+                }
+
                 // ── Reset all state for the new market ───────────────────
                 self.state.active_condition_id = Some(condition_id);
                 self.state.active_yes_token_id = Some(yes_token_id);
@@ -2875,6 +2882,13 @@ impl StrategyEngine {
     ///
     /// Called by main.rs on graceful shutdown in live mode.
     pub fn send_live_session_summary(&self) {
+        // Persist current market's condition ID if we traded in it.
+        if !self.live_market_trades.is_empty()
+            && let Some(ref cid) = self.state.active_condition_id
+        {
+            crate::control::wallet::append_condition_id_sync(cid);
+        }
+
         let reporter = match &self.reporter {
             Some(r) => r,
             None => return,

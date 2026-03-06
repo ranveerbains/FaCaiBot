@@ -90,6 +90,83 @@ fn short_id(id: &str) -> String {
     }
 }
 
+/// Path to the persistent redemption file (relative to working directory).
+const REDEEMS_FILE: &str = "redeems.txt";
+
+/// Append a condition ID to `redeems.txt` (sync I/O — called from engine thread).
+/// Deduplicates: skips if the ID is already present in the file.
+pub fn append_condition_id_sync(condition_id: &str) {
+    use std::io::Write;
+
+    // Read existing content to check for duplicates.
+    let existing = std::fs::read_to_string(REDEEMS_FILE).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == condition_id) {
+        return;
+    }
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(REDEEMS_FILE)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{condition_id}") {
+                tracing::warn!(error = %e, "failed to append condition ID to redeems.txt");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open redeems.txt for append");
+        }
+    }
+}
+
+/// Read condition IDs from `redeems.txt` (async). Returns deduplicated, validated IDs.
+async fn read_condition_ids_from_file() -> Vec<String> {
+    let content = match tokio::fs::read_to_string(REDEEMS_FILE).await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut ids: Vec<String> = content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.len() == 66 && l.starts_with("0x"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Remove successfully redeemed IDs from `redeems.txt` (async, atomic write-temp-rename).
+async fn remove_redeemed_ids(redeemed: &[String]) {
+    if redeemed.is_empty() {
+        return;
+    }
+
+    let content = match tokio::fs::read_to_string(REDEEMS_FILE).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let remaining: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !redeemed.iter().any(|r| r == l))
+        .collect();
+
+    let tmp = format!("{REDEEMS_FILE}.tmp");
+    if remaining.is_empty() {
+        // All redeemed — remove the file entirely.
+        let _ = tokio::fs::remove_file(REDEEMS_FILE).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    } else {
+        let new_content = remaining.join("\n") + "\n";
+        if tokio::fs::write(&tmp, new_content.as_bytes()).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp, REDEEMS_FILE).await;
+        }
+    }
+}
+
 // ─── Command Handlers ────────────────────────────────────────────────────────
 
 /// `/balance` — Show EOA wallet USDC.e + POL balance on Polygon.
@@ -197,40 +274,43 @@ async fn redeem_inner() -> Result<String> {
     let rpc_url = get_rpc_url();
     let client = reqwest::Client::new();
 
-    // Fetch current positions to find condition IDs.
-    let positions_url = format!("{DATA_API}/positions?user={address}");
-    let positions_resp: serde_json::Value = client
-        .get(&positions_url)
+    // Source 1: Data API positions (graceful — don't fail if API errors).
+    let mut condition_ids: Vec<String> = Vec::new();
+    match client
+        .get(format!("{DATA_API}/positions?user={address}"))
         .send()
         .await
-        .context("failed to fetch positions")?
-        .json()
-        .await
-        .context("failed to parse positions response")?;
-
-    let positions = positions_resp
-        .as_array()
-        .context("positions response is not an array")?;
-
-    if positions.is_empty() {
-        return Ok("No positions found — nothing to redeem.".into());
+    {
+        Ok(resp) => {
+            if let Ok(positions_resp) = resp.json::<serde_json::Value>().await
+                && let Some(positions) = positions_resp.as_array()
+            {
+                for p in positions {
+                    if let Some(cid) = p
+                        .get("conditionId")
+                        .or_else(|| p.get("condition_id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        condition_ids.push(cid.to_string());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Data API fetch failed — continuing with file IDs only");
+        }
     }
 
-    // Extract unique condition IDs.
-    let mut condition_ids: Vec<String> = positions
-        .iter()
-        .filter_map(|p| {
-            p.get("conditionId")
-                .or_else(|| p.get("condition_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
+    // Source 2: Persistent file of condition IDs from completed trades.
+    let file_ids = read_condition_ids_from_file().await;
+    condition_ids.extend(file_ids);
+
+    // Dedup.
     condition_ids.sort();
     condition_ids.dedup();
 
     if condition_ids.is_empty() {
-        return Ok("No condition IDs found in positions — nothing to redeem.".into());
+        return Ok("No positions found — nothing to redeem.".into());
     }
 
     // Build signing provider with cached nonce management (prevents "nonce too low" on rapid txs).
@@ -250,6 +330,7 @@ async fn redeem_inner() -> Result<String> {
     let mut redeemed = 0u32;
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    let mut redeemed_ids: Vec<String> = Vec::new();
 
     for cid_hex in &condition_ids {
         let condition_id: FixedBytes<32> = match cid_hex.parse() {
@@ -273,6 +354,7 @@ async fn redeem_inner() -> Result<String> {
                     Ok(Ok(receipt)) => {
                         if receipt.status() {
                             redeemed += 1;
+                            redeemed_ids.push(cid_hex.clone());
                         } else {
                             skipped += 1;
                             errors.push(format!(
@@ -284,6 +366,7 @@ async fn redeem_inner() -> Result<String> {
                     Ok(Err(e)) if e.to_string().contains("null response") => {
                         // Tx was broadcast — RPC just lost the receipt. Count as success.
                         redeemed += 1;
+                        redeemed_ids.push(cid_hex.clone());
                     }
                     Ok(Err(e)) => {
                         skipped += 1;
@@ -303,6 +386,9 @@ async fn redeem_inner() -> Result<String> {
         }
     }
 
+    // Remove successfully redeemed IDs from the persistent file.
+    remove_redeemed_ids(&redeemed_ids).await;
+
     let mut msg = format!("Redemption complete: {redeemed} redeemed, {skipped} skipped");
     if !errors.is_empty() {
         msg.push_str("\n\nErrors:");
@@ -312,6 +398,73 @@ async fn redeem_inner() -> Result<String> {
     }
 
     Ok(msg)
+}
+
+/// `/redeem <condition_id>` — Redeem a specific condition ID.
+pub async fn handle_redeem_specific(condition_id: String) -> String {
+    match tokio::time::timeout(Duration::from_secs(30), redeem_specific_inner(&condition_id)).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => format!("Redemption failed: {e}"),
+        Err(_) => "Redemption timed out (30s).".into(),
+    }
+}
+
+async fn redeem_specific_inner(cid_hex: &str) -> Result<String> {
+    let cid_hex = cid_hex.trim();
+    if cid_hex.len() != 66 || !cid_hex.starts_with("0x") {
+        anyhow::bail!("Invalid condition ID format. Expected 0x-prefixed 32-byte hex (66 chars).");
+    }
+
+    let condition_id: FixedBytes<32> = cid_hex
+        .parse()
+        .context("failed to parse condition ID as bytes32")?;
+
+    let (signer, _address) = get_wallet_info()?;
+    let rpc_url = get_rpc_url();
+
+    let wallet = EthereumWallet::from(signer);
+    let provider = ProviderBuilder::new()
+        .with_cached_nonce_management()
+        .wallet(wallet)
+        .connect_http(rpc_url.parse().context("invalid RPC URL")?);
+    let ctf = ICTF::new(CTF, &provider);
+
+    let parent_collection_id = FixedBytes::<32>::ZERO;
+    let index_sets = vec![U256::from(1), U256::from(2)];
+
+    let pending = ctf
+        .redeemPositions(USDC_E, parent_collection_id, condition_id, index_sets)
+        .send()
+        .await
+        .context("redeemPositions call failed")?;
+
+    let tx_hash = *pending.tx_hash();
+
+    match tokio::time::timeout(Duration::from_secs(8), pending.get_receipt()).await {
+        Ok(Ok(receipt)) => {
+            if receipt.status() {
+                remove_redeemed_ids(&[cid_hex.to_string()]).await;
+                Ok(format!("Redeemed {}: tx {tx_hash}", short_id(cid_hex)))
+            } else {
+                Ok(format!(
+                    "Tx reverted for {} (market not resolved?): tx {tx_hash}",
+                    short_id(cid_hex)
+                ))
+            }
+        }
+        Ok(Err(e)) if e.to_string().contains("null response") => {
+            remove_redeemed_ids(&[cid_hex.to_string()]).await;
+            Ok(format!(
+                "Redeemed {} (receipt lost, tx broadcast): tx {tx_hash}",
+                short_id(cid_hex)
+            ))
+        }
+        Ok(Err(e)) => Ok(format!("Receipt error for {}: {e}", short_id(cid_hex))),
+        Err(_) => Ok(format!(
+            "Receipt timed out for {}: tx {tx_hash}",
+            short_id(cid_hex)
+        )),
+    }
 }
 
 // ─── Auto-Redeem Background Task ────────────────────────────────────────────
@@ -327,7 +480,8 @@ pub async fn auto_redeem_loop(tls_connector: TlsConnector, bot_token: String, ch
         let result = handle_redeem().await;
 
         // Only notify when something was actually redeemed (skip "0 redeemed, 0 skipped" noise).
-        let is_noop = result.contains("No positions found")
+        let is_noop = result.contains("nothing to redeem")
+            || result.contains("No positions found")
             || result.contains("No condition IDs")
             || result.starts_with("Redemption complete: 0 redeemed, 0 skipped");
         if is_noop {
