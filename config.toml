@@ -27,7 +27,7 @@ binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 1000
 # Block entry if YES mid > this or < (1 - this)
-max_price_skew = 0.85
+max_price_skew = 0.90
 # Cancel unfilled Leg 1 after this many ms
 leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
