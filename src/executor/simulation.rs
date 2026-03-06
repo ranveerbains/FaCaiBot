@@ -279,7 +279,6 @@ impl SimulationExecutor {
                         hedged      = self.state.trades_hedged,
                         emergency   = self.state.trades_emergency_taker,
                         emergency_maker = self.state.emergency_maker_fills,
-                        adverse_fok = self.state.trades_adverse_hedged,
                         be_fok      = self.state.trades_break_even_fok,
                         pnl         = %self.state.total_pnl,
                         win_rate    = %self.state.win_rate_pct(),
@@ -433,30 +432,6 @@ impl SimulationExecutor {
         };
 
         match signal.exit_reason {
-            Some(ExitReason::AdverseMovement) => {
-                if is_taker {
-                    info!(
-                        token_id = %signal.token_id,
-                        taker_price = %fill.price,
-                        taker_fee = %fill.taker_fee,
-                        position_idx,
-                        "Leg 2: adverse movement FOK fallback"
-                    );
-                    self.state.record_adverse_hedge(position_idx, fill);
-                } else {
-                    info!(
-                        token_id = %signal.token_id,
-                        price = %fill.price,
-                        position_idx,
-                        "Leg 2: adverse movement post-only (maker)"
-                    );
-                    self.state.record_emergency_maker(
-                        position_idx,
-                        fill,
-                        &ExitReason::AdverseMovement,
-                    );
-                }
-            }
             Some(ExitReason::BreakEvenBreach) => {
                 let label = "break-even breach";
                 let reason_ref = ExitReason::BreakEvenBreach;
@@ -1038,7 +1013,7 @@ mod tests {
         // Session PnL accumulates USDC amounts.
         assert_eq!(state.total_pnl, d("0.03") * size1); // 0.30 USDC
 
-        // Trade 2: adverse — pair_cost > 1.0 → loss.
+        // Trade 2: emergency taker — pair_cost > 1.0 → loss.
         let fill2_leg1 = SimFill {
             side: Side::Buy,
             price: d("0.55"),

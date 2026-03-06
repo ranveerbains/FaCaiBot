@@ -60,13 +60,11 @@ min_spike_atr_ratio = 20
 strong_spike_atr_ratio = 75
 
 [risk]
-# Binance reversal fraction triggering immediate emergency FOK. this is in % of btc.
-adverse_threshold = 0.001
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 2000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
-# Hard deadline (ms) from first emergency post to FOK taker fallback
-emergency_deadline_ms = 2000
-# Phase 1 breach: pair cost > this triggers transition to Phase 2
+# Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.04
+# Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
+phase2_timeout_ms = 2000

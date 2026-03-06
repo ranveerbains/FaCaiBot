@@ -540,10 +540,6 @@ mod formatter {
                 " [PHASE-1 BREACH POST-ONLY]".to_owned()
             } else if trade.phase1_breach {
                 " [PHASE-1 BREACH FOK FALLBACK]".to_owned()
-            } else if trade.adverse_movement_hedge && trade.emergency_maker {
-                " [ADVERSE POST-ONLY]".to_owned()
-            } else if trade.adverse_movement_hedge {
-                " [ADVERSE FOK FALLBACK]".to_owned()
             } else if trade.favorable_taker && trade.emergency_maker {
                 " [FAVORABLE POST-ONLY]".to_owned()
             } else if trade.favorable_taker {
@@ -849,7 +845,6 @@ mod formatter {
               Walls outbid: {walls}\n\
             \n\
             <b>Emergency exits (Leg 2):</b>\n\
-              Adverse movement FOK: {adverse}\n\
               Break-even breach FOK: {break_even}\n\
               Timer/expiry deadline FOK: {timer}\n\
               Emergency post-only (maker): {emergency_maker}\n\
@@ -887,7 +882,6 @@ mod formatter {
             hedged = s.trades_hedged,
             hedge_rate = hedge_rate_pct,
             walls = s.walls_outbid,
-            adverse = s.adverse_movement_fok,
             break_even = s.break_even_fok,
             timer = s.timer_deadline_fok,
             emergency_maker = s.emergency_maker_fills,

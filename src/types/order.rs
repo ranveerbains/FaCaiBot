@@ -5,14 +5,12 @@ use super::market::{Direction, OrderBook, SpikeInfo};
 
 // ─── Exit Reason ─────────────────────────────────────────────────────────────
 
-/// Reason for an emergency Leg 2 exit (post-only first, FOK fallback).
+/// Reason for an emergency Leg 2 exit (immediate FOK taker).
 ///
 /// Set by the evaluator when generating emergency signals so the executor
 /// can accurately categorize the exit for session statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExitReason {
-    /// Binance price reversed beyond adverse_threshold.
-    AdverseMovement,
     /// Opposing ask worsened beyond break-even tolerance.
     BreakEvenBreach,
     /// Market rotation arrived while Leg 1 was filled but Leg 2 incomplete.

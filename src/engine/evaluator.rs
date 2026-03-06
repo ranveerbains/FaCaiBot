@@ -384,16 +384,15 @@ impl Leg1Evaluator {
 
 /// Evaluates whether to emit a Leg 2 hedge signal after Leg 1 fills.
 ///
-/// Handles 2-phase hedge (profit target → break-even pursuit), adverse movement,
+/// Handles 2-phase hedge (profit target → break-even pursuit), Phase 1 breach,
 /// and break-even breach emergency FOK fills.
 ///
 /// All reads are from borrowed `&MarketState` and `&HedgeSnap`; no mutation occurs here.
 pub(crate) struct Leg2Evaluator {
-    pub adverse_threshold: Decimal,
     pub phase1_timeout_ms: u64,
     pub depth_wall_multiplier: Decimal,
-    pub emergency_deadline_ms: u64,
     pub phase1_breach_threshold: Decimal,
+    pub phase2_timeout_ms: u64,
 }
 
 impl Leg2Evaluator {
@@ -404,8 +403,7 @@ impl Leg2Evaluator {
     /// # Important
     /// The caller **must** apply post-signal state mutations depending on decision type:
     /// - `Phase1Post`: `last_hedge_signal_ms = now_ms`, `leg2_state = Posted { … }`
-    /// - `PhaseTransition`: `hedge.phase = Phase2`, `hedge.phase2_posted_price = Some(price)`
-    /// - `Phase2Repost`: `hedge.phase2_posted_price = Some(price)`
+    /// - `PhaseTransition`: `hedge.phase = Phase2`, `hedge.phase2_start_ms = Some(now)`
     /// - `Emergency`: `hedge.emergency_submitted = true`, `leg2_state = Posted { … }`
     ///
     /// The `last_hedge_ms` argument is passed in by the caller (from `self.last_hedge_signal_ms`)
@@ -457,176 +455,27 @@ impl Leg2Evaluator {
             Direction::Down => state.active_yes_token_id.as_ref()?.clone(),
         };
 
-        // ── Emergency price-improvement chase with hard deadline ────────
-        // Only repost when the book offers a strictly better price (preserves
-        // FIFO queue priority). After emergency_deadline_ms → FOK taker.
+        // Emergency already submitted — no chase, just wait for executor.
         if snap.emergency_submitted {
-            let best_ask = hedge_book.best_ask().map(|a| a.price)?;
-            let exit_reason = snap.exit_reason.unwrap_or(ExitReason::BreakEvenBreach);
-
-            // 1. Hard deadline check — if elapsed >= deadline, FOK taker at best_ask.
-            let elapsed = snap
-                .emergency_first_post_ms
-                .map(|first| now_ms.saturating_sub(first))
-                .unwrap_or(0);
-
-            if elapsed >= self.emergency_deadline_ms {
-                if snap.fok_emitted {
-                    return None;
-                }
-                let leg1_size = match &state.leg1_state {
-                    OrderState::Filled { size, .. } => *size,
-                    _ => return None,
-                };
-                let fok_price = round_to_tick(best_ask, tick);
-                // Re-evaluate exit_reason with actual FOK price
-                let exit_reason = {
-                    let pair_cost = snap.leg1_fill_price + fok_price;
-                    if pair_cost < Decimal::ONE {
-                        exit_reason
-                    } else {
-                        match exit_reason {
-                            ExitReason::FavorableTaker => ExitReason::BreakEvenBreach,
-                            other => other,
-                        }
-                    }
-                };
-                warn!(%best_ask, %fok_price, ?exit_reason, elapsed_ms = elapsed,
-                    "emergency deadline reached — FOK taker fallback");
-                let mut signal = make_leg2_signal(
-                    &hedge_token_id,
-                    state.active_condition_id.as_deref().unwrap_or(""),
-                    fok_price,
-                    leg1_size,
-                    reference_price,
-                    snap.confidence,
-                    snap.tier,
-                    Decimal::ZERO,
-                    snap.direction,
-                    snap.spike_info,
-                    snap.leg1_fill_price,
-                    now_ms,
-                    market_end_ms,
-                    tick,
-                    atr,
-                    false,
-                    Some(hedge_book.clone()),
-                    Some(exit_reason),
-                );
-                signal.sim_was_taker = true;
-                return Some(Leg2Decision::Emergency {
-                    signal,
-                    price: fok_price,
-                    size: leg1_size,
-                });
-            }
-
-            // 2. Price-improvement check — only repost if new top-of-book is strictly better.
-            let best_bid_we_can_post = round_to_tick(best_ask - tick, tick);
-            let current_posted = snap.emergency_posted_price.unwrap_or(Decimal::ZERO);
-
-            if best_bid_we_can_post > current_posted {
-                let leg1_size = match &state.leg1_state {
-                    OrderState::Filled { size, .. } => *size,
-                    _ => return None,
-                };
-                debug!(%best_bid_we_can_post, %current_posted, ?exit_reason,
-                    "emergency price chase — reposting at improved price");
-                let signal = make_leg2_signal(
-                    &hedge_token_id,
-                    state.active_condition_id.as_deref().unwrap_or(""),
-                    best_bid_we_can_post,
-                    leg1_size,
-                    reference_price,
-                    snap.confidence,
-                    snap.tier,
-                    Decimal::ZERO,
-                    snap.direction,
-                    snap.spike_info,
-                    snap.leg1_fill_price,
-                    now_ms,
-                    market_end_ms,
-                    tick,
-                    atr,
-                    false,
-                    Some(hedge_book.clone()),
-                    Some(exit_reason),
-                );
-                return Some(Leg2Decision::Emergency {
-                    signal,
-                    price: best_bid_we_can_post,
-                    size: leg1_size,
-                });
-            }
-
-            // 3. No improvement and within deadline — keep current order, preserve queue priority.
             return None;
-        }
-
-        // ── Adverse movement (immediate — ultimate safeguard, zero grace) ─
-        // If Binance reverses > adverse_threshold at ANY point after Leg 1 fill,
-        // the spike thesis is invalidated → emergency post-only at top-of-book.
-        // FOK fallback after emergency_deadline_ms via the price-chase block.
-        if let (Some(cur), Some(fill_p)) = (state.binance_price, snap.binance_at_fill) {
-            if !fill_p.is_zero() {
-                let change = (cur - fill_p).abs() / fill_p;
-                let adverse = match snap.direction {
-                    Direction::Up => cur < fill_p,
-                    Direction::Down => cur > fill_p,
-                };
-                if adverse && change >= self.adverse_threshold {
-                    let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
-                    if fok_size <= Decimal::ZERO {
-                        warn!(%change, direction = ?snap.direction, "adverse movement — no ask depth for emergency");
-                        return None;
-                    }
-                    let price = round_to_tick(best_ask_price? - tick, tick);
-                    warn!(%change, direction = ?snap.direction, %fok_size, %price, "adverse movement — emergency post-only Leg 2");
-                    let signal = make_leg2_signal(
-                        &hedge_token_id,
-                        state.active_condition_id.as_deref().unwrap_or(""),
-                        price,
-                        fok_size,
-                        reference_price,
-                        snap.confidence,
-                        snap.tier,
-                        Decimal::ZERO,
-                        snap.direction,
-                        snap.spike_info,
-                        leg1_price,
-                        now_ms,
-                        market_end_ms,
-                        tick,
-                        atr,
-                        false,
-                        Some(hedge_book.clone()),
-                        Some(ExitReason::AdverseMovement),
-                    );
-                    return Some(Leg2Decision::Emergency {
-                        signal,
-                        price,
-                        size: fok_size,
-                    });
-                }
-            }
         }
 
         // ── Phase 1: Resting at profit target ────────────────────────────
         if snap.phase == HedgePhase::Phase1 {
-            // Phase 1 breach: pair cost > threshold → transition to Phase 2.
+            // Phase 1 breach: pair cost > threshold → immediate FOK taker at ask.
             if let Some(ask_price) = best_ask_price {
                 if leg1_price + ask_price > self.phase1_breach_threshold {
-                    let price = round_to_tick(ask_price - tick, tick);
+                    let price = round_to_tick(ask_price, tick);
                     let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
                     if fok_size <= Decimal::ZERO {
-                        warn!(%leg1_price, %ask_price, "phase 1 breach — no ask depth for transition");
+                        warn!(%leg1_price, %ask_price, "phase 1 breach — no ask depth for FOK");
                         return None;
                     }
                     warn!(
                         %leg1_price, %ask_price, threshold = %self.phase1_breach_threshold,
-                        %fok_size, %price, "phase 1 breach — transitioning to phase 2"
+                        %fok_size, %price, "phase 1 breach — immediate FOK taker"
                     );
-                    let signal = make_leg2_signal(
+                    let mut signal = make_leg2_signal(
                         &hedge_token_id,
                         state.active_condition_id.as_deref().unwrap_or(""),
                         price,
@@ -646,11 +495,11 @@ impl Leg2Evaluator {
                         Some(hedge_book.clone()),
                         Some(ExitReason::Phase1Breach),
                     );
-                    return Some(Leg2Decision::PhaseTransition {
+                    signal.sim_was_taker = true;
+                    return Some(Leg2Decision::Emergency {
                         signal,
                         price,
                         size: fok_size,
-                        reason: TransitionReason::Breach,
                     });
                 }
             }
@@ -769,20 +618,57 @@ impl Leg2Evaluator {
             });
         }
 
-        // ── Phase 2: Break-even pursuit (ask-1tick) ──────────────────────
-        // Phase 2 entered via PhaseTransition. Now monitor and repost.
+        // ── Phase 2: Break-even pursuit (ask-1tick), hold position ───────
+        // Phase 2 entered via PhaseTransition. No reposts — preserve FIFO.
 
-        // Immediate BE breach: if ask >= break-even → emergency.
+        // Phase 2 timeout → FOK taker at best ask.
+        if let Some(phase2_start) = snap.phase2_start_ms {
+            let elapsed = now_ms.saturating_sub(phase2_start);
+            if elapsed >= self.phase2_timeout_ms {
+                if let Some(ask_price) = best_ask_price {
+                    let price = round_to_tick(ask_price, tick);
+                    warn!(elapsed_ms = elapsed, %price, "phase 2 timeout — FOK taker");
+                    let mut signal = make_leg2_signal(
+                        &hedge_token_id,
+                        state.active_condition_id.as_deref().unwrap_or(""),
+                        price,
+                        leg1_size,
+                        reference_price,
+                        snap.confidence,
+                        snap.tier,
+                        Decimal::ZERO,
+                        snap.direction,
+                        snap.spike_info,
+                        leg1_price,
+                        now_ms,
+                        market_end_ms,
+                        tick,
+                        atr,
+                        false,
+                        Some(hedge_book.clone()),
+                        Some(ExitReason::BreakEvenBreach),
+                    );
+                    signal.sim_was_taker = true;
+                    return Some(Leg2Decision::Emergency {
+                        signal,
+                        price,
+                        size: leg1_size,
+                    });
+                }
+            }
+        }
+
+        // Immediate BE breach: if ask >= break-even → immediate FOK taker.
         if let Some(ask_price) = best_ask_price {
             if leg1_price + ask_price > Decimal::ONE {
-                let price = round_to_tick(ask_price - tick, tick);
+                let price = round_to_tick(ask_price, tick);
                 let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
                 if fok_size <= Decimal::ZERO {
-                    warn!(%leg1_price, %ask_price, "phase 2 BE breach — no ask depth for emergency");
+                    warn!(%leg1_price, %ask_price, "phase 2 BE breach — no ask depth for FOK");
                     return None;
                 }
-                warn!(%leg1_price, %ask_price, %fok_size, %price, "phase 2 break-even breach — emergency Leg 2");
-                let signal = make_leg2_signal(
+                warn!(%leg1_price, %ask_price, %fok_size, %price, "phase 2 break-even breach — immediate FOK taker");
+                let mut signal = make_leg2_signal(
                     &hedge_token_id,
                     state.active_condition_id.as_deref().unwrap_or(""),
                     price,
@@ -802,6 +688,7 @@ impl Leg2Evaluator {
                     Some(hedge_book.clone()),
                     Some(ExitReason::BreakEvenBreach),
                 );
+                signal.sim_was_taker = true;
                 return Some(Leg2Decision::Emergency {
                     signal,
                     price,
@@ -810,42 +697,7 @@ impl Leg2Evaluator {
             }
         }
 
-        // Phase 2 price improvement: repost only when book offers strictly better price.
-        if let Some(ask_price) = best_ask_price {
-            let target_price = round_to_tick(ask_price - tick, tick);
-            let current_posted = snap.phase2_posted_price.unwrap_or(Decimal::ZERO);
-
-            if target_price > current_posted {
-                debug!(%target_price, %current_posted, "phase 2 price improvement — reposting");
-                let signal = make_leg2_signal(
-                    &hedge_token_id,
-                    state.active_condition_id.as_deref().unwrap_or(""),
-                    target_price,
-                    leg1_size,
-                    reference_price,
-                    snap.confidence,
-                    snap.tier,
-                    Decimal::ZERO,
-                    snap.direction,
-                    snap.spike_info,
-                    leg1_price,
-                    now_ms,
-                    market_end_ms,
-                    tick,
-                    atr,
-                    false,
-                    Some(hedge_book.clone()),
-                    None,
-                );
-                return Some(Leg2Decision::Phase2Repost {
-                    signal,
-                    price: target_price,
-                    size: leg1_size,
-                });
-            }
-        }
-
-        // No improvement — preserve queue priority.
+        // Hold position — preserve FIFO queue priority.
         None
     }
 }
@@ -871,13 +723,7 @@ pub(crate) enum Leg2Decision {
         size: Decimal,
         reason: TransitionReason,
     },
-    /// Phase 2 improvement repost: book offers better price than current resting order.
-    Phase2Repost {
-        signal: TradeSignal,
-        price: Decimal,
-        size: Decimal,
-    },
-    /// An emergency FOK fill (deadline, break-even breach, or adverse movement).
+    /// An emergency FOK fill (break-even breach, Phase 1 breach, Phase 2 timeout, or whipsaw).
     Emergency {
         signal: TradeSignal,
         price: Decimal,
@@ -888,8 +734,6 @@ pub(crate) enum Leg2Decision {
 /// Reason for transitioning from Phase 1 to Phase 2.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransitionReason {
-    /// Pair cost exceeded phase1_breach_threshold.
-    Breach,
     /// Phase 1 timeout elapsed without fill.
     Timeout,
 }
@@ -899,7 +743,6 @@ impl Leg2Decision {
         match self {
             Leg2Decision::Phase1Post { signal, .. }
             | Leg2Decision::PhaseTransition { signal, .. }
-            | Leg2Decision::Phase2Repost { signal, .. }
             | Leg2Decision::Emergency { signal, .. } => signal,
         }
     }
@@ -912,7 +755,6 @@ impl Leg2Decision {
         match self {
             Leg2Decision::Phase1Post { price, .. }
             | Leg2Decision::PhaseTransition { price, .. }
-            | Leg2Decision::Phase2Repost { price, .. }
             | Leg2Decision::Emergency { price, .. } => *price,
         }
     }
@@ -921,7 +763,6 @@ impl Leg2Decision {
         match self {
             Leg2Decision::Phase1Post { size, .. }
             | Leg2Decision::PhaseTransition { size, .. }
-            | Leg2Decision::Phase2Repost { size, .. }
             | Leg2Decision::Emergency { size, .. } => *size,
         }
     }
@@ -1154,7 +995,7 @@ mod tests {
 
     /// Build a minimal MarketState + HedgeSnap suitable for emergency repost tests.
     /// Direction::Up → hedge token is NO → evaluator reads `poly_no_book`.
-    fn make_emergency_test_setup(
+    fn make_leg2_test_setup(
         no_book_ask: &str,
         now_ms: u64,
     ) -> (MarketState, HedgeSnap, Leg2Evaluator) {
@@ -1189,7 +1030,7 @@ mod tests {
                 fill_timestamp_ms: now_ms - 5_000,
             },
             leg2_state: OrderState::Posted {
-                order_id: "sim-leg2-emergency".into(),
+                order_id: "sim-leg2".into(),
                 price: Decimal::new(48, 2),
                 size: Decimal::new(100, 0),
                 timestamp_ms: now_ms - 1_000,
@@ -1198,11 +1039,10 @@ mod tests {
         };
 
         let snap = HedgeSnap {
-            emergency_submitted: true,
+            emergency_submitted: false,
             break_even: Decimal::new(50, 2),
             initial_profit_target: Decimal::new(25, 3), // 2.5%
             direction: Direction::Up,
-            binance_at_fill: Some(Decimal::new(50_000, 0)),
             fill_ms: now_ms - 5_000,
             tier: ProfitTier::High,
             confidence: Decimal::new(7, 1),
@@ -1213,142 +1053,44 @@ mod tests {
                 timestamp_ms: now_ms - 6_000,
                 atr_ratio: Decimal::ZERO,
             },
-            leg1_fill_price: Decimal::new(50, 2),
-            exit_reason: Some(ExitReason::AdverseMovement),
-            emergency_first_post_ms: Some(now_ms - 1_000),
-            emergency_posted_price: Some(Decimal::new(48, 2)),
-            fok_emitted: false,
             phase: HedgePhase::Phase1,
             phase1_target_price: Decimal::new(475, 3),
-            phase2_posted_price: None,
+            phase2_start_ms: None,
         };
 
         let evaluator = Leg2Evaluator {
-            adverse_threshold: Decimal::new(3, 3),
             phase1_timeout_ms: 2000,
             depth_wall_multiplier: Decimal::new(4, 0),
-            emergency_deadline_ms: 2500,
             phase1_breach_threshold: Decimal::new(105, 2),
+            phase2_timeout_ms: 2000,
         };
 
         (state, snap, evaluator)
     }
 
-    #[test]
-    fn test_emergency_no_repost_without_price_improvement() {
-        let now_ms = 100_000;
-        // Posted at 0.48, ask at 0.49 → best_ask - tick = 0.48 == posted → no improvement.
-        let (state, snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        let last_hedge_ms = now_ms - 200;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
-        assert!(
-            result.is_none(),
-            "should not repost when price hasn't improved (preserves queue priority)"
-        );
-    }
+    // ── Emergency submitted returns None (no chase) ───────────────────
 
     #[test]
-    fn test_emergency_price_chase_on_improvement() {
+    fn test_emergency_submitted_returns_none() {
         let now_ms = 100_000;
-        // Posted at 0.48, ask at 0.52 → best_ask - tick = 0.51 > 0.48 → price improved.
-        let (state, snap, evaluator) = make_emergency_test_setup("0.52", now_ms);
-        let last_hedge_ms = now_ms - 200;
-        let decision = evaluator
-            .evaluate_leg2(&state, &snap, last_hedge_ms, now_ms)
-            .expect("should emit price-chase repost");
-        assert!(decision.is_emergency());
-        assert_eq!(
-            decision.price(),
-            Decimal::new(51, 2),
-            "should repost at best_ask(0.52) - tick(0.01) = 0.51"
-        );
-        let sig = decision.into_signal();
-        assert_eq!(sig.exit_reason, Some(ExitReason::AdverseMovement));
-        assert!(
-            !sig.sim_was_taker,
-            "price-chase should be post-only (not taker)"
-        );
-    }
-
-    #[test]
-    fn test_emergency_fok_at_deadline() {
-        let now_ms = 100_000;
-        let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // Emergency started 3s ago → past 2.5s deadline.
-        snap.emergency_first_post_ms = Some(now_ms - 3_000);
-        let last_hedge_ms = now_ms - 200;
-        let decision = evaluator
-            .evaluate_leg2(&state, &snap, last_hedge_ms, now_ms)
-            .expect("should emit FOK at deadline");
-        assert!(decision.is_emergency());
-        assert_eq!(
-            decision.price(),
-            Decimal::new(49, 2),
-            "deadline FOK should be at best_ask (crosses spread)"
-        );
-        let sig = decision.into_signal();
-        assert!(sig.sim_was_taker, "deadline FOK should be marked as taker");
-    }
-
-    #[test]
-    fn test_emergency_no_fok_before_deadline() {
-        let now_ms = 100_000;
-        let (state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // Emergency started 1s ago → within 2.5s deadline. Same price → no improvement.
-        snap.emergency_first_post_ms = Some(now_ms - 1_000);
-        let last_hedge_ms = now_ms - 200;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
-        assert!(
-            result.is_none(),
-            "should not FOK before deadline when no price improvement"
-        );
-    }
-
-    // ── Adverse movement uses post-only price ─────────────────────────
-
-    #[test]
-    fn test_adverse_movement_uses_post_only_price() {
-        use crate::types::market::OrderState;
-        let now_ms = 100_000;
-
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        // NOT in emergency mode, Phase 1 in progress.
-        snap.emergency_submitted = false;
-        snap.exit_reason = None;
-        // Set Binance fill price and current — adverse movement > 0.3% reversal.
-        snap.binance_at_fill = Some(Decimal::new(50_000, 0));
-        state.binance_price = Some(Decimal::new(49_800, 0)); // 0.4% drop → adverse
-        state.leg2_state = OrderState::Posted {
-            order_id: "sim-leg2".into(),
-            price: Decimal::new(48, 2),
-            size: Decimal::new(100, 0),
-            timestamp_ms: now_ms - 1_000,
+        let (_state, mut snap, evaluator) = make_leg2_test_setup("0.49", now_ms);
+        snap.emergency_submitted = true;
+        let state = {
+            let (s, _, _) = make_leg2_test_setup("0.49", now_ms);
+            s
         };
-
-        let last_hedge_ms = now_ms - 5_000;
-        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
-        assert!(result.is_some(), "adverse should trigger");
-        let decision = result.unwrap();
-        assert!(decision.is_emergency());
-        // Price should be post-only: best_ask(0.49) - tick(0.01) = 0.48
-        assert_eq!(
-            decision.price(),
-            Decimal::new(48, 2),
-            "adverse movement should post at best_ask - tick (post-only)"
-        );
+        let result = evaluator.evaluate_leg2(&state, &snap, now_ms - 200, now_ms);
+        assert!(result.is_none(), "emergency_submitted should short-circuit to None");
     }
 
-    // ── Phase 1 breach triggers transition ────────────────────────────
+    // ── Phase 1 breach triggers immediate FOK ─────────────────────────
 
     #[test]
-    fn test_phase1_breach_triggers_transition() {
+    fn test_phase1_breach_triggers_fok() {
         use crate::types::market::OrderState;
         let now_ms = 100_000;
 
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.56", now_ms);
-        // NOT in emergency mode, Phase 1 in progress.
-        snap.emergency_submitted = false;
-        snap.exit_reason = None;
+        let (mut state, mut snap, evaluator) = make_leg2_test_setup("0.56", now_ms);
         snap.phase = HedgePhase::Phase1;
         state.leg2_state = OrderState::Posted {
             order_id: "sim-leg2".into(),
@@ -1359,14 +1101,14 @@ mod tests {
         // leg1=0.50, ask=0.56 → pair=1.06 > 1.05 threshold → breach
         let last_hedge_ms = now_ms - 200;
         let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
-        assert!(result.is_some(), "phase 1 breach should trigger transition");
+        assert!(result.is_some(), "phase 1 breach should trigger FOK");
         let decision = result.unwrap();
-        assert!(!decision.is_emergency(), "breach should be transition, not emergency");
-        assert!(matches!(decision, Leg2Decision::PhaseTransition { reason: TransitionReason::Breach, .. }));
-        // Price should be post-only: 0.56 - 0.01 = 0.55
-        assert_eq!(decision.price(), Decimal::new(55, 2));
+        assert!(decision.is_emergency(), "breach should be emergency (FOK)");
+        // Price should be at ask: 0.56
+        assert_eq!(decision.price(), Decimal::new(56, 2));
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::Phase1Breach));
+        assert!(sig.sim_was_taker, "phase 1 breach FOK should be marked as taker");
     }
 
     // ── Phase 1 timeout triggers transition ───────────────────────────
@@ -1376,9 +1118,7 @@ mod tests {
         use crate::types::market::OrderState;
         let now_ms = 100_000;
 
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        snap.emergency_submitted = false;
-        snap.exit_reason = None;
+        let (mut state, mut snap, evaluator) = make_leg2_test_setup("0.49", now_ms);
         snap.phase = HedgePhase::Phase1;
         // fill_ms 3s ago → past 2s timeout
         snap.fill_ms = now_ms - 3_000;
@@ -1403,11 +1143,9 @@ mod tests {
         use crate::types::market::OrderState;
         let now_ms = 100_000;
 
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.51", now_ms);
-        snap.emergency_submitted = false;
-        snap.exit_reason = None;
+        let (mut state, mut snap, evaluator) = make_leg2_test_setup("0.51", now_ms);
         snap.phase = HedgePhase::Phase2;
-        snap.phase2_posted_price = Some(Decimal::new(48, 2));
+        snap.phase2_start_ms = Some(now_ms - 500);
         state.leg2_state = OrderState::Posted {
             order_id: "sim-leg2".into(),
             price: Decimal::new(48, 2),
@@ -1420,35 +1158,61 @@ mod tests {
         assert!(result.is_some(), "BE breach should trigger emergency");
         let decision = result.unwrap();
         assert!(decision.is_emergency());
+        // Price should be at ask (FOK): 0.51
+        assert_eq!(decision.price(), Decimal::new(51, 2));
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+        assert!(sig.sim_was_taker, "BE breach FOK should be marked as taker");
     }
 
-    // ── Phase 2 price improvement triggers repost ─────────────────────
+    // ── Phase 2 timeout triggers FOK ───────────────────────────────────
 
     #[test]
-    fn test_phase2_price_improvement_repost() {
+    fn test_phase2_timeout_triggers_fok() {
         use crate::types::market::OrderState;
         let now_ms = 100_000;
 
-        let (mut state, mut snap, evaluator) = make_emergency_test_setup("0.49", now_ms);
-        snap.emergency_submitted = false;
-        snap.exit_reason = None;
+        let (mut state, mut snap, evaluator) = make_leg2_test_setup("0.49", now_ms);
         snap.phase = HedgePhase::Phase2;
-        snap.phase2_posted_price = Some(Decimal::new(46, 2)); // currently at 0.46
+        snap.phase2_start_ms = Some(now_ms - 3_000); // 3s ago > 2s timeout
+        state.leg2_state = OrderState::Posted {
+            order_id: "sim-leg2".into(),
+            price: Decimal::new(48, 2),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 3_000,
+        };
+        let last_hedge_ms = now_ms - 200;
+        let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
+        assert!(result.is_some(), "phase 2 timeout should trigger FOK");
+        let decision = result.unwrap();
+        assert!(decision.is_emergency());
+        // Price should be at ask (FOK): 0.49
+        assert_eq!(decision.price(), Decimal::new(49, 2));
+        let sig = decision.into_signal();
+        assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+        assert!(sig.sim_was_taker, "phase 2 timeout FOK should be marked as taker");
+    }
+
+    // ── Phase 2 holds position (no repost) ──────────────────────────────
+
+    #[test]
+    fn test_phase2_no_repost_on_price_improvement() {
+        use crate::types::market::OrderState;
+        let now_ms = 100_000;
+
+        let (mut state, mut snap, evaluator) = make_leg2_test_setup("0.49", now_ms);
+        snap.phase = HedgePhase::Phase2;
+        snap.phase2_start_ms = Some(now_ms - 500); // within timeout
         state.leg2_state = OrderState::Posted {
             order_id: "sim-leg2".into(),
             price: Decimal::new(46, 2),
             size: Decimal::new(100, 0),
             timestamp_ms: now_ms - 1_000,
         };
-        // ask=0.49 → ask-tick=0.48 > 0.46 → improvement
+        // ask=0.49 → previously would have triggered repost. Now should hold.
         let last_hedge_ms = now_ms - 200;
         let result = evaluator.evaluate_leg2(&state, &snap, last_hedge_ms, now_ms);
-        assert!(result.is_some(), "price improvement should trigger repost");
-        let decision = result.unwrap();
-        assert!(matches!(decision, Leg2Decision::Phase2Repost { .. }));
-        assert_eq!(decision.price(), Decimal::new(48, 2));
+        assert!(result.is_none(), "Phase 2 should hold position — no reposts");
     }
 
 }

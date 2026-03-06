@@ -31,15 +31,10 @@ pub(crate) struct HedgeState {
     pub direction: Direction,
     pub spike_info: SpikeInfo,
     pub confidence: Decimal,
-    pub binance_at_fill: Option<Decimal>,
     pub emergency_submitted: bool,
     /// Set when an emergency FOK is confirmed — carries the reason for executor categorization.
     pub exit_reason: Option<ExitReason>,
-    /// Epoch ms when the first emergency order was posted (for hard deadline).
-    pub emergency_first_post_ms: Option<u64>,
-    /// Price of the currently resting emergency order (for price-chase comparison).
-    pub emergency_posted_price: Option<Decimal>,
-    /// Set once a deadline-triggered FOK signal has been emitted to the executor.
+    /// Set once an emergency FOK signal has been emitted to the executor.
     /// Prevents the evaluator from re-emitting FOK on every cycle (~2-50ms).
     pub fok_emitted: bool,
     /// Current hedge phase.
@@ -48,6 +43,8 @@ pub(crate) struct HedgeState {
     pub phase1_target_price: Decimal,
     /// Tracks the currently resting Phase 2 price (for improvement check).
     pub phase2_posted_price: Option<Decimal>,
+    /// Epoch ms when Phase 2 started (for Phase 2 timeout).
+    pub phase2_start_ms: Option<u64>,
 }
 
 impl HedgeState {
@@ -59,7 +56,6 @@ impl HedgeState {
         direction: Direction,
         spike_info: SpikeInfo,
         confidence: Decimal,
-        binance_at_fill: Option<Decimal>,
         phase1_target_price: Decimal,
     ) -> Self {
         Self {
@@ -70,15 +66,13 @@ impl HedgeState {
             direction,
             spike_info,
             confidence,
-            binance_at_fill,
             emergency_submitted: false,
             exit_reason: None,
-            emergency_first_post_ms: None,
-            emergency_posted_price: None,
             fok_emitted: false,
             phase: HedgePhase::Phase1,
             phase1_target_price,
             phase2_posted_price: None,
+            phase2_start_ms: None,
         }
     }
 
@@ -108,28 +102,16 @@ pub(crate) struct HedgeSnap {
     pub break_even: Decimal,
     pub initial_profit_target: Decimal,
     pub direction: Direction,
-    pub binance_at_fill: Option<Decimal>,
     pub fill_ms: u64,
     pub tier: ProfitTier,
     pub confidence: Decimal,
     pub spike_info: SpikeInfo,
-    /// Leg 1 fill price — needed for building repost signals.
-    pub leg1_fill_price: Decimal,
-    /// Exit reason from the hedge state — carried for emergency reposts.
-    pub exit_reason: Option<ExitReason>,
-    /// Epoch ms when the first emergency order was posted (for hard deadline).
-    pub emergency_first_post_ms: Option<u64>,
-    /// Price of the currently resting emergency order (for price-chase comparison).
-    pub emergency_posted_price: Option<Decimal>,
-    /// `true` once a deadline-triggered FOK signal has been emitted. Prevents
-    /// the evaluator from flooding the executor with duplicate FOK signals.
-    pub fok_emitted: bool,
     /// Current hedge phase.
     pub phase: HedgePhase,
     /// The initial Phase 1 post price (for skip-guard comparison).
     pub phase1_target_price: Decimal,
-    /// Tracks the currently resting Phase 2 price (for improvement check).
-    pub phase2_posted_price: Option<Decimal>,
+    /// Epoch ms when Phase 2 started (for Phase 2 timeout).
+    pub phase2_start_ms: Option<u64>,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -153,7 +135,6 @@ mod tests {
                 atr_ratio: Decimal::ZERO,
             },
             Decimal::new(7, 1),      // confidence = 0.7
-            None,
             Decimal::new(475, 3),    // phase1_target_price = 0.475
         )
     }
@@ -180,10 +161,8 @@ mod tests {
     }
 
     #[test]
-    fn test_emergency_fields_initialize_to_none() {
+    fn test_emergency_fields_initialize_to_defaults() {
         let h = make_hedge();
-        assert!(h.emergency_first_post_ms.is_none());
-        assert!(h.emergency_posted_price.is_none());
         assert!(!h.emergency_submitted);
         assert!(!h.fok_emitted);
     }

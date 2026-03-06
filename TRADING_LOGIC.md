@@ -13,16 +13,15 @@ This document covers FaCaiBot's trading logic: signal detection, entry validatio
 5. [Leg 1 Execution](#5-leg-1-execution)
 6. [Leg 2 Hedge System (2-Phase)](#6-leg-2-hedge-system-2-phase)
 7. [Emergency Exits](#7-emergency-exits)
-8. [Price-Improvement Chase Strategy](#8-price-improvement-chase-strategy)
-9. [Favorable Taker Exits](#9-favorable-taker-exits)
-10. [Trade Completion & State Reset](#10-trade-completion--state-reset)
-11. [Market Rotation](#11-market-rotation)
-12. [Cutoff Window](#12-cutoff-window)
-13. [Capital Management](#13-capital-management)
-14. [State Machines & Transitions](#14-state-machines--transitions)
-15. [Edge Cases & Race Conditions](#15-edge-cases--race-conditions)
-16. [Complete Trade Example](#16-complete-trade-example)
-17. [Simulation vs Live Differences](#17-simulation-vs-live-differences)
+8. [Favorable Taker Exits](#8-favorable-taker-exits)
+9. [Trade Completion & State Reset](#9-trade-completion--state-reset)
+10. [Market Rotation](#10-market-rotation)
+11. [Cutoff Window](#11-cutoff-window)
+12. [Capital Management](#12-capital-management)
+13. [State Machines & Transitions](#13-state-machines--transitions)
+14. [Edge Cases & Race Conditions](#14-edge-cases--race-conditions)
+15. [Complete Trade Example](#15-complete-trade-example)
+16. [Simulation vs Live Differences](#16-simulation-vs-live-differences)
 
 ---
 
@@ -40,7 +39,7 @@ Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
 
 **Key economics:**
 - Both legs target post-only execution (maker, zero fee)
-- Taker fees apply only to FOK emergency exits (adverse, Phase 1 breach, break-even breach, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
+- Taker fees apply only to FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
 - Unfilled post-only orders cost nothing — failed signals are free
 
 **One trade at a time.** The engine self-gates after emitting a Leg 1 signal: no new spikes are evaluated until the current trade completes or resets.
@@ -185,7 +184,7 @@ If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) 
 
 ### Hedge state initialization
 
-When Leg 1 fills, the engine calls `init_leg2()` which captures: fill timestamp, fill price, fill size, initial profit target (from tier), the Binance mid at fill time (`binance_at_fill`), and computes the Phase 1 target price. The hedge begins in `HedgePhase::Phase1`.
+When Leg 1 fills, the engine calls `init_leg2()` which captures: fill timestamp, fill price, fill size, initial profit target (from tier), and computes the Phase 1 target price. The hedge begins in `HedgePhase::Phase1`.
 
 ### 2-Phase design
 
@@ -197,10 +196,11 @@ The hedge system uses two phases with a single cancel/repost at the transition �
 - If filled during Phase 1 → trade completes at the profit target (best outcome)
 - If `phase1_timeout_ms` elapses without fill → transition to Phase 2
 
-**Phase 2 — Break-even pursuit**:
+**Phase 2 — Break-even pursuit** (`phase2_timeout_ms`, default 2000ms):
 - Single cancel/repost at `best_ask - 1 tick` (aggressive maker)
-- Only repost when the book offers a strictly better price (preserves FIFO queue priority)
-- If `leg1_price + ask > $1.00` → break-even breach → emergency exit (Section 7/8)
+- **No reposts** — hold position, preserve FIFO queue priority
+- Phase 2 timeout (`phase2_timeout_ms` elapsed) → immediate FOK taker at best ask
+- If `leg1_price + ask > $1.00` → break-even breach → immediate FOK taker at best ask (Section 7)
 
 ### Phase 1 target price computation
 
@@ -214,65 +214,62 @@ The hedge system uses two phases with a single cancel/repost at the transition �
 
 If the current resting Leg 2 order is already at a price equal to or better than the Phase 1 target, the evaluator returns None — preserving the favorable position.
 
-### Phase 2 price tracking
+### Phase 2 behavior
 
-`HedgeState.phase2_posted_price` tracks the currently resting Phase 2 price. Reposts only occur when `round_to_tick(best_ask - tick, tick) > phase2_posted_price` — strictly better price available. This preserves FIFO queue priority and avoids unnecessary cancel/repost churn.
+Phase 2 posts once at `best_ask - 1 tick` and holds position — no reposts, preserving FIFO queue priority. Two exit triggers: (1) `phase2_timeout_ms` elapsed → FOK taker; (2) break-even breach (`pair > $1.00`) → immediate FOK taker. `HedgeState.phase2_start_ms` tracks when Phase 2 began for timeout calculation.
 
 ### Hedge evaluation flow
 
 On every engine event, if hedge exists and `leg1_state == Filled`:
 
-1. Is emergency already submitted? → price-improvement chase (see Section 8). After `emergency_deadline_ms` → FOK at best_ask
+1. Is emergency already submitted? → return None (FOK already dispatched, executor handles it)
 2. Compute hedge book data (direction-aware)
-3. Check adverse movement (Binance reversal) → emergency post-only
-4. **Phase 1 path** (if `phase == Phase1`):
-   - Check Phase 1 breach (pair cost > `phase1_breach_threshold`) → transition to Phase 2
+3. **Phase 1 path** (if `phase == Phase1`):
+   - Check Phase 1 breach (pair cost > `phase1_breach_threshold`) → immediate FOK taker at ask
    - Check Phase 1 timeout (`elapsed >= phase1_timeout_ms`) → transition to Phase 2
    - Skip guard: if posted price <= target → hold
    - Emit Phase 1 post signal
-5. **Phase 2 path** (if `phase == Phase2`):
-   - Check break-even breach (pair cost > $1.00) → emergency
-   - Check price improvement → repost at `ask - 1 tick`
-   - No improvement → hold (preserve queue priority)
+4. **Phase 2 path** (if `phase == Phase2`):
+   - Check Phase 2 timeout (`elapsed >= phase2_timeout_ms`) → FOK taker at best ask
+   - Check break-even breach (pair cost > $1.00) → immediate FOK taker at ask
+   - No breach/timeout → hold (preserve queue priority, no reposts)
 
 ---
 
 ## 7. Emergency Exits
 
-All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator switches from hedge mode to emergency repost mode (see Section 8). Exception: `WhipsawReversal` bypasses the hedge system and emergency repost entirely — it emits an immediate FOK at best ask.
+All emergency exits set `emergency_submitted = true` and record an `exit_reason`. Once set, the evaluator returns None on subsequent evaluations — the executor handles the FOK. All emergency exits are **immediate FOK taker at ask** — no post-only chase, no deadline, no reposts. The ~4s hedge window (Phase 1 + Phase 2) is short enough that any meaningful Binance reversal reprices the Polymarket book and triggers Phase 2 BE breach anyway. Whipsaw catches violent reversals (opposite spike detected after fill).
 
-### 7a. Adverse Movement
+### 7a. Phase 1 Breach
 
-**Trigger:** Binance reversal from `binance_at_fill` exceeds `adverse_threshold` (0.1%). Checked on every evaluation with zero grace period. The spike thesis is invalidated by the source (Binance) itself.
-
-- Direction-aware: Up spike → adverse if price dropped; Down spike → adverse if price rose
-- **Price:** First signal is post-only at `best_ask - 1 tick`. Subsequent reposts only on price improvement (Section 8), FOK fallback at `emergency_deadline_ms`
-- **FOK size:** `min(leg1_size, ask_depth_within_2_ticks)` — capped at available liquidity
-- **Exit reason:** `AdverseMovement`
-
-### 7b. Phase 1 Breach
-
-**Trigger:** Pair cost has exceeded `phase1_breach_threshold` ($1.05) during Phase 1. Catches fast book repricing that pushes the pair well above break-even. Rather than waiting for the Phase 1 timeout to expire, this triggers an immediate transition to Phase 2 (break-even pursuit).
+**Trigger:** Pair cost has exceeded `phase1_breach_threshold` ($1.05) during Phase 1. Catches fast book repricing that pushes the pair well above break-even.
 
 **Gates (all must be true):**
 1. `phase == Phase1` (only during Phase 1 — Phase 2 has its own break-even breach check)
 2. `leg1_price + current_opposing_ask > phase1_breach_threshold` (stricter threshold than break-even)
 
-**Action:** Transition to Phase 2 — cancel and repost at `best_ask - 1 tick`.
+**Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
 
 **Exit reason:** `Phase1Breach`
 
-### 7c. Break-Even Breach
+### 7b. Break-Even Breach
 
-**Trigger:** Pair cost has exceeded $1.00 during Phase 2.
+**Trigger:** Pair cost has exceeded $1.00 during Phase 2 — continuous check while the maker order rests.
 
 **Gates (all must be true):**
-1. `phase == Phase2` (only during Phase 2 — Phase 1 has its own breach check at a stricter threshold)
-2. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
+1. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
 
-**Price:** Post-only at `best_ask - 1 tick`, price-improvement chase, FOK fallback at deadline (Section 8).
+**Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
 
 **Exit reason:** `BreakEvenBreach`
+
+### 7c. Phase 2 Timeout
+
+**Trigger:** Phase 2 has been active for `phase2_timeout_ms` (default 2000ms) without a fill.
+
+**Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
+
+**Exit reason:** `BreakEvenBreach` (the market has moved away from the profit target; the timeout is a safety net)
 
 ### 7d. Rotation Emergency (Market Expiry)
 
@@ -298,48 +295,7 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 ---
 
-## 8. Price-Improvement Chase Strategy
-
-Emergency exits use a **price-improvement chase with hard deadline** strategy to minimize taker fees while preserving FIFO queue priority.
-
-### How it works
-
-Once `emergency_submitted = true`, the engine posts an aggressive post-only limit at `best_ask - 1 tick` and records `emergency_first_post_ms` (deadline clock start) and `emergency_posted_price` (current resting price). From that point, on each Polymarket book update:
-
-1. **Deadline check**: If `now - emergency_first_post_ms >= emergency_deadline_ms` (default 2000ms) → FOK at `round_to_tick(best_ask, tick)` (guaranteed fill, taker fee). The `exit_reason` is re-evaluated at deadline time: if the FOK price makes `pair_cost >= $1.00`, a stale `FavorableTaker` is overridden to `BreakEvenBreach` (prevents favorable labeling on losing trades). The price is rounded to tick size to prevent SDK validation errors from raw book prices (e.g., 16-decimal-place prices)
-2. **Price improvement check**: If `best_ask - 1 tick > emergency_posted_price` → cancel and repost at the improved price (price-chase)
-3. **No change**: Hold current order — preserve FIFO queue priority (no blind reposts)
-
-**Key insight**: Binance tick events are irrelevant during emergency exit (only Polymarket book changes affect exit pricing). The engine skips evaluation on Binance events when in emergency mode, only re-evaluating on Polymarket book/price updates or when the deadline may have expired.
-
-### Example timeline
-
-| Time | Book state | Action |
-|------|-----------|--------|
-| T+0 | ask=0.52 | Emergency trigger → post-only at 0.51 (`best_ask - tick`) |
-| T+800ms | ask=0.52 | Book update, no improvement → hold (preserve queue) |
-| T+1200ms | ask=0.54 | Book update, 0.53 > 0.51 → cancel and repost at 0.53 |
-| T+2000ms | ask=0.54 | Book update, no improvement → hold |
-| T+2000ms | — | Deadline expired → FOK at `best_ask` |
-
-### Live executor flow
-
-The evaluator communicates intent via the `sim_was_taker` flag on `TradeSignal`:
-
-- `sim_was_taker = true` (deadline expired): Cancel existing → FOK at `signal.price` (the evaluator set this to `round_to_tick(best_ask, tick)`). On liquidity failure (Rejected or non-transient error), price escalates +1 tick per attempt up to `$1.00` cap (~23 ticks max, ~2.3s to sweep). `clob_safe_fok_size()` recomputed each iteration. Aborts immediately on SDK validation errors ("decimal places", "Validation", "balance", "allowance") or zero safe size
-- `sim_was_taker = false` (price-chase): Cancel existing → aggressive post-only at `signal.price` (evaluator already computed `best_ask - 1 tick`). If CLOB rejects (would cross spread) → FOK fallback at `signal.price + tick` with same price-escalating sweep
-
-### Simulation model
-
-Emergency fills wait the full deadline window. On each book update: if `best_ask <= posted_price` → maker fill (zero fee, market came to our bid). If deadline expires without fill → taker FOK at `best_ask` (taker fee applies). The `sim_was_taker` flag propagates to the executor for fee treatment.
-
-### Fee savings
-
-At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase avoids this fee entirely when the market moves to our posted price within the deadline. Queue priority preservation means our resting order is ahead of later arrivals at the same price level.
-
----
-
-## 9. Favorable Taker Exits
+## 8. Favorable Taker Exits
 
 **Trigger:** During normal hedge (Phase 1 or Phase 2), the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes at the ask — taker fee is acceptable insurance vs the risk of an open position.
 
@@ -353,7 +309,7 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 
 ---
 
-## 10. Trade Completion & State Reset
+## 9. Trade Completion & State Reset
 
 ### Detection
 
@@ -377,7 +333,7 @@ On completion: `leg1_state`, `leg2_state`, and `hedge` all reset to None. `cumul
 
 ---
 
-## 11. Market Rotation
+## 10. Market Rotation
 
 ### Timeline
 
@@ -422,7 +378,7 @@ All market-specific state resets: active token IDs updated, books cleared, spike
 
 ---
 
-## 12. Cutoff Window
+## 11. Cutoff Window
 
 ### Detection
 
@@ -434,14 +390,14 @@ Checked on every event (not just spikes) — the cutoff is detected promptly reg
 |--------|---------------|
 | New Leg 1 entries | **Blocked** — spikes dropped |
 | Existing Leg 2 hedge | **Continues** — no cutoff check in Leg 2 evaluation |
-| Emergency exits | **Continue** — adverse, Phase 1 breach, break-even, whipsaw, favorable all active |
+| Emergency exits | **Continue** — Phase 1 breach, break-even, Phase 2 timeout, whipsaw, favorable all active |
 | Market summary | **Sent** — `MarketCutoff` triggers Telegram summary (sim) |
 
 When first entering cutoff with an open position, a log notes "Leg 2 will continue until rotation" — informational only, no special action taken.
 
 ---
 
-## 12b. Rotation Quiet Period
+## 11b. Rotation Quiet Period
 
 ### Detection
 
@@ -465,7 +421,7 @@ After market rotation, the Polymarket book takes ~20-30s to fully reprice. Entri
 
 ---
 
-## 12c. Trade Cooldown
+## 11c. Trade Cooldown
 
 ### Detection
 
@@ -492,7 +448,7 @@ Cleared on `MarketRotation` — a new market shouldn't inherit a stale cooldown 
 
 ---
 
-## 13. Capital Management
+## 12. Capital Management
 
 ### Per-trade allocation
 
@@ -518,7 +474,7 @@ In live mode, the wallet USDC.e balance is the real constraint. No virtual balan
 
 ---
 
-## 14. State Machines & Transitions
+## 13. State Machines & Transitions
 
 ### OrderState
 
@@ -545,21 +501,25 @@ None ──────────────► Posted ───────�
                   init_leg2()
    None ────────────────────► Phase1 (emergency=false)
                                   │
-                       ┌──────────┼──────────┐
-                       ▼          ▼          ▼
-                Phase1 breach  Adverse   Phase1 timeout
-                or timeout     movement
-                       │          │          │
-                       ▼          │          ▼
-                    Phase2        │     Phase2 (ask-1tick)
-                       │          │          │
-                       ▼          ▼          ▼
-                  BE breach  emergency_submitted = true
-                       │     exit_reason = Some(...)
-                       │          │
-                       ▼          ▼
-                    Leg 2 fill detected
-                       │
+                       ┌──────────┴──────────┐
+                       ▼                     ▼
+                Phase1 breach          Phase1 timeout
+                (immediate FOK)              │
+                       │                     ▼
+                       │              Phase2 (ask-1tick)
+                       │                     │
+                       │          ┌──────────┼──────────┐
+                       │          ▼          ▼          ▼
+                       │    BE breach   Phase2 timeout  Maker fill
+                       │   (immed FOK)  (immed FOK)       │
+                       │          │          │             │
+                       ▼          ▼          ▼             ▼
+                    emergency_submitted = true      Leg 2 Filled
+                    exit_reason = Some(...)               │
+                       │                                  │
+                       ▼                                  ▼
+                    Leg 2 fill detected          on_trade_complete()
+                       │                          hedge = None
                        ▼
               on_trade_complete()
                   hedge = None
@@ -596,8 +556,8 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 5. evaluate_leg2() runs on each event:
    - Phase 1: post at profit target, hold until fill or timeout
-   - Phase 2: post at ask-1tick, repost on improvement only
-   - Emergency: set emergency_submitted → post-only first, FOK fallback
+   - Phase 2: post at ask-1tick, hold position (no reposts — preserve FIFO)
+   - Emergency triggers (breach/timeout/whipsaw): immediate FOK taker at ask
 
 6a. [SIM] advance_simulation() Leg 2 fill detected
     leg2_state = Filled, emit confirmed fill signal
@@ -610,7 +570,7 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 ---
 
-## 15. Edge Cases & Race Conditions
+## 14. Edge Cases & Race Conditions
 
 ### Rotation while Leg 2 is posting
 
@@ -632,17 +592,13 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 The evaluator's stale book check (500ms threshold) rejects signals based on old data.
 
-### Adverse movement false positives
-
-The `adverse_threshold` (0.1%) is designed to filter normal market noise. At BTC $65K, this requires a $65 reversal — well above tick-to-tick noise but catching genuine spike reversals.
-
 ### Leg 2 with zero ask depth
 
 If the hedge book has no ask depth within 2 ticks, the emergency FOK size caps to zero. The evaluator returns None and will re-evaluate on the next event.
 
 ### Double emergency submission
 
-Once `emergency_submitted = true`, the evaluator switches to price-improvement chase mode (not re-triggering). The `exit_reason` is preserved from the original trigger. Reposts only happen on Polymarket book price improvement; otherwise the order holds its FIFO queue position. This applies regardless of which phase triggered the emergency.
+Once `emergency_submitted = true`, the evaluator returns None on subsequent evaluations (not re-triggering). The `exit_reason` is preserved from the original trigger. The executor's FOK retry loop handles the exit — no further signals are needed from the engine.
 
 ### SpikeFailed races with fill (live)
 
@@ -695,7 +651,7 @@ The `ActiveTrade` guard rejects the spike, incrementing `rej_busy`. The spike is
 
 ---
 
-## 16. Complete Trade Example
+## 15. Complete Trade Example
 
 **Scenario:** BTC spikes up $400 (0.77% at $52,000). 5-minute market has 3 minutes remaining.
 
@@ -727,7 +683,7 @@ Result: `SpikeConfirmed` — sim fill gate cleared, order has been resting on CL
 
 Sim: gate cleared by SpikeConfirmed, ask=0.505 > bid=0.50, near depth > 0 → fill. Live: CLOB accepts post-only GTC at T+0 (300ms queue priority), User WS notifies fill.
 
-Result: `leg1_state = Filled`, hedge initialized (`init_leg2()`). `binance_at_fill` = 52200, `initial_profit_target` = 0.025 (HIGH).
+Result: `leg1_state = Filled`, hedge initialized (`init_leg2()`). `initial_profit_target` = 0.025 (HIGH).
 
 ### Step 5: Phase 1 Post (T+350ms, immediately after fill)
 
@@ -750,15 +706,15 @@ Alternatively, if not filled by T+2350ms (2000ms after fill): Phase 1 timeout �
 | **Taker fee** | | | $0.00 |
 | **Net profit** | | | **$1.00 (2.56%)** |
 
-### Alternative: Emergency adverse movement (T+5000ms)
+### Alternative: Phase 2 break-even breach
 
-If BTC reverses to $51,950 at T+5s: change = |51950-52200|/52200 = 0.48% >= 0.1% → **ADVERSE MOVEMENT**.
+If Phase 1 times out and Phase 2 posts at `ask - 1 tick = $0.505`. Book reprices further: `leg1_price + ask = $0.50 + $0.51 = $1.01 > $1.00` → **BREAK-EVEN BREACH**.
 
-Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero fee, pair = $1.00 (break-even). If rejected → FOK at $0.51 → pair = $1.01, loss = $0.40 gross + ~$0.63 fee = -$1.03 net.
+Immediate FOK taker at `round_to_tick(0.51, tick)` = $0.51. Pair = $1.01, loss = $0.40 gross + ~$0.63 taker fee = -$1.03 net.
 
 ---
 
-## 17. Simulation vs Live Differences
+## 16. Simulation vs Live Differences
 
 | Aspect | Simulation | Live |
 |--------|-----------|------|
@@ -767,7 +723,7 @@ Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero f
 | **Leg 1 fill model** | Post-only check: bid < ask AND near depth > 0 (after gate clears) | Real CLOB matching engine |
 | **Leg 2 fill model** | Book-based: ask <= posted → fill | Real CLOB matching engine |
 | **Leg 2 hedge model** | 2-phase: Phase 1 at profit target, Phase 2 at ask-1tick | 2-phase: same logic, real CLOB matching |
-| **Emergency fill model** | Deadline-aware: maker if ask <= posted, taker FOK at deadline | Price-improvement chase, FOK at deadline or CLOB rejection |
+| **Emergency fill model** | Immediate FOK taker at ask (uses `fok_emitted` as discriminator) | Immediate FOK taker at ask, price-escalating retry on liquidity failure |
 | **Feedback channel** | Not used (engine is fill authority) | Executor → engine order IDs |
 | **Spike cancel** | `SpikeFailed` cancels Posted Leg 1 (no fill ever) | `CancelLeg1` sent to executor; if already filled, no-op |
 | **Fill latency** | After sustain confirmation (~300ms + next event loop) | CLOB + network RTT (order posted ~300ms earlier than old model) |
@@ -786,6 +742,6 @@ Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero f
 1. **Fills after sustain:** Sim fills only happen after `SpikeConfirmed` (~300ms); live mode may fill earlier since the order is on the CLOB from T+0
 2. **Full depth available:** Assumes entire order fills at posted price; real CLOB may partially fill
 3. **No queue position:** Doesn't model time priority in the CLOB queue
-4. **Deterministic emergency fees:** Uses book state for maker/taker; live depends on actual CLOB acceptance
+4. **Deterministic emergency fees:** All emergency exits are taker FOK; live depends on actual CLOB acceptance and price escalation
 
 These simplifications mean simulation PnL is an optimistic estimate. Live trading will likely see lower fill rates, occasional partial fills, and more FOK fallbacks.

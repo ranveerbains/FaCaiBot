@@ -95,8 +95,6 @@ pub struct SimPosition {
     pub hedge_phase: u8,
     /// Whether a competitor depth wall was detected during this trade.
     pub bot_contested: bool,
-    /// Whether Leg 2 was triggered by adverse Binance price movement.
-    pub adverse_movement_hedge: bool,
     /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
     pub favorable_taker: bool,
     /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
@@ -159,8 +157,6 @@ pub struct SimTrade {
     pub hedge_phase: u8,
     /// Whether Leg 2 executed as an emergency taker (FOK).
     pub leg2_was_taker: bool,
-    /// Whether Leg 2 was triggered by adverse Binance price movement.
-    pub adverse_movement_hedge: bool,
     /// Whether a competitor depth wall was detected during this trade.
     pub bot_contested: bool,
     /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
@@ -254,7 +250,6 @@ pub struct SessionSummary {
     /// Smart outbidding events.
     pub walls_outbid: u32,
     /// Emergency taker fills breakdown.
-    pub adverse_movement_fok: u32,
     pub break_even_fok: u32,
     pub timer_deadline_fok: u32,
     /// Total emergency taker fills.
@@ -327,8 +322,6 @@ pub struct SimulationState {
     pub leg1_fills: u32,
     /// Trades where Leg 2 hedge filled (maker).
     pub trades_hedged: u32,
-    /// Trades hedged via adverse movement protocol (emergency taker).
-    pub trades_adverse_hedged: u32,
     /// Trades hedged via break-even breach FOK.
     pub trades_break_even_fok: u32,
     /// Trades hedged via deadline FOK.
@@ -391,7 +384,6 @@ impl SimulationState {
             signals_detected: 0,
             leg1_fills: 0,
             trades_hedged: 0,
-            trades_adverse_hedged: 0,
             trades_break_even_fok: 0,
             trades_deadline_fok: 0,
             trades_emergency_taker: 0,
@@ -510,7 +502,6 @@ impl SimulationState {
             status: PositionStatus::Open,
             hedge_phase: 0,
             bot_contested: false,
-            adverse_movement_hedge: false,
             favorable_taker: false,
             emergency_maker: false,
             exit_reason: None,
@@ -535,7 +526,7 @@ impl SimulationState {
         }
     }
 
-    /// Record an emergency taker Leg 2 fill (deadline, adverse, break-even breach).
+    /// Record an emergency taker Leg 2 fill (break-even breach, Phase 1 breach, Phase 2 timeout).
     ///
     /// Updates the position at `position_idx`, sets status to `Hedged`,
     /// increments both `trades_hedged`, `trades_emergency_taker`, and
@@ -547,23 +538,6 @@ impl SimulationState {
             pos.status = PositionStatus::Hedged;
             self.trades_hedged += 1;
             self.trades_emergency_taker += 1;
-        }
-    }
-
-    /// Record a Leg 2 fill triggered by adverse Binance price movement (FOK taker).
-    ///
-    /// Updates the position at `position_idx`, sets status to `Hedged`, and
-    /// increments `trades_hedged`, `trades_emergency_taker`, and
-    /// `trades_adverse_hedged`. Also accumulates `total_taker_fees_paid`.
-    pub fn record_adverse_hedge(&mut self, position_idx: usize, fill: SimFill) {
-        if let Some(pos) = self.open_positions.get_mut(position_idx) {
-            pos.adverse_movement_hedge = true;
-            self.total_taker_fees_paid += fill.taker_fee;
-            pos.leg2 = Some(fill);
-            pos.status = PositionStatus::Hedged;
-            self.trades_hedged += 1;
-            self.trades_emergency_taker += 1;
-            self.trades_adverse_hedged += 1;
         }
     }
 
@@ -583,10 +557,8 @@ impl SimulationState {
             pos.status = PositionStatus::Hedged;
             self.trades_hedged += 1;
             self.emergency_maker_fills += 1;
-            match exit_reason {
-                ExitReason::AdverseMovement => pos.adverse_movement_hedge = true,
-                ExitReason::FavorableTaker => pos.favorable_taker = true,
-                _ => {}
+            if matches!(exit_reason, ExitReason::FavorableTaker) {
+                pos.favorable_taker = true;
             }
         }
     }
@@ -684,7 +656,6 @@ impl SimulationState {
             resolution_timestamp_ms: None,
             hedge_phase: pos.hedge_phase,
             leg2_was_taker,
-            adverse_movement_hedge: pos.adverse_movement_hedge,
             bot_contested: pos.bot_contested,
             favorable_taker: pos.favorable_taker,
             emergency_maker: pos.emergency_maker,
@@ -823,7 +794,6 @@ impl SimulationState {
             trades_hedged: self.trades_hedged,
             total_trades,
             walls_outbid: self.walls_outbid,
-            adverse_movement_fok: self.trades_adverse_hedged,
             break_even_fok: self.trades_break_even_fok,
             timer_deadline_fok: self.trades_deadline_fok,
             emergency_taker_fills: self.trades_emergency_taker,

@@ -41,11 +41,10 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "confidence.min_spike_atr_ratio", min: 5.0, max: 200.0 },
     ParamSpec { name: "confidence.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
     // risk
-    ParamSpec { name: "risk.adverse_threshold", min: 0.0001, max: 0.05 },
     ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },
-    ParamSpec { name: "risk.emergency_deadline_ms", min: 500.0, max: 30000.0 },
     ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
+    ParamSpec { name: "risk.phase2_timeout_ms", min: 500.0, max: 10000.0 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
 ];
@@ -281,13 +280,13 @@ mod tests {
         let path = dir.join("config_read.toml");
         std::fs::write(
             &path,
-            "[spike_detection]\nmultiplier = 3.0\n\n[risk]\nadverse_threshold = 0.001\n",
+            "[spike_detection]\nmultiplier = 3.0\n\n[risk]\nphase1_timeout_ms = 2000\n",
         )
         .unwrap();
 
         let section = read_config_section(&path, "spike_detection").unwrap();
         assert!(section.contains("multiplier"));
-        assert!(!section.contains("adverse_threshold"));
+        assert!(!section.contains("phase1_timeout_ms"));
 
         let all = read_config_all(&path).unwrap();
         assert!(all.contains("spike_detection"));

@@ -73,7 +73,6 @@ struct SpikeDiagData {
 struct LiveTradeMeta {
     leg2_was_taker: bool,
     emergency_maker: bool,
-    adverse_movement: bool,
     favorable_taker: bool,
     phase1_breach: bool,
     exit_reason: Option<ExitReason>,
@@ -109,7 +108,7 @@ const BOOK_DEPTH_ONE_MINUS: Decimal = Decimal::from_parts(9, 0, 0, false, 1);
 /// Implements the full three-stage arbitrage strategy:
 /// 1. **Leg 1**: Detect Binance spike → enter directional position (post-only maker)
 /// 2. **Leg 2**: After Leg 1 fills → hedge with opposite side (post-only maker)
-/// 3. **Emergency**: FOK taker fills when deadlines or adverse movement is detected
+/// 3. **Emergency**: FOK taker fills when breach, timeout, or whipsaw is detected
 ///
 /// Signal evaluation logic (guard checks + signal building) lives in
 /// [`Leg1Evaluator`] and [`Leg2Evaluator`]. This struct owns shared mutable
@@ -168,11 +167,6 @@ pub struct StrategyEngine {
     /// Gates sim Leg 1 fills until `SpikeConfirmed` clears it.
     /// Set `true` on `SpikeCandidate`, cleared on `SpikeConfirmed` or `SpikeFailed`.
     speculative_awaiting_sustain: bool,
-
-    /// Set `true` when any Polymarket book event updates the hedge book.
-    /// During emergency mode, `evaluate_leg2()` skips evaluation if this is `false`
-    /// (Binance ticks can't change the Polymarket book, so re-evaluation is pointless).
-    hedge_book_changed: bool,
 
     /// Set `true` when an emergency Leg 2 signal is dispatched to the executor.
     /// Cleared on feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete).
@@ -240,7 +234,6 @@ pub struct StrategyEngine {
     diag_phase_transitions: u64,
     diag_leg2_fills_maker: u64,
     diag_leg2_fills_taker: u64,
-    diag_emg_adverse: u64,
     diag_emg_breakeven: u64,
     diag_emg_expiry: u64,
     diag_emg_favorable: u64,
@@ -323,7 +316,6 @@ impl StrategyEngine {
             pending_spike_cancel: None,
             pending_tick_size_cmd: None,
             speculative_awaiting_sustain: false,
-            hedge_book_changed: false,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
             last_spike_diag: None,
@@ -359,7 +351,6 @@ impl StrategyEngine {
             diag_phase_transitions: 0,
             diag_leg2_fills_maker: 0,
             diag_leg2_fills_taker: 0,
-            diag_emg_adverse: 0,
             diag_emg_breakeven: 0,
             diag_emg_expiry: 0,
             diag_emg_favorable: 0,
@@ -401,11 +392,10 @@ impl StrategyEngine {
                 strong_spike_atr_ratio: config.strong_spike_atr_ratio,
             },
             leg2: Leg2Evaluator {
-                adverse_threshold: config.adverse_threshold,
                 phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
                 depth_wall_multiplier,
-                emergency_deadline_ms: config.bot.risk.emergency_deadline_ms,
                 phase1_breach_threshold: config.phase1_breach_threshold,
+                phase2_timeout_ms: config.bot.risk.phase2_timeout_ms,
             },
         }
     }
@@ -442,7 +432,6 @@ impl StrategyEngine {
                 }
                 self.state.poly_book = Some(book);
                 self.state.last_update_ms = ts;
-                self.hedge_book_changed = true;
             }
 
             // ── Incremental price level update ────────────────────────────
@@ -509,7 +498,6 @@ impl StrategyEngine {
                 }
 
                 self.state.last_update_ms = now_ms;
-                self.hedge_book_changed = true;
             }
 
             // ── Fast-path top-of-book update ──────────────────────────────
@@ -606,7 +594,6 @@ impl StrategyEngine {
                 }
 
                 self.state.last_update_ms = now_ms;
-                self.hedge_book_changed = true;
             }
 
             // ── Tick size change (rare, at price extremes) ────────────────
@@ -1332,22 +1319,6 @@ impl StrategyEngine {
         }
         let now_ms = now_epoch_ms();
 
-        // During emergency exit, only Polymarket book changes matter for
-        // price-improvement checks. Skip evaluation if the hedge book hasn't
-        // changed — UNLESS the hard deadline may have expired (time-based).
-        let in_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
-        if in_emergency {
-            let deadline_may_have_expired = self.hedge.as_ref().is_some_and(|e| {
-                e.emergency_first_post_ms
-                    .map(|first| now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms)
-                    .unwrap_or(false)
-            });
-            if !self.hedge_book_changed && !deadline_may_have_expired {
-                return None;
-            }
-            self.hedge_book_changed = false;
-        }
-
         // Build borrow-free snapshot of hedge state to pass to evaluator.
         let snap = match self.hedge.as_ref() {
             None => return None,
@@ -1356,19 +1327,13 @@ impl StrategyEngine {
                 break_even: e.break_even(),
                 initial_profit_target: e.initial_profit_target,
                 direction: e.direction,
-                binance_at_fill: e.binance_at_fill,
                 fill_ms: e.leg1_fill_ms,
                 tier: e.tier,
                 confidence: e.confidence,
                 spike_info: e.spike_info,
-                leg1_fill_price: e.leg1_fill_price,
-                exit_reason: e.exit_reason,
-                emergency_first_post_ms: e.emergency_first_post_ms,
-                emergency_posted_price: e.emergency_posted_price,
-                fok_emitted: e.fok_emitted,
                 phase: e.phase,
                 phase1_target_price: e.phase1_target_price,
-                phase2_posted_price: e.phase2_posted_price,
+                phase2_start_ms: e.phase2_start_ms,
             },
         };
 
@@ -1403,13 +1368,12 @@ impl StrategyEngine {
                 _ => (None, false),
             };
             match reason {
-                Some(ExitReason::AdverseMovement) => self.diag_emg_adverse += 1,
                 Some(ExitReason::BreakEvenBreach) => self.diag_emg_breakeven += 1,
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
                 Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
                 Some(ExitReason::WhipsawReversal) => {} // counted in spike handler (diag_whipsaw_foks)
-                None => self.diag_emg_adverse += 1, // fallback
+                None => {}
             }
             // Track for live mode trade-completed Telegram message.
             // Preserve leg1_cancel_race — it was set on Leg 1 fill, before Leg 2 emergency.
@@ -1418,18 +1382,12 @@ impl StrategyEngine {
                 leg2_was_taker: was_taker,
                 exit_reason: reason,
                 emergency_maker: reason.is_some() && !was_taker,
-                adverse_movement: matches!(reason, Some(ExitReason::AdverseMovement)) && was_taker,
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
                 phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
                 leg1_cancel_race: cancel_race,
             };
             if let Some(e) = self.hedge.as_mut() {
-                if !e.emergency_submitted {
-                    // First emergency post — record the timestamp for deadline tracking.
-                    e.emergency_first_post_ms = Some(now_ms);
-                }
                 e.emergency_submitted = true;
-                e.emergency_posted_price = Some(price);
                 e.exit_reason = match &decision {
                     Leg2Decision::Emergency { signal, .. } => signal.exit_reason,
                     _ => None,
@@ -1450,7 +1408,7 @@ impl StrategyEngine {
                 timestamp_ms: now_ms,
             };
         } else {
-            // Non-emergency hedge path: Phase1Post, PhaseTransition, or Phase2Repost.
+            // Non-emergency hedge path: Phase1Post or PhaseTransition.
             match &decision {
                 Leg2Decision::Phase1Post { .. } => {
                     // Initial post at profit target — no phase change needed.
@@ -1461,15 +1419,9 @@ impl StrategyEngine {
                     if let Some(e) = self.hedge.as_mut() {
                         e.phase = HedgePhase::Phase2;
                         e.phase2_posted_price = Some(price);
+                        e.phase2_start_ms = Some(now_ms);
                     }
                     self.diag_phase_transitions += 1;
-                    self.diag_leg2_reposts += 1;
-                }
-                Leg2Decision::Phase2Repost { .. } => {
-                    // Improvement repost in Phase 2.
-                    if let Some(e) = self.hedge.as_mut() {
-                        e.phase2_posted_price = Some(price);
-                    }
                     self.diag_leg2_reposts += 1;
                 }
                 _ => {}
@@ -1556,7 +1508,6 @@ impl StrategyEngine {
             phase_transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
-            emg_adverse = self.diag_emg_adverse,
             emg_breakeven = self.diag_emg_breakeven,
             emg_expiry = self.diag_emg_expiry,
             emg_favorable = self.diag_emg_favorable,
@@ -1620,7 +1571,7 @@ impl StrategyEngine {
              \n\
              <b>Leg 2</b>\n\
              Reposts: {reposts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
-             Emergencies — adverse: {emg_adv}  phase1-breach: {emg_p1b}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
+             Emergencies — phase1-breach: {emg_p1b}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
             spike = spike_section,
@@ -1647,7 +1598,6 @@ impl StrategyEngine {
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
-            emg_adv = self.diag_emg_adverse,
             emg_be = self.diag_emg_breakeven,
             emg_exp = self.diag_emg_expiry,
             emg_fav = self.diag_emg_favorable,
@@ -2220,7 +2170,6 @@ impl StrategyEngine {
         };
 
         let leg2_was_taker = exit_reason.is_some();
-        let adverse_movement = exit_reason == Some(ExitReason::AdverseMovement);
         let favorable_taker = exit_reason == Some(ExitReason::FavorableTaker);
         // In live mode, we can't distinguish maker vs taker fills during emergency chase
         // (no executor feedback). Conservative: only true if emergency entered but no exit_reason
@@ -2255,7 +2204,6 @@ impl StrategyEngine {
             alloc_amount,
             hedge_phase,
             leg2_was_taker,
-            adverse_movement,
             bot_contested,
             l1_order_id,
             Some(l2_order_id),
@@ -2383,7 +2331,6 @@ impl StrategyEngine {
                 direction,
                 spike,
                 conf,
-                self.state.binance_price,
                 phase1_target_price,
             ));
             info!(tier = tier.label(), %fill_price, %fill_size, %phase1_target_price, "leg2 hedge initialised");
@@ -2454,7 +2401,6 @@ impl StrategyEngine {
             leg2_was_taker: true,
             exit_reason: Some(ExitReason::WhipsawReversal),
             emergency_maker: false,
-            adverse_movement: false,
             favorable_taker: false,
             phase1_breach: false,
             leg1_cancel_race: cancel_race,
@@ -2462,8 +2408,6 @@ impl StrategyEngine {
         if let Some(e) = self.hedge.as_mut() {
             e.emergency_submitted = true;
             e.fok_emitted = true;
-            e.emergency_first_post_ms = Some(now_ms);
-            e.emergency_posted_price = Some(fok_price);
             e.exit_reason = Some(ExitReason::WhipsawReversal);
         }
         self.emergency_signal_in_flight = true;
@@ -2605,92 +2549,51 @@ impl StrategyEngine {
             let posted_price = *price;
             let posted_size = *size;
 
-            let is_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
+            let is_fok = self.hedge.as_ref().is_some_and(|e| e.fok_emitted);
 
             // Determine fill outcome: (should_fill, is_favorable_taker, fill_price, sim_was_taker).
-            // Emergency fills use deadline-aware model: wait for market to come to our
-            // posted price (maker fill), or FOK taker after emergency_deadline_ms.
-            // Normal fills check the opposing book's best ask:
+            // FOK orders fill immediately at ask (taker). Non-FOK use normal maker fill logic:
             //   ask < posted_price → favorable taker fill at ask_price
             //   ask == posted_price → normal maker fill at posted_price
             //   ask > posted_price or no ask → no fill (order rests)
-            let (should_fill, is_favorable_taker, fill_price, sim_was_taker) = if is_emergency {
-                let best_ask = match self.leg1_direction {
-                    Some(Direction::Up) => self
-                        .state
-                        .poly_no_book
-                        .as_ref()
-                        .or(self.state.poly_book.as_ref())
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                    Some(Direction::Down) => self
-                        .state
-                        .poly_yes_book
-                        .as_ref()
-                        .or(self.state.poly_book.as_ref())
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                    None => self
-                        .state
-                        .poly_book
-                        .as_ref()
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                };
+            let best_ask = match self.leg1_direction {
+                Some(Direction::Up) => self
+                    .state
+                    .poly_no_book
+                    .as_ref()
+                    .or(self.state.poly_book.as_ref())
+                    .and_then(|b| b.best_ask())
+                    .map(|a| a.price),
+                Some(Direction::Down) => self
+                    .state
+                    .poly_yes_book
+                    .as_ref()
+                    .or(self.state.poly_book.as_ref())
+                    .and_then(|b| b.best_ask())
+                    .map(|a| a.price),
+                None => self
+                    .state
+                    .poly_book
+                    .as_ref()
+                    .and_then(|b| b.best_ask())
+                    .map(|a| a.price),
+            };
 
-                // Market moved to our price → maker fill (our bid gets hit).
-                let maker_fillable = best_ask.is_some_and(|ask| ask <= posted_price);
-
-                if maker_fillable {
-                    (true, false, posted_price, false)
-                } else {
-                    // Check hard deadline.
-                    let deadline_passed = self.hedge.as_ref().is_some_and(|e| {
-                        e.emergency_first_post_ms
-                            .map(|first| {
-                                now_ms.saturating_sub(first) >= self.leg2.emergency_deadline_ms
-                            })
-                            .unwrap_or(false)
-                    });
-
-                    if deadline_passed {
-                        match best_ask {
-                            Some(ask) => (true, false, ask, true), // taker FOK
-                            None => (false, false, posted_price, false),
-                        }
-                    } else {
-                        (false, false, posted_price, false) // wait
-                    }
+            let (should_fill, is_favorable_taker, fill_price, sim_was_taker) = if is_fok {
+                // FOK orders fill immediately at ask (taker).
+                match best_ask {
+                    Some(ask) => (true, false, ask, true),
+                    None => (false, false, posted_price, false),
                 }
             } else {
-                let best_ask = match self.leg1_direction {
-                    Some(Direction::Up) => self
-                        .state
-                        .poly_no_book
-                        .as_ref()
-                        .or(self.state.poly_book.as_ref())
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                    Some(Direction::Down) => self
-                        .state
-                        .poly_yes_book
-                        .as_ref()
-                        .or(self.state.poly_book.as_ref())
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                    None => self
-                        .state
-                        .poly_book
-                        .as_ref()
-                        .and_then(|b| b.best_ask())
-                        .map(|a| a.price),
-                };
                 match best_ask {
                     Some(ask) if ask < posted_price => (true, true, ask, false),
                     Some(ask) if ask <= posted_price => (true, false, posted_price, false),
                     _ => (false, false, posted_price, false),
                 }
             };
+
+            let is_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
 
             if should_fill {
                 if sim_was_taker {
@@ -2955,7 +2858,6 @@ impl StrategyEngine {
         let mut worst_market = String::new();
         let mut worst_conf = Decimal::ZERO;
         let mut walls_outbid: u32 = 0;
-        let mut adverse_fok: u32 = 0;
         let mut break_even_fok: u32 = 0;
         let mut timer_fok: u32 = 0;
         let mut emergency_taker: u32 = 0;
@@ -2972,7 +2874,6 @@ impl StrategyEngine {
             if t.leg2_was_taker { emergency_taker += 1; }
             if t.emergency_maker { emergency_maker += 1; }
             if t.favorable_taker { favorable_taker += 1; }
-            if t.adverse_movement_hedge && t.leg2_was_taker { adverse_fok += 1; }
             match t.exit_reason {
                 Some(ExitReason::BreakEvenBreach) | Some(ExitReason::Phase1Breach) => {
                     break_even_fok += 1;
@@ -3028,7 +2929,6 @@ impl StrategyEngine {
             trades_hedged,
             total_trades,
             walls_outbid,
-            adverse_movement_fok: adverse_fok,
             break_even_fok,
             timer_deadline_fok: timer_fok,
             emergency_taker_fills: emergency_taker,
@@ -3148,7 +3048,6 @@ impl StrategyEngine {
             resolution_timestamp_ms: None,
             hedge_phase: hedge.phase as u8,
             leg2_was_taker: self.live_trade_meta.leg2_was_taker,
-            adverse_movement_hedge: self.live_trade_meta.adverse_movement,
             bot_contested: signal.bot_contested,
             favorable_taker: self.live_trade_meta.favorable_taker,
             emergency_maker: self.live_trade_meta.emergency_maker,
@@ -3530,7 +3429,6 @@ mod tests {
             Direction::Up,
             spike,
             Decimal::new(85, 2),
-            None,
             phase1_target,
         );
 
@@ -3565,7 +3463,6 @@ mod tests {
             Direction::Up,
             spike,
             Decimal::ZERO,
-            None,
             Decimal::new(495, 3),
         );
         // break_even = 1.0 - leg1_fill_price = 0.52
@@ -4043,7 +3940,7 @@ mod tests {
         // Simulate emergency: set emergency_submitted = true on the hedge state.
         if let Some(e) = engine.hedge.as_mut() {
             e.emergency_submitted = true;
-            e.exit_reason = Some(ExitReason::AdverseMovement);
+            e.exit_reason = Some(ExitReason::BreakEvenBreach);
         }
 
         engine
@@ -4052,11 +3949,6 @@ mod tests {
     #[test]
     fn test_sim_emergency_maker_when_ask_drops_to_posted() {
         let mut engine = engine_with_emergency_leg2();
-
-        // Set emergency_first_post_ms so deadline hasn't passed yet.
-        if let Some(e) = engine.hedge.as_mut() {
-            e.emergency_first_post_ms = Some(now_epoch_ms());
-        }
 
         // Get the posted Leg 2 price.
         let posted_price = match &engine.state.leg2_state {
@@ -4090,7 +3982,7 @@ mod tests {
         );
         assert!(
             !leg2_fills[0].sim_was_taker,
-            "when ask <= posted_price, fill should be maker (sim_was_taker=false)"
+            "when ask <= posted_price and fok_emitted=false, fill should be maker"
         );
         assert_eq!(
             leg2_fills[0].price, posted_price,
@@ -4099,12 +3991,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sim_emergency_waits_within_deadline() {
+    fn test_sim_fok_emitted_fills_immediately_at_ask() {
         let mut engine = engine_with_emergency_leg2();
 
-        // Set emergency_first_post_ms to now — deadline not yet reached.
+        // Set fok_emitted = true → FOK orders fill immediately at ask.
         if let Some(e) = engine.hedge.as_mut() {
-            e.emergency_first_post_ms = Some(now_epoch_ms());
+            e.fok_emitted = true;
         }
 
         // Get the posted Leg 2 price.
@@ -4114,51 +4006,7 @@ mod tests {
         };
         let tick = engine.state.tick_size;
 
-        // Set NO book ask ABOVE posted_price → market hasn't reached our bid.
-        let ask_above = posted_price + tick * Decimal::TWO;
-        engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
-            asset_id: "no".to_string(),
-            bids: vec![PriceLevel {
-                price: Decimal::new(40, 2),
-                size: Decimal::new(200, 0),
-            }],
-            asks: vec![PriceLevel {
-                price: ask_above,
-                size: Decimal::new(200, 0),
-            }],
-            timestamp_ms: now_epoch_ms(),
-        }));
-
-        let signals = engine.advance_simulation();
-        let leg2_fills: Vec<_> = signals
-            .iter()
-            .filter(|s| s.is_leg2 && s.sim_confirmed_fill)
-            .collect();
-        assert_eq!(
-            leg2_fills.len(),
-            0,
-            "should NOT fill when ask > posted_price and deadline not reached"
-        );
-    }
-
-    #[test]
-    fn test_sim_emergency_taker_at_deadline() {
-        let mut engine = engine_with_emergency_leg2();
-
-        // Set emergency_first_post_ms far in the past → deadline expired.
-        if let Some(e) = engine.hedge.as_mut() {
-            e.emergency_first_post_ms = Some(0); // epoch 0 — well past any deadline
-        }
-
-        // Get the posted Leg 2 price.
-        let posted_price = match &engine.state.leg2_state {
-            OrderState::Posted { price, .. } => *price,
-            _ => panic!("expected Posted"),
-        };
-        let tick = engine.state.tick_size;
-
-        // Set NO book ask ABOVE posted_price — market hasn't reached our bid,
-        // but deadline has passed → FOK taker at best_ask.
+        // Set NO book ask ABOVE posted_price → FOK fills at ask regardless.
         let ask_above = posted_price + tick * Decimal::TWO;
         engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
             asset_id: "no".to_string(),
@@ -4181,11 +4029,11 @@ mod tests {
         assert_eq!(
             leg2_fills.len(),
             1,
-            "should produce FOK taker fill after deadline"
+            "FOK should produce taker fill at ask"
         );
         assert!(
             leg2_fills[0].sim_was_taker,
-            "deadline-expired fill should be taker (sim_was_taker=true)"
+            "fok_emitted fill should be taker (sim_was_taker=true)"
         );
         assert_eq!(
             leg2_fills[0].price, ask_above,
@@ -4371,7 +4219,6 @@ mod tests {
         if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg2_state {
             *timestamp_ms = now_epoch_ms() - timeout - 1;
         }
-        engine.hedge_book_changed = true;
 
         // evaluate_leg2 should trigger phase transition.
         let transition = engine.evaluate_leg2();
