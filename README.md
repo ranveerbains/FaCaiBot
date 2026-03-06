@@ -93,6 +93,30 @@ cp config.toml /opt/facaibot/
 
 **`config.toml`** — all tuning parameters (spike detection, capital, entry guards, erosion). Defaults are production-ready.
 
+### Step 5b: Recovery of Stuck Positions (One-Time if Applicable)
+
+If you have unresolved positions from prior sessions that the Data API can't find (because markets have resolved), create `redeems.txt` in the bot's working directory:
+
+```bash
+cd /opt/facaibot
+cat > redeems.txt << 'EOF'
+0x<condition_id_1>
+0x<condition_id_2>
+...
+EOF
+```
+
+Find stuck condition IDs by:
+1. Checking your bot's Telegram trade history (look for completed trades)
+2. Checking Polygonscan for ERC-1155 CTF holdings: `https://polygonscan.com/address/<YOUR_WALLET>#tokentxnsErc1155`
+
+The bot will automatically:
+- **Write** condition IDs to `redeems.txt` once per traded market (at rotation or shutdown)
+- **Read** the file during `/redeem` and merge with Data API positions
+- **Clean up** successfully redeemed IDs from the file
+
+You can manually trigger redemption any time with `/redeem` or `/redeem <condition_id>` via Telegram (won't affect trading logic).
+
 ### Step 6: Smoke Test
 
 Verifies your credentials and on-chain approvals work before going live.
@@ -162,7 +186,8 @@ Set `TELEGRAM_ALLOWED_USER_ID` in `.env` to enable remote control — no SSH nee
 | `/shutdown` | Graceful shutdown (drains open position first) |
 | `/balance` | Wallet USDC.e + POL balance |
 | `/polybalance` | Polymarket positions and value |
-| `/redeem` | Redeem resolved positions to USDC.e |
+| `/redeem` | Redeem all resolved positions to USDC.e (merges Data API + persistent file) |
+| `/redeem <condition_id>` | Redeem a specific condition ID (30s timeout) |
 | `/help` | List all commands |
 
 `/shutdown` and `/set` never abandon open positions — they wait for the current trade to resolve first.

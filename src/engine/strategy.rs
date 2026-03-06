@@ -1768,10 +1768,6 @@ impl StrategyEngine {
             // Bug 1 fix: executor-initiated favorable exits set live_trade_meta
             // so Telegram shows the correct tag.
             match fill_method {
-                Some(FillMethod::FavorableMaker) => {
-                    self.live_trade_meta.favorable_taker = true;
-                    self.live_trade_meta.emergency_maker = true;
-                }
                 Some(FillMethod::FavorableTaker) => {
                     self.live_trade_meta.favorable_taker = true;
                     self.live_trade_meta.leg2_was_taker = true;

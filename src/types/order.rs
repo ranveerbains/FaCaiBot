@@ -313,12 +313,10 @@ pub enum OrderStatus {
 
 /// How the executor actually filled a Leg 2 order. Set when the executor
 /// autonomously converts a normal erosion signal into a favorable exit
-/// (e.g., "crosses book" → aggressive post-only or FOK fallback).
+/// (e.g., "crosses book" → immediate FOK taker).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillMethod {
-    /// "crosses book" → aggressive post-only filled as maker (zero fee).
-    FavorableMaker,
-    /// "crosses book" → FOK fallback filled as taker.
+    /// "crosses book" → immediate FOK taker at the favorable ask.
     FavorableTaker,
     /// Emergency FOK taker fill (deadline FOK or emergency post-only rejected → FOK fallback).
     EmergencyTaker,

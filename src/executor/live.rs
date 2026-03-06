@@ -448,92 +448,12 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 2 favorable exit: walk-down post-only, FOK fallback ──────
-
-    /// Walk-down offsets in ticks: 1, 2, 4, 8 (exponential).
-    /// Each attempt is ~100ms (CLOB HTTP round-trip). First successful
-    /// placement rests as maker for the remaining hedge window.
-    const WALKDOWN_OFFSETS: [u32; 4] = [1, 2, 4, 8];
+    // ─── Leg 2 favorable exit: immediate FOK taker ────────────────────
 
     async fn attempt_favorable_exit(&mut self, signal: &TradeSignal) {
-        // Walk down with exponential tick offsets to find a valid maker price.
-        for (i, &offset) in Self::WALKDOWN_OFFSETS.iter().enumerate() {
-            let tick_offset = signal.tick_size * Decimal::from(offset);
-            let post_only_price = round_to_tick(signal.price - tick_offset, signal.tick_size);
-
-            // Guard: price must be positive and meet $1 notional minimum.
-            if post_only_price <= Decimal::ZERO {
-                warn!(attempt = i + 1, %post_only_price, "walk-down price non-positive — skipping to FOK");
-                break;
-            }
-            if post_only_price * signal.size < Decimal::ONE {
-                warn!(attempt = i + 1, %post_only_price, size = %signal.size, "walk-down below $1 minimum — skipping to FOK");
-                break;
-            }
-
-            let order = OrderRequest::aggressive_post_only(
-                signal.token_id.clone(),
-                signal.side,
-                post_only_price,
-                signal.size,
-            );
-
-            match self.poly.place_order(&order).await {
-                Ok(resp) => {
-                    if resp.status == OrderStatus::Rejected {
-                        // Still crosses — try next offset.
-                        warn!(
-                            attempt = i + 1,
-                            price = %post_only_price,
-                            "Leg 2 favorable walk-down: post-only REJECTED — trying deeper"
-                        );
-                        continue;
-                    }
-                    // Accepted — order rests as maker.
-                    info!(
-                        attempt = i + 1,
-                        order_id = %resp.order_id,
-                        price = %post_only_price,
-                        "Leg 2 favorable walk-down: post-only accepted"
-                    );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
-
-
-
-                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                        is_leg2: true,
-                        order_id: resp.order_id,
-                        price: post_only_price,
-                        size: signal.size,
-                        fill_method: Some(FillMethod::FavorableMaker),
-                        already_filled: false,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("crosses book") {
-                        // Same as rejection — try deeper offset.
-                        warn!(
-                            attempt = i + 1,
-                            price = %post_only_price,
-                            "Leg 2 favorable walk-down: 'crosses book' — trying deeper"
-                        );
-                        continue;
-                    }
-                    // Non-crossing error — skip remaining attempts, go to FOK.
-                    error!(
-                        attempt = i + 1,
-                        error = %e,
-                        "Leg 2 favorable walk-down: placement FAILED — skipping to FOK"
-                    );
-                    break;
-                }
-            }
-        }
-
-        // All walk-down attempts crossed or failed — FOK fallback.
-        warn!("Leg 2 favorable walk-down: all post-only attempts exhausted — FOK fallback");
+        // Favorable pricing detected — FOK taker to capture the low ask immediately.
+        // Previously used a walk-down (4 post-only attempts at lower prices), but the
+        // favorable ask is transient and maker orders get stranded when the market bounces.
         self.favorable_exit_fok_fallback(signal).await;
     }
 
