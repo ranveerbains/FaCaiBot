@@ -276,6 +276,21 @@ async fn async_main() -> Result<()> {
                     } => {
                         engine.on_cancel_result(order_id, was_cancelled, is_leg2);
                     }
+                    ExecutorFeedback::RestFillDetected {
+                        order_id,
+                        price,
+                        size,
+                        size_matched,
+                        original_size,
+                    } => {
+                        engine.on_rest_fill_detected(
+                            order_id,
+                            price,
+                            size,
+                            size_matched,
+                            original_size,
+                        );
+                    }
                     ExecutorFeedback::BalanceExhausted => {
                         engine.on_balance_exhausted();
                     }

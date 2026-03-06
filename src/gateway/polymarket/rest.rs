@@ -265,6 +265,28 @@ impl PolymarketGateway {
         Ok(was_cancelled)
     }
 
+    /// Query the status of an order by its ID.
+    ///
+    /// Uses the SDK's `order()` method (GET `/data/order/{id}`) with L2 HMAC auth.
+    /// Returns `(status, size_matched, original_size)`.
+    pub async fn get_order_status(
+        &self,
+        order_id: &str,
+    ) -> Result<(OrderStatus, rust_decimal::Decimal, rust_decimal::Decimal)> {
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("SDK client not initialized — order query unavailable"))?;
+
+        let resp = sdk
+            .order(order_id)
+            .await
+            .map_err(|e| anyhow!("get_order_status failed: {e}"))?;
+
+        let status = map_sdk_status(&resp.status);
+        Ok((status, resp.size_matched, resp.original_size))
+    }
+
     /// Cancel all open orders.
     ///
     /// Uses the SDK's authenticated `cancel_all_orders` method (DELETE `/cancel-all`).

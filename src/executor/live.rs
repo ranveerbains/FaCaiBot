@@ -65,6 +65,9 @@ pub struct LiveExecutor {
     /// rejected with `OrderFailed` until cleared on `MarketRotation`.
     balance_exhausted: bool,
 
+    /// Buffered command received during Leg 1 fill polling (e.g., MarketRotation).
+    /// Consumed at the top of the next `run()` loop iteration before blocking on `rx.recv()`.
+    deferred_cmd: Option<ExecutorCommand>,
 }
 
 impl LiveExecutor {
@@ -82,6 +85,7 @@ impl LiveExecutor {
             caches_warm: false,
             active_leg2_order_id: None,
             balance_exhausted: false,
+            deferred_cmd: None,
         }
     }
 
@@ -91,13 +95,18 @@ impl LiveExecutor {
         self.reporter.send_live_startup_message();
 
         loop {
-            let cmd = match tokio::task::block_in_place(|| rx.recv()) {
-                Ok(cmd) => cmd,
-                Err(_) => break,
+            // Consume deferred command (buffered during Leg 1 fill polling) before blocking.
+            let cmd = if let Some(deferred) = self.deferred_cmd.take() {
+                deferred
+            } else {
+                match tokio::task::block_in_place(|| rx.recv()) {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                }
             };
             match cmd {
                 ExecutorCommand::Signal(signal) => {
-                    self.handle_signal(signal).await;
+                    self.handle_signal(signal, &rx).await;
                 }
                 ExecutorCommand::MarketRotation {
                     condition_id,
@@ -156,7 +165,7 @@ impl LiveExecutor {
 
     // ─── Signal dispatch ────────────────────────────────────────────────
 
-    async fn handle_signal(&mut self, signal: TradeSignal) {
+    async fn handle_signal(&mut self, signal: TradeSignal, rx: &Receiver<ExecutorCommand>) {
         if !self.caches_warm {
             warn!(
                 token = %signal.token_id,
@@ -169,7 +178,7 @@ impl LiveExecutor {
         }
 
         if !signal.is_leg2 {
-            self.handle_leg1(&signal).await;
+            self.handle_leg1(&signal, rx).await;
         } else if self.balance_exhausted {
             warn!("Leg 2 signal REJECTED — balance exhausted, waiting for rotation");
             let _ = self
@@ -184,7 +193,7 @@ impl LiveExecutor {
 
     // ─── Leg 1: post-only GTC entry ────────────────────────────────────
 
-    async fn handle_leg1(&mut self, signal: &TradeSignal) {
+    async fn handle_leg1(&mut self, signal: &TradeSignal, rx: &Receiver<ExecutorCommand>) {
         self.active_leg2_order_id = None; // New trade — clear any stale Leg 2 ID from previous trade
         info!(
             side = ?signal.side,
@@ -218,6 +227,7 @@ impl LiveExecutor {
 
                     self.log_signal_to_cold(signal, "rejected");
                 } else {
+                    let order_id = resp.order_id.clone();
                     info!(
                         order_id = %resp.order_id,
                         status = ?resp.status,
@@ -235,6 +245,10 @@ impl LiveExecutor {
                     });
 
                     self.log_signal_to_cold(signal, "submitted");
+
+                    // Poll CLOB REST for Leg 1 fill (~200ms deterministic, primary path).
+                    self.poll_leg1_fill(&order_id, signal.price, signal.size, rx)
+                        .await;
                 }
             }
             Err(e) => {
@@ -248,6 +262,91 @@ impl LiveExecutor {
                 self.log_signal_to_cold(signal, "failed");
             }
         }
+    }
+
+    // ─── Leg 1 REST fill polling ───────────────────────────────────────
+
+    /// Poll `GET /data/order/{id}` every 200ms for up to ~2600ms to detect
+    /// Leg 1 fills deterministically (~200ms latency) instead of waiting for
+    /// the User WS MATCHED event (50-100ms typical but can spike to seconds).
+    ///
+    /// Interleaves `rx.try_recv()` each iteration to handle `CancelLeg1` inline
+    /// and buffer other commands (MarketRotation, etc.) in `deferred_cmd`.
+    const POLL_INTERVAL_MS: u64 = 200;
+    const MAX_POLLS: u32 = 13; // 13 × 200ms = 2600ms
+
+    async fn poll_leg1_fill(
+        &mut self,
+        order_id: &str,
+        price: Decimal,
+        size: Decimal,
+        rx: &Receiver<ExecutorCommand>,
+    ) {
+        for poll in 0..Self::MAX_POLLS {
+            tokio::time::sleep(tokio::time::Duration::from_millis(Self::POLL_INTERVAL_MS)).await;
+
+            // Check for incoming commands between polls.
+            match rx.try_recv() {
+                Ok(ExecutorCommand::CancelLeg1 {
+                    order_id: cancel_id,
+                }) => {
+                    info!(%cancel_id, poll, "Leg 1 poll: CancelLeg1 received — cancelling inline");
+                    match self.poly.cancel_order(&cancel_id).await {
+                        Ok(was_cancelled) => {
+                            let _ =
+                                self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                                    order_id: cancel_id,
+                                    was_cancelled,
+                                    is_leg2: false,
+                                });
+                        }
+                        Err(e) => {
+                            warn!(%cancel_id, error = %e, "failed to cancel Leg 1 during polling");
+                        }
+                    }
+                    return;
+                }
+                Ok(other_cmd) => {
+                    info!(poll, "Leg 1 poll: non-cancel command received — deferring, exiting poll");
+                    self.deferred_cmd = Some(other_cmd);
+                    return;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {} // expected
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
+
+            // Poll CLOB REST for order status.
+            match self.poly.get_order_status(order_id).await {
+                Ok((status, size_matched, original_size)) => {
+                    if status == OrderStatus::Filled {
+                        info!(
+                            %order_id, %price, %size, %size_matched, %original_size,
+                            poll, "REST poll: Leg 1 fill detected!"
+                        );
+                        let _ =
+                            self.feedback_tx.try_send(ExecutorFeedback::RestFillDetected {
+                                order_id: order_id.to_string(),
+                                price,
+                                size,
+                                size_matched,
+                                original_size,
+                            });
+                        return;
+                    }
+                    if status == OrderStatus::Cancelled || status == OrderStatus::Rejected {
+                        info!(%order_id, ?status, poll, "REST poll: order no longer active — exiting poll");
+                        return;
+                    }
+                    // Status is Placed — order still resting, continue polling.
+                }
+                Err(e) => {
+                    // Network error — log and continue (User WS is backup).
+                    tracing::debug!(%order_id, error = %e, poll, "REST poll: get_order_status failed — continuing");
+                }
+            }
+        }
+        // Max polls reached — exit silently. Engine staleness handles cleanup.
+        info!(%order_id, "REST poll: max polls reached — deferring to staleness/User WS");
     }
 
     // ─── Leg 2 erosion: cancel previous + repost at new price ──────────
@@ -849,11 +948,14 @@ impl LiveExecutor {
             }
             if all_ok {
                 self.caches_warm = true;
+                // Pre-warm CLOB connection pool (TLS session establishment).
+                // The 404 response is ignored — the reqwest pool is warm regardless.
+                let _ = sdk.order("0x0000000000000000000000000000000000000000000000000000000000000000").await;
                 info!(
                     condition_id,
                     yes_token_id,
                     no_token_id,
-                    "SDK caches pre-warmed from CLOB (tick_size, neg_risk, fee_rate) — trading enabled"
+                    "SDK caches pre-warmed from CLOB (tick_size, neg_risk, fee_rate, conn pool) — trading enabled"
                 );
             } else {
                 warn!("SDK cache pre-warm incomplete — trading BLOCKED until next rotation");

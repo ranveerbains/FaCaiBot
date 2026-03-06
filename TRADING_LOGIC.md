@@ -88,7 +88,7 @@ If all pass → emit `SpikeConfirmed` → sim fills unblocked. If any fail → e
 Three event variants carry spike lifecycle signals:
 
 - **`SpikeCandidate(SpikeInfo)`**: ATR + magnitude passed → triggers speculative Leg 1 posting. Engine sets `spike_detected = true`, `speculative_awaiting_sustain = true`
-- **`SpikeConfirmed(SpikeInfo)`**: Sustain + momentum passed → clears `speculative_awaiting_sustain` (sim fills allowed). Live mode: no-op (fills come from User WS)
+- **`SpikeConfirmed(SpikeInfo)`**: Sustain + momentum passed → clears `speculative_awaiting_sustain` (sim fills allowed). Live mode: no-op (fills come from REST poll / User WS)
 - **`SpikeFailed { timestamp_ms }`**: Spike faded → engine cancels speculative Leg 1 if `Posted`, resets spike state. If already `Filled`: no-op, Leg 2 proceeds normally
 
 Normal `BinanceTick` events only update `binance_price` and never trigger spike evaluation.
@@ -169,11 +169,11 @@ Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 s
 
 **Simulation:** The engine acts as the simulated CLOB. On each event loop iteration, it checks post-only validity (bid < ask) and near-ask depth within 2 ticks. If both pass, transitions `leg1_state` from `Posted` to `Filled`, initializes erosion, and emits a confirmed fill signal. **Speculative fill gate**: fills are blocked while `speculative_awaiting_sustain = true` (set on `SpikeCandidate`, cleared on `SpikeConfirmed`). This ensures sim fills only happen after the spike is confirmed (~300ms).
 
-**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine. Fills arrive via the authenticated User WebSocket as `TradeStatusUpdate` events, matched by order ID. No fill gate needed — the CLOB decides fill timing.
+**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine, then enters a REST fill polling loop (`poll_leg1_fill()`): every 200ms it calls `GET /data/order/{id}` via the SDK's `order()` method. On detecting `Filled` status, it sends `RestFillDetected` feedback — the engine transitions Leg 1 to `Filled` and starts erosion (~200ms deterministic latency). The User WS remains as backup: if the REST poll doesn't detect the fill (network error, order cancelled externally, max polls reached), the User WS `TradeStatusUpdate` with MATCHED status will handle it. If REST detects the fill first, the later User WS event is deduped (`leg1_state` is already `Filled`, not `Posted`). During polling, the executor checks for incoming commands via `rx.try_recv()`: `CancelLeg1` is executed inline, other commands (MarketRotation, etc.) are buffered in `deferred_cmd` and processed in the next `run()` loop iteration.
 
 ### Leg 1 staleness timeout
 
-If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
+If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
 
 **Sim mode:** Checked in `advance_simulation()` before fill check. Rarely fires (instant fills). Uses the provisional `timestamp_ms` from `evaluate()`, which is correct since there's no CLOB round-trip.
 
@@ -379,7 +379,7 @@ At p=0.50 and 50 shares, the taker fee is ~$0.78. The price-improvement chase av
 **Simulation:** `advance_simulation()` detects both legs Filled after Leg 2 fill.
 
 **Live:** Two detection paths:
-1. **User WS fill**: The main engine loop checks after processing each event — if both `leg1_state` and `leg2_state` are Filled, calls `on_trade_complete()`.
+1. **User WS fill or REST fill**: The main engine loop checks after processing each event — if both `leg1_state` and `leg2_state` are Filled, calls `on_trade_complete()`. Leg 1 fills may arrive via `RestFillDetected` (primary, ~200ms) or User WS `TradeStatusUpdate` (backup).
 2. **Sync FOK fill**: When `OrderPosted` feedback has `already_filled=true` (FOK returned `Filled` synchronously from REST), the engine transitions Leg 2 directly to `OrderState::Filled` in `on_order_posted()`. The main loop detects both legs filled immediately in the feedback drain iteration and triggers `on_trade_complete()`. This prevents the double-fill bug where the engine keeps evaluating and dispatching additional FOK signals while waiting for a User WS MATCHED event that never arrives for synchronous FOK fills.
 
 ### State reset
@@ -527,7 +527,7 @@ None ──────────────► Posted ───────�
 
 **Triggers:**
 - `None → Posted`: Engine emits signal on `SpikeCandidate`, executor posts order (speculative)
-- `Posted → Filled`: User WS fill (live) or `advance_simulation()` after `SpikeConfirmed` (sim)
+- `Posted → Filled`: REST poll fill or User WS fill (live) or `advance_simulation()` after `SpikeConfirmed` (sim)
 - `Posted → None`: CLOB rejection/error OR Leg 1 staleness timeout OR `SpikeFailed` cancel
 - `Filled → None`: Trade completion (both legs done) or MarketRotation
 
@@ -581,7 +581,7 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 4b. [LIVE] Executor places post-only GTC (at T+0, gains ~300ms queue priority)
     OrderPosted feedback → engine stores order_id
-    User WS fill → leg1_state = Filled, init_erosion()
+    REST poll fill (~200ms) or User WS fill → leg1_state = Filled, init_erosion()
 
 5. evaluate_leg2() runs on each event:
    - Normal: emit erosion signal → executor cancel+repost
@@ -610,11 +610,11 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 ### User WS fill notification delay (live)
 
-**Scenario:** CLOB fills an order, but the User WS notification arrives 200-500ms later.
+**Scenario:** CLOB fills an order, but the User WS notification has variable latency (50-100ms typical, can spike to seconds during reconnects).
 
-**Handle:** The feedback channel sends the real CLOB order ID back in ~50-100ms (REST round-trip). The engine stores this ID immediately. When the User WS notification arrives later, the engine matches it.
+**Handle:** REST fill polling is the primary detection path: after placing Leg 1, the executor polls `GET /data/order/{id}` every 200ms for deterministic fill detection. On `Filled` status, `RestFillDetected` feedback triggers immediate state transition + erosion init (~200ms latency). The User WS remains as backup — if it arrives first, it processes normally; if it arrives after REST detection, it's deduped (`leg1_state` already `Filled`).
 
-**Safety:** Feedback channel is drained BEFORE `on_event()` in each main loop iteration.
+**Safety:** Feedback channel is drained BEFORE `on_event()` in each main loop iteration. `on_rest_fill_detected()` guards on `leg1_state == Posted` with matching `order_id`.
 
 ### Stale events
 
@@ -750,7 +750,7 @@ Post-only first at `best_ask - tick` = $0.50. If accepted → maker fill, zero f
 
 | Aspect | Simulation | Live |
 |--------|-----------|------|
-| **Fill authority** | Engine (`advance_simulation()`) | CLOB (User WS fills) |
+| **Fill authority** | Engine (`advance_simulation()`) | CLOB (REST poll primary + User WS backup) |
 | **Speculative fill gate** | Blocked until `SpikeConfirmed` clears `speculative_awaiting_sustain` | No gate — CLOB decides fill timing |
 | **Leg 1 fill model** | Post-only check: bid < ask AND near depth > 0 (after gate clears) | Real CLOB matching engine |
 | **Leg 2 fill model** | Book-based: ask <= posted → fill | Real CLOB matching engine |

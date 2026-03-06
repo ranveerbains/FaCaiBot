@@ -360,6 +360,15 @@ pub enum ExecutorFeedback {
         was_cancelled: bool,
         is_leg2: bool,
     },
+    /// REST poll detected a Leg 1 fill before the User WS MATCHED event.
+    /// Primary fill detection path (~200ms deterministic). User WS is backup.
+    RestFillDetected {
+        order_id: String,
+        price: Decimal,
+        size: Decimal,
+        size_matched: Decimal,
+        original_size: Decimal,
+    },
     /// Leg 2 placement failed due to insufficient balance/allowance.
     /// Executor halts further Leg 2 attempts until rotation. Engine sends
     /// a critical Telegram alert with position details.

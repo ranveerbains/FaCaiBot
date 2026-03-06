@@ -16,7 +16,7 @@ Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-
 **Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. Post-only entry preserves the full spread at the cost of lower fill rate (~30-50%). Unfilled signals cost nothing.
 
 **Modes** (`MODE` env var):
-- **`live`**: Submits real orders via polymarket-client-sdk (EIP-712 signing handled internally), monitors fills via User WS
+- **`live`**: Submits real orders via polymarket-client-sdk (EIP-712 signing handled internally), detects fills via REST polling (primary, ~200ms) + User WS (backup)
 - **`simulation`**: Full pipeline against live data, but engine simulates fills internally. Reports via Telegram + QuestDB
 
 ---
@@ -83,6 +83,7 @@ Three feedback types flow from executor → engine via the `ExecutorFeedback` ch
 | `OrderPosted { order_id, price, size, is_leg2, fill_method, already_filled }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. For Leg 2: apply `fill_method` metadata to `LiveTradeMeta` (favorable exit tags). If `already_filled` (FOK returned `Filled` synchronously), transition directly to `OrderState::Filled` and trigger trade completion — do NOT wait for User WS MATCHED. Replay `pending_fills` buffer |
 | `OrderFailed { is_leg2 }` | CLOB rejected or network error (non-emergency only — emergency FOKs retry internally, never send this) | Reset leg state to `None`. If `cancel_leg1_on_feedback` is set, clear the flag (nothing to cancel) |
 | `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, replay `pending_fills` buffer (which sends opportunity alert + increments `live_market_signals` for Leg 1 fills), then set `leg1_cancel_race = true` on `LiveTradeMeta` AFTER replay (so it survives the `LiveTradeMeta::default()` reset inside replay) |
+| `RestFillDetected { order_id, price, size, size_matched, original_size }` | REST poll detected Leg 1 fill (~200ms, primary path) | Dedup guard: only process if `leg1_state == Posted` with matching `order_id`. Transition to `Filled`, init erosion, send opportunity alert. User WS MATCHED that arrives later is harmlessly ignored (state already Filled) |
 
 **User WS event routing**: The Polymarket User WS sends two event types: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate` — their `id` field matches the hex hash stored from `OrderPosted` feedback. `"trade"` UUIDs never match and are harmlessly ignored. Actionable statuses forwarded: MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED. Non-actionable statuses (LIVE) are silently skipped by `parse_trade_status()`.
 
@@ -138,7 +139,7 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 
 | Signal | Action |
 |--------|--------|
-| Leg 1 | Post-only GTC → feedback `OrderPosted` to engine |
+| Leg 1 | Post-only GTC → feedback `OrderPosted` to engine → REST poll for fill (`poll_leg1_fill()`: 200ms intervals, max 13 polls) → `RestFillDetected` feedback on fill |
 | Leg 1 rejected | CLOB returns `Rejected` → feedback `OrderFailed` to engine |
 | CancelLeg1 | Send cancel → `CancelResult { was_cancelled }` feedback to engine |
 | Leg 2 erosion | Cancel previous → confirmed: repost at eroded price. NOT confirmed: `CancelResult` feedback, skip replacement |
@@ -146,7 +147,7 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 | Leg 2 emergency | Cancel resting → confirmed: place emergency order. NOT confirmed: `CancelResult` feedback, skip replacement |
 | Leg 2 emergency rejected | Post-only rejected → FOK fallback at `best_ask + 1 tick` (retries internally until CLOB accepts — never sends `OrderFailed`) |
 | Leg 2 balance error | "balance"/"allowance" error → set `balance_exhausted` flag, send `BalanceExhausted` feedback + `OrderFailed`. All subsequent Leg 2 commands rejected until rotation |
-| Market rotation | `cancel_all()` → reset state → clear `balance_exhausted` → pre-warm SDK caches → `caches_warm = true` |
+| Market rotation | `cancel_all()` → reset state → clear `balance_exhausted` → pre-warm SDK caches → pre-warm CLOB connection pool (`sdk.order("0x000...")`) → `caches_warm = true` |
 
 On network error during cancel, the executor cannot determine state — it proceeds with the replacement (cancel counted, no `CancelResult` sent). The User WS is the final authority: if the old order filled, the MATCHED event will arrive and be matched by the engine.
 
@@ -425,7 +426,7 @@ Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows
 
 ### Leg 1 Staleness Timeout
 
-If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) of actual book resting time, the engine cancels it and frees the slot for the next spike.
+If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) of actual book resting time, the engine cancels it and frees the slot for the next spike.
 
 - **Timer start**: Begins when `on_order_posted()` sets the real CLOB ID (resets `timestamp_ms`). The ~1.2s CLOB round-trip does NOT count.
 - **Provisional skip**: `check_leg1_staleness()` returns `None` for `"sim-..."` IDs — the order hasn't reached the book yet.
@@ -434,7 +435,7 @@ If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 5000ms) 
 
 ### Leg 2: Hedge
 
-Triggered when Leg 1 fills. In live mode, fills arrive via User WS `"order"` events with MATCHED status. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally (only after `SpikeConfirmed` clears the speculative fill gate).
+Triggered when Leg 1 fills. In live mode, fills are detected via dual-path: (1) REST polling (primary, ~200ms deterministic — `poll_leg1_fill()` polls `GET /data/order/{id}` every 200ms, sends `RestFillDetected` feedback), or (2) User WS `"order"` events with MATCHED status (backup, variable latency). Whichever arrives first transitions Leg 1 to `Filled` and starts erosion; the second is deduped. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally (only after `SpikeConfirmed` clears the speculative fill gate).
 
 **Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)`
 

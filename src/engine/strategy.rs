@@ -1785,6 +1785,76 @@ impl StrategyEngine {
         None
     }
 
+    /// Called when the live executor's REST poll detects a Leg 1 fill.
+    /// Primary fill detection path (~200ms deterministic). User WS remains
+    /// as backup but will be deduped (leg1_state already Filled).
+    pub fn on_rest_fill_detected(
+        &mut self,
+        order_id: String,
+        price: Decimal,
+        size: Decimal,
+        size_matched: Decimal,
+        original_size: Decimal,
+    ) {
+        // Dedup guard: only transition if Leg 1 is Posted with matching order_id.
+        let is_match = matches!(
+            &self.state.leg1_state,
+            OrderState::Posted { order_id: oid, .. } if *oid == order_id
+        );
+        if !is_match {
+            info!(%order_id, "REST fill deduped — Leg 1 not Posted or order_id mismatch");
+            return;
+        }
+
+        let now_ms = now_epoch_ms();
+        info!(%order_id, %price, %size, %size_matched, %original_size, "Leg 1 fill via REST poll");
+
+        // Partial fill tracking.
+        if size_matched < original_size {
+            warn!(%order_id, %size_matched, %original_size, "partial fill on Leg 1 (REST) — deferring alert to MINED");
+            self.pending_partial_fills.insert(
+                order_id.clone(),
+                PendingPartialFill {
+                    leg: "Leg 1",
+                    size_matched,
+                    original_size,
+                },
+            );
+        }
+
+        // State transition: Posted → Filled.
+        self.state.leg1_state = OrderState::Filled {
+            order_id,
+            price,
+            size,
+            fill_timestamp_ms: now_ms,
+        };
+        self.init_erosion(price, size, now_ms);
+        self.live_trade_meta = LiveTradeMeta::default();
+
+        // Send opportunity alert via Telegram in live mode.
+        if let (Some(reporter), Some(signal)) = (
+            self.reporter.clone(),
+            self.pending_leg1_signal.clone(),
+        ) {
+            let book = signal
+                .book_snapshot
+                .clone()
+                .or_else(|| self.state.poly_book.clone())
+                .unwrap_or_else(|| OrderBook {
+                    asset_id: signal.token_id.clone(),
+                    bids: vec![],
+                    asks: vec![],
+                    timestamp_ms: now_ms,
+                });
+            reporter.send_opportunity_alert(&signal, price, size, &book);
+            self.live_market_signals += 1;
+            if signal.bot_contested {
+                self.live_market_walls += 1;
+            }
+        }
+    }
+
     /// Called by the live executor (via feedback channel) when order placement fails.
     /// Resets the affected leg state to `None` so the engine can re-evaluate.
     pub fn on_order_failed(&mut self, is_leg2: bool) {
@@ -4439,5 +4509,125 @@ mod tests {
             "leg1_direction should be restored"
         );
         assert!(engine.state.last_spike.is_some(), "last_spike should be restored");
+    }
+
+    // ── REST fill detection ──────────────────────────────────────────────
+
+    #[test]
+    fn test_rest_fill_transitions_posted_to_filled() {
+        let mut engine = make_engine_with_market(600);
+        let now_ms = now_epoch_ms();
+        engine.state.leg1_state = OrderState::Posted {
+            order_id: "rest-ord-1".to_string(),
+            price: Decimal::new(48, 2),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 500,
+        };
+        engine.state.last_spike = Some(SpikeInfo {
+            direction: Direction::Up,
+            magnitude: Decimal::new(5, 3),
+            sustained_ms: 250,
+            timestamp_ms: now_ms - 300,
+            atr_ratio: Decimal::ZERO,
+        });
+        engine.state.atr = Some(Decimal::new(2, 3));
+
+        engine.on_rest_fill_detected(
+            "rest-ord-1".into(),
+            Decimal::new(48, 2),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+        );
+
+        assert!(
+            matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "rest-ord-1"),
+            "leg1_state should transition to Filled"
+        );
+        assert!(engine.erosion.is_some(), "erosion should be initialised");
+    }
+
+    #[test]
+    fn test_rest_fill_deduped_when_already_filled() {
+        let mut engine = make_engine_with_market(600);
+        let now_ms = now_epoch_ms();
+        // Already filled (e.g., User WS beat REST poll).
+        engine.state.leg1_state = OrderState::Filled {
+            order_id: "already-filled".to_string(),
+            price: Decimal::new(48, 2),
+            size: Decimal::new(100, 0),
+            fill_timestamp_ms: now_ms - 100,
+        };
+
+        // REST fill arrives for the same order — should be ignored.
+        engine.on_rest_fill_detected(
+            "already-filled".into(),
+            Decimal::new(48, 2),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+        );
+
+        // State unchanged — still Filled, no double init_erosion.
+        assert!(
+            matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "already-filled"),
+        );
+    }
+
+    #[test]
+    fn test_rest_fill_deduped_when_state_is_none() {
+        let mut engine = make_engine_with_market(600);
+        // State is None (e.g., staleness already cancelled the order).
+        assert!(matches!(engine.state.leg1_state, OrderState::None));
+
+        engine.on_rest_fill_detected(
+            "stale-order".into(),
+            Decimal::new(48, 2),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+        );
+
+        // State stays None.
+        assert!(matches!(engine.state.leg1_state, OrderState::None));
+        assert!(engine.erosion.is_none());
+    }
+
+    #[test]
+    fn test_rest_fill_partial_tracked() {
+        let mut engine = make_engine_with_market(600);
+        let now_ms = now_epoch_ms();
+        engine.state.leg1_state = OrderState::Posted {
+            order_id: "partial-ord".to_string(),
+            price: Decimal::new(48, 2),
+            size: Decimal::new(100, 0),
+            timestamp_ms: now_ms - 500,
+        };
+        engine.state.last_spike = Some(SpikeInfo {
+            direction: Direction::Up,
+            magnitude: Decimal::new(5, 3),
+            sustained_ms: 250,
+            timestamp_ms: now_ms - 300,
+            atr_ratio: Decimal::ZERO,
+        });
+        engine.state.atr = Some(Decimal::new(2, 3));
+
+        // size_matched < original_size → partial fill.
+        engine.on_rest_fill_detected(
+            "partial-ord".into(),
+            Decimal::new(48, 2),
+            Decimal::new(100, 0),
+            Decimal::new(50, 0),  // only 50 matched
+            Decimal::new(100, 0), // of 100 original
+        );
+
+        assert!(
+            matches!(engine.state.leg1_state, OrderState::Filled { .. }),
+            "should still transition to Filled"
+        );
+        assert!(
+            engine.pending_partial_fills.contains_key("partial-ord"),
+            "partial fill should be tracked"
+        );
     }
 }
