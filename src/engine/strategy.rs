@@ -723,10 +723,12 @@ impl StrategyEngine {
                                 return; // Skip rest of SpikeConfirmed handling
                             }
                             OrderState::Filled { .. } => {
-                                info!(
+                                warn!(
                                     spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
-                                    "whipsaw — Leg 1 filled, relying on emergency exits for Leg 2"
+                                    "whipsaw — Leg 1 filled, triggering emergency exit"
                                 );
+                                self.whipsaw_fok_pending = true;
+                                self.diag_whipsaw_foks += 1;
                             }
                             _ => {}
                         }

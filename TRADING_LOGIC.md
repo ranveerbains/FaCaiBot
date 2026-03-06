@@ -290,11 +290,11 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 **Two sub-cases:**
 1. **Leg 1 Posted (unfilled):** Cancel immediately. Reuses the SpikeFailed cancel pattern, including provisional ID deferral (`cancel_leg1_on_feedback`). Resets all Leg 1 state and returns early from the SpikeConfirmed handler.
-2. **Leg 1 Filled:** Log the opposite spike but **do not force an immediate FOK**. The existing emergency exit mechanisms (adverse movement, Phase 1 breach, break-even breach) are better suited to handle this — they evaluate actual book conditions rather than preemptively cancelling a potentially favorable resting Leg 2 order. If the opposite spike truly invalidates the position, adverse movement will trigger within milliseconds.
+2. **Leg 1 Filled:** Set `whipsaw_fok_pending = true`, triggering immediate emergency exit on the next `evaluate_leg2()` cycle. `emit_whipsaw_fok()` builds the emergency signal with `ExitReason::WhipsawReversal` and `sim_was_taker = true` — the executor goes straight to `emergency_fok_fallback()` (direct FOK, no post-only attempt). This exits within one CLOB round-trip (~200ms) rather than waiting 2-3s for Phase 1 timeout + Phase 2 transition + BE breach detection. Taker fee (~$0.015/sh) is negligible vs the $0.05-0.07/sh saved by exiting faster.
 
-**Exit reason (if triggered by other emergency paths):** `AdverseMovement`, `Phase1Breach`, `BreakEvenBreach`, etc. — whichever fires first based on actual market conditions.
+**Exit reason:** `WhipsawReversal`
 
-**Note:** `emit_whipsaw_fok()`, `WhipsawReversal` exit reason, and `diag_whipsaw_foks` counter remain in the codebase (referenced by tests and the Leg 1 Posted cancel path) but the Filled Leg 1 path no longer sets `whipsaw_fok_pending`.
+**Diagnostic counter:** `diag_whipsaw_foks` — incremented when Leg 1 Filled whipsaw detected.
 
 ---
 
