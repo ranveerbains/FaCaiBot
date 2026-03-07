@@ -5,15 +5,15 @@ prewarm_lead_secs = 20
 
 [spike_detection]
 # ATR multiplier for spike candidate trigger
-multiplier = 30
+multiplier = 20
 # EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
 atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
-sustain_ms = 400
+sustain_ms = 300
 # Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
 min_magnitude_pct = 0.01
 # Minimum displacement/peak ratio at sustain time
-momentum_ratio_min = 0.8
+momentum_ratio_min = 0.75
 
 [entry_guards]
 # Maximum bid-ask spread in dollars
@@ -26,10 +26,8 @@ entry_cutoff_secs = 25
 binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 1000
-# Block entry if YES mid > this or < (1 - this)
-max_price_skew = 0.85
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 2000
+leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
@@ -37,27 +35,25 @@ trade_cooldown_ms = 0
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 9
-# Fraction of max_alloc for each confidence tier
-high_alloc_pct = 1
-med_alloc_pct = 0.8
-low_alloc_pct = 0.5
+max_alloc_per_trade = 4.5
 
 [confidence]
-# Score >= this → HIGH tier (max score 0.8)
-high_threshold = 0.5
-# Score >= this → MED tier, below → LOW
-med_threshold = 0.35
-# Profit target % for HIGH tier
-high_target_pct = 0.03
-# Profit target % for MED tier
-med_target_pct = 0.02
-# Profit target % for LOW tier
-low_target_pct = 0.02
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
 min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
 strong_spike_atr_ratio = 75
+
+[repricing]
+# Model output ceiling / 100% allocation threshold (0.015 = 1.5% max target for perfect signal)
+reprice_scale = 0.05
+# Minimum model output to enter a trade (0.005 = 0.5%)
+min_reprice_pct = 0.005
+# Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
+min_alloc_pct = 1.0
+# Hard reject: YES mid beyond this regardless of model
+hard_skew_cap = 0.90
+# Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
+time_exponent = 0.5
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
@@ -65,6 +61,8 @@ phase1_timeout_ms = 2500
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.04
+phase1_breach_threshold = 1.03
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
+# Timeout (ms) for favorable maker try before FOK fallback on crosses-book
+favorable_maker_timeout_ms = 1000

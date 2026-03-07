@@ -79,15 +79,13 @@ impl ProfitTier {
         }
     }
 
-    /// Determine the tier from a confidence score (0.0–1.0) using configurable thresholds.
-    pub fn from_confidence(
-        confidence: Decimal,
-        high_threshold: Decimal,
-        med_threshold: Decimal,
-    ) -> Self {
-        if confidence >= high_threshold {
+    /// Determine the tier from expected repricing percentage.
+    /// HIGH: pct >= reprice_scale, MED: pct >= reprice_scale/2, LOW: below.
+    pub fn from_expected_reprice(pct: Decimal, reprice_scale: Decimal) -> Self {
+        let half_scale = reprice_scale / Decimal::TWO;
+        if pct >= reprice_scale {
             ProfitTier::High
-        } else if confidence >= med_threshold {
+        } else if pct >= half_scale {
             ProfitTier::Med
         } else {
             ProfitTier::Low
@@ -169,6 +167,10 @@ pub struct TradeSignal {
     pub bot_contested: bool,
 
     // ── Book snapshot ────────────────────────────────────────────────────
+    /// Best ask price on the hedge book at signal generation time.
+    /// Used by the executor for favorable maker try-first pricing.
+    pub best_ask: Option<Decimal>,
+
     /// Snapshot of the Polymarket orderbook at signal generation time.
     /// Used by the executor to simulate fills without a separate book feed.
     pub book_snapshot: Option<OrderBook>,
@@ -207,6 +209,13 @@ pub enum ExecutorCommand {
     },
     /// Cancel a stale Leg 1 order that wasn't filled in time.
     CancelLeg1 { order_id: String },
+    /// Post a Phase 2 order alongside the existing Phase 1 order (dual-order).
+    /// Does NOT cancel Phase 1.
+    PostLeg2Phase2 { signal: TradeSignal },
+    /// Cancel a specific Leg 2 order by ID (used when one of two dual orders fills).
+    CancelLeg2Order { order_id: String },
+    /// Rebalance FOK: buy Leg 1 side after a double-fill race condition.
+    RebalanceLeg1 { signal: TradeSignal },
     /// Tick size changed mid-market — update SDK cache for both tokens.
     TickSizeChanged {
         yes_token_id: String,
@@ -260,25 +269,6 @@ impl OrderRequest {
         }
     }
 
-    /// Convenience constructor for an aggressive post-only GTC order used in
-    /// emergency code paths. Functionally identical to `post_only_gtc()` but
-    /// named distinctly so call sites communicate intent.
-    pub fn aggressive_post_only(
-        token_id: String,
-        side: Side,
-        price: Decimal,
-        size: Decimal,
-    ) -> Self {
-        Self {
-            token_id,
-            side,
-            price,
-            size,
-            order_type: OrderType::Gtc,
-            post_only: true,
-            expiration: None,
-        }
-    }
 }
 
 // ─── Order Response ──────────────────────────────────────────────────────────
@@ -314,10 +304,26 @@ pub enum OrderStatus {
 /// (e.g., "crosses book" → immediate FOK taker).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillMethod {
+    /// "crosses book" → try maker first, then FOK fallback. This variant means
+    /// the maker order filled within the favorable_maker_timeout window.
+    FavorableMaker,
     /// "crosses book" → immediate FOK taker at the favorable ask.
     FavorableTaker,
     /// Emergency FOK taker fill (deadline FOK or emergency post-only rejected → FOK fallback).
     EmergencyTaker,
+}
+
+/// Tag identifying which Leg 2 order a feedback message refers to.
+/// Used to route `OrderPosted` and fill events to the correct order slot
+/// when two Leg 2 orders rest simultaneously (dual-order Phase 1 + Phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderTag {
+    /// The initial Phase 1 hedge order (profit target price).
+    Leg2Phase1,
+    /// The Phase 2 hedge order (ask-1tick, posted alongside Phase 1).
+    Leg2Phase2,
+    /// Rebalance FOK order after a double-fill race condition.
+    Rebalance,
 }
 
 // ─── Executor Feedback ──────────────────────────────────────────────────
@@ -343,6 +349,9 @@ pub enum ExecutorFeedback {
         /// to `Filled` state. Prevents the double-fill bug where the engine keeps
         /// evaluating and dispatching more FOK signals.
         already_filled: bool,
+        /// Identifies which Leg 2 order this feedback refers to (Phase 1, Phase 2,
+        /// or Rebalance). `None` for Leg 1 or legacy Leg 2 initial posts.
+        order_tag: Option<OrderTag>,
     },
     /// Order placement failed — reset the leg state to `OrderState::None`.
     OrderFailed { is_leg2: bool },
@@ -361,6 +370,18 @@ pub enum ExecutorFeedback {
         size: Decimal,
         size_matched: Decimal,
         original_size: Decimal,
+    },
+    /// Result of cancelling a specific Leg 2 order (from dual-order system).
+    Leg2OrderCancelResult {
+        order_id: String,
+        was_cancelled: bool,
+    },
+    /// Result of a rebalance FOK after double-fill race condition.
+    RebalanceResult {
+        success: bool,
+        price: Decimal,
+        size: Decimal,
+        order_id: Option<String>,
     },
     /// Leg 2 placement failed due to insufficient balance/allowance.
     /// Executor halts further Leg 2 attempts until rotation. Engine sends

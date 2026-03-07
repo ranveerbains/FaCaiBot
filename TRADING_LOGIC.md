@@ -105,11 +105,12 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 3 | **Direction book** | Book for YES (Up) or NO (Down) token exists with bid+ask | `NoBook` | Can't price without book |
 | 4 | **Binance price** | `binance_price` exists | `NoBinance` | Reference price needed |
 | 5 | **Stale book** | `book_age_ms > stale_book_ms` (500ms) | `StaleBook` | Stale data = unreliable pricing |
-| 6 | **Price skew** | YES mid > 0.80 or < 0.20 | `PriceSkewed` | Near-certain markets have illiquid sides |
+| 6 | **Hard skew cap** | YES mid > `hard_skew_cap` or < `1 - hard_skew_cap` (default 0.90) | `PriceSkewed` | Extreme markets have negligible repricing capacity |
 | 7 | **Spread** | `(ask - bid) > max_spread` ($0.02) | `SpreadWide` | Book too thin for reliable entry |
 | 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
 | 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
-| 10 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
+| 10 | **Repricing model** | `expected_pct < min_reprice_pct` (0.5%) | `InsufficientRepricing` | Model output too low to justify entry |
+| 11 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
 
 ### Direction-aware book selection
 
@@ -122,35 +123,60 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 
 ---
 
-## 4. Confidence Scoring & Allocation
+## 4. Repricing Model & Allocation
 
-### Confidence formula
+### Expected repricing formula
 
 ```
-f1 = clamp((atr_ratio - min_spike_atr_ratio) / (strong_spike_atr_ratio - min_spike_atr_ratio), 0, 1)
-f2 = min(total_book_depth / avg_depth, 1.0)
-f3 = time_remaining_secs / 300.0
-
-confidence = 0.4 × f1 + 0.2 × f2 + 0.2 × f3
+expected_reprice_pct = norm_spike × adjusted_sensitivity × time_factor × reprice_scale
 ```
 
-Max possible: **0.8**. The spike quality factor (f1) uses ATR-relative scoring: `atr_ratio = abs_displacement / ema_atr` (dimensionless, computed in the spike detector). Spikes at `min_spike_atr_ratio` (config, default 25) score f1 = 0; spikes at `strong_spike_atr_ratio` (config, default 75) score f1 = 1.0. The ATR ratio automatically adapts to volatility regime — no unit mismatch possible. `SpikeInfo` carries `atr_ratio` from the spike detector through to the evaluator.
+Output is a decimal fraction (e.g., 0.015 = 1.5%). The model output directly IS the Phase 1 profit target. Tick-size independent — quantization happens via `round_to_tick()`.
 
-### Tier thresholds
+**Component 1: `norm_spike` [0,1]** — ATR-relative spike quality:
+```
+norm_spike = clamp((atr_ratio - min_spike_atr_ratio) / (strong_spike_atr_ratio - min_spike_atr_ratio), 0, 1)
+```
+`atr_ratio = |displacement| / ema_atr` (dimensionless, on `SpikeInfo.atr_ratio`). Default range: 20–75.
 
-| Confidence | Tier | Profit Target | Default `tier_pct` | Example ($9 max) |
-|------------|------|---------------|--------------------|-------------------|
-| >= 0.5 | HIGH | 3% | 100% | $9 |
-| >= 0.30 | MED | 2% | 80% | $7.20 |
-| < 0.30 | LOW | 2% | 50% | $4.50 |
+**Component 2: `adjusted_sensitivity`** — binary option delta proxy:
+```
+base = 4P(1-P)                    // P = yes_mid
+distance = |yes_mid - 0.5|
+with_consensus = (Up AND yes_mid > 0.5) OR (Down AND yes_mid < 0.5)
+alignment = with_consensus ? (1.0 + distance) : (1.0 - distance)
+adjusted_sensitivity = base × alignment
+```
+
+**Component 3: `time_factor`** — expiry amplification:
+```
+time_factor = (300.0 / max(time_remaining_secs, 10)) ^ time_exponent
+```
+Default `time_exponent = 0.5` (sqrt). Set to 0 to disable.
+
+**Component 4: `reprice_scale`** — calibration ceiling (default 0.015 = 1.5%).
+
+### Three-layer entry guard
+
+1. **Hard skew cap** (`hard_skew_cap`, default 0.90): Reject if YES mid > 0.90 or < 0.10.
+2. **Minimum expected repricing** (`min_reprice_pct`, default 0.005 = 0.5%): Model output must exceed this floor. Rejection reason: `InsufficientRepricing`.
+3. **Dynamic allocation**: `alloc_fraction = clamp(model_output / reprice_scale, min_alloc_pct, 1.0)`.
 
 ### Allocation
 
-**Zero-alloc guard:** If `tier_pct == 0` for any tier, the signal is rejected immediately with `Leg1RejectReason::Other` before the allocation calculation. This allows disabling entire tiers via config by setting their `*_alloc_pct = 0`. Currently all tiers are enabled: `high_alloc_pct = 1.0`, `med_alloc_pct = 0.8`, `low_alloc_pct = 0.5`.
+`alloc = max(round(max_alloc_per_trade × alloc_fraction, 2dp), $0.01)`. Dynamic — better signals get more capital.
 
-`alloc = max(round(max_alloc_per_trade × tier_pct), $1)`. The $1 floor ensures we always trade at least the minimum.
+Entry size: `round_dp(alloc / bid_price, 2)`. If entry_size rounds to 0, the signal is rejected.
 
-Entry size: `round_dp(alloc / bid_price, 2)`. Polymarket min precision is 0.01 shares. If entry_size rounds to 0, the signal is rejected.
+### ProfitTier (display-only label)
+
+| Expected Repricing | Tier |
+|--------------------|------|
+| >= `reprice_scale` (1.5%) | HIGH |
+| >= `reprice_scale / 2` (0.75%) | MED |
+| < `reprice_scale / 2` | LOW |
+
+`ProfitTier::from_expected_reprice()` — used for Telegram labels and diagnostics only. Does not affect allocation or targets.
 
 ---
 
@@ -196,27 +222,31 @@ The hedge system uses two phases with a single cancel/repost at the transition �
 - If filled during Phase 1 → trade completes at the profit target (best outcome)
 - If `phase1_timeout_ms` elapses without fill → transition to Phase 2
 
-**Phase 2 — Break-even pursuit** (`phase2_timeout_ms`, default 2000ms):
-- Single cancel/repost at `best_ask - 1 tick` (aggressive maker)
-- **No reposts** — hold position, preserve FIFO queue priority
+**Phase 2 — Break-even pursuit / Dual-order** (`phase2_timeout_ms`, default 2000ms):
+- Post Phase 2 order at `best_ask - 1 tick` **without cancelling Phase 1** — two maker orders rest simultaneously (dual-order)
+- **No reposts** on either order — preserve FIFO queue priority
+- Whichever order fills first → cancel the other → trade complete
 - Phase 2 timeout (`phase2_timeout_ms` elapsed) → immediate FOK taker at best ask
-- If `leg1_price + ask > $1.00` → break-even breach → immediate FOK taker at best ask (Section 7)
+- If `ask > phase2_posted_price` → Phase 2 breach → immediate FOK taker at best ask (Section 7)
+- **Phase 2 entry guard**: If `ask - 1tick > breakeven_hedge_price` (`$1.00 - leg1_price`), even the best maker fill would give pair cost > $1.00 → skip posting Phase 2, FOK immediately
 
 ### Phase 1 target price computation
 
 `target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)`
 
-**Constraints applied in order:**
-1. **Don't cross ask:** If target >= best_ask, clamp to `best_ask - tick`
-2. **Smart outbid:** If depth wall detected on the ask side and wall price <= our target, outbid by 1 tick (must keep `leg1_price + outbid < $1.00` and `outbid < ask`)
+The raw target is sent to the executor as-is (no don't-cross-ask clamping, no smart outbid). If the price would cross the book, the CLOB rejects the post-only order or returns "crosses book", and the executor routes to `attempt_favorable_maker_then_fok()` — which is the correct path for that scenario.
 
-### Phase 1 skip guard
+### Phase 1 post-once-and-wait
 
-If the current resting Leg 2 order is already at a price equal to or better than the Phase 1 target, the evaluator returns None — preserving the favorable position.
+Phase 1 posts once at the profit target, then holds. The evaluator returns `None` if `leg2_state` is already `Posted` or `Filled`. If `OrderFailed` feedback resets `leg2_state` to `None`, the evaluator will re-emit a Phase 1 post signal on the next cycle (retry on failure). No reposts, no outbidding, no price adjustments during Phase 1.
 
-### Phase 2 behavior
+### Phase 2 behavior (dual-order)
 
-Phase 2 posts once at `best_ask - 1 tick` and holds position — no reposts, preserving FIFO queue priority. Two exit triggers: (1) `phase2_timeout_ms` elapsed → FOK taker; (2) break-even breach (`pair > $1.00`) → immediate FOK taker. `HedgeState.phase2_start_ms` tracks when Phase 2 began for timeout calculation.
+Phase 2 posts at `best_ask - 1 tick` **without cancelling the Phase 1 order** — two maker orders rest simultaneously (dual-order). No reposts on either order, preserving FIFO queue priority on both. Whichever fills first wins; the engine cancels the other and completes the trade. Three exit triggers: (1) `phase2_timeout_ms` elapsed → FOK taker; (2) Phase 2 breach (`ask > phase2_posted_price`) → immediate FOK taker; (3) Phase 2 entry breach (ask - tick > breakeven) → skip posting, immediate FOK. `HedgeState.phase2_start_ms` tracks when Phase 2 began for timeout calculation. `HedgeState.phase2_posted_price` records the Phase 2 order price for breach detection.
+
+### Double-fill rebalance
+
+Rare race condition: both Phase 1 and Phase 2 orders fill before the cancel reaches the CLOB (~3ms window). Result: N shares Leg 1 + 2N shares Leg 2 (excess). Fix: FOK taker buy N shares on Leg 1 side (same direction as original entry) to form a second pair. Uses the standard `emergency_fok_fallback` price-escalation loop, capped at $1.00. FOK is atomic → no recursive overfill risk. If FOK fails → critical Telegram alert (naked directional exposure, manual intervention needed). Tracked via `post_trade_orphan` on `StrategyEngine` — persists across `on_trade_complete()` so the orphan fill can be detected after the trade resets.
 
 ### Hedge evaluation flow
 
@@ -227,12 +257,12 @@ On every engine event, if hedge exists and `leg1_state == Filled`:
 3. **Phase 1 path** (if `phase == Phase1`):
    - Check Phase 1 breach (pair cost > `phase1_breach_threshold`) → immediate FOK taker at ask
    - Check Phase 1 timeout (`elapsed >= phase1_timeout_ms`) → transition to Phase 2
-   - Skip guard: if posted price <= target → hold
-   - Emit Phase 1 post signal
+   - If already posted or filled → hold (post-once-and-wait)
+   - Emit Phase 1 post signal (only when `leg2_state == None`)
 4. **Phase 2 path** (if `phase == Phase2`):
    - Check Phase 2 timeout (`elapsed >= phase2_timeout_ms`) → FOK taker at best ask
-   - Check break-even breach (pair cost > $1.00) → immediate FOK taker at ask
-   - No breach/timeout → hold (preserve queue priority, no reposts)
+   - Check Phase 2 breach (`ask > phase2_posted_price`) → immediate FOK taker at ask
+   - No breach/timeout → hold (preserve queue priority, no reposts on either order)
 
 ---
 
@@ -252,16 +282,19 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 **Exit reason:** `Phase1Breach`
 
-### 7b. Break-Even Breach
+### 7b. Phase 2 Breach (was Break-Even Breach)
 
-**Trigger:** Pair cost has exceeded $1.00 during Phase 2 — continuous check while the maker order rests.
+**Trigger:** Current ask has risen above the Phase 2 posted price — the Phase 2 order is deep in the book and unlikely to fill.
 
 **Gates (all must be true):**
-1. `leg1_price + current_opposing_ask > 1.0` (pair cost exceeds $1.00, strict — at exactly $1.00 the emergency exit often fills worse)
+1. `phase == Phase2`
+2. `current_opposing_ask > phase2_posted_price` (ask moved above our Phase 2 order)
 
 **Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
 
 **Exit reason:** `BreakEvenBreach`
+
+**Note:** This replaces the old `leg1_price + ask > $1.00` check. The Phase 2 posted price (ask-1tick at posting) is the worst maker price we'll accept. If ask rises above it, exit via FOK.
 
 ### 7c. Phase 2 Timeout
 
@@ -295,17 +328,26 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 ---
 
-## 8. Favorable Taker Exits
+## 8. Favorable Exits (Try Maker First)
 
-**Trigger:** During normal hedge (Phase 1 or Phase 2), the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread). Instead of leaving Leg 1 unhedged, the bot market-takes at the ask — taker fee is acceptable insurance vs the risk of an open position.
+**Trigger:** During normal hedge (Phase 1 or Phase 2), the opposing ask drops strictly below the posted Leg 2 bid. A post-only order at this price would be rejected by the CLOB (would cross spread).
 
 **Simulation:** `advance_simulation()` detects `ask < posted_price` on each book update across all direction branches. Fills at the ask price with `ExitReason::FavorableTaker`.
 
-**Live:** When the CLOB rejects a post-only hedge order (price would cross, including "crosses book" SDK errors), the executor calls `attempt_favorable_exit()` which immediately places a **FOK taker** at `signal.price` to capture the transient favorable ask. The favorable ask is fleeting — a maker walk-down risks the order sitting unfilled while the market bounces back, leading to a BE breach emergency exit at a worse price. The FOK approach locks in the favorable pricing in a single round-trip (~100ms). Guards: `clob_safe_fok_size()` zero-size check and `price × size >= $1` notional minimum. `fill_method=FavorableTaker` + `already_filled` if sync fill. The CLOB fills FOK at the actual best ask (below our limit), giving automatic price improvement. Emergency FOK paths (`emergency_fok_fallback` and `emergency_fok_at_price`) send `fill_method=EmergencyTaker` — distinct from favorable exits so the engine correctly classifies the trade. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags (`favorable_taker`, `leg2_was_taker`) even though the executor autonomously converted the signal.
+**Live — Try Maker First:** When the CLOB rejects a post-only hedge order (price would cross, including "crosses book" SDK errors), the executor uses `attempt_favorable_maker_then_fok()`:
 
-**Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]` when the emergency dispatch happened before the cancel race resolved.
+1. Post maker at `best_ask - 1tick` (rests below current ask)
+2. Poll for fill up to `favorable_maker_timeout_ms` (default 1000ms)
+3. If filled → maker fill (no taker fee + rebate = ~$0.37 savings). `fill_method=FavorableMaker`
+4. If not filled → cancel → FOK taker fallback (existing path). `fill_method=FavorableTaker`
 
-**Tracking:** `favorable_taker_fills` counter across all reporting contexts. Telegram tags: `[FAVORABLE POST-ONLY]` or `[FAVORABLE FOK FALLBACK]`.
+5. If cancel NOT confirmed (order may have filled) → send `OrderPosted` with `already_filled=false`, let User WS determine outcome
+
+Guards: `clob_safe_fok_size()` zero-size check and `price × size >= $1` notional minimum. `already_filled` set if sync fill. Emergency FOK paths (`emergency_fok_fallback`) send `fill_method=EmergencyTaker` — distinct from favorable exits. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags even though the executor autonomously converted the signal.
+
+**Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]`.
+
+**Tracking:** `diag_favorable_exits` counter (total), `diag_favorable_maker_fills` (maker try succeeded), `diag_favorable_maker_timeouts` (fell back to FOK). Telegram tags: `[FAVORABLE MAKER]` (maker try succeeded), `[FAVORABLE FOK FALLBACK]` (FOK fallback), `[FAVORABLE POST-ONLY]` (emergency maker fill).
 
 ---
 

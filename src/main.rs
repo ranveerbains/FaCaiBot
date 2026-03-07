@@ -246,9 +246,10 @@ async fn async_main() -> Result<()> {
                         size,
                         fill_method,
                         already_filled,
+                        order_tag,
                     } => {
                         if let Some(cancel_cmd) =
-                            engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled)
+                            engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled, order_tag)
                         {
                             let _ = executor_tx.send(cancel_cmd);
                         }
@@ -264,6 +265,10 @@ async fn async_main() -> Result<()> {
                                 warn!(error = %e, "failed to record live trade to QuestDB (FOK already_filled)");
                             }
                             engine.on_trade_complete();
+                            // After trade complete, check for orphan cancel.
+                            if let Some(orphan_cmd) = engine.take_orphan_cancel() {
+                                let _ = executor_tx.send(orphan_cmd);
+                            }
                         }
                     }
                     ExecutorFeedback::OrderFailed { is_leg2 } => {
@@ -275,6 +280,12 @@ async fn async_main() -> Result<()> {
                         is_leg2,
                     } => {
                         engine.on_cancel_result(order_id, was_cancelled, is_leg2);
+                    }
+                    ExecutorFeedback::Leg2OrderCancelResult {
+                        order_id,
+                        was_cancelled,
+                    } => {
+                        engine.on_leg2_order_cancel_result(order_id, was_cancelled);
                     }
                     ExecutorFeedback::RestFillDetected {
                         order_id,
@@ -293,6 +304,14 @@ async fn async_main() -> Result<()> {
                     }
                     ExecutorFeedback::BalanceExhausted => {
                         engine.on_balance_exhausted();
+                    }
+                    ExecutorFeedback::RebalanceResult {
+                        success,
+                        price,
+                        size,
+                        order_id,
+                    } => {
+                        engine.on_rebalance_result(success, price, size, order_id);
                     }
                 }
             }
@@ -573,9 +592,29 @@ async fn async_main() -> Result<()> {
                     true
                 };
                 if should_send {
-                    if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
+                    // Phase2Alongside: send as PostLeg2Phase2 (don't cancel Phase 1).
+                    let cmd = if engine.take_phase2_alongside_flag() {
+                        ExecutorCommand::PostLeg2Phase2 { signal }
+                    } else {
+                        ExecutorCommand::Signal(signal)
+                    };
+                    if let Err(e) = executor_tx.send(cmd) {
                         error!(error = %e, "failed to send Leg 2 signal to executor");
                         break;
+                    }
+                }
+            }
+
+            // In live mode: check for orphan cancel and rebalance after trade status updates.
+            if engine_mode == Mode::Live {
+                if engine.has_orphan_cancel() {
+                    if let Some(orphan_cmd) = engine.take_orphan_cancel() {
+                        let _ = executor_tx.send(orphan_cmd);
+                    }
+                }
+                if engine.rebalance_in_progress() {
+                    if let Some(rebal_cmd) = engine.take_rebalance_signal() {
+                        let _ = executor_tx.send(rebal_cmd);
                     }
                 }
             }
@@ -592,6 +631,10 @@ async fn async_main() -> Result<()> {
                     warn!(error = %e, "failed to record live trade to QuestDB");
                 }
                 engine.on_trade_complete();
+                // After trade complete, check for orphan cancel.
+                if let Some(orphan_cmd) = engine.take_orphan_cancel() {
+                    let _ = executor_tx.send(orphan_cmd);
+                }
             }
 
             // Check drain completion: position fully closed after drain was activated.
@@ -696,7 +739,13 @@ async fn async_main() -> Result<()> {
                 )
                 .with_notify_flags(Arc::clone(&executor_notify_flags));
 
-                let live_executor = LiveExecutor::new(poly, feedback_tx, reporter, cold);
+                let live_executor = LiveExecutor::new(
+                    poly,
+                    feedback_tx,
+                    reporter,
+                    cold,
+                    config.bot.risk.favorable_maker_timeout_ms,
+                );
 
                 if let Err(e) = live_executor.run(executor_rx).await {
                     error!(error = %e, "live executor crashed");

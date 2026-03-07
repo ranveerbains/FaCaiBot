@@ -54,8 +54,6 @@ pub struct EntryGuardsConfig {
     pub binance_stale_event_ms: u64,
     /// Max book age (ms) before blocking entry.
     pub stale_book_ms: u64,
-    /// Block entry if YES mid price exceeds this (or falls below 1 - this).
-    pub max_price_skew: f64,
     /// Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
     pub leg1_timeout_ms: u64,
     /// Quiet period (ms) after market rotation — no new Leg 1 entries.
@@ -72,7 +70,6 @@ impl Default for EntryGuardsConfig {
             entry_cutoff_secs: 180,
             binance_stale_event_ms: 50,
             stale_book_ms: 1000,
-            max_price_skew: 0.80,
             leg1_timeout_ms: 5000,
             rotation_quiet_ms: 30000,
             trade_cooldown_ms: 5000,
@@ -85,21 +82,12 @@ impl Default for EntryGuardsConfig {
 pub struct CapitalConfig {
     /// Maximum USDC to allocate per leg per trade (nearest dollar, $1 floor).
     pub max_alloc_per_trade: f64,
-    /// Fraction of max_alloc_per_trade for HIGH confidence tier.
-    pub high_alloc_pct: f64,
-    /// Fraction of max_alloc_per_trade for MED confidence tier.
-    pub med_alloc_pct: f64,
-    /// Fraction of max_alloc_per_trade for LOW confidence tier.
-    pub low_alloc_pct: f64,
 }
 
 impl Default for CapitalConfig {
     fn default() -> Self {
         Self {
             max_alloc_per_trade: 10.0,
-            high_alloc_pct: 1.00,
-            med_alloc_pct: 0.50,
-            low_alloc_pct: 0.25,
         }
     }
 }
@@ -107,16 +95,6 @@ impl Default for CapitalConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ConfidenceConfig {
-    /// Confidence >= this → HIGH tier.
-    pub high_threshold: f64,
-    /// Confidence >= this → MED tier.
-    pub med_threshold: f64,
-    /// Profit target % for HIGH tier (e.g. 0.025 = 2.5%).
-    pub high_target_pct: f64,
-    /// Profit target % for MED tier (e.g. 0.015 = 1.5%).
-    pub med_target_pct: f64,
-    /// Profit target % for LOW tier (e.g. 0.010 = 1.0%).
-    pub low_target_pct: f64,
     /// Minimum spike ATR ratio to trade. Spikes below this → f1 = 0.
     pub min_spike_atr_ratio: f64,
     /// Spike ATR ratio at which spike quality factor = 1.0.
@@ -126,11 +104,6 @@ pub struct ConfidenceConfig {
 impl Default for ConfidenceConfig {
     fn default() -> Self {
         Self {
-            high_threshold: 0.6,
-            med_threshold: 0.3,
-            high_target_pct: 0.025,
-            med_target_pct: 0.015,
-            low_target_pct: 0.010,
             min_spike_atr_ratio: 25.0,
             strong_spike_atr_ratio: 75.0,
         }
@@ -149,6 +122,8 @@ pub struct RiskConfig {
     pub phase1_breach_threshold: f64,
     /// Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit.
     pub phase2_timeout_ms: u64,
+    /// Timeout (ms) for favorable maker try before FOK fallback on crosses-book.
+    pub favorable_maker_timeout_ms: u64,
 }
 
 impl Default for RiskConfig {
@@ -158,6 +133,7 @@ impl Default for RiskConfig {
             depth_wall_multiplier: 4.0,
             phase1_breach_threshold: 1.05,
             phase2_timeout_ms: 2000,
+            favorable_maker_timeout_ms: 1000,
         }
     }
 }
@@ -177,6 +153,33 @@ impl Default for RotationConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RepricingConfig {
+    /// Model output ceiling / 100% allocation threshold (0.015 = 1.5%).
+    pub reprice_scale: f64,
+    /// Minimum model output to enter a trade (0.005 = 0.5%).
+    pub min_reprice_pct: f64,
+    /// Floor allocation fraction (0.3 = always use at least 30% of max_alloc).
+    pub min_alloc_pct: f64,
+    /// Hard reject: YES mid beyond this regardless of model.
+    pub hard_skew_cap: f64,
+    /// Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear).
+    pub time_exponent: f64,
+}
+
+impl Default for RepricingConfig {
+    fn default() -> Self {
+        Self {
+            reprice_scale: 0.015,
+            min_reprice_pct: 0.005,
+            min_alloc_pct: 0.3,
+            hard_skew_cap: 0.90,
+            time_exponent: 0.5,
+        }
+    }
+}
+
 // ─── Top-level TOML config ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +191,7 @@ pub struct BotConfig {
     pub capital: CapitalConfig,
     pub confidence: ConfidenceConfig,
     pub risk: RiskConfig,
+    pub repricing: RepricingConfig,
 }
 
 impl Default for BotConfig {
@@ -199,6 +203,7 @@ impl Default for BotConfig {
             capital: CapitalConfig::default(),
             confidence: ConfidenceConfig::default(),
             risk: RiskConfig::default(),
+            repricing: RepricingConfig::default(),
         }
     }
 }
@@ -240,23 +245,24 @@ pub struct Config {
 
     // ── Derived Decimal values (computed from BotConfig at load time) ─
     pub max_alloc_per_trade: Decimal,
-    pub high_alloc_pct: Decimal,
-    pub med_alloc_pct: Decimal,
-    pub low_alloc_pct: Decimal,
     pub phase1_breach_threshold: Decimal,
     pub stale_event_threshold_ms: u64,
-    /// Profit target for HIGH tier (from config).
-    pub high_target_pct: Decimal,
-    /// Profit target for MED tier (from config).
-    pub med_target_pct: Decimal,
-    /// Profit target for LOW tier (from config).
-    pub low_target_pct: Decimal,
     /// Minimum spike magnitude (from spike_detection config), as Decimal.
     pub min_magnitude_pct: Decimal,
     /// Minimum spike ATR ratio to trade, as Decimal.
     pub min_spike_atr_ratio: Decimal,
     /// Spike ATR ratio at which spike quality factor = 1.0, as Decimal.
     pub strong_spike_atr_ratio: Decimal,
+    /// Repricing model: output ceiling / 100% allocation threshold.
+    pub reprice_scale: Decimal,
+    /// Repricing model: minimum output to enter a trade.
+    pub min_reprice_pct: Decimal,
+    /// Repricing model: floor allocation fraction.
+    pub min_alloc_pct: Decimal,
+    /// Repricing model: hard reject cap on YES mid price.
+    pub hard_skew_cap: Decimal,
+    /// Repricing model: exponent for time amplification (stays f64 for powf).
+    pub time_exponent: f64,
 }
 
 impl Config {
@@ -342,27 +348,24 @@ impl Config {
         // ── Derive Decimal values from BotConfig ─────────────────────
         let max_alloc_per_trade = Decimal::try_from(bot.capital.max_alloc_per_trade)
             .context("capital.max_alloc_per_trade: invalid decimal")?;
-        let high_alloc_pct = Decimal::try_from(bot.capital.high_alloc_pct)
-            .context("capital.high_alloc_pct: invalid decimal")?;
-        let med_alloc_pct = Decimal::try_from(bot.capital.med_alloc_pct)
-            .context("capital.med_alloc_pct: invalid decimal")?;
-        let low_alloc_pct = Decimal::try_from(bot.capital.low_alloc_pct)
-            .context("capital.low_alloc_pct: invalid decimal")?;
         let phase1_breach_threshold = Decimal::try_from(bot.risk.phase1_breach_threshold)
             .context("risk.phase1_breach_threshold: invalid decimal")?;
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
-        let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct)
-            .context("confidence.high_target_pct: invalid decimal")?;
-        let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct)
-            .context("confidence.med_target_pct: invalid decimal")?;
-        let low_target_pct = Decimal::try_from(bot.confidence.low_target_pct)
-            .context("confidence.low_target_pct: invalid decimal")?;
         let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct)
             .context("spike_detection.min_magnitude_pct: invalid decimal")?;
         let min_spike_atr_ratio = Decimal::try_from(bot.confidence.min_spike_atr_ratio)
             .context("confidence.min_spike_atr_ratio: invalid decimal")?;
         let strong_spike_atr_ratio = Decimal::try_from(bot.confidence.strong_spike_atr_ratio)
             .context("confidence.strong_spike_atr_ratio: invalid decimal")?;
+        let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale)
+            .context("repricing.reprice_scale: invalid decimal")?;
+        let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct)
+            .context("repricing.min_reprice_pct: invalid decimal")?;
+        let min_alloc_pct = Decimal::try_from(bot.repricing.min_alloc_pct)
+            .context("repricing.min_alloc_pct: invalid decimal")?;
+        let hard_skew_cap = Decimal::try_from(bot.repricing.hard_skew_cap)
+            .context("repricing.hard_skew_cap: invalid decimal")?;
+        let time_exponent = bot.repricing.time_exponent;
 
         let config = Self {
             mode,
@@ -380,17 +383,16 @@ impl Config {
             telegram_allowed_user_id,
             bot,
             max_alloc_per_trade,
-            high_alloc_pct,
-            med_alloc_pct,
-            low_alloc_pct,
             phase1_breach_threshold,
             stale_event_threshold_ms,
-            high_target_pct,
-            med_target_pct,
-            low_target_pct,
             min_magnitude_pct,
             min_spike_atr_ratio,
             strong_spike_atr_ratio,
+            reprice_scale,
+            min_reprice_pct,
+            min_alloc_pct,
+            hard_skew_cap,
+            time_exponent,
         };
 
         // ── Validation ───────────────────────────────────────────────
@@ -400,10 +402,6 @@ impl Config {
         if config.bot.spike_detection.multiplier <= 0.0 {
             anyhow::bail!("spike_detection.multiplier must be positive");
         }
-        if config.bot.confidence.high_threshold <= config.bot.confidence.med_threshold {
-            anyhow::bail!("confidence.high_threshold must be > med_threshold");
-        }
-
         Ok(config)
     }
 
@@ -414,17 +412,16 @@ impl Config {
         let bot = BotConfig::default();
 
         let max_alloc_per_trade = Decimal::try_from(bot.capital.max_alloc_per_trade).unwrap();
-        let high_alloc_pct = Decimal::try_from(bot.capital.high_alloc_pct).unwrap();
-        let med_alloc_pct = Decimal::try_from(bot.capital.med_alloc_pct).unwrap();
-        let low_alloc_pct = Decimal::try_from(bot.capital.low_alloc_pct).unwrap();
         let phase1_breach_threshold = Decimal::try_from(bot.risk.phase1_breach_threshold).unwrap();
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
-        let high_target_pct = Decimal::try_from(bot.confidence.high_target_pct).unwrap();
-        let med_target_pct = Decimal::try_from(bot.confidence.med_target_pct).unwrap();
-        let low_target_pct = Decimal::try_from(bot.confidence.low_target_pct).unwrap();
         let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct).unwrap();
         let min_spike_atr_ratio = Decimal::try_from(bot.confidence.min_spike_atr_ratio).unwrap();
         let strong_spike_atr_ratio = Decimal::try_from(bot.confidence.strong_spike_atr_ratio).unwrap();
+        let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale).unwrap();
+        let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct).unwrap();
+        let min_alloc_pct = Decimal::try_from(bot.repricing.min_alloc_pct).unwrap();
+        let hard_skew_cap = Decimal::try_from(bot.repricing.hard_skew_cap).unwrap();
+        let time_exponent = bot.repricing.time_exponent;
 
         Self {
             mode: Mode::Simulation,
@@ -440,17 +437,16 @@ impl Config {
             telegram_allowed_user_id: None,
             bot,
             max_alloc_per_trade,
-            high_alloc_pct,
-            med_alloc_pct,
-            low_alloc_pct,
             phase1_breach_threshold,
             stale_event_threshold_ms,
-            high_target_pct,
-            med_target_pct,
-            low_target_pct,
             min_magnitude_pct,
             min_spike_atr_ratio,
             strong_spike_atr_ratio,
+            reprice_scale,
+            min_reprice_pct,
+            min_alloc_pct,
+            hard_skew_cap,
+            time_exponent,
         }
     }
 }

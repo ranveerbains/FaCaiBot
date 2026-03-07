@@ -27,11 +27,13 @@ use crate::types::market::{
     DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState, PriceLevel,
     SpikeInfo, TradeStatus,
 };
-use crate::types::order::{ExecutorCommand, ExitReason, FillMethod, ProfitTier, Side, TradeSignal};
+use crate::types::order::{
+    ExecutorCommand, ExitReason, FillMethod, OrderTag, ProfitTier, Side, TradeSignal,
+};
 use crate::types::simulation::{MarketSummary, SessionSummary, SimFill, SimTrade};
 use crate::utils::time::epoch_ms as now_epoch_ms;
 
-use super::confidence::compute_confidence;
+use super::confidence::compute_expected_repricing;
 use super::erosion::{ConnectivityState, HedgePhase, HedgeSnap, HedgeState};
 use super::evaluator::{
     Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
@@ -74,7 +76,11 @@ struct LiveTradeMeta {
     leg2_was_taker: bool,
     emergency_maker: bool,
     favorable_taker: bool,
+    /// `true` if Leg 2 filled via the favorable maker try-first path (no taker fee).
+    favorable_maker: bool,
     phase1_breach: bool,
+    /// `true` if Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
+    phase1_dual_fill: bool,
     exit_reason: Option<ExitReason>,
     /// `true` if Leg 1 filled via the cancel-not-confirmed replay path.
     leg1_cancel_race: bool,
@@ -92,6 +98,23 @@ struct CancelledLeg1 {
     signal: Option<TradeSignal>,
     direction: Option<Direction>,
     spike: Option<SpikeInfo>,
+}
+
+// ─── Orphan state for dual-order double-fill recovery ───────────────────────
+
+/// State for the "other" order after one of the dual Phase 1/Phase 2 orders fills.
+/// Persists across `on_trade_complete()` — the orphan may fill after the trade resets.
+/// Cleared on: confirmed cancel, rebalance complete, or market rotation.
+#[derive(Debug, Clone)]
+struct OrphanState {
+    order_id: String,
+    price: Decimal,
+    size: Decimal,
+    leg1_direction: Direction,
+    leg1_price: Decimal,
+    token_id: String,
+    condition_id: String,
+    tick_size: Decimal,
 }
 
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
@@ -119,8 +142,6 @@ pub struct StrategyEngine {
     connectivity: ConnectivityState,
     /// EMA of total poly book depth (alpha=0.1) for depth wall detection.
     avg_book_depth: Option<Decimal>,
-    /// Epoch ms of the last Leg 2 hedge signal emitted.
-    last_hedge_signal_ms: u64,
     /// Direction of the active Leg 1 trade. Set by evaluate(), cleared on completion/rotation.
     leg1_direction: Option<Direction>,
 
@@ -226,24 +247,47 @@ pub struct StrategyEngine {
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_spread: u64,  // SpreadWide
     diag_rej_depth: u64,   // InsufficientDepth
+    diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
     diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
     diag_leg1_fills: u64,
-    diag_leg2_reposts: u64,
+    diag_leg2_phase1_posts: u64,
     diag_phase_transitions: u64,
     diag_leg2_fills_maker: u64,
     diag_leg2_fills_taker: u64,
-    diag_emg_breakeven: u64,
+    diag_emg_phase2_breach: u64,
     diag_emg_expiry: u64,
-    diag_emg_favorable: u64,
+    diag_favorable_exits: u64,
     diag_emg_maker: u64,  // emergency exits filled as post-only maker
     diag_emg_taker: u64,  // emergency exits filled as FOK taker
+    diag_favorable_maker_fills: u64,
+    diag_favorable_maker_timeouts: u64,
+    diag_double_fills: u64,
+    diag_rebalance_attempts: u64,
+    diag_rebalance_successes: u64,
+    diag_phase2_entry_breach: u64,
     diag_leg1_timeouts: u64,
     diag_spike_sustain_cancel: u64,
     diag_spike_failures: u64,
     diag_order_failures: u64,
     last_diag_ms: u64,
+
+    // ── Dual-order tracking (Phase 1 + Phase 2) ────────────────────────
+    /// Phase 1 Leg 2 order ID (persists into Phase 2 when dual-order active).
+    leg2_phase1_order_id: Option<String>,
+    /// Phase 2 Leg 2 order ID (posted alongside Phase 1 at ask-1tick).
+    leg2_phase2_order_id: Option<String>,
+    /// Orphan state: survives `on_trade_complete()` — tracks the "other" order
+    /// after one of the dual orders fills. Cleared on confirmed cancel, rebalance
+    /// complete, or market rotation.
+    post_trade_orphan: Option<OrphanState>,
+    /// `true` when a rebalance FOK is in progress (double-fill recovery).
+    rebalance_in_progress: bool,
+    /// Set `true` when the last `evaluate_leg2()` returned a Phase2Alongside signal.
+    /// Main loop checks this to send `PostLeg2Phase2` instead of `Signal`.
+    /// Cleared after being consumed.
+    last_leg2_was_phase2_alongside: bool,
 
     // ── Drain / pause mode ─────────────────────────────────────────────
     /// When `true`, `evaluate()` blocks new Leg 1 entries. Set by `/shutdown` or `/set`.
@@ -292,16 +336,11 @@ impl StrategyEngine {
             Decimal::try_from(config.bot.entry_guards.depth_min_pct).unwrap_or(Decimal::new(15, 2));
         let depth_wall_multiplier =
             Decimal::try_from(config.bot.risk.depth_wall_multiplier).unwrap_or(Decimal::new(4, 0));
-        let high_threshold =
-            Decimal::try_from(config.bot.confidence.high_threshold).unwrap_or(Decimal::new(8, 1));
-        let med_threshold =
-            Decimal::try_from(config.bot.confidence.med_threshold).unwrap_or(Decimal::new(5, 1));
         Self {
             state,
             hedge: None,
             connectivity: ConnectivityState::default(),
             avg_book_depth: None,
-            last_hedge_signal_ms: 0,
             leg1_direction: None,
             in_cutoff_window: false,
             in_quiet_period: false,
@@ -343,24 +382,36 @@ impl StrategyEngine {
             diag_rej_skew: 0,
             diag_rej_spread: 0,
             diag_rej_depth: 0,
+            diag_rej_reprice: 0,
             diag_rej_paused: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
             diag_leg1_fills: 0,
-            diag_leg2_reposts: 0,
+            diag_leg2_phase1_posts: 0,
             diag_phase_transitions: 0,
             diag_leg2_fills_maker: 0,
             diag_leg2_fills_taker: 0,
-            diag_emg_breakeven: 0,
+            diag_emg_phase2_breach: 0,
             diag_emg_expiry: 0,
-            diag_emg_favorable: 0,
+            diag_favorable_exits: 0,
             diag_emg_maker: 0,
             diag_emg_taker: 0,
+            diag_favorable_maker_fills: 0,
+            diag_favorable_maker_timeouts: 0,
+            diag_double_fills: 0,
+            diag_rebalance_attempts: 0,
+            diag_rebalance_successes: 0,
+            diag_phase2_entry_breach: 0,
             diag_leg1_timeouts: 0,
             diag_spike_sustain_cancel: 0,
             diag_spike_failures: 0,
             diag_order_failures: 0,
             last_diag_ms: 0,
+            leg2_phase1_order_id: None,
+            leg2_phase2_order_id: None,
+            post_trade_orphan: None,
+            rebalance_in_progress: false,
+            last_leg2_was_phase2_alongside: false,
             draining: false,
             paused: false,
             cancel_leg1_on_feedback: false,
@@ -375,25 +426,19 @@ impl StrategyEngine {
                 depth_min_pct,
                 stale_book_ms: config.bot.entry_guards.stale_book_ms,
                 max_alloc_per_trade: config.max_alloc_per_trade,
-                high_alloc_pct: config.high_alloc_pct,
-                med_alloc_pct: config.med_alloc_pct,
-                low_alloc_pct: config.low_alloc_pct,
                 depth_wall_multiplier,
-                high_threshold,
-                med_threshold,
-                high_target_pct: config.high_target_pct,
-                med_target_pct: config.med_target_pct,
-                low_target_pct: config.low_target_pct,
-                max_price_skew: Decimal::try_from(config.bot.entry_guards.max_price_skew)
-                    .unwrap_or(Decimal::new(9, 1)),
                 leg1_timeout_ms: config.bot.entry_guards.leg1_timeout_ms,
                 min_magnitude_pct: config.min_magnitude_pct,
                 min_spike_atr_ratio: config.min_spike_atr_ratio,
                 strong_spike_atr_ratio: config.strong_spike_atr_ratio,
+                reprice_scale: config.reprice_scale,
+                min_reprice_pct: config.min_reprice_pct,
+                min_alloc_pct: config.min_alloc_pct,
+                hard_skew_cap: config.hard_skew_cap,
+                time_exponent: config.time_exponent,
             },
             leg2: Leg2Evaluator {
                 phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
-                depth_wall_multiplier,
                 phase1_breach_threshold: config.phase1_breach_threshold,
                 phase2_timeout_ms: config.bot.risk.phase2_timeout_ms,
             },
@@ -911,7 +956,6 @@ impl StrategyEngine {
                 self.state.cumulative_used = Decimal::ZERO;
                 self.state.last_update_ms = now_ms;
                 self.hedge = None;
-                self.last_hedge_signal_ms = 0;
                 self.avg_book_depth = None;
                 self.leg1_direction = None;
                 self.pending_leg1_signal = None;
@@ -926,6 +970,11 @@ impl StrategyEngine {
                 self.prev_leg2_order = None;
                 self.pending_fills.clear();
                 self.pending_partial_fills.clear();
+                // Dual-order: clear ALL state on rotation (new market).
+                self.leg2_phase1_order_id = None;
+                self.leg2_phase2_order_id = None;
+                self.post_trade_orphan = None;
+                self.rebalance_in_progress = false;
                 self.in_cutoff_window = false;
                 self.in_quiet_period = true;
                 self.in_trade_cooldown = false;
@@ -1009,18 +1058,58 @@ impl StrategyEngine {
                     }
                 }
 
+                // Leg 2 matching: check leg2_state AND both phase order IDs.
                 let is_leg2 = match &self.state.leg2_state {
                     OrderState::Posted { order_id: oid, .. } => *oid == order_id,
                     _ => false,
                 };
-                if is_leg2 {
-                    let (price, size) = match &self.state.leg2_state {
-                        OrderState::Posted { price, size, .. } => (*price, *size),
-                        _ => unreachable!(),
+                // Also check if order matches phase1 or phase2 tracked IDs
+                // (dual-order: the non-primary order may fill).
+                let is_leg2_phase1 = self.leg2_phase1_order_id.as_deref() == Some(&order_id);
+                let is_leg2_phase2 = self.leg2_phase2_order_id.as_deref() == Some(&order_id);
+                let is_any_leg2 = is_leg2 || is_leg2_phase1 || is_leg2_phase2;
+
+                if is_any_leg2 {
+                    // For dual-order fills, use the price/size from the matching order.
+                    // If the order matches leg2_state, use that. Otherwise find it
+                    // from the tracked phase IDs.
+                    let (fill_price, fill_size) = if is_leg2 {
+                        match &self.state.leg2_state {
+                            OrderState::Posted { price, size, .. } => (*price, *size),
+                            _ => unreachable!(),
+                        }
+                    } else if let Some(hedge) = &self.hedge {
+                        // Order matched a tracked phase ID but not leg2_state.
+                        // Use hedge state to determine price.
+                        if is_leg2_phase1 {
+                            let size_from_state = match &self.state.leg2_state {
+                                OrderState::Posted { size, .. } => *size,
+                                _ => match &self.state.leg1_state {
+                                    OrderState::Filled { size, .. } => *size,
+                                    _ => Decimal::ZERO,
+                                },
+                            };
+                            (hedge.phase1_target_price, size_from_state)
+                        } else {
+                            // Phase 2 order filled
+                            let p2_price = hedge.phase2_posted_price.unwrap_or(Decimal::ZERO);
+                            let size_from_state = match &self.state.leg2_state {
+                                OrderState::Posted { size, .. } => *size,
+                                _ => match &self.state.leg1_state {
+                                    OrderState::Filled { size, .. } => *size,
+                                    _ => Decimal::ZERO,
+                                },
+                            };
+                            (p2_price, size_from_state)
+                        }
+                    } else {
+                        // No hedge state — shouldn't happen, but fallback.
+                        (Decimal::ZERO, Decimal::ZERO)
                     };
+
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
-                            info!(%order_id, %price, %size, status = ?status, "Leg 2 fill — pair complete");
+                            info!(%order_id, %fill_price, %fill_size, status = ?status, "Leg 2 fill — pair complete");
                             // Partial fill detection — defer alert to MINED/CONFIRMED.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
                                 if matched < original {
@@ -1032,10 +1121,57 @@ impl StrategyEngine {
                             }
                             self.state.leg2_state = OrderState::Filled {
                                 order_id: order_id.clone(),
-                                price,
-                                size,
+                                price: fill_price,
+                                size: fill_size,
                                 fill_timestamp_ms: now_ms,
                             };
+
+                            // Dual-order: identify the "other" order and store as orphan.
+                            let phase1_filled = is_leg2_phase1 || (!is_leg2_phase2 && is_leg2);
+                            let other_id = if phase1_filled {
+                                // Phase 1 filled (or single-order leg2) — orphan is Phase 2.
+                                self.leg2_phase2_order_id.take()
+                            } else {
+                                // Phase 2 filled — orphan is Phase 1.
+                                self.leg2_phase1_order_id.take()
+                            };
+                            // Mark phase1_dual_fill if Phase 1 order filled while Phase 2 was also active.
+                            if phase1_filled && self.hedge.as_ref().is_some_and(|e| matches!(e.phase, HedgePhase::Phase2)) {
+                                self.live_trade_meta.phase1_dual_fill = true;
+                            }
+                            if let Some(orphan_id) = other_id {
+                                if let (Some(hedge), Some(dir), Some(l1_price)) = (
+                                    &self.hedge,
+                                    self.leg1_direction,
+                                    match &self.state.leg1_state {
+                                        OrderState::Filled { price, .. } => Some(*price),
+                                        _ => None,
+                                    },
+                                ) {
+                                    let orphan_price = if is_leg2_phase2 || (!is_leg2_phase1 && !is_leg2) {
+                                        // The filled one was Phase 2, orphan is Phase 1.
+                                        hedge.phase1_target_price
+                                    } else {
+                                        // The filled one was Phase 1, orphan is Phase 2.
+                                        hedge.phase2_posted_price.unwrap_or(Decimal::ZERO)
+                                    };
+                                    let hedge_token_id = match dir {
+                                        Direction::Up => self.state.active_no_token_id.clone().unwrap_or_default(),
+                                        Direction::Down => self.state.active_yes_token_id.clone().unwrap_or_default(),
+                                    };
+                                    self.post_trade_orphan = Some(OrphanState {
+                                        order_id: orphan_id.clone(),
+                                        price: orphan_price,
+                                        size: fill_size,
+                                        leg1_direction: dir,
+                                        leg1_price: l1_price,
+                                        token_id: hedge_token_id,
+                                        condition_id: self.state.active_condition_id.clone().unwrap_or_default(),
+                                        tick_size: self.state.tick_size,
+                                    });
+                                    info!(%orphan_id, %orphan_price, "dual-order: storing orphan, emitting cancel");
+                                }
+                            }
                             // hedge cleared by on_trade_complete() after Telegram + recording
                         }
                         TradeStatus::Failed => {
@@ -1053,9 +1189,28 @@ impl StrategyEngine {
                     }
                 }
 
+                // Check orphan fill (dual-order double-fill recovery).
+                let is_orphan = self.post_trade_orphan.as_ref().is_some_and(|o| o.order_id == order_id);
+                if is_orphan && !is_any_leg2 && !is_leg1 {
+                    match status {
+                        TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                            warn!(%order_id, ?status, "DOUBLE-FILL: orphan order filled — triggering rebalance");
+                            // The orphan filled after the trade completed. Need rebalance.
+                            self.diag_double_fills += 1;
+                            self.rebalance_in_progress = true;
+                            // Rebalance signal built in take_rebalance_signal().
+                        }
+                        TradeStatus::Canceled => {
+                            info!(%order_id, "orphan order cancelled — clearing orphan state");
+                            self.post_trade_orphan = None;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Buffer unmatched TradeStatusUpdate events (may arrive before
                 // OrderPosted feedback or after a cancel cleared state).
-                if !is_leg1 && !is_leg2 {
+                if !is_leg1 && !is_any_leg2 && !is_orphan {
                     // Check if this event resolves a deferred partial fill check.
                     if let Some(mut pending) = self.pending_partial_fills.remove(&order_id) {
                         match status {
@@ -1251,7 +1406,7 @@ impl StrategyEngine {
         }
 
         let now_ms = now_epoch_ms();
-        let outcome = self.leg1.evaluate(&self.state, self.avg_book_depth, now_ms);
+        let outcome = self.leg1.evaluate(&self.state, now_ms);
 
         match outcome {
             Leg1Outcome::Signal(signal) => {
@@ -1286,6 +1441,7 @@ impl StrategyEngine {
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
                     Leg1RejectReason::SpreadWide => self.diag_rej_spread += 1,
                     Leg1RejectReason::InsufficientDepth => self.diag_rej_depth += 1,
+                    Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
                     Leg1RejectReason::Other => self.diag_rej_other += 1,
                 }
                 None
@@ -1303,8 +1459,7 @@ impl StrategyEngine {
     /// Applies post-signal state mutations here after a successful evaluation:
     /// - Sets `leg2_state` to `Posted`
     /// - On emergency: sets `hedge.emergency_submitted = true`
-    /// - On phase transition: sets `hedge.phase` to `Phase2`,
-    ///   updates `last_hedge_signal_ms`
+    /// - On phase transition: sets `hedge.phase` to `Phase2`
     pub fn evaluate_leg2(&mut self) -> Option<TradeSignal> {
         if self.emergency_signal_in_flight {
             return None;
@@ -1334,13 +1489,13 @@ impl StrategyEngine {
                 phase: e.phase,
                 phase1_target_price: e.phase1_target_price,
                 phase2_start_ms: e.phase2_start_ms,
+                phase2_posted_price: e.phase2_posted_price,
             },
         };
 
-        let last_hedge_ms = self.last_hedge_signal_ms;
         let decision = match self
             .leg2
-            .evaluate_leg2(&self.state, &snap, last_hedge_ms, now_ms)
+            .evaluate_leg2(&self.state, &snap, now_ms)
         {
             Some(d) => d,
             None => {
@@ -1368,9 +1523,9 @@ impl StrategyEngine {
                 _ => (None, false),
             };
             match reason {
-                Some(ExitReason::BreakEvenBreach) => self.diag_emg_breakeven += 1,
+                Some(ExitReason::BreakEvenBreach) => self.diag_emg_phase2_breach += 1,
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
-                Some(ExitReason::FavorableTaker) => self.diag_emg_favorable += 1,
+                Some(ExitReason::FavorableTaker) => self.diag_favorable_exits += 1,
                 Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
                 Some(ExitReason::WhipsawReversal) => {} // counted in spike handler (diag_whipsaw_foks)
                 None => {}
@@ -1383,7 +1538,9 @@ impl StrategyEngine {
                 exit_reason: reason,
                 emergency_maker: reason.is_some() && !was_taker,
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
+                favorable_maker: false,
                 phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
+                phase1_dual_fill: false,
                 leg1_cancel_race: cancel_race,
             };
             if let Some(e) = self.hedge.as_mut() {
@@ -1396,7 +1553,6 @@ impl StrategyEngine {
                     e.fok_emitted = true;
                 }
             }
-            self.last_hedge_signal_ms = now_ms;
             self.emergency_signal_in_flight = true;
             if self.reporter.is_some() {
                 self.leg2_command_pending = true;
@@ -1408,40 +1564,76 @@ impl StrategyEngine {
                 timestamp_ms: now_ms,
             };
         } else {
-            // Non-emergency hedge path: Phase1Post or PhaseTransition.
+            // Non-emergency hedge path: Phase1Post or Phase2Alongside.
             match &decision {
                 Leg2Decision::Phase1Post { .. } => {
                     // Initial post at profit target — no phase change needed.
-                    self.diag_leg2_reposts += 1;
+                    self.diag_leg2_phase1_posts += 1;
+                    self.last_leg2_was_phase2_alongside = false;
+                    if self.reporter.is_some() {
+                        self.leg2_command_pending = true;
+                    }
+                    self.state.leg2_state = OrderState::Posted {
+                        order_id: format!("sim-leg2-hedge-{}", now_ms),
+                        price,
+                        size,
+                        timestamp_ms: now_ms,
+                    };
                 }
-                Leg2Decision::PhaseTransition { .. } => {
-                    // Transition from Phase 1 to Phase 2.
+                Leg2Decision::Phase2Alongside { .. } => {
+                    // Dual-order: keep Phase 1 alive, post Phase 2 alongside.
                     if let Some(e) = self.hedge.as_mut() {
                         e.phase = HedgePhase::Phase2;
                         e.phase2_posted_price = Some(price);
                         e.phase2_start_ms = Some(now_ms);
                     }
                     self.diag_phase_transitions += 1;
-                    self.diag_leg2_reposts += 1;
+                    self.last_leg2_was_phase2_alongside = true;
+                    if self.reporter.is_some() {
+                        self.leg2_command_pending = true;
+                    }
+                    // In live mode, Phase 1 order stays alive — we track Phase 2
+                    // separately via leg2_phase2_order_id.
+                    // For sim mode, update leg2_state to Phase 2 price (sim only
+                    // tracks one order; advance_simulation handles dual-order).
+                    self.leg2_phase2_order_id = Some(format!("sim-leg2-p2-{}", now_ms));
+                    if self.reporter.is_none() {
+                        // Sim mode: overwrite leg2_state (Phase 1 order doesn't
+                        // exist in CLOB, sim tracks it via phase1_target_price).
+                        self.state.leg2_state = OrderState::Posted {
+                            order_id: format!("sim-leg2-hedge-{}", now_ms),
+                            price,
+                            size,
+                            timestamp_ms: now_ms,
+                        };
+                    }
                 }
                 _ => {}
             }
-            self.last_hedge_signal_ms = now_ms;
-            if self.reporter.is_some() {
-                self.leg2_command_pending = true;
-            }
-            self.state.leg2_state = OrderState::Posted {
-                order_id: format!("sim-leg2-hedge-{}", now_ms),
-                price,
-                size,
-                timestamp_ms: now_ms,
-            };
         }
 
         Some(decision.into_signal())
     }
 
     // ─── Spike cancel drain ─────────────────────────────────────────────
+
+    /// Returns `true` if the last `evaluate_leg2()` returned a Phase2Alongside signal.
+    /// Consumed (cleared) on read. Main loop uses this to send `PostLeg2Phase2`.
+    pub fn take_phase2_alongside_flag(&mut self) -> bool {
+        let v = self.last_leg2_was_phase2_alongside;
+        self.last_leg2_was_phase2_alongside = false;
+        v
+    }
+
+    /// Returns `true` if a rebalance FOK is in progress.
+    pub fn rebalance_in_progress(&self) -> bool {
+        self.rebalance_in_progress
+    }
+
+    /// Returns `true` if there's a pending orphan cancel to send.
+    pub fn has_orphan_cancel(&self) -> bool {
+        self.post_trade_orphan.is_some()
+    }
 
     /// Take the pending spike cancel command (if any).
     /// Called by the main loop after `on_event()` to send `CancelLeg1` to the executor.
@@ -1501,18 +1693,25 @@ impl StrategyEngine {
             rej_skew = self.diag_rej_skew,
             rej_spread = self.diag_rej_spread,
             rej_depth = self.diag_rej_depth,
+            rej_reprice = self.diag_rej_reprice,
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
-            reposts = self.diag_leg2_reposts,
+            l2_p1_posts = self.diag_leg2_phase1_posts,
             phase_transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
-            emg_breakeven = self.diag_emg_breakeven,
+            emg_p2_breach = self.diag_emg_phase2_breach,
             emg_expiry = self.diag_emg_expiry,
-            emg_favorable = self.diag_emg_favorable,
+            fav_exits = self.diag_favorable_exits,
+            fav_maker = self.diag_favorable_maker_fills,
+            fav_maker_timeout = self.diag_favorable_maker_timeouts,
             emg_maker = self.diag_emg_maker,
             emg_taker = self.diag_emg_taker,
+            double_fills = self.diag_double_fills,
+            rebal_attempts = self.diag_rebalance_attempts,
+            rebal_success = self.diag_rebalance_successes,
+            p2_entry_breach = self.diag_phase2_entry_breach,
             leg1_timeout = self.diag_leg1_timeouts,
             sustain_cancel = self.diag_spike_sustain_cancel,
             spike_fail = self.diag_spike_failures,
@@ -1564,15 +1763,17 @@ impl StrategyEngine {
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
-             Spread: {spread}  Depth: {depth}  Other: {other}\n\
+             Spread: {spread}  Depth: {depth}  Reprice: {reprice}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
              \n\
              <b>Leg 2</b>\n\
-             Reposts: {reposts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
-             Emergencies — phase1-breach: {emg_p1b}  break-even: {emg_be}  expiry: {emg_exp}  favorable: {emg_fav}\n\
+             P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
+             Favorable: exits={fav_exits}  maker={fav_maker}  maker-timeout={fav_maker_timeout}\n\
+             Emergency — p1-breach: {emg_p1b}  p2-breach: {emg_p2b}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
+             Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
              Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
             spike = spike_section,
             mkts = self.diag_markets_rotated,
@@ -1588,22 +1789,29 @@ impl StrategyEngine {
             skew = self.diag_rej_skew,
             spread = self.diag_rej_spread,
             depth = self.diag_rej_depth,
+            reprice = self.diag_rej_reprice,
             other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
             failed = self.diag_order_failures,
             timeout = self.diag_leg1_timeouts,
             sus_cancel = self.diag_spike_sustain_cancel,
-            reposts = self.diag_leg2_reposts,
+            l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
-            emg_be = self.diag_emg_breakeven,
+            fav_exits = self.diag_favorable_exits,
+            fav_maker = self.diag_favorable_maker_fills,
+            fav_maker_timeout = self.diag_favorable_maker_timeouts,
+            emg_p2b = self.diag_emg_phase2_breach,
+            p2_entry_breach = self.diag_phase2_entry_breach,
             emg_exp = self.diag_emg_expiry,
-            emg_fav = self.diag_emg_favorable,
             emg_p1b = self.diag_emg_phase1_breach,
             emg_mkr = self.diag_emg_maker,
             emg_tkr = self.diag_emg_taker,
+            double_fills = self.diag_double_fills,
+            rebal_attempts = self.diag_rebalance_attempts,
+            rebal_success = self.diag_rebalance_successes,
             whip_cancel = self.diag_whipsaw_cancels,
             whip_fok = self.diag_whipsaw_foks,
         ));
@@ -1684,6 +1892,7 @@ impl StrategyEngine {
         size: Decimal,
         fill_method: Option<FillMethod>,
         already_filled: bool,
+        order_tag: Option<OrderTag>,
     ) -> Option<ExecutorCommand> {
         // Deferred cancel: SpikeFailed/staleness arrived while ID was provisional.
         // Now we have the real CLOB ID — cancel it instead of resurrecting state.
@@ -1722,11 +1931,36 @@ impl StrategyEngine {
                     self.live_trade_meta.favorable_taker = true;
                     self.live_trade_meta.leg2_was_taker = true;
                 }
+                Some(FillMethod::FavorableMaker) => {
+                    // Favorable maker try succeeded — no taker fee, maker rebate.
+                    self.live_trade_meta.favorable_taker = false;
+                    self.live_trade_meta.favorable_maker = true;
+                    self.live_trade_meta.leg2_was_taker = false;
+                    self.diag_favorable_maker_fills += 1;
+                    self.diag_favorable_exits += 1;
+                }
                 Some(FillMethod::EmergencyTaker) => {
                     self.live_trade_meta.leg2_was_taker = true;
                     self.live_trade_meta.emergency_maker = false;
                 }
                 None => {}
+            }
+
+            // Track dual-order IDs: update Phase 1 or Phase 2 based on OrderTag.
+            match order_tag {
+                Some(OrderTag::Leg2Phase1) => {
+                    self.leg2_phase1_order_id = Some(order_id.clone());
+                }
+                Some(OrderTag::Leg2Phase2) => {
+                    self.leg2_phase2_order_id = Some(order_id.clone());
+                }
+                Some(OrderTag::Rebalance) => {
+                    // Rebalance order posted — if already_filled, handled below.
+                }
+                None => {
+                    // Backward compat: no tag → treat as Phase 1 (initial Leg 2 post).
+                    self.leg2_phase1_order_id = Some(order_id.clone());
+                }
             }
 
             // Bug 3 fix: FOK returned Filled synchronously from REST API.
@@ -1970,6 +2204,127 @@ impl StrategyEngine {
         if leg1_restored {
             self.live_trade_meta.leg1_cancel_race = true;
         }
+    }
+
+    /// Called when the executor confirms a specific Leg 2 order cancel (dual-order).
+    pub fn on_leg2_order_cancel_result(&mut self, order_id: String, was_cancelled: bool) {
+        if let Some(ref orphan) = self.post_trade_orphan {
+            if orphan.order_id == order_id {
+                if was_cancelled {
+                    info!(%order_id, "orphan cancel confirmed — clearing orphan state");
+                    self.post_trade_orphan = None;
+                } else {
+                    warn!(%order_id, "orphan cancel NOT confirmed — watching for fill via User WS");
+                    // Keep orphan state — may fill via User WS TradeStatusUpdate.
+                }
+                return;
+            }
+        }
+        // Not an orphan cancel — treat as standard Leg 2 cancel result.
+        self.on_cancel_result(order_id, was_cancelled, true);
+    }
+
+    /// Called when the executor completes a rebalance FOK (double-fill recovery).
+    pub fn on_rebalance_result(
+        &mut self,
+        success: bool,
+        price: Decimal,
+        size: Decimal,
+        _order_id: Option<String>,
+    ) {
+        self.rebalance_in_progress = false;
+        self.post_trade_orphan = None;
+        self.diag_rebalance_attempts += 1;
+
+        if success {
+            self.diag_rebalance_successes += 1;
+            info!(%price, %size, "rebalance FOK succeeded — double-fill recovered");
+            if let Some(ref reporter) = self.reporter {
+                reporter.fire_critical(format!(
+                    "REBALANCE COMPLETED\nDouble-fill recovery: bought {} @ {}\nPair cost (rebalance): {}",
+                    size, price, Decimal::ONE - price,
+                ));
+            }
+        } else {
+            warn!(%price, %size, "REBALANCE FOK FAILED — naked directional exposure");
+            if let Some(ref reporter) = self.reporter {
+                reporter.fire_critical(format!(
+                    "REBALANCE FAILED\nDouble-fill detected\nRebalance FOK FAILED — naked directional exposure\nManual intervention required",
+                ));
+            }
+        }
+    }
+
+    /// Take the pending orphan cancel command (if any).
+    /// Called by the main loop after `on_trade_complete()` when `post_trade_orphan` is set.
+    pub fn take_orphan_cancel(&mut self) -> Option<ExecutorCommand> {
+        let orphan = self.post_trade_orphan.as_ref()?;
+        Some(ExecutorCommand::CancelLeg2Order {
+            order_id: orphan.order_id.clone(),
+        })
+    }
+
+    /// Take the pending rebalance signal (if any).
+    /// Called by the main loop when `rebalance_in_progress` is set.
+    pub fn take_rebalance_signal(&mut self) -> Option<ExecutorCommand> {
+        if !self.rebalance_in_progress {
+            return None;
+        }
+        let orphan = self.post_trade_orphan.as_ref()?;
+
+        // Build a rebalance signal: buy Leg 1 side (same direction as original entry).
+        let (token_id, book) = match orphan.leg1_direction {
+            Direction::Up => (
+                self.state.active_yes_token_id.clone().unwrap_or_default(),
+                self.state
+                    .poly_yes_book
+                    .clone()
+                    .or_else(|| self.state.poly_book.clone()),
+            ),
+            Direction::Down => (
+                self.state.active_no_token_id.clone().unwrap_or_default(),
+                self.state
+                    .poly_no_book
+                    .clone()
+                    .or_else(|| self.state.poly_book.clone()),
+            ),
+        };
+
+        let breakeven_price = Decimal::ONE - orphan.leg1_price;
+        let signal = TradeSignal {
+            side: Side::Buy,
+            token_id,
+            condition_id: orphan.condition_id.clone(),
+            price: breakeven_price,
+            size: orphan.size,
+            reference_price: Decimal::ZERO,
+            confidence: Decimal::ZERO,
+            profit_target_tier: ProfitTier::Low,
+            profit_target_pct: Decimal::ZERO,
+            alloc_amount: Decimal::ZERO,
+            direction: orphan.leg1_direction,
+            spike_info: self.state.last_spike.unwrap_or(SpikeInfo {
+                direction: orphan.leg1_direction,
+                magnitude: Decimal::ZERO,
+                sustained_ms: 0,
+                timestamp_ms: 0,
+                atr_ratio: Decimal::ZERO,
+            }),
+            is_leg2: true,
+            leg1_fill_price: Some(orphan.leg1_price),
+            entry_timestamp_ms: now_epoch_ms(),
+            market_end_timestamp_ms: self.state.market_end_timestamp_ms,
+            tick_size: orphan.tick_size,
+            exit_reason: None,
+            sim_confirmed_fill: false,
+            sim_was_taker: true,
+            atr: Decimal::ZERO,
+            bot_contested: false,
+            best_ask: None,
+            book_snapshot: book,
+        };
+
+        Some(ExecutorCommand::RebalanceLeg1 { signal })
     }
 
     /// Replay buffered TradeStatusUpdate events that didn't match any leg when
@@ -2261,7 +2616,6 @@ impl StrategyEngine {
         self.state.leg1_state = OrderState::None;
         self.state.leg2_state = OrderState::None;
         self.hedge = None;
-        self.last_hedge_signal_ms = 0;
         self.leg1_direction = None;
         self.pending_leg1_signal = None;
         self.pending_spike_cancel = None;
@@ -2274,6 +2628,11 @@ impl StrategyEngine {
         self.cancelled_leg1_info = None;
         self.prev_leg2_order = None;
         self.pending_fills.clear();
+        // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
+        self.leg2_phase1_order_id = None;
+        self.leg2_phase2_order_id = None;
+        self.last_leg2_was_phase2_alongside = false;
+        // post_trade_orphan deliberately NOT cleared — survives trade reset.
         // cumulative_used is NOT reset — capital stays allocated within this market.
     }
 
@@ -2285,35 +2644,39 @@ impl StrategyEngine {
     /// `advance_simulation()` (simulation mode).
     fn init_leg2(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
         if let Some(spike) = self.state.last_spike {
-            // Use the original signal's confidence and tier (computed at signal time)
+            // Use the original signal's confidence (= expected_pct) and tier (computed at signal time)
             // rather than recomputing — the allocation was locked in at signal time,
-            // so the summary should reflect the same tier that determined the allocation.
-            let (conf, tier) = if let Some(sig) = &self.pending_leg1_signal {
-                (sig.confidence, sig.profit_target_tier)
+            // so the summary should reflect the same values that determined the allocation.
+            let (conf, tier, initial_profit_target) = if let Some(sig) = &self.pending_leg1_signal {
+                (sig.confidence, sig.profit_target_tier, sig.profit_target_pct)
             } else {
                 let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
-                let depth = self
+                let yes_mid = self
                     .state
-                    .poly_book
+                    .poly_yes_book
                     .as_ref()
-                    .map(|b| b.total_bid_depth() + b.total_ask_depth())
-                    .unwrap_or(Decimal::ONE);
-                let c = compute_confidence(
+                    .or(self.state.poly_book.as_ref())
+                    .and_then(|b| {
+                        let bid = b.best_bid()?.price;
+                        let ask = b.best_ask()?.price;
+                        Some((bid + ask) / Decimal::TWO)
+                    })
+                    .unwrap_or(Decimal::new(5, 1));
+                let c = compute_expected_repricing(
                     spike.atr_ratio,
                     self.leg1.min_spike_atr_ratio,
                     self.leg1.strong_spike_atr_ratio,
-                    depth,
-                    self.avg_book_depth.unwrap_or(Decimal::ONE),
+                    yes_mid,
+                    spike.direction,
                     t_secs,
+                    self.leg1.reprice_scale,
+                    self.leg1.time_exponent,
                 );
-                let t = ProfitTier::from_confidence(
-                    c,
-                    self.leg1.high_threshold,
-                    self.leg1.med_threshold,
-                );
-                (c, t)
+                let t = ProfitTier::from_expected_reprice(c, self.leg1.reprice_scale);
+                let tick = self.state.tick_size;
+                let target = round_to_tick(c, tick);
+                (c, t, target)
             };
-            let initial_profit_target = self.leg1.target_pct_for_tier(tier);
             // Use leg1_direction (set at signal generation, survives spike overwrites)
             // instead of spike.direction to prevent YES/NO label swap when an
             // opposite spike arrives between Leg 1 fill and init_leg2().
@@ -2390,6 +2753,7 @@ impl StrategyEngine {
             tick,
             self.state.atr.unwrap_or(Decimal::ZERO),
             false,
+            Some(best_ask),
             Some(hedge_book.clone()),
             Some(ExitReason::WhipsawReversal),
         );
@@ -2402,7 +2766,9 @@ impl StrategyEngine {
             exit_reason: Some(ExitReason::WhipsawReversal),
             emergency_maker: false,
             favorable_taker: false,
+            favorable_maker: false,
             phase1_breach: false,
+            phase1_dual_fill: false,
             leg1_cancel_race: cancel_race,
         };
         if let Some(e) = self.hedge.as_mut() {
@@ -2579,11 +2945,57 @@ impl StrategyEngine {
                     .map(|a| a.price),
             };
 
+            // Dual-order: also check if Phase 1 target price would fill (when in Phase 2).
+            let phase1_fill = if !is_fok {
+                if let Some(hedge) = &self.hedge {
+                    if hedge.phase == HedgePhase::Phase2 {
+                        let p1_price = hedge.phase1_target_price;
+                        match best_ask {
+                            Some(ask) if ask <= p1_price => Some((p1_price, false)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let (should_fill, is_favorable_taker, fill_price, sim_was_taker) = if is_fok {
                 // FOK orders fill immediately at ask (taker).
                 match best_ask {
                     Some(ask) => (true, false, ask, true),
                     None => (false, false, posted_price, false),
+                }
+            } else if let Some((p1_fill_price, _)) = phase1_fill {
+                // Phase 1 order fills first (better price for us = lower fill price).
+                // Compare: which fills? Phase 1 fills if ask <= p1_target.
+                // Phase 2 fills if ask <= p2_posted. Pick the one with lower price (better).
+                match best_ask {
+                    Some(ask) if ask < posted_price => {
+                        // Both would fill — Phase 2 is favorable taker (ask < posted).
+                        // Pick Phase 1 if its price is lower (better for us).
+                        if p1_fill_price <= ask {
+                            (true, false, p1_fill_price, false) // Phase 1 maker fill
+                        } else {
+                            (true, true, ask, false) // Phase 2 favorable taker
+                        }
+                    }
+                    Some(ask) if ask <= posted_price => {
+                        // Phase 2 would fill at posted, Phase 1 also fills.
+                        if p1_fill_price <= posted_price {
+                            (true, false, p1_fill_price, false) // Phase 1 fills (better price)
+                        } else {
+                            (true, false, posted_price, false) // Phase 2 fills
+                        }
+                    }
+                    _ => {
+                        // Phase 2 wouldn't fill, but Phase 1 does.
+                        (true, false, p1_fill_price, false)
+                    }
                 }
             } else {
                 match best_ask {
@@ -2657,7 +3069,6 @@ impl StrategyEngine {
             self.state.leg1_state = OrderState::None;
             self.state.leg2_state = OrderState::None;
             self.hedge = None;
-            self.last_hedge_signal_ms = 0;
             self.leg1_direction = None;
             // cumulative_used is NOT reset — capital stays allocated within this market.
         }
@@ -2716,6 +3127,7 @@ impl StrategyEngine {
             self.state.tick_size,
             self.state.atr.unwrap_or(Decimal::ZERO),
             false,
+            None,
             hedge_book,
             exit_reason,
         );
@@ -2772,6 +3184,7 @@ impl StrategyEngine {
         let emergency_taker_fills = trades.iter().filter(|t| t.leg2_was_taker).count() as u32;
         let emergency_maker_fills = trades.iter().filter(|t| t.emergency_maker).count() as u32;
         let favorable_taker_fills = trades.iter().filter(|t| t.favorable_taker).count() as u32;
+        let favorable_maker_fills = trades.iter().filter(|t| t.favorable_maker).count() as u32;
 
         let mut allocation_used = Decimal::ZERO;
         let mut taker_fees_paid = Decimal::ZERO;
@@ -2801,6 +3214,7 @@ impl StrategyEngine {
             emergency_taker_fills,
             emergency_maker_fills,
             favorable_taker_fills,
+            favorable_maker_fills,
             trades,
             allocation_used,
             allocation_cap: self.leg1.max_alloc_per_trade,
@@ -2863,6 +3277,7 @@ impl StrategyEngine {
         let mut emergency_taker: u32 = 0;
         let mut emergency_maker: u32 = 0;
         let mut favorable_taker: u32 = 0;
+        let mut favorable_maker: u32 = 0;
 
         for t in trades {
             gross_pnl += t.gross_profit;
@@ -2874,6 +3289,7 @@ impl StrategyEngine {
             if t.leg2_was_taker { emergency_taker += 1; }
             if t.emergency_maker { emergency_maker += 1; }
             if t.favorable_taker { favorable_taker += 1; }
+            if t.favorable_maker { favorable_maker += 1; }
             match t.exit_reason {
                 Some(ExitReason::BreakEvenBreach) | Some(ExitReason::Phase1Breach) => {
                     break_even_fok += 1;
@@ -2934,6 +3350,7 @@ impl StrategyEngine {
             emergency_taker_fills: emergency_taker,
             emergency_maker_fills: emergency_maker,
             favorable_taker_fills: favorable_taker,
+            favorable_maker_fills: favorable_maker,
             high_conf_trades: high_count,
             high_conf_avg_alloc: if high_count > 0 { high_alloc_sum / Decimal::from(high_count) } else { Decimal::ZERO },
             med_conf_trades: med_count,
@@ -3050,11 +3467,13 @@ impl StrategyEngine {
             leg2_was_taker: self.live_trade_meta.leg2_was_taker,
             bot_contested: signal.bot_contested,
             favorable_taker: self.live_trade_meta.favorable_taker,
+            favorable_maker: self.live_trade_meta.favorable_maker,
             emergency_maker: self.live_trade_meta.emergency_maker,
             exit_reason: self.live_trade_meta.exit_reason,
             spike_magnitude: hedge.spike_info.magnitude,
             leg1_cancel_race: self.live_trade_meta.leg1_cancel_race,
             phase1_breach: self.live_trade_meta.phase1_breach,
+            phase1_dual_fill: self.live_trade_meta.phase1_dual_fill,
             whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
             open_timestamp_ms: l1_ts,
             close_timestamp_ms: now_ms,
@@ -3378,31 +3797,33 @@ mod tests {
     // ── ProfitTier ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_profit_tier_thresholds() {
-        let high = Decimal::new(8, 1);
-        let med = Decimal::new(5, 1);
+    fn test_profit_tier_from_expected_reprice() {
+        let scale = Decimal::new(15, 3); // 0.015
+        // HIGH: pct >= scale
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::new(9, 1), high, med),
+            ProfitTier::from_expected_reprice(Decimal::new(20, 3), scale),
             ProfitTier::High
         );
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::new(8, 1), high, med),
+            ProfitTier::from_expected_reprice(Decimal::new(15, 3), scale),
             ProfitTier::High
         );
+        // MED: pct >= scale/2 (0.0075)
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::new(75, 2), high, med),
+            ProfitTier::from_expected_reprice(Decimal::new(10, 3), scale),
             ProfitTier::Med
         );
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::new(5, 1), high, med),
+            ProfitTier::from_expected_reprice(Decimal::new(75, 4), scale),
             ProfitTier::Med
         );
+        // LOW: below scale/2
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::new(3, 1), high, med),
+            ProfitTier::from_expected_reprice(Decimal::new(5, 3), scale),
             ProfitTier::Low
         );
         assert_eq!(
-            ProfitTier::from_confidence(Decimal::ZERO, high, med),
+            ProfitTier::from_expected_reprice(Decimal::ZERO, scale),
             ProfitTier::Low
         );
     }
@@ -3578,7 +3999,6 @@ mod tests {
         engine.state.leg1_state = OrderState::None;
         engine.state.leg2_state = OrderState::None;
         engine.hedge = None;
-        engine.last_hedge_signal_ms = 0;
 
         inject_spike(&mut engine, Direction::Up);
         let s2 = engine.evaluate();
@@ -4098,7 +4518,7 @@ mod tests {
         );
 
         // Simulate real CLOB ID arriving via feedback.
-        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0), None, false);
+        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0), None, false, None);
         assert!(cancel_cmd.is_some(), "should return CancelLeg1 for deferred cancel");
         match cancel_cmd.unwrap() {
             ExecutorCommand::CancelLeg1 { order_id } => {
@@ -4177,12 +4597,12 @@ mod tests {
     #[test]
     fn test_phase1_timeout_triggers_phase_transition() {
         // Test: after Phase 1 timeout, evaluate_leg2 should emit a
-        // PhaseTransition signal and advance the hedge to Phase 2.
+        // Phase2Alongside signal and advance the hedge to Phase 2.
         let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.19", "0.21"); // YES: bid=0.19, ask=0.21
+        set_book(&mut engine, "0.495", "0.505"); // YES: bid=0.495, ask=0.505
         inject_spike(&mut engine, Direction::Up);
 
-        // Leg 1: evaluate → posted at 0.20 (bid+tick).
+        // Leg 1: evaluate → posted at 0.50 (bid+tick).
         let _s = engine.evaluate().expect("Leg 1 signal");
         assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
 
@@ -4191,15 +4611,15 @@ mod tests {
         assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
         assert!(engine.hedge.is_some());
 
-        // Set up the NO book: ask=0.79 (pair_cost = 0.20 + 0.79 = 0.99 < 1.0).
+        // Set up the NO book: ask=0.49 (pair_cost = 0.50 + 0.49 = 0.99 < 1.0).
         engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
             asset_id: "no".to_string(),
             bids: vec![PriceLevel {
-                price: Decimal::new(70, 2),
+                price: Decimal::new(40, 2),
                 size: Decimal::new(200, 0),
             }],
             asks: vec![PriceLevel {
-                price: Decimal::new(79, 2),
+                price: Decimal::new(49, 2),
                 size: Decimal::new(200, 0),
             }],
             timestamp_ms: now_epoch_ms(),
@@ -4302,7 +4722,7 @@ mod tests {
         assert_eq!(engine.leg1_direction, Some(Direction::Up));
 
         // Simulate real CLOB ID arriving (staleness skips provisional IDs).
-        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size, None, false);
+        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size, None, false, None);
         assert!(engine.pending_leg1_signal.is_some());
 
         // Force staleness: set timestamp far in the past so elapsed > timeout.
@@ -4335,7 +4755,7 @@ mod tests {
         assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
 
         // Simulate real CLOB ID arriving.
-        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size, None, false);
+        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size, None, false, None);
 
         // Force staleness: set timestamp far in the past so elapsed > timeout.
         if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {

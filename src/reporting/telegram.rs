@@ -529,7 +529,9 @@ mod formatter {
         let total_cost_usdc = trade.pair_cost * trade.leg1.size;
 
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
-            let phase_note = if trade.hedge_phase > 0 {
+            let phase_note = if trade.phase1_dual_fill {
+                " (PHASE-1-DUAL)"
+            } else if trade.hedge_phase > 0 {
                 " (PHASE-2)"
             } else {
                 " (PHASE-1)"
@@ -540,6 +542,8 @@ mod formatter {
                 " [PHASE-1 BREACH POST-ONLY]".to_owned()
             } else if trade.phase1_breach {
                 " [PHASE-1 BREACH FOK FALLBACK]".to_owned()
+            } else if trade.favorable_maker {
+                " [FAVORABLE MAKER]".to_owned()
             } else if trade.favorable_taker && trade.emergency_maker {
                 " [FAVORABLE POST-ONLY]".to_owned()
             } else if trade.favorable_taker {
@@ -735,7 +739,7 @@ mod formatter {
             Hedged: {hedged}/{l1_fills} ({hedge_rate:.0}%)\n\
             Walls outbid: {walls}\n\
             Emergency taker fills: {emergency} (post-only: {emergency_maker})\n\
-            Favorable taker fills: {favorable}\n\
+            Favorable exits: {favorable} taker / {favorable_maker} maker\n\
             \n\
             {trade_lines}\n\
             \n\
@@ -756,6 +760,7 @@ mod formatter {
             emergency = s.emergency_taker_fills,
             emergency_maker = s.emergency_maker_fills,
             favorable = s.favorable_taker_fills,
+            favorable_maker = s.favorable_maker_fills,
             trade_lines = trade_lines,
             alloc = s.allocation_used,
             cap = s.allocation_cap,
@@ -848,7 +853,7 @@ mod formatter {
               Break-even breach FOK: {break_even}\n\
               Timer/expiry deadline FOK: {timer}\n\
               Emergency post-only (maker): {emergency_maker}\n\
-              Favorable taker fills: {favorable}\n\
+              Favorable exits: {favorable} taker / {favorable_maker} maker\n\
             \n\
             <b>Allocation:</b>\n\
               High confidence (≥0.8, target 2.5%): {high_n} trades, avg ${high_avg:.0}\n\
@@ -886,6 +891,7 @@ mod formatter {
             timer = s.timer_deadline_fok,
             emergency_maker = s.emergency_maker_fills,
             favorable = s.favorable_taker_fills,
+            favorable_maker = s.favorable_maker_fills,
             high_n = s.high_conf_trades,
             high_avg = s.high_conf_avg_alloc,
             med_n = s.med_conf_trades,

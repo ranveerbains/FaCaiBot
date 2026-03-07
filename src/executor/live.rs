@@ -22,7 +22,7 @@ use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
 use crate::types::market::Direction;
 use crate::types::order::{
-    ExecutorCommand, ExecutorFeedback, FillMethod, OrderRequest, OrderStatus, TradeSignal,
+    ExecutorCommand, ExecutorFeedback, FillMethod, OrderRequest, OrderStatus, OrderTag, TradeSignal,
 };
 
 use super::fill_engine::round_to_tick;
@@ -57,13 +57,18 @@ pub struct LiveExecutor {
     caches_warm: bool,
 
     // ── Position tracking ───────────────────────────────────────────
-    /// Current active Leg 2 order ID on the CLOB. `None` if no Leg 2 posted.
-    active_leg2_order_id: Option<String>,
+    /// Active Phase 1 Leg 2 order ID (persists into Phase 2 when dual-order).
+    active_leg2_phase1_id: Option<String>,
+    /// Active Phase 2 Leg 2 order ID (posted alongside Phase 1 at ask-1tick).
+    active_leg2_phase2_id: Option<String>,
 
     /// Set `true` when a "not enough balance" / "allowance" error is detected
     /// during Leg 2 placement. All subsequent Leg 2 commands are immediately
     /// rejected with `OrderFailed` until cleared on `MarketRotation`.
     balance_exhausted: bool,
+
+    /// Timeout (ms) for favorable maker try before FOK fallback on crosses-book.
+    favorable_maker_timeout_ms: u64,
 
     /// Buffered command received during Leg 1 fill polling (e.g., MarketRotation).
     /// Consumed at the top of the next `run()` loop iteration before blocking on `rx.recv()`.
@@ -76,6 +81,7 @@ impl LiveExecutor {
         feedback_tx: Sender<ExecutorFeedback>,
         reporter: TelegramReporter,
         cold: Option<ColdStorage>,
+        favorable_maker_timeout_ms: u64,
     ) -> Self {
         Self {
             poly,
@@ -83,8 +89,10 @@ impl LiveExecutor {
             reporter,
             cold,
             caches_warm: false,
-            active_leg2_order_id: None,
+            active_leg2_phase1_id: None,
+            active_leg2_phase2_id: None,
             balance_exhausted: false,
+            favorable_maker_timeout_ms,
             deferred_cmd: None,
         }
     }
@@ -156,6 +164,15 @@ impl LiveExecutor {
                         }
                     }
                 }
+                ExecutorCommand::PostLeg2Phase2 { signal } => {
+                    self.handle_post_leg2_phase2(&signal).await;
+                }
+                ExecutorCommand::CancelLeg2Order { order_id } => {
+                    self.handle_cancel_leg2_order(&order_id).await;
+                }
+                ExecutorCommand::RebalanceLeg1 { signal } => {
+                    self.handle_rebalance_leg1(&signal).await;
+                }
             }
         }
 
@@ -194,7 +211,9 @@ impl LiveExecutor {
     // ─── Leg 1: post-only GTC entry ────────────────────────────────────
 
     async fn handle_leg1(&mut self, signal: &TradeSignal, rx: &Receiver<ExecutorCommand>) {
-        self.active_leg2_order_id = None; // New trade — clear any stale Leg 2 ID from previous trade
+        // New trade — clear any stale Leg 2 IDs from previous trade.
+        self.active_leg2_phase1_id = None;
+        self.active_leg2_phase2_id = None;
         info!(
             side = ?signal.side,
             token = %signal.token_id,
@@ -242,6 +261,7 @@ impl LiveExecutor {
                         size: signal.size,
                         fill_method: None,
                         already_filled: false,
+                        order_tag: None,
                     });
 
                     self.log_signal_to_cold(signal, "submitted");
@@ -352,13 +372,14 @@ impl LiveExecutor {
     // ─── Leg 2 hedge: cancel previous + repost at new price ────────────
 
     async fn handle_leg2_hedge(&mut self, signal: &TradeSignal) {
-        // Cancel existing Leg 2 order if one is resting.
-        if let Some(ref prev_order_id) = self.active_leg2_order_id {
-            info!(order_id = %prev_order_id, "Leg 2 hedge: cancelling previous order");
+        // Defensive: cancel existing Phase 1 Leg 2 order if one is resting.
+        // With post-once-and-wait, this block should never fire on the initial call
+        // (active_leg2_phase1_id is None). Kept as defense-in-depth.
+        if let Some(ref prev_order_id) = self.active_leg2_phase1_id {
+            info!(order_id = %prev_order_id, "Leg 2 hedge: cancelling previous Phase 1 order");
             match self.poly.cancel_order(prev_order_id).await {
                 Ok(true) => {
-
-                    self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
+                    self.active_leg2_phase1_id = None;
                 }
                 Ok(false) => {
                     warn!(
@@ -375,7 +396,6 @@ impl LiveExecutor {
                 }
                 Err(e) => {
                     warn!(error = %e, "Leg 2 hedge: cancel failed — posting replacement anyway");
-
                 }
             }
         }
@@ -396,15 +416,14 @@ impl LiveExecutor {
                         price = %signal.price,
                         "Leg 2 hedge: post-only REJECTED — attempting favorable exit"
                     );
-                    self.attempt_favorable_exit(signal).await;
+                    self.attempt_favorable_maker_then_fok(signal).await;
                 } else {
                     info!(
                         order_id = %resp.order_id,
                         price = %signal.price,
                         "Leg 2 hedge: new order placed"
                     );
-                    self.active_leg2_order_id = Some(resp.order_id.clone());
-
+                    self.active_leg2_phase1_id = Some(resp.order_id.clone());
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
@@ -413,23 +432,21 @@ impl LiveExecutor {
                         size: signal.size,
                         fill_method: None,
                         already_filled: false,
+                        order_tag: Some(OrderTag::Leg2Phase1),
                     });
                 }
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("crosses book") {
-                    // CLOB returned "crosses book" as an Err (not Ok(Rejected)).
-                    // This means the ask dropped below our bid — favorable pricing.
                     warn!(
                         error = %e,
                         "Leg 2 hedge: 'crosses book' error — attempting favorable exit"
                     );
-                    self.attempt_favorable_exit(signal).await;
+                    self.attempt_favorable_maker_then_fok(signal).await;
                 } else {
                     error!(error = %e, "Leg 2 hedge: order placement FAILED");
-
-                    self.active_leg2_order_id = None;
+                    self.active_leg2_phase1_id = None;
 
                     // Detect balance errors — stop all Leg 2 attempts until rotation
                     if err_msg.contains("balance") || err_msg.contains("allowance") {
@@ -448,21 +465,165 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 2 favorable exit: immediate FOK taker ────────────────────
+    // ─── Leg 2 favorable exit: try maker first, then FOK fallback ─────
 
-    async fn attempt_favorable_exit(&mut self, signal: &TradeSignal) {
-        // Favorable pricing detected — FOK taker to capture the low ask immediately.
-        // Previously used a walk-down (4 post-only attempts at lower prices), but the
-        // favorable ask is transient and maker orders get stranded when the market bounces.
-        self.favorable_exit_fok_fallback(signal).await;
+    /// Favorable pricing detected (post-only rejected or "crosses book").
+    /// 1. Post maker at best_ask - 1tick.
+    /// 2. Poll for fill up to `favorable_maker_timeout_ms`.
+    /// 3. If not filled → cancel → FOK taker fallback.
+    async fn attempt_favorable_maker_then_fok(&mut self, signal: &TradeSignal) {
+        let tick = signal.tick_size;
+        let maker_price = match signal.best_ask {
+            Some(ask) => round_to_tick(ask - tick, tick),
+            None => {
+                warn!("favorable maker: no best_ask — falling back to FOK");
+                self.favorable_exit_fok(signal).await;
+                return;
+            }
+        };
+
+        // Post maker at ask - 1tick.
+        let order = OrderRequest::post_only_gtc(
+            signal.token_id.clone(),
+            signal.side,
+            maker_price,
+            signal.size,
+        );
+
+        match self.poly.place_order(&order).await {
+            Ok(resp) => {
+                if resp.status == OrderStatus::Rejected {
+                    // Ask dropped further — maker would cross, go straight to FOK.
+                    warn!(
+                        price = %maker_price,
+                        "favorable maker: post-only REJECTED — immediate FOK fallback"
+                    );
+                    self.favorable_exit_fok(signal).await;
+                    return;
+                }
+                if resp.status == OrderStatus::Filled {
+                    // Instant fill — rare but possible.
+                    info!(
+                        order_id = %resp.order_id,
+                        price = %maker_price,
+                        "favorable maker: instant fill"
+                    );
+                    self.active_leg2_phase1_id = None;
+                    self.active_leg2_phase2_id = None;
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: true,
+                        order_id: resp.order_id,
+                        price: maker_price,
+                        size: signal.size,
+                        fill_method: Some(FillMethod::FavorableMaker),
+                        already_filled: true,
+                        order_tag: None,
+                    });
+                    return;
+                }
+
+                // Order resting — poll for fill.
+                info!(
+                    order_id = %resp.order_id,
+                    price = %maker_price,
+                    "favorable maker: order resting — polling for fill"
+                );
+                let maker_order_id = resp.order_id;
+                let poll_interval_ms = 200u64;
+                let max_polls = (self.favorable_maker_timeout_ms / poll_interval_ms).max(1);
+                let mut filled = false;
+
+                for _ in 0..max_polls {
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+
+                    // Check for fill via REST poll.
+                    match self.poly.get_order_status(&maker_order_id).await {
+                        Ok((status, ..)) if status == OrderStatus::Filled => {
+                            info!(
+                                order_id = %maker_order_id,
+                                price = %maker_price,
+                                "favorable maker: fill detected via polling"
+                            );
+                            filled = true;
+                            break;
+                        }
+                        Ok(_) => {} // still resting, continue polling
+                        Err(e) => {
+                            warn!(error = %e, "favorable maker: poll error — continuing");
+                        }
+                    }
+                }
+
+                if filled {
+                    self.active_leg2_phase1_id = None;
+                    self.active_leg2_phase2_id = None;
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: true,
+                        order_id: maker_order_id,
+                        price: maker_price,
+                        size: signal.size,
+                        fill_method: Some(FillMethod::FavorableMaker),
+                        already_filled: true,
+                        order_tag: None,
+                    });
+                } else {
+                    // Not filled — cancel and fall back to FOK.
+                    info!(order_id = %maker_order_id, "favorable maker: timeout — cancelling");
+                    match self.poly.cancel_order(&maker_order_id).await {
+                        Ok(true) => {
+                            // Cancelled — FOK fallback.
+                            self.favorable_exit_fok(signal).await;
+                        }
+                        Ok(false) => {
+                            // Cancel NOT confirmed — order may have filled in the interim.
+                            // Send OrderPosted and let User WS determine the outcome.
+                            info!(
+                                order_id = %maker_order_id,
+                                "favorable maker: cancel NOT confirmed — may have filled"
+                            );
+                            self.active_leg2_phase1_id = Some(maker_order_id.clone());
+                            let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                                is_leg2: true,
+                                order_id: maker_order_id,
+                                price: maker_price,
+                                size: signal.size,
+                                fill_method: Some(FillMethod::FavorableMaker),
+                                already_filled: false,
+                                order_tag: None,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "favorable maker: cancel error — FOK fallback");
+                            self.favorable_exit_fok(signal).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("crosses book") {
+                    // Even the maker price crosses — go straight to FOK.
+                    warn!(error = %e, "favorable maker: crosses book — FOK fallback");
+                    self.favorable_exit_fok(signal).await;
+                } else {
+                    error!(error = %e, "favorable maker: placement FAILED");
+                    self.active_leg2_phase1_id = None;
+                    self.active_leg2_phase2_id = None;
+                    let _ = self
+                        .feedback_tx
+                        .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                }
+            }
+        }
     }
 
-    async fn favorable_exit_fok_fallback(&mut self, signal: &TradeSignal) {
+    /// FOK taker fallback for favorable exits.
+    async fn favorable_exit_fok(&mut self, signal: &TradeSignal) {
         let safe_size = clob_safe_fok_size(signal.price, signal.size);
         if safe_size.is_zero() {
             error!(price = %signal.price, size = %signal.size, "favorable FOK size zero — aborting");
-
-            self.active_leg2_order_id = None;
+            self.active_leg2_phase1_id = None;
+            self.active_leg2_phase2_id = None;
             let _ = self
                 .feedback_tx
                 .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -470,8 +631,8 @@ impl LiveExecutor {
         }
         if signal.price * safe_size < Decimal::ONE {
             warn!(price = %signal.price, size = %safe_size, "favorable FOK below $1 minimum — aborting");
-
-            self.active_leg2_order_id = None;
+            self.active_leg2_phase1_id = None;
+            self.active_leg2_phase2_id = None;
             let _ = self
                 .feedback_tx
                 .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -487,10 +648,9 @@ impl LiveExecutor {
         match self.poly.place_order(&order).await {
             Ok(resp) => {
                 if resp.status == OrderStatus::Rejected {
-                    warn!("Leg 2 favorable exit: FOK also rejected — hedge continues");
-
-                    self.active_leg2_order_id = None;
-
+                    warn!("Leg 2 favorable exit: FOK rejected — hedge continues");
+                    self.active_leg2_phase1_id = None;
+                    self.active_leg2_phase2_id = None;
                     let _ = self
                         .feedback_tx
                         .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -498,17 +658,14 @@ impl LiveExecutor {
                     info!(
                         order_id = %resp.order_id,
                         price = %signal.price,
-                        "Leg 2 favorable exit: FOK fallback filled"
+                        "Leg 2 favorable exit: FOK filled"
                     );
-                    // Don't track filled FOKs — prevents stale cancel by next signal
                     if resp.status == OrderStatus::Filled {
-                        self.active_leg2_order_id = None;
+                        self.active_leg2_phase1_id = None;
+                        self.active_leg2_phase2_id = None;
                     } else {
-                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                        self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
-
-
-
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
@@ -516,14 +673,14 @@ impl LiveExecutor {
                         size: signal.size,
                         fill_method: Some(FillMethod::FavorableTaker),
                         already_filled: resp.status == OrderStatus::Filled,
+                        order_tag: None,
                     });
                 }
             }
             Err(e) => {
                 error!(error = %e, "Leg 2 favorable exit: FOK FAILED");
-
-                self.active_leg2_order_id = None;
-
+                self.active_leg2_phase1_id = None;
+                self.active_leg2_phase2_id = None;
                 let _ = self
                     .feedback_tx
                     .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
@@ -536,97 +693,42 @@ impl LiveExecutor {
     async fn handle_leg2_emergency(&mut self, signal: &TradeSignal) {
         let exit_reason = signal.exit_reason.unwrap();
 
-        // Cancel any existing Leg 2 resting order first.
-        if let Some(ref prev_order_id) = self.active_leg2_order_id {
-            info!(order_id = %prev_order_id, "Leg 2 emergency: cancelling previous resting order");
-            match self.poly.cancel_order(prev_order_id).await {
+        // Cancel ALL resting Leg 2 orders (Phase 1 + Phase 2) before emergency FOK.
+        for phase_id in [self.active_leg2_phase1_id.clone(), self.active_leg2_phase2_id.clone()].into_iter().flatten() {
+            info!(order_id = %phase_id, "Leg 2 emergency: cancelling resting order");
+            match self.poly.cancel_order(&phase_id).await {
                 Ok(true) => {
-
-                    self.active_leg2_order_id = None; // Cancelled — clear before posting replacement
+                    // Cancelled successfully.
                 }
                 Ok(false) => {
                     warn!(
-                        order_id = %prev_order_id,
+                        order_id = %phase_id,
                         "Leg 2 emergency cancel NOT confirmed — order may have filled, skipping replacement"
                     );
                     let _ =
                         self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
-                            order_id: prev_order_id.clone(),
+                            order_id: phase_id,
                             was_cancelled: false,
                             is_leg2: true,
                         });
                     return;
                 }
                 Err(e) => {
-                    warn!(error = %e, "Leg 2 emergency: cancel failed — proceeding with replacement");
-
+                    warn!(order_id = %phase_id, error = %e, "Leg 2 emergency: cancel failed — proceeding");
                 }
             }
         }
+        self.active_leg2_phase1_id = None;
+        self.active_leg2_phase2_id = None;
 
-        if signal.sim_was_taker {
-            // Deadline expired — evaluator determined FOK taker at best_ask.
-            warn!(
-                reason = ?exit_reason,
-                price = %signal.price,
-                size = %signal.size,
-                "Leg 2 EMERGENCY: deadline expired — direct FOK taker"
-            );
-            self.emergency_fok_fallback(signal, exit_reason).await;
-        } else {
-            // Price-chase — aggressive post-only at evaluator-computed price (best_ask - tick).
-            warn!(
-                reason = ?exit_reason,
-                price = %signal.price,
-                size = %signal.size,
-                "Leg 2 EMERGENCY: price-chase post-only"
-            );
-            let order = OrderRequest::aggressive_post_only(
-                signal.token_id.clone(),
-                signal.side,
-                signal.price,
-                signal.size,
-            );
-
-            match self.poly.place_order(&order).await {
-                Ok(resp) => {
-                    if resp.status == OrderStatus::Rejected {
-                        // Post-only would cross spread → FOK fallback at best_ask.
-                        let fok_price =
-                            round_to_tick(signal.price + signal.tick_size, signal.tick_size);
-                        warn!(
-                            price = %signal.price,
-                            fok_price = %fok_price,
-                            "Leg 2 emergency: post-only REJECTED — falling back to FOK"
-                        );
-                        self.emergency_fok_at_price(signal, exit_reason, fok_price)
-                            .await;
-                    } else {
-                        info!(
-                            order_id = %resp.order_id,
-                            price = %signal.price,
-                            "Leg 2 emergency: price-chase post-only accepted"
-                        );
-                        self.active_leg2_order_id = Some(resp.order_id.clone());
-    
-    
-
-                        let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                            is_leg2: true,
-                            order_id: resp.order_id,
-                            price: signal.price,
-                            size: signal.size,
-                            fill_method: None,
-                            already_filled: false,
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "Leg 2 emergency: post-only placement FAILED — trying FOK fallback");
-                    self.emergency_fok_fallback(signal, exit_reason).await;
-                }
-            }
-        }
+        // All emergency signals use FOK taker (sim_was_taker is always true).
+        warn!(
+            reason = ?exit_reason,
+            price = %signal.price,
+            size = %signal.size,
+            "Leg 2 EMERGENCY: direct FOK taker"
+        );
+        self.emergency_fok_fallback(signal, exit_reason).await;
     }
 
     // ─── Emergency FOK fallback (when post-only is rejected or fails) ────
@@ -684,9 +786,10 @@ impl LiveExecutor {
                     );
                     // Don't track filled FOKs — prevents stale cancel by next signal
                     if resp.status == OrderStatus::Filled {
-                        self.active_leg2_order_id = None;
+                        self.active_leg2_phase1_id = None;
+                        self.active_leg2_phase2_id = None;
                     } else {
-                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                        self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
 
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
@@ -696,6 +799,7 @@ impl LiveExecutor {
                         size: safe_size,
                         fill_method: Some(FillMethod::EmergencyTaker),
                         already_filled: resp.status == OrderStatus::Filled,
+                        order_tag: None,
                     });
                     return;
                 }
@@ -720,30 +824,134 @@ impl LiveExecutor {
                 }
             }
         }
-        self.active_leg2_order_id = None;
+        self.active_leg2_phase1_id = None;
+        self.active_leg2_phase2_id = None;
         let _ = self
             .feedback_tx
             .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
     }
 
-    // ─── Emergency FOK at a specific price (CLOB rejection fallback) ────
+    // ─── Dual-order: Post Leg 2 Phase 2 (alongside Phase 1) ───────────
 
-    async fn emergency_fok_at_price(
-        &mut self,
-        signal: &TradeSignal,
-        exit_reason: crate::types::order::ExitReason,
-        price: Decimal,
-    ) {
-        // Price-escalating FOK — same rationale as emergency_fok_fallback().
-        // We must exit the position. Walks up +1 tick per attempt, capped at $1.00.
-        let mut current_price = price;
-        let mut attempt: u32 = 0;
+    async fn handle_post_leg2_phase2(&mut self, signal: &TradeSignal) {
+        if self.balance_exhausted {
+            warn!("PostLeg2Phase2 REJECTED — balance exhausted");
+            let _ = self
+                .feedback_tx
+                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
+
+        // Do NOT cancel Phase 1 order — it stays alive.
+        let order = OrderRequest::post_only_gtc(
+            signal.token_id.clone(),
+            signal.side,
+            signal.price,
+            signal.size,
+        );
+
+        match self.poly.place_order(&order).await {
+            Ok(resp) => {
+                if resp.status == OrderStatus::Rejected {
+                    // Post-only rejected — ask is below our bid. Attempt favorable exit.
+                    warn!(
+                        price = %signal.price,
+                        "Leg 2 Phase 2: post-only REJECTED — attempting favorable exit"
+                    );
+                    self.attempt_favorable_maker_then_fok(signal).await;
+                } else {
+                    info!(
+                        order_id = %resp.order_id,
+                        price = %signal.price,
+                        "Leg 2 Phase 2: order placed alongside Phase 1"
+                    );
+                    self.active_leg2_phase2_id = Some(resp.order_id.clone());
+
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: true,
+                        order_id: resp.order_id,
+                        price: signal.price,
+                        size: signal.size,
+                        fill_method: None,
+                        already_filled: false,
+                        order_tag: Some(OrderTag::Leg2Phase2),
+                    });
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("crosses book") {
+                    warn!(
+                        error = %e,
+                        "Leg 2 Phase 2: 'crosses book' — attempting favorable exit"
+                    );
+                    self.attempt_favorable_maker_then_fok(signal).await;
+                } else {
+                    error!(error = %e, "Leg 2 Phase 2: order placement FAILED");
+                    if err_msg.contains("balance") || err_msg.contains("allowance") {
+                        self.balance_exhausted = true;
+                        let _ = self
+                            .feedback_tx
+                            .try_send(ExecutorFeedback::BalanceExhausted);
+                    }
+                    let _ = self
+                        .feedback_tx
+                        .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+                }
+            }
+        }
+    }
+
+    // ─── Dual-order: Cancel specific Leg 2 order ────────────────────────
+
+    async fn handle_cancel_leg2_order(&mut self, order_id: &str) {
+        info!(%order_id, "cancelling specific Leg 2 order");
+        let was_cancelled = match self.poly.cancel_order(order_id).await {
+            Ok(cancelled) => cancelled,
+            Err(e) => {
+                warn!(%order_id, error = %e, "cancel Leg 2 order failed");
+                false
+            }
+        };
+        // Clear matching phase ID.
+        if self.active_leg2_phase1_id.as_deref() == Some(order_id) {
+            self.active_leg2_phase1_id = None;
+        }
+        if self.active_leg2_phase2_id.as_deref() == Some(order_id) {
+            self.active_leg2_phase2_id = None;
+        }
+        let _ = self.feedback_tx.try_send(ExecutorFeedback::Leg2OrderCancelResult {
+            order_id: order_id.to_string(),
+            was_cancelled,
+        });
+    }
+
+    // ─── Double-fill rebalance: FOK buy Leg 1 side ──────────────────────
+
+    async fn handle_rebalance_leg1(&mut self, signal: &TradeSignal) {
+        warn!(
+            price = %signal.price,
+            size = %signal.size,
+            "REBALANCE: FOK buy Leg 1 side to recover from double-fill"
+        );
+        // Reuse the emergency FOK price-escalation loop.
+        let mut current_price = signal.price;
+        let dollar = Decimal::ONE;
+
         loop {
-            attempt += 1;
             let safe_size = clob_safe_fok_size(current_price, signal.size);
             if safe_size.is_zero() {
-                error!(price = %current_price, size = %signal.size, "FOK at price size zero — aborting");
+                error!("rebalance FOK size zero at price {} — aborting", current_price);
                 break;
+            }
+            if current_price * safe_size < Decimal::ONE {
+                warn!("rebalance FOK below $1 minimum at price {} — escalating", current_price);
+                current_price += signal.tick_size;
+                if current_price > dollar {
+                    error!("rebalance FOK exceeded $1.00 cap — aborting");
+                    break;
+                }
+                continue;
             }
             let order = OrderRequest::emergency_fok(
                 signal.token_id.clone(),
@@ -751,74 +959,68 @@ impl LiveExecutor {
                 current_price,
                 safe_size,
             );
-
             match self.poly.place_order(&order).await {
                 Ok(resp) => {
-                    if resp.status == OrderStatus::Rejected {
-                        warn!(
+                    if resp.status == OrderStatus::Filled {
+                        info!(
                             order_id = %resp.order_id,
                             price = %current_price,
-                            reason = ?exit_reason,
-                            attempt,
-                            "Leg 2 emergency: FOK at price rejected — escalating price"
+                            size = %safe_size,
+                            "rebalance FOK FILLED"
                         );
+                        let _ = self.feedback_tx.try_send(ExecutorFeedback::RebalanceResult {
+                            success: true,
+                            price: current_price,
+                            size: safe_size,
+                            order_id: Some(resp.order_id),
+                        });
+                        return;
+                    } else if resp.status == OrderStatus::Rejected {
+                        warn!(price = %current_price, "rebalance FOK rejected — escalating price");
                         current_price += signal.tick_size;
-                        if current_price > Decimal::ONE {
-                            error!(reason = ?exit_reason, "FOK at price exceeded $1.00 cap — aborting");
+                        if current_price > dollar {
+                            error!("rebalance FOK exceeded $1.00 cap — aborting");
                             break;
                         }
                         continue;
-                    }
-
-                    info!(
-                        order_id = %resp.order_id,
-                        status = ?resp.status,
-                        price = %current_price,
-                        reason = ?exit_reason,
-                        "Leg 2 emergency: FOK at price placed"
-                    );
-                    // Don't track filled FOKs — prevents stale cancel by next signal
-                    if resp.status == OrderStatus::Filled {
-                        self.active_leg2_order_id = None;
                     } else {
-                        self.active_leg2_order_id = Some(resp.order_id.clone());
+                        // Non-terminal status — treat as success (wait for WS).
+                        let _ = self.feedback_tx.try_send(ExecutorFeedback::RebalanceResult {
+                            success: true,
+                            price: current_price,
+                            size: safe_size,
+                            order_id: Some(resp.order_id),
+                        });
+                        return;
                     }
-
-                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                        is_leg2: true,
-                        order_id: resp.order_id,
-                        price: current_price,
-                        size: safe_size,
-                        fill_method: Some(FillMethod::EmergencyTaker),
-                        already_filled: resp.status == OrderStatus::Filled,
-                    });
-                    return;
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-
                     if err_msg.contains("decimal places")
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
                         || err_msg.contains("allowance")
                     {
-                        error!(error = %e, "FOK at price non-transient error — aborting retries");
+                        error!(error = %e, "rebalance FOK non-transient error — aborting");
                         break;
                     }
-                    warn!(error = %e, price = %current_price, attempt, "Leg 2 emergency: FOK at price FAILED — escalating price");
+                    warn!(error = %e, price = %current_price, "rebalance FOK failed — escalating price");
                     current_price += signal.tick_size;
-                    if current_price > Decimal::ONE {
-                        error!(reason = ?exit_reason, "FOK at price exceeded $1.00 cap — aborting");
+                    if current_price > dollar {
+                        error!("rebalance FOK exceeded $1.00 cap — aborting");
                         break;
                     }
                     continue;
                 }
             }
         }
-        self.active_leg2_order_id = None;
-        let _ = self
-            .feedback_tx
-            .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+        // All attempts failed.
+        let _ = self.feedback_tx.try_send(ExecutorFeedback::RebalanceResult {
+            success: false,
+            price: current_price,
+            size: signal.size,
+            order_id: None,
+        });
     }
 
     // ─── Market rotation ────────────────────────────────────────────────
@@ -839,7 +1041,8 @@ impl LiveExecutor {
             warn!(error = %e, "cancel_all failed during rotation");
         }
 
-        self.active_leg2_order_id = None;
+        self.active_leg2_phase1_id = None;
+        self.active_leg2_phase2_id = None;
         self.balance_exhausted = false;
 
         // Reset warm flag — block trading until pre-warm succeeds.

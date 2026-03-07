@@ -112,6 +112,8 @@ pub(crate) struct HedgeSnap {
     pub phase1_target_price: Decimal,
     /// Epoch ms when Phase 2 started (for Phase 2 timeout).
     pub phase2_start_ms: Option<u64>,
+    /// The price at which Phase 2 order was posted (for Phase 2 breach guard).
+    pub phase2_posted_price: Option<Decimal>,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

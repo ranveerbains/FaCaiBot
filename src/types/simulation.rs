@@ -97,6 +97,8 @@ pub struct SimPosition {
     pub bot_contested: bool,
     /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
     pub favorable_taker: bool,
+    /// Whether Leg 2 filled via the favorable maker try-first path (no taker fee + rebate).
+    pub favorable_maker: bool,
     /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
     pub emergency_maker: bool,
     /// Why the trade exited. `None` for normal erosion fills.
@@ -105,6 +107,8 @@ pub struct SimPosition {
     pub spike_magnitude: Decimal,
     /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
     pub phase1_breach: bool,
+    /// Whether Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
+    pub phase1_dual_fill: bool,
     /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
     pub whipsaw_reversal: bool,
 }
@@ -161,6 +165,8 @@ pub struct SimTrade {
     pub bot_contested: bool,
     /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
     pub favorable_taker: bool,
+    /// Whether Leg 2 filled via the favorable maker try-first path (no taker fee + rebate).
+    pub favorable_maker: bool,
     /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
     pub emergency_maker: bool,
     /// Why the trade exited. `None` for normal erosion fills.
@@ -172,6 +178,8 @@ pub struct SimTrade {
     pub leg1_cancel_race: bool,
     /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
     pub phase1_breach: bool,
+    /// Whether Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
+    pub phase1_dual_fill: bool,
     /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
     pub whipsaw_reversal: bool,
 
@@ -213,6 +221,8 @@ pub struct MarketSummary {
     pub emergency_maker_fills: u32,
     /// Favorable taker fills in this market (ask < posted bid).
     pub favorable_taker_fills: u32,
+    /// Favorable maker fills in this market (try-maker-first succeeded).
+    pub favorable_maker_fills: u32,
     /// All closed trades in this market (for detail lines).
     pub trades: Vec<SimTrade>,
     /// Total USDC allocated this market.
@@ -258,6 +268,8 @@ pub struct SessionSummary {
     pub emergency_maker_fills: u32,
     /// Favorable taker fills (ask < posted bid).
     pub favorable_taker_fills: u32,
+    /// Favorable maker fills (try-maker-first succeeded).
+    pub favorable_maker_fills: u32,
 
     // ── Confidence tier breakdown ─────────────────────────────────────────
     pub high_conf_trades: u32,
@@ -332,6 +344,8 @@ pub struct SimulationState {
     pub emergency_maker_fills: u32,
     /// Favorable taker fills (ask < posted bid — market-take at better price).
     pub favorable_taker_fills: u32,
+    /// Favorable maker fills (try-maker-first succeeded).
+    pub favorable_maker_fills: u32,
     /// Smart outbidding events (depth walls detected and outbid).
     pub walls_outbid: u32,
 
@@ -389,6 +403,7 @@ impl SimulationState {
             trades_emergency_taker: 0,
             emergency_maker_fills: 0,
             favorable_taker_fills: 0,
+            favorable_maker_fills: 0,
             walls_outbid: 0,
             unfilled_post_only: 0,
             unfilled_liquidity: 0,
@@ -503,10 +518,12 @@ impl SimulationState {
             hedge_phase: 0,
             bot_contested: false,
             favorable_taker: false,
+            favorable_maker: false,
             emergency_maker: false,
             exit_reason: None,
             spike_magnitude: Decimal::ZERO,
             phase1_breach: false,
+            phase1_dual_fill: false,
             whipsaw_reversal: false,
         };
 
@@ -658,11 +675,13 @@ impl SimulationState {
             leg2_was_taker,
             bot_contested: pos.bot_contested,
             favorable_taker: pos.favorable_taker,
+            favorable_maker: pos.favorable_maker,
             emergency_maker: pos.emergency_maker,
             exit_reason: pos.exit_reason,
             spike_magnitude: pos.spike_magnitude,
             leg1_cancel_race: false,
             phase1_breach: pos.phase1_breach,
+            phase1_dual_fill: pos.phase1_dual_fill,
             whipsaw_reversal: pos.whipsaw_reversal,
             open_timestamp_ms: pos.leg1.timestamp_ms,
             close_timestamp_ms,
@@ -799,6 +818,7 @@ impl SimulationState {
             emergency_taker_fills: self.trades_emergency_taker,
             emergency_maker_fills: self.emergency_maker_fills,
             favorable_taker_fills: self.favorable_taker_fills,
+            favorable_maker_fills: self.favorable_maker_fills,
             high_conf_trades: high_count,
             high_conf_avg_alloc,
             med_conf_trades: med_count,
@@ -852,6 +872,7 @@ impl SimulationState {
         let emergency_taker_fills = trades.iter().filter(|t| t.leg2_was_taker).count() as u32;
         let emergency_maker_fills = trades.iter().filter(|t| t.emergency_maker).count() as u32;
         let favorable_taker_fills = trades.iter().filter(|t| t.favorable_taker).count() as u32;
+        let favorable_maker_fills = trades.iter().filter(|t| t.favorable_maker).count() as u32;
         let walls_outbid = self.current_market_walls;
 
         let mut allocation_used = Decimal::ZERO;
@@ -901,6 +922,7 @@ impl SimulationState {
             emergency_taker_fills,
             emergency_maker_fills,
             favorable_taker_fills,
+            favorable_maker_fills,
             trades,
             allocation_used,
             allocation_cap,

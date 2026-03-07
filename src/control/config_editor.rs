@@ -23,28 +23,26 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.entry_cutoff_secs", min: 30.0, max: 600.0 },
     ParamSpec { name: "entry_guards.binance_stale_event_ms", min: 10.0, max: 1000.0 },
     ParamSpec { name: "entry_guards.stale_book_ms", min: 50.0, max: 5000.0 },
-    ParamSpec { name: "entry_guards.max_price_skew", min: 0.5, max: 0.99 },
     ParamSpec { name: "entry_guards.leg1_timeout_ms", min: 500.0, max: 30000.0 },
     ParamSpec { name: "entry_guards.rotation_quiet_ms", min: 0.0, max: 120000.0 },
     ParamSpec { name: "entry_guards.trade_cooldown_ms", min: 0.0, max: 60000.0 },
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
-    ParamSpec { name: "capital.high_alloc_pct", min: 0.01, max: 1.0 },
-    ParamSpec { name: "capital.med_alloc_pct", min: 0.01, max: 1.0 },
-    ParamSpec { name: "capital.low_alloc_pct", min: 0.01, max: 1.0 },
     // confidence
-    ParamSpec { name: "confidence.high_threshold", min: 0.01, max: 1.0 },
-    ParamSpec { name: "confidence.med_threshold", min: 0.01, max: 1.0 },
-    ParamSpec { name: "confidence.high_target_pct", min: 0.001, max: 0.2 },
-    ParamSpec { name: "confidence.med_target_pct", min: 0.001, max: 0.2 },
-    ParamSpec { name: "confidence.low_target_pct", min: 0.001, max: 0.2 },
     ParamSpec { name: "confidence.min_spike_atr_ratio", min: 5.0, max: 200.0 },
     ParamSpec { name: "confidence.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
+    // repricing
+    ParamSpec { name: "repricing.reprice_scale", min: 0.001, max: 0.10 },
+    ParamSpec { name: "repricing.min_reprice_pct", min: 0.001, max: 0.10 },
+    ParamSpec { name: "repricing.min_alloc_pct", min: 0.01, max: 1.0 },
+    ParamSpec { name: "repricing.hard_skew_cap", min: 0.5, max: 0.99 },
+    ParamSpec { name: "repricing.time_exponent", min: 0.0, max: 2.0 },
     // risk
     ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },
     ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     ParamSpec { name: "risk.phase2_timeout_ms", min: 500.0, max: 10000.0 },
+    ParamSpec { name: "risk.favorable_maker_timeout_ms", min: 200.0, max: 5000.0 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
 ];

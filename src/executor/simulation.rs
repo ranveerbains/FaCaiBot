@@ -262,6 +262,19 @@ impl SimulationExecutor {
                         self.tick_size = new_tick_size;
                         debug!(%new_tick_size, "SimExecutor: tick_size updated");
                     }
+                    ExecutorCommand::PostLeg2Phase2 { signal } => {
+                        // Sim mode: treat as regular Leg 2 hedge signal.
+                        if let Some(book) = signal.book_snapshot.clone() {
+                            self.update_book(book);
+                        }
+                        self.handle_leg2(&signal);
+                    }
+                    ExecutorCommand::CancelLeg2Order { order_id } => {
+                        debug!(%order_id, "SimExecutor: Leg 2 order cancel (no-op in sim)");
+                    }
+                    ExecutorCommand::RebalanceLeg1 { .. } => {
+                        debug!("SimExecutor: rebalance (no-op in sim — no concurrent orders)");
+                    }
                 }
 
                 // 60-second session diagnostic (cumulative, same source as Telegram).
@@ -678,6 +691,7 @@ mod tests {
             tick_size: d("0.01"),
             atr: Decimal::ZERO,
             bot_contested: false,
+            best_ask: None,
             book_snapshot: None,
             sim_confirmed_fill: false,
             sim_was_taker: false,
