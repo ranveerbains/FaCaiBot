@@ -9,7 +9,7 @@ This document covers FaCaiBot's trading logic: signal detection, entry validatio
 1. [Core Trade Model](#1-core-trade-model)
 2. [Signal Detection Pipeline](#2-signal-detection-pipeline)
 3. [Entry Validation (Leg 1 Guards)](#3-entry-validation-leg-1-guards)
-4. [Confidence Scoring & Allocation](#4-confidence-scoring--allocation)
+4. [Repricing Model & Allocation](#4-repricing-model--allocation)
 5. [Leg 1 Execution](#5-leg-1-execution)
 6. [Leg 2 Hedge System (2-Phase)](#6-leg-2-hedge-system-2-phase)
 7. [Emergency Exits](#7-emergency-exits)
@@ -217,7 +217,7 @@ When Leg 1 fills, the engine calls `init_leg2()` which captures: fill timestamp,
 The hedge system uses two phases with a single cancel/repost at the transition — reducing off-book time from the old multi-step erosion cascade (~1s per cancel/repost) to ~200ms total.
 
 **Phase 1 — Profit target rest** (`phase1_timeout_ms`, default 2000ms):
-- Leg 2 is posted at the confidence-scaled profit target price (same as old Step 0)
+- Leg 2 is posted at the repricing-model profit target price
 - The order rests on the book for up to `phase1_timeout_ms` waiting for a fill
 - If filled during Phase 1 → trade completes at the profit target (best outcome)
 - If `phase1_timeout_ms` elapses without fill → transition to Phase 2
@@ -707,9 +707,9 @@ Result: `SpikeCandidate { direction: Up, magnitude: 0.0077, sustained_ms: 0 }` �
 
 Guards pass: no active trade, Binance price present, YES book bid=0.495/ask=0.505, book age 50ms, YES mid=0.50 (no skew), spread = 1 tick, 200 shares depth.
 
-Confidence = 0.4×1.0 + 0.2×1.0 + 0.2×0.667 = 0.733 → **HIGH** tier.
+Repricing model: `norm_spike` × `4P(1-P)` × alignment × time_factor × reprice_scale → expected_pct. Used as Phase 1 profit target.
 
-Allocation = round(20 × 1.0) = $20. Bid = round_to_tick(0.495 + 0.01) = $0.50. Size = round_dp(20 / 0.50) = 40 shares.
+Allocation = round(max_alloc × alloc_fraction) based on dynamic sizing. Bid = round_to_tick(best_bid). Size = round_dp(alloc / price).
 
 **Signal:** Buy YES @ $0.50 × 40 shares = $20.00 (speculative — posted before sustain confirmation)
 

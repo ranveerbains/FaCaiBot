@@ -108,11 +108,9 @@ struct CancelledLeg1 {
 #[derive(Debug, Clone)]
 struct OrphanState {
     order_id: String,
-    price: Decimal,
     size: Decimal,
     leg1_direction: Direction,
     leg1_price: Decimal,
-    token_id: String,
     condition_id: String,
     tick_size: Decimal,
 }
@@ -242,7 +240,8 @@ pub struct StrategyEngine {
     diag_whipsaw_foks: u64,
     // Leg 1 rejection distribution — only incremented when spike_detected = true
     diag_rej_busy: u64,    // ActiveTrade: trade already in flight
-    diag_rej_no_book: u64, // NoBook / NoBinance: data unavailable
+    diag_rej_no_book: u64,    // NoBook: Polymarket book missing
+    diag_rej_no_binance: u64, // NoBinance: no Binance reference price
     diag_rej_stale: u64,   // StaleBook
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_spread: u64,  // SpreadWide
@@ -378,6 +377,7 @@ impl StrategyEngine {
             diag_whipsaw_foks: 0,
             diag_rej_busy: 0,
             diag_rej_no_book: 0,
+            diag_rej_no_binance: 0,
             diag_rej_stale: 0,
             diag_rej_skew: 0,
             diag_rej_spread: 0,
@@ -1155,17 +1155,11 @@ impl StrategyEngine {
                                         // The filled one was Phase 1, orphan is Phase 2.
                                         hedge.phase2_posted_price.unwrap_or(Decimal::ZERO)
                                     };
-                                    let hedge_token_id = match dir {
-                                        Direction::Up => self.state.active_no_token_id.clone().unwrap_or_default(),
-                                        Direction::Down => self.state.active_yes_token_id.clone().unwrap_or_default(),
-                                    };
                                     self.post_trade_orphan = Some(OrphanState {
                                         order_id: orphan_id.clone(),
-                                        price: orphan_price,
                                         size: fill_size,
                                         leg1_direction: dir,
                                         leg1_price: l1_price,
-                                        token_id: hedge_token_id,
                                         condition_id: self.state.active_condition_id.clone().unwrap_or_default(),
                                         tick_size: self.state.tick_size,
                                     });
@@ -1434,9 +1428,8 @@ impl StrategyEngine {
                 self.state.spike_detected = false;
                 match reason {
                     Leg1RejectReason::ActiveTrade => self.diag_rej_busy += 1,
-                    Leg1RejectReason::NoBook | Leg1RejectReason::NoBinance => {
-                        self.diag_rej_no_book += 1
-                    }
+                    Leg1RejectReason::NoBook => self.diag_rej_no_book += 1,
+                    Leg1RejectReason::NoBinance => self.diag_rej_no_binance += 1,
                     Leg1RejectReason::StaleBook => self.diag_rej_stale += 1,
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
                     Leg1RejectReason::SpreadWide => self.diag_rej_spread += 1,
@@ -1484,7 +1477,7 @@ impl StrategyEngine {
                 direction: e.direction,
                 fill_ms: e.leg1_fill_ms,
                 tier: e.tier,
-                confidence: e.confidence,
+                expected_pct: e.expected_pct,
                 spike_info: e.spike_info,
                 phase: e.phase,
                 phase1_target_price: e.phase1_target_price,
@@ -1689,6 +1682,7 @@ impl StrategyEngine {
             rej_paused = self.diag_rej_paused,
             rej_busy = self.diag_rej_busy,
             rej_no_book = self.diag_rej_no_book,
+            rej_no_bnc = self.diag_rej_no_binance,
             rej_stale = self.diag_rej_stale,
             rej_skew = self.diag_rej_skew,
             rej_spread = self.diag_rej_spread,
@@ -1762,7 +1756,7 @@ impl StrategyEngine {
              Markets rotated: {mkts}  Spikes: {spikes}  Spike fails: {spike_fail}  Cutoff drops: {spikes_cut}  Quiet drops: {spikes_quiet}  Cooldown drops: {spikes_cooldown}\n\
              \n\
              <b>Leg 1 Rejections</b>\n\
-             Paused: {paused}  Busy: {busy}  No book: {no_book}  Stale: {stale}  Skewed: {skew}\n\
+             Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Skewed: {skew}\n\
              Spread: {spread}  Depth: {depth}  Reprice: {reprice}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
@@ -1785,6 +1779,7 @@ impl StrategyEngine {
             paused = self.diag_rej_paused,
             busy = self.diag_rej_busy,
             no_book = self.diag_rej_no_book,
+            no_bnc = self.diag_rej_no_binance,
             stale = self.diag_rej_stale,
             skew = self.diag_rej_skew,
             spread = self.diag_rej_spread,
@@ -1953,9 +1948,6 @@ impl StrategyEngine {
                 }
                 Some(OrderTag::Leg2Phase2) => {
                     self.leg2_phase2_order_id = Some(order_id.clone());
-                }
-                Some(OrderTag::Rebalance) => {
-                    // Rebalance order posted — if already_filled, handled below.
                 }
                 None => {
                     // Backward compat: no tag → treat as Phase 1 (initial Leg 2 post).
@@ -2298,7 +2290,7 @@ impl StrategyEngine {
             price: breakeven_price,
             size: orphan.size,
             reference_price: Decimal::ZERO,
-            confidence: Decimal::ZERO,
+            expected_pct: Decimal::ZERO,
             profit_target_tier: ProfitTier::Low,
             profit_target_pct: Decimal::ZERO,
             alloc_amount: Decimal::ZERO,
@@ -2483,7 +2475,7 @@ impl StrategyEngine {
 
         // Extract hedge metadata (if available).
         let (
-            confidence,
+            expected_pct,
             profit_tier,
             hedge_phase,
             exit_reason,
@@ -2493,7 +2485,7 @@ impl StrategyEngine {
             spike_magnitude,
         ) = match (&self.hedge, &self.pending_leg1_signal) {
             (Some(h), Some(sig)) => (
-                h.confidence,
+                h.expected_pct,
                 h.tier.label(),
                 h.phase as u8,
                 h.exit_reason,
@@ -2503,7 +2495,7 @@ impl StrategyEngine {
                 h.spike_info.magnitude,
             ),
             (Some(h), None) => (
-                h.confidence,
+                h.expected_pct,
                 h.tier.label(),
                 h.phase as u8,
                 h.exit_reason,
@@ -2554,7 +2546,7 @@ impl StrategyEngine {
             taker_fee,
             net_profit,
             profit_pct,
-            confidence,
+            expected_pct,
             profit_tier,
             alloc_amount,
             hedge_phase,
@@ -2644,11 +2636,11 @@ impl StrategyEngine {
     /// `advance_simulation()` (simulation mode).
     fn init_leg2(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
         if let Some(spike) = self.state.last_spike {
-            // Use the original signal's confidence (= expected_pct) and tier (computed at signal time)
+            // Use the original signal's expected_pct and tier (computed at signal time)
             // rather than recomputing — the allocation was locked in at signal time,
             // so the summary should reflect the same values that determined the allocation.
             let (conf, tier, initial_profit_target) = if let Some(sig) = &self.pending_leg1_signal {
-                (sig.confidence, sig.profit_target_tier, sig.profit_target_pct)
+                (sig.expected_pct, sig.profit_target_tier, sig.profit_target_pct)
             } else {
                 let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
                 let yes_mid = self
@@ -2742,7 +2734,7 @@ impl StrategyEngine {
             fok_price,
             leg1_size,
             self.state.binance_price.unwrap_or(Decimal::ZERO),
-            hedge.confidence,
+            hedge.expected_pct,
             hedge.tier,
             Decimal::ZERO,
             direction,
@@ -3116,7 +3108,7 @@ impl StrategyEngine {
             price,
             size,
             self.state.binance_price.unwrap_or(Decimal::ZERO),
-            hedge.confidence,
+            hedge.expected_pct,
             hedge.tier,
             hedge.initial_profit_target,
             hedge.direction,
@@ -3260,17 +3252,17 @@ impl StrategyEngine {
         let mut high_alloc_sum = Decimal::ZERO;
         let mut med_alloc_sum = Decimal::ZERO;
         let mut low_alloc_sum = Decimal::ZERO;
-        let mut conf_sum = Decimal::ZERO;
+        let mut reprice_sum = Decimal::ZERO;
         let mut gross_pnl = Decimal::ZERO;
         let mut taker_fees = Decimal::ZERO;
         let mut maker_rebates = Decimal::ZERO;
         let mut profit_pct_sum = Decimal::ZERO;
         let mut best_pct = Decimal::MIN;
         let mut best_market = String::new();
-        let mut best_conf = Decimal::ZERO;
+        let mut best_reprice = Decimal::ZERO;
         let mut worst_pct = Decimal::MAX;
         let mut worst_market = String::new();
-        let mut worst_conf = Decimal::ZERO;
+        let mut worst_reprice = Decimal::ZERO;
         let mut walls_outbid: u32 = 0;
         let mut break_even_fok: u32 = 0;
         let mut timer_fok: u32 = 0;
@@ -3283,7 +3275,7 @@ impl StrategyEngine {
             gross_pnl += t.gross_profit;
             taker_fees += t.taker_fee;
             maker_rebates += t.maker_rebate;
-            conf_sum += t.confidence;
+            reprice_sum += t.expected_pct;
             profit_pct_sum += t.profit_pct;
             if t.bot_contested { walls_outbid += 1; }
             if t.leg2_was_taker { emergency_taker += 1; }
@@ -3305,12 +3297,12 @@ impl StrategyEngine {
             if t.profit_pct > best_pct {
                 best_pct = t.profit_pct;
                 best_market = t.market_id.clone();
-                best_conf = t.confidence;
+                best_reprice = t.expected_pct;
             }
             if t.profit_pct < worst_pct {
                 worst_pct = t.profit_pct;
                 worst_market = t.market_id.clone();
-                worst_conf = t.confidence;
+                worst_reprice = t.expected_pct;
             }
         }
 
@@ -3320,8 +3312,8 @@ impl StrategyEngine {
         }
 
         let net_pnl = gross_pnl - taker_fees + maker_rebates;
-        let avg_confidence = if total_trades > 0 {
-            conf_sum / Decimal::from(total_trades)
+        let avg_expected_pct = if total_trades > 0 {
+            reprice_sum / Decimal::from(total_trades)
         } else {
             Decimal::ZERO
         };
@@ -3351,13 +3343,13 @@ impl StrategyEngine {
             emergency_maker_fills: emergency_maker,
             favorable_taker_fills: favorable_taker,
             favorable_maker_fills: favorable_maker,
-            high_conf_trades: high_count,
-            high_conf_avg_alloc: if high_count > 0 { high_alloc_sum / Decimal::from(high_count) } else { Decimal::ZERO },
-            med_conf_trades: med_count,
-            med_conf_avg_alloc: if med_count > 0 { med_alloc_sum / Decimal::from(med_count) } else { Decimal::ZERO },
-            low_conf_trades: low_count,
-            low_conf_avg_alloc: if low_count > 0 { low_alloc_sum / Decimal::from(low_count) } else { Decimal::ZERO },
-            avg_confidence,
+            high_tier_trades: high_count,
+            high_tier_avg_alloc: if high_count > 0 { high_alloc_sum / Decimal::from(high_count) } else { Decimal::ZERO },
+            med_tier_trades: med_count,
+            med_tier_avg_alloc: if med_count > 0 { med_alloc_sum / Decimal::from(med_count) } else { Decimal::ZERO },
+            low_tier_trades: low_count,
+            low_tier_avg_alloc: if low_count > 0 { low_alloc_sum / Decimal::from(low_count) } else { Decimal::ZERO },
+            avg_expected_pct,
             gross_pnl,
             emergency_taker_fees: taker_fees,
             est_maker_rebates: maker_rebates,
@@ -3366,10 +3358,10 @@ impl StrategyEngine {
             avg_net_profit_pct,
             best_trade_pct: best_pct,
             best_trade_market: best_market,
-            best_trade_conf: best_conf,
+            best_trade_reprice: best_reprice,
             worst_trade_pct: worst_pct,
             worst_trade_market: worst_market,
-            worst_trade_conf: worst_conf,
+            worst_trade_reprice: worst_reprice,
             unfilled_signals: unfilled_post_only,
             unfilled_post_only,
             unfilled_liquidity: 0,
@@ -3452,7 +3444,7 @@ impl StrategyEngine {
             direction: hedge.direction,
             leg1: leg1_fill,
             leg2: Some(leg2_fill),
-            confidence: hedge.confidence,
+            expected_pct: hedge.expected_pct,
             profit_target_tier: hedge.tier,
             alloc_amount: signal.alloc_amount,
             pair_cost,
@@ -4154,7 +4146,7 @@ mod tests {
             .expect("hedge should be initialized");
         assert_eq!(hedge.leg1_fill_price, Decimal::new(50, 2));
         assert_eq!(hedge.leg1_fill_ms, now_ms);
-        assert!(hedge.confidence > Decimal::ZERO);
+        assert!(hedge.expected_pct > Decimal::ZERO);
         assert_eq!(hedge.phase, HedgePhase::Phase1);
     }
 

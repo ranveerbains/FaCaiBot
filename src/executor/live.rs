@@ -219,7 +219,7 @@ impl LiveExecutor {
             token = %signal.token_id,
             price = %signal.price,
             size = %signal.size,
-            confidence = %signal.confidence,
+            expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
             "Leg 1: placing post-only GTC order"
         );
@@ -1104,7 +1104,7 @@ impl LiveExecutor {
             if let Err(e) = c.record_signal(
                 &signal.token_id,
                 direction_str,
-                signal.confidence,
+                signal.expected_pct,
                 signal.spike_info.magnitude,
                 signal.atr,
                 signal

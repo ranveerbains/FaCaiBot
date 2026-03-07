@@ -79,8 +79,8 @@ pub struct SimPosition {
     pub market_id: String,
     /// Spike direction that triggered this position.
     pub direction: Direction,
-    /// Signal confidence score (0.0–1.0).
-    pub confidence: Decimal,
+    /// Expected repricing percentage.
+    pub expected_pct: Decimal,
     /// Profit target tier (HIGH / MED / LOW).
     pub profit_target_tier: ProfitTier,
     /// USDC allocated to this trade.
@@ -129,8 +129,8 @@ pub struct SimTrade {
     pub leg2: Option<SimFill>,
 
     // ── Signal context ───────────────────────────────────────────────────
-    /// Confidence score that generated this trade (0.0–1.0).
-    pub confidence: Decimal,
+    /// Expected repricing percentage that generated this trade.
+    pub expected_pct: Decimal,
     /// Profit target tier (HIGH / MED / LOW).
     pub profit_target_tier: ProfitTier,
     /// USDC allocated to this trade.
@@ -271,14 +271,14 @@ pub struct SessionSummary {
     /// Favorable maker fills (try-maker-first succeeded).
     pub favorable_maker_fills: u32,
 
-    // ── Confidence tier breakdown ─────────────────────────────────────────
-    pub high_conf_trades: u32,
-    pub high_conf_avg_alloc: Decimal,
-    pub med_conf_trades: u32,
-    pub med_conf_avg_alloc: Decimal,
-    pub low_conf_trades: u32,
-    pub low_conf_avg_alloc: Decimal,
-    pub avg_confidence: Decimal,
+    // ── Repricing tier breakdown ──────────────────────────────────────────
+    pub high_tier_trades: u32,
+    pub high_tier_avg_alloc: Decimal,
+    pub med_tier_trades: u32,
+    pub med_tier_avg_alloc: Decimal,
+    pub low_tier_trades: u32,
+    pub low_tier_avg_alloc: Decimal,
+    pub avg_expected_pct: Decimal,
 
     // ── PnL ──────────────────────────────────────────────────────────────
     pub gross_pnl: Decimal,
@@ -294,11 +294,11 @@ pub struct SessionSummary {
     /// Best net_profit trade description.
     pub best_trade_pct: Decimal,
     pub best_trade_market: String,
-    pub best_trade_conf: Decimal,
+    pub best_trade_reprice: Decimal,
     /// Worst net_profit trade description.
     pub worst_trade_pct: Decimal,
     pub worst_trade_market: String,
-    pub worst_trade_conf: Decimal,
+    pub worst_trade_reprice: Decimal,
 
     // ── Unfilled signal breakdown ──────────────────────────────────────────
     pub unfilled_signals: u32,
@@ -495,7 +495,7 @@ impl SimulationState {
         fill: SimFill,
         market_id: String,
         direction: Direction,
-        confidence: Decimal,
+        expected_pct: Decimal,
         profit_tier: ProfitTier,
         alloc: Decimal,
     ) -> usize {
@@ -509,7 +509,7 @@ impl SimulationState {
         let position = SimPosition {
             market_id,
             direction,
-            confidence,
+            expected_pct,
             profit_target_tier: profit_tier,
             alloc_amount: alloc,
             leg1: fill,
@@ -660,7 +660,7 @@ impl SimulationState {
             direction: pos.direction,
             leg1: pos.leg1.clone(),
             leg2: pos.leg2.clone(),
-            confidence: pos.confidence,
+            expected_pct: pos.expected_pct,
             profit_target_tier: pos.profit_target_tier,
             alloc_amount: pos.alloc_amount,
             pair_cost,
@@ -717,28 +717,28 @@ impl SimulationState {
         let total_trades = self.closed_trades.len() as u32;
         let unfilled_signals = self.signals_detected.saturating_sub(self.leg1_fills);
 
-        // Confidence tier breakdown across all closed trades.
+        // Repricing tier breakdown across all closed trades.
         let mut high_alloc_sum = Decimal::ZERO;
         let mut med_alloc_sum = Decimal::ZERO;
         let mut low_alloc_sum = Decimal::ZERO;
         let mut high_count: u32 = 0;
         let mut med_count: u32 = 0;
         let mut low_count: u32 = 0;
-        let mut conf_sum = Decimal::ZERO;
+        let mut reprice_sum = Decimal::ZERO;
 
         let mut gross_pnl = Decimal::ZERO;
         let mut profit_pct_sum = Decimal::ZERO;
         let mut best_pct = Decimal::MIN;
         let mut best_market = String::new();
-        let mut best_conf = Decimal::ZERO;
+        let mut best_reprice = Decimal::ZERO;
         let mut worst_pct = Decimal::MAX;
         let mut worst_market = String::new();
-        let mut worst_conf = Decimal::ZERO;
+        let mut worst_reprice = Decimal::ZERO;
 
         for trade in &self.closed_trades {
             gross_pnl += trade.gross_profit;
             profit_pct_sum += trade.profit_pct;
-            conf_sum += trade.confidence;
+            reprice_sum += trade.expected_pct;
 
             match trade.profit_target_tier {
                 ProfitTier::High => {
@@ -758,17 +758,17 @@ impl SimulationState {
             if trade.profit_pct > best_pct {
                 best_pct = trade.profit_pct;
                 best_market = trade.market_id.clone();
-                best_conf = trade.confidence;
+                best_reprice = trade.expected_pct;
             }
             if trade.profit_pct < worst_pct {
                 worst_pct = trade.profit_pct;
                 worst_market = trade.market_id.clone();
-                worst_conf = trade.confidence;
+                worst_reprice = trade.expected_pct;
             }
         }
 
-        let avg_confidence = if total_trades > 0 {
-            conf_sum / Decimal::from(total_trades)
+        let avg_expected_pct = if total_trades > 0 {
+            reprice_sum / Decimal::from(total_trades)
         } else {
             Decimal::ZERO
         };
@@ -779,17 +779,17 @@ impl SimulationState {
             Decimal::ZERO
         };
 
-        let high_conf_avg_alloc = if high_count > 0 {
+        let high_tier_avg_alloc = if high_count > 0 {
             high_alloc_sum / Decimal::from(high_count)
         } else {
             Decimal::ZERO
         };
-        let med_conf_avg_alloc = if med_count > 0 {
+        let med_tier_avg_alloc = if med_count > 0 {
             med_alloc_sum / Decimal::from(med_count)
         } else {
             Decimal::ZERO
         };
-        let low_conf_avg_alloc = if low_count > 0 {
+        let low_tier_avg_alloc = if low_count > 0 {
             low_alloc_sum / Decimal::from(low_count)
         } else {
             Decimal::ZERO
@@ -819,13 +819,13 @@ impl SimulationState {
             emergency_maker_fills: self.emergency_maker_fills,
             favorable_taker_fills: self.favorable_taker_fills,
             favorable_maker_fills: self.favorable_maker_fills,
-            high_conf_trades: high_count,
-            high_conf_avg_alloc,
-            med_conf_trades: med_count,
-            med_conf_avg_alloc,
-            low_conf_trades: low_count,
-            low_conf_avg_alloc,
-            avg_confidence,
+            high_tier_trades: high_count,
+            high_tier_avg_alloc,
+            med_tier_trades: med_count,
+            med_tier_avg_alloc,
+            low_tier_trades: low_count,
+            low_tier_avg_alloc,
+            avg_expected_pct,
             gross_pnl,
             emergency_taker_fees: self.total_taker_fees_paid,
             est_maker_rebates,
@@ -834,10 +834,10 @@ impl SimulationState {
             avg_net_profit_pct,
             best_trade_pct: best_pct,
             best_trade_market: best_market,
-            best_trade_conf: best_conf,
+            best_trade_reprice: best_reprice,
             worst_trade_pct: worst_pct,
             worst_trade_market: worst_market,
-            worst_trade_conf: worst_conf,
+            worst_trade_reprice: worst_reprice,
             unfilled_signals,
             unfilled_post_only: self.unfilled_post_only,
             unfilled_liquidity: self.unfilled_liquidity,

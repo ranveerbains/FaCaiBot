@@ -184,14 +184,14 @@ impl ColdStorage {
     /// Schema:
     /// - market_id (symbol): Polymarket condition ID
     /// - direction (symbol): "YES" or "NO" (directional entry side)
-    /// - confidence (f64): confidence score [0.0, 1.0]
+    /// - confidence (f64): expected repricing percentage [0.0, 1.0]
     /// - spike_magnitude (f64): spike size relative to ATR
     /// - atr (f64): current ATR value at signal time
     /// - book_depth (f64): Polymarket book depth at signal time (USDC)
     /// - time_remaining (i64): seconds to market expiry
     /// - alloc_amount (f64): USDC allocated for this signal
     /// - action (symbol): "entered" | "aborted_spread" | "aborted_liquidity" |
-    ///                     "unfilled_postonly" | "skipped_confidence"
+    ///                     "unfilled_postonly" | "skipped_reprice"
     /// - timestamp (designated timestamp): signal generation time
     ///
     /// Flushes immediately.
@@ -245,7 +245,7 @@ impl ColdStorage {
     /// - taker_fee (f64): taker fee paid (0 in normal flow; non-zero for emergency FOK)
     /// - net_profit (f64): gross_profit - taker_fee
     /// - profit_pct (f64): net_profit / pair_cost * 100
-    /// - confidence (f64): signal confidence score
+    /// - confidence (f64): expected repricing percentage
     /// - profit_tier (symbol): "HIGH" | "MED" | "LOW"
     /// - alloc_amount (f64): USDC allocated
     /// - hedge_phase (i64): hedge phase at fill (0=Phase1, 1=Phase2)
@@ -409,7 +409,7 @@ impl ColdStorage {
             .column_f64("leg2_price", leg2_price)?
             .column_f64("leg1_size", trade.leg1.size.try_into().unwrap_or(0.0))?
             .column_f64("leg2_size", leg2_size)?
-            .column_f64("confidence", trade.confidence.try_into().unwrap_or(0.0))?
+            .column_f64("confidence", trade.expected_pct.try_into().unwrap_or(0.0))?
             .column_f64("alloc_amount", trade.alloc_amount.try_into().unwrap_or(0.0))?
             .column_f64("pair_cost", trade.pair_cost.try_into().unwrap_or(0.0))?
             .column_f64("gross_profit", trade.gross_profit.try_into().unwrap_or(0.0))?

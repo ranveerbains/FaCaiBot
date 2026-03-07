@@ -533,7 +533,7 @@ alignment = with_consensus ? (1 + |yes_mid - 0.5|) : (1 - |yes_mid - 0.5|)
 time_factor = (300 / max(T, 10)) ^ time_exponent
 ```
 
-The model output IS the Phase 1 profit target (after `round_to_tick()`). Replaces fixed confidence tiers.
+The model output IS the Phase 1 profit target (after `round_to_tick()`).
 
 **Three-layer entry guard**:
 1. Hard skew cap: YES mid > `hard_skew_cap` (0.90) or < 0.10 → reject
@@ -616,11 +616,9 @@ leg1_timeout_ms, rotation_quiet_ms, trade_cooldown_ms
 [capital]              # 1 param
 max_alloc_per_trade
 
-[confidence]           # 2 params
+[repricing]            # 7 params
+reprice_scale, min_reprice_pct, min_alloc_pct, hard_skew_cap, time_exponent,
 min_spike_atr_ratio, strong_spike_atr_ratio
-
-[repricing]            # 5 params
-reprice_scale, min_reprice_pct, min_alloc_pct, hard_skew_cap, time_exponent
 
 [risk]                 # 3 params
 phase1_timeout_ms,
@@ -656,9 +654,9 @@ All execution state lives in-memory (no database on the hot path). QuestDB is us
 |-------|-------------|--------------|
 | `binance_ticks` | symbol, bid, ask, mid | Engine loop (batch flush every 1000 rows) |
 | `poly_book_snapshots` | token_id, best_bid/ask, depth, spread | Engine loop (every 5s) |
-| `trade_signals` | market_id, direction, action, confidence, spike_magnitude | SimulationExecutor |
+| `trade_signals` | market_id, direction, action, expected_pct, spike_magnitude | SimulationExecutor |
 | `executed_trades` | market_id, leg1/2 price+size, pair_cost, profit | LiveExecutor |
-| `simulated_trades` | Full trade record: tier, hedge_phase, taker_fee, confidence, exit_reason, spike_magnitude, etc. | SimulationExecutor |
+| `simulated_trades` | Full trade record: tier, hedge_phase, taker_fee, expected_pct, exit_reason, spike_magnitude, etc. | SimulationExecutor |
 
 `binance_ticks` and `poly_book_snapshots` are recorded continuously in the engine loop for backtesting and parameter tuning. Trade tables are written by the executor on fill events.
 
@@ -690,7 +688,7 @@ See `queries.sql` for 15 analytics queries (7 operational + 8 tuning). Tuning qu
 
 Four tiers via `hyper` + `tokio-rustls` (fire-and-forget, no teloxide):
 
-1. **Opportunity Alert**: Per signal — spike info, confidence, allocation, Leg 1 entry, Leg 2 target
+1. **Opportunity Alert**: Per signal — spike info, expected repricing %, allocation, Leg 1 entry, Leg 2 target
 2. **Trade Completed**: Per trade — "Buy YES"/"Buy NO" labels, pair cost, profit (USDC), hedge phase. Leg 1 line shows `[FILLED MID-CANCEL]` when `leg1_cancel_race=true`. Leg 2 line shows `[FAVORABLE MAKER]`, `[FAVORABLE FOK FALLBACK]`, `[FAVORABLE POST-ONLY]`, `[EMERGENCY POST-ONLY]`, or `[FOK FALLBACK]` based on `LiveTradeMeta` flags. Phase tags: `(PHASE-1)`, `(PHASE-2)`, `(PHASE-1-DUAL)` (Phase 1 order filled during dual-order Phase 2)
 3. **Market Summary**: Per 5-min expiry — fill rate, trades, PnL
 4. **Session Summary**: Hourly + shutdown — aggregate stats, win rate, balance

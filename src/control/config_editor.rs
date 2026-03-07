@@ -28,10 +28,9 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.trade_cooldown_ms", min: 0.0, max: 60000.0 },
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
-    // confidence
-    ParamSpec { name: "confidence.min_spike_atr_ratio", min: 5.0, max: 200.0 },
-    ParamSpec { name: "confidence.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
     // repricing
+    ParamSpec { name: "repricing.min_spike_atr_ratio", min: 5.0, max: 200.0 },
+    ParamSpec { name: "repricing.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
     ParamSpec { name: "repricing.reprice_scale", min: 0.001, max: 0.10 },
     ParamSpec { name: "repricing.min_reprice_pct", min: 0.001, max: 0.10 },
     ParamSpec { name: "repricing.min_alloc_pct", min: 0.01, max: 1.0 },

@@ -94,24 +94,6 @@ impl Default for CapitalConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct ConfidenceConfig {
-    /// Minimum spike ATR ratio to trade. Spikes below this → f1 = 0.
-    pub min_spike_atr_ratio: f64,
-    /// Spike ATR ratio at which spike quality factor = 1.0.
-    pub strong_spike_atr_ratio: f64,
-}
-
-impl Default for ConfidenceConfig {
-    fn default() -> Self {
-        Self {
-            min_spike_atr_ratio: 25.0,
-            strong_spike_atr_ratio: 75.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
 pub struct RiskConfig {
     /// Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2.
     pub phase1_timeout_ms: u64,
@@ -156,6 +138,10 @@ impl Default for RotationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RepricingConfig {
+    /// Minimum spike ATR ratio to trade. Spikes below this → f1 = 0.
+    pub min_spike_atr_ratio: f64,
+    /// Spike ATR ratio at which spike quality factor = 1.0.
+    pub strong_spike_atr_ratio: f64,
     /// Model output ceiling / 100% allocation threshold (0.015 = 1.5%).
     pub reprice_scale: f64,
     /// Minimum model output to enter a trade (0.005 = 0.5%).
@@ -171,6 +157,8 @@ pub struct RepricingConfig {
 impl Default for RepricingConfig {
     fn default() -> Self {
         Self {
+            min_spike_atr_ratio: 25.0,
+            strong_spike_atr_ratio: 75.0,
             reprice_scale: 0.015,
             min_reprice_pct: 0.005,
             min_alloc_pct: 0.3,
@@ -189,7 +177,6 @@ pub struct BotConfig {
     pub spike_detection: SpikeDetectionConfig,
     pub entry_guards: EntryGuardsConfig,
     pub capital: CapitalConfig,
-    pub confidence: ConfidenceConfig,
     pub risk: RiskConfig,
     pub repricing: RepricingConfig,
 }
@@ -201,7 +188,6 @@ impl Default for BotConfig {
             spike_detection: SpikeDetectionConfig::default(),
             entry_guards: EntryGuardsConfig::default(),
             capital: CapitalConfig::default(),
-            confidence: ConfidenceConfig::default(),
             risk: RiskConfig::default(),
             repricing: RepricingConfig::default(),
         }
@@ -353,10 +339,10 @@ impl Config {
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct)
             .context("spike_detection.min_magnitude_pct: invalid decimal")?;
-        let min_spike_atr_ratio = Decimal::try_from(bot.confidence.min_spike_atr_ratio)
-            .context("confidence.min_spike_atr_ratio: invalid decimal")?;
-        let strong_spike_atr_ratio = Decimal::try_from(bot.confidence.strong_spike_atr_ratio)
-            .context("confidence.strong_spike_atr_ratio: invalid decimal")?;
+        let min_spike_atr_ratio = Decimal::try_from(bot.repricing.min_spike_atr_ratio)
+            .context("repricing.min_spike_atr_ratio: invalid decimal")?;
+        let strong_spike_atr_ratio = Decimal::try_from(bot.repricing.strong_spike_atr_ratio)
+            .context("repricing.strong_spike_atr_ratio: invalid decimal")?;
         let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale)
             .context("repricing.reprice_scale: invalid decimal")?;
         let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct)
@@ -415,8 +401,8 @@ impl Config {
         let phase1_breach_threshold = Decimal::try_from(bot.risk.phase1_breach_threshold).unwrap();
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
         let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct).unwrap();
-        let min_spike_atr_ratio = Decimal::try_from(bot.confidence.min_spike_atr_ratio).unwrap();
-        let strong_spike_atr_ratio = Decimal::try_from(bot.confidence.strong_spike_atr_ratio).unwrap();
+        let min_spike_atr_ratio = Decimal::try_from(bot.repricing.min_spike_atr_ratio).unwrap();
+        let strong_spike_atr_ratio = Decimal::try_from(bot.repricing.strong_spike_atr_ratio).unwrap();
         let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale).unwrap();
         let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct).unwrap();
         let min_alloc_pct = Decimal::try_from(bot.repricing.min_alloc_pct).unwrap();

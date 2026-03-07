@@ -480,7 +480,7 @@ mod formatter {
             "<b>--- OPPORTUNITY DETECTED ---</b>\n\n\
             Market: {market}\n\
             Spike: {dir} {sign}{mag:.4}% | {sus}ms sustained\n\
-            Confidence: {conf:.2} ({tier}) | Target: {target:.2}%\n\
+            Reprice: {reprice:.2}% ({tier}) | Target: {target:.2}%\n\
             Capital: ${alloc:.2}\n\
             \n\
             <b>Leg 1</b>\n\
@@ -497,7 +497,7 @@ mod formatter {
             sign = spike_sign,
             mag = spike_mag_pct,
             sus = signal.spike_info.sustained_ms,
-            conf = signal.confidence,
+            reprice = signal.expected_pct * Decimal::ONE_HUNDRED,
             tier = tier_label,
             target = profit_target_pct,
             alloc = signal.alloc_amount,
@@ -717,9 +717,9 @@ mod formatter {
                     )
                 };
                 format!(
-                    "Trade {n}: conf={conf:.2} target={tier} alloc=${alloc:.0} → {detail}",
+                    "Trade {n}: reprice={reprice:.2}% target={tier} alloc=${alloc:.0} → {detail}",
                     n = i + 1,
-                    conf = t.confidence,
+                    reprice = t.expected_pct * Decimal::ONE_HUNDRED,
                     tier = t.profit_target_tier.label(),
                     alloc = t.alloc_amount,
                     detail = leg2_info,
@@ -801,11 +801,11 @@ mod formatter {
                 ""
             };
             format!(
-                "Best trade: {sign}{pct:.1}% (market {mkt}, conf={conf:.2}, both maker)",
+                "Best trade: {sign}{pct:.1}% (market {mkt}, reprice={reprice:.2}%, both maker)",
                 sign = sign,
                 pct = s.best_trade_pct,
                 mkt = short_market_id(&s.best_trade_market),
-                conf = s.best_trade_conf,
+                reprice = s.best_trade_reprice * Decimal::ONE_HUNDRED,
             )
         } else {
             "Best trade: n/a".to_owned()
@@ -818,11 +818,11 @@ mod formatter {
                 ""
             };
             format!(
-                "Worst trade: {sign}{pct:.1}% (market {mkt}, conf={conf:.2})",
+                "Worst trade: {sign}{pct:.1}% (market {mkt}, reprice={reprice:.2}%)",
                 sign = sign,
                 pct = s.worst_trade_pct,
                 mkt = short_market_id(&s.worst_trade_market),
-                conf = s.worst_trade_conf,
+                reprice = s.worst_trade_reprice * Decimal::ONE_HUNDRED,
             )
         } else {
             "Worst trade: n/a".to_owned()
@@ -834,7 +834,6 @@ mod formatter {
             format!("Est. maker rebates: ${:.3}", s.est_maker_rebates)
         };
 
-        // HTML-escape the `<0.5` in the low confidence label.
         format!(
             "<b>--- SESSION SUMMARY ({uptime_h}h {uptime_m:02}m) ---</b>\n\n\
             Uptime: {uptime_h}h {uptime_m:02}m\n\
@@ -855,11 +854,11 @@ mod formatter {
               Emergency post-only (maker): {emergency_maker}\n\
               Favorable exits: {favorable} taker / {favorable_maker} maker\n\
             \n\
-            <b>Allocation:</b>\n\
-              High confidence (≥0.8, target 2.5%): {high_n} trades, avg ${high_avg:.0}\n\
-              Medium confidence (≥0.5, target 1.5%): {med_n} trades, avg ${med_avg:.0}\n\
-              Low confidence (&lt;0.5, target 1.0%): {low_n} trades, avg ${low_avg:.0}\n\
-              Avg confidence: {avg_conf:.2}\n\
+            <b>Allocation by tier:</b>\n\
+              HIGH (≥reprice_scale): {high_n} trades, avg ${high_avg:.0}\n\
+              MED (≥reprice_scale/2): {med_n} trades, avg ${med_avg:.0}\n\
+              LOW (&lt;reprice_scale/2): {low_n} trades, avg ${low_avg:.0}\n\
+              Avg expected reprice: {avg_reprice:.2}%\n\
             \n\
             Gross PnL: {gross_sign}${gross:.3}\n\
             Emergency taker fees: ${fees:.3} ({emergency} emergency fill(s))\n\
@@ -892,13 +891,13 @@ mod formatter {
             emergency_maker = s.emergency_maker_fills,
             favorable = s.favorable_taker_fills,
             favorable_maker = s.favorable_maker_fills,
-            high_n = s.high_conf_trades,
-            high_avg = s.high_conf_avg_alloc,
-            med_n = s.med_conf_trades,
-            med_avg = s.med_conf_avg_alloc,
-            low_n = s.low_conf_trades,
-            low_avg = s.low_conf_avg_alloc,
-            avg_conf = s.avg_confidence,
+            high_n = s.high_tier_trades,
+            high_avg = s.high_tier_avg_alloc,
+            med_n = s.med_tier_trades,
+            med_avg = s.med_tier_avg_alloc,
+            low_n = s.low_tier_trades,
+            low_avg = s.low_tier_avg_alloc,
+            avg_reprice = s.avg_expected_pct * Decimal::ONE_HUNDRED,
             gross_sign = gross_sign,
             gross = s.gross_pnl,
             fees = s.emergency_taker_fees,

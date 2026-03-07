@@ -346,7 +346,7 @@ impl SimulationExecutor {
             fill,
             signal.condition_id.clone(),
             signal.direction,
-            signal.confidence,
+            signal.expected_pct,
             signal.profit_target_tier,
             signal.alloc_amount,
         );
@@ -360,7 +360,7 @@ impl SimulationExecutor {
             price = %signal.price,
             size = %fill_size,
             position_idx,
-            confidence = %signal.confidence,
+            expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
             "Leg 1: confirmed fill"
         );
@@ -612,7 +612,7 @@ impl SimulationExecutor {
             if let Err(e) = c.record_signal(
                 &signal.token_id,
                 direction_str,
-                signal.confidence,
+                signal.expected_pct,
                 signal.spike_info.magnitude,
                 atr,
                 book_depth,
@@ -672,7 +672,7 @@ mod tests {
             price,
             size: Decimal::from(10),
             reference_price: Decimal::from(50_000),
-            confidence: d("0.85"),
+            expected_pct: d("0.85"),
             profit_target_tier: ProfitTier::High,
             profit_target_pct: d("0.025"),
             alloc_amount: Decimal::from(30),

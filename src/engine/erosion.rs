@@ -30,7 +30,7 @@ pub(crate) struct HedgeState {
     pub tier: ProfitTier,
     pub direction: Direction,
     pub spike_info: SpikeInfo,
-    pub confidence: Decimal,
+    pub expected_pct: Decimal,
     pub emergency_submitted: bool,
     /// Set when an emergency FOK is confirmed — carries the reason for executor categorization.
     pub exit_reason: Option<ExitReason>,
@@ -55,7 +55,7 @@ impl HedgeState {
         initial_profit_target: Decimal,
         direction: Direction,
         spike_info: SpikeInfo,
-        confidence: Decimal,
+        expected_pct: Decimal,
         phase1_target_price: Decimal,
     ) -> Self {
         Self {
@@ -65,7 +65,7 @@ impl HedgeState {
             tier,
             direction,
             spike_info,
-            confidence,
+            expected_pct,
             emergency_submitted: false,
             exit_reason: None,
             fok_emitted: false,
@@ -104,7 +104,7 @@ pub(crate) struct HedgeSnap {
     pub direction: Direction,
     pub fill_ms: u64,
     pub tier: ProfitTier,
-    pub confidence: Decimal,
+    pub expected_pct: Decimal,
     pub spike_info: SpikeInfo,
     /// Current hedge phase.
     pub phase: HedgePhase,
@@ -136,7 +136,7 @@ mod tests {
                 timestamp_ms: 0,
                 atr_ratio: Decimal::ZERO,
             },
-            Decimal::new(7, 1),      // confidence = 0.7
+            Decimal::new(7, 1),      // expected_pct = 0.7
             Decimal::new(475, 3),    // phase1_target_price = 0.475
         )
     }

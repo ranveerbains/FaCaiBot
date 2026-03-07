@@ -25,9 +25,9 @@ entry_cutoff_secs = 25
 # Max age (ms) of Binance SBE event before discard
 binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
-stale_book_ms = 1000
+stale_book_ms = 500
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 2500
+leg1_timeout_ms = 3000
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
@@ -35,21 +35,19 @@ trade_cooldown_ms = 0
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 4.5
+max_alloc_per_trade = 9
 
-[confidence]
+[repricing]
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
 min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
 strong_spike_atr_ratio = 75
-
-[repricing]
 # Model output ceiling / 100% allocation threshold (0.015 = 1.5% max target for perfect signal)
 reprice_scale = 0.05
 # Minimum model output to enter a trade (0.005 = 0.5%)
-min_reprice_pct = 0.005
+min_reprice_pct = 0.01
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 1.0
+min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model
 hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
@@ -57,7 +55,7 @@ time_exponent = 0.5
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 2000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit

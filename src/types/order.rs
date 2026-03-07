@@ -54,17 +54,17 @@ pub enum OrderType {
 
 // ─── Profit Tier ─────────────────────────────────────────────────────────────
 
-/// Confidence-based profit target tier.
+/// Repricing-model profit target tier (display-only label).
 ///
-/// Determines the initial profit target percentage, erosion step size,
-/// and allocation percentage for a trade signal.
+/// Determined by `from_expected_reprice()` based on the repricing model output.
+/// Used for Telegram reporting and QuestDB analytics — does not affect execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProfitTier {
-    /// Confidence >= 0.8 → 2.5% target, 30% allocation.
+    /// expected_pct >= reprice_scale → HIGH tier.
     High,
-    /// Confidence >= 0.5 → 1.5% target, 20% allocation.
+    /// expected_pct >= reprice_scale/2 → MED tier.
     Med,
-    /// Confidence < 0.5  → 1.0% target, 10% allocation.
+    /// expected_pct < reprice_scale/2 → LOW tier.
     Low,
 }
 
@@ -128,15 +128,14 @@ pub struct TradeSignal {
     /// Binance mid-price at the moment the signal was generated.
     pub reference_price: Decimal,
 
-    // ── Confidence & allocation ──────────────────────────────────────────
-    /// Composite confidence score (0.0–1.0), computed from spike/ATR, sustain,
-    /// depth, and time remaining.
-    pub confidence: Decimal,
-    /// Profit target tier derived from confidence.
+    // ── Repricing & allocation ──────────────────────────────────────────
+    /// Expected repricing percentage from the repricing model.
+    pub expected_pct: Decimal,
+    /// Profit target tier derived from expected repricing.
     pub profit_target_tier: ProfitTier,
     /// Initial profit target as a decimal fraction (e.g., 0.025).
     pub profit_target_pct: Decimal,
-    /// USDC amount allocated to this signal (after confidence weighting).
+    /// USDC amount allocated to this signal (after repricing-scaled allocation).
     pub alloc_amount: Decimal,
 
     // ── Directional context ──────────────────────────────────────────────
@@ -322,8 +321,6 @@ pub enum OrderTag {
     Leg2Phase1,
     /// The Phase 2 hedge order (ask-1tick, posted alongside Phase 1).
     Leg2Phase2,
-    /// Rebalance FOK order after a double-fill race condition.
-    Rebalance,
 }
 
 // ─── Executor Feedback ──────────────────────────────────────────────────
