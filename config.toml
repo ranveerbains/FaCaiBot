@@ -27,7 +27,7 @@ binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 500
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 3000
+leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
@@ -55,7 +55,7 @@ time_exponent = 0.5
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2000
+phase1_timeout_ms = 3000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
@@ -63,4 +63,4 @@ phase1_breach_threshold = 1.03
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
-favorable_maker_timeout_ms = 1000
+favorable_maker_timeout_ms = 2000
