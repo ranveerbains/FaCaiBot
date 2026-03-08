@@ -1015,10 +1015,11 @@ impl StrategyEngine {
                                 }
                             }
                             // Use actual fill size when partial fill detected.
+                            // Truncate to 2dp — CLOB max lot precision is 2 decimal places.
                             let actual_size = if let (Some(matched), Some(_orig)) = (size_matched, original_size) {
-                                if matched > Decimal::ZERO && matched < size { matched } else { size }
+                                if matched > Decimal::ZERO && matched < size { matched.round_dp(2) } else { size.round_dp(2) }
                             } else {
-                                size
+                                size.round_dp(2)
                             };
                             self.state.leg1_state = OrderState::Filled {
                                 order_id: order_id.clone(),
@@ -2048,10 +2049,12 @@ impl StrategyEngine {
 
         // State transition: Posted → Filled.
         // Use actual fill size when partial fill detected.
+        // Truncate to 2dp — CLOB max lot precision is 2 decimal places, and
+        // REST API size_matched can return arbitrary precision.
         let actual_size = if size_matched > Decimal::ZERO && size_matched < size {
-            size_matched
+            size_matched.round_dp(2)
         } else {
-            size
+            size.round_dp(2)
         };
         self.state.leg1_state = OrderState::Filled {
             order_id,
@@ -2381,13 +2384,14 @@ impl StrategyEngine {
                                 });
                             }
                         }
+                        let fill_size = size.round_dp(2);
                         self.state.leg1_state = OrderState::Filled {
                             order_id,
                             price,
-                            size,
+                            size: fill_size,
                             fill_timestamp_ms: now_ms,
                         };
-                        self.init_leg2(price, size, now_ms);
+                        self.init_leg2(price, fill_size, now_ms);
                         // Preserve cancel-race flag across reset so on_trade_complete sees it.
                         let cancel_race = self.live_trade_meta.leg1_cancel_race;
                         self.live_trade_meta = LiveTradeMeta {
