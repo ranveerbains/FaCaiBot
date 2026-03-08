@@ -1,10 +1,11 @@
 //! Market rotation manager — Gamma API discovery and market lifecycle management.
 //!
-//! Single 5s timer drives all rotation logic:
-//! - **Prewarm** at T-180s: discovers the next market and pre-fetches order books.
+//! Dual-timer architecture:
+//! - **Precise expiry sleep**: `tokio::time::sleep_until` fires at the exact market
+//!   boundary (±10ms), eliminating the 0–5s random latency from the old 5s poll.
+//! - **5s housekeeping interval**: drives prewarm discovery (T-180s), marketless
+//!   retry (startup, post-expiry fallback failure, any gap).
 //! - **Instant switch** at T-0: emits the pre-warmed rotation with zero gap.
-//! - **Aggressive retry**: when marketless (startup, post-expiry fallback failure,
-//!   any gap), retries Gamma discovery every 5s until a market is found.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,13 +39,13 @@ pub struct MarketInfo {
     pub tick_size: rust_decimal::Decimal,
 }
 
-/// Long-running market rotation manager.
+/// Long-running market rotation manager (dual-timer).
 ///
-/// - Pre-warms the NEXT market before expiry (lead time configurable).
-///   Retries every 5s on failure until the prewarm window closes.
-/// - At T-0, emits the pre-warmed rotation instantly (zero gap).
-/// - When marketless (startup, post-expiry failure, any gap), retries
-///   Gamma discovery every 5s until a market is found.
+/// - **Precise expiry timer**: `tokio::time::sleep_until` fires at the exact
+///   market boundary, triggering instant switch to pre-warmed market or
+///   fallback to marketless state. Eliminates the 0–5s random latency from
+///   the old fixed-interval approach.
+/// - **5s housekeeping interval**: drives prewarm discovery and marketless retry.
 /// - Emits `IngestorEvent::MarketRotation` once per market transition.
 ///
 /// The caller (`main.rs` / integration layer) is responsible for:
@@ -60,9 +61,14 @@ pub(super) async fn run_market_rotation(
 ) -> Result<()> {
     let mut last_emitted_condition_id: Option<String> = None;
     let mut current_market: Option<MarketInfo> = None;
-    // Single 5s timer drives all rotation logic: prewarm at T-180s, expiry
-    // detection, and aggressive retry when marketless.
+    // 5s housekeeping timer: prewarm discovery + marketless retry.
     let mut rotation_check = tokio::time::interval(Duration::from_secs(5));
+
+    // ── Precise expiry timer ──────────────────────────────────────────────
+    // Fires at the exact market boundary. Far-future when marketless.
+    let far_future = tokio::time::Instant::now() + Duration::from_secs(86400 * 365);
+    let expiry_sleep = tokio::time::sleep_until(far_future);
+    tokio::pin!(expiry_sleep);
 
     // ── Anticipatory pre-warming state ────────────────────────────────────
     let mut next_market: Option<MarketInfo> = None;
@@ -72,6 +78,44 @@ pub(super) async fn run_market_rotation(
 
     loop {
         tokio::select! {
+            // ── Precise expiry: fires at exact market boundary ────────
+            _ = &mut expiry_sleep => {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("market rotation manager shutdown — exiting");
+                    return Ok(());
+                }
+
+                if let Some(next) = next_market.take() {
+                    info!(
+                        condition_id = %next.condition_id,
+                        "instant switch to pre-warmed market (zero gap)"
+                    );
+                    emit_rotation_events(
+                        &tx,
+                        &token_tx,
+                        &next,
+                        &prewarmed_books,
+                        &mut last_emitted_condition_id,
+                    );
+                    // Reset expiry timer for new market.
+                    expiry_sleep.as_mut().reset(expiry_instant(next.end_timestamp_ms));
+                    current_market = Some(next);
+                } else {
+                    info!(
+                        "current market expired, no pre-warmed market \
+                         — polling Gamma immediately"
+                    );
+                    current_market = None;
+                    // Park until a market is discovered by the 5s timer.
+                    expiry_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + Duration::from_secs(86400 * 365),
+                    );
+                }
+                prewarmed_books.clear();
+                prewarm_attempted = false;
+            }
+
+            // ── 5s housekeeping: prewarm + marketless retry ───────────
             _ = rotation_check.tick() => {
                 if shutdown.load(Ordering::Relaxed) {
                     info!("market rotation manager shutdown — exiting");
@@ -80,12 +124,10 @@ pub(super) async fn run_market_rotation(
 
                 let now_ms = now_epoch_ms();
 
+                // ── Pre-warm before expiry ───────────────────────────
                 if let Some(ref market) = current_market {
                     let remaining_ms = market.end_timestamp_ms.saturating_sub(now_ms);
 
-                    // ── Pre-warm before expiry ───────────────────────────
-                    // Discover the NEXT market (ending after current) and
-                    // pre-fetch its order books so the switch is instant.
                     if remaining_ms > 0
                         && remaining_ms <= prewarm_lead_ms
                         && !prewarm_attempted
@@ -141,41 +183,11 @@ pub(super) async fn run_market_rotation(
                                 prewarm_attempted = true;
                             }
                             Err(e) => {
-                                // Pre-warm failures are expected retries (market may
-                                // not be listed yet). Keep at debug to avoid log noise.
                                 debug!(
                                     error = %e,
                                     "pre-warm discovery failed — will retry next tick"
                                 );
                             }
-                        }
-                    }
-
-                    // ── Expiry: instant switch or fallback poll ───────────
-                    if remaining_ms == 0 {
-                        if let Some(next) = next_market.take() {
-                            info!(
-                                condition_id = %next.condition_id,
-                                "instant switch to pre-warmed market (zero gap)"
-                            );
-                            emit_rotation_events(
-                                &tx,
-                                &token_tx,
-                                &next,
-                                &prewarmed_books,
-                                &mut last_emitted_condition_id,
-                            );
-                            current_market = Some(next);
-                            prewarmed_books.clear();
-                            prewarm_attempted = false;
-                        } else {
-                            info!(
-                                "current market expired, no pre-warmed market \
-                                 — polling Gamma immediately"
-                            );
-                            current_market = None;
-                            prewarmed_books.clear();
-                            prewarm_attempted = false;
                         }
                     }
                 }
@@ -191,8 +203,10 @@ pub(super) async fn run_market_rotation(
                         &mut current_market,
                     ).await;
 
-                    if current_market.is_some() {
+                    if let Some(ref market) = current_market {
                         consecutive_failures = 0;
+                        // Arm the precise expiry timer for the discovered market.
+                        expiry_sleep.as_mut().reset(expiry_instant(market.end_timestamp_ms));
                     } else {
                         consecutive_failures += 1;
                         if consecutive_failures == 1 {
@@ -205,6 +219,17 @@ pub(super) async fn run_market_rotation(
             }
         }
     }
+}
+
+/// Compute a `tokio::time::Instant` for a given epoch-ms expiry timestamp.
+///
+/// Uses the delta between the target epoch-ms and `now_epoch_ms()` to offset
+/// from `tokio::time::Instant::now()`. If the target is in the past, returns
+/// an instant in the past (fires immediately on next poll).
+fn expiry_instant(end_timestamp_ms: u64) -> tokio::time::Instant {
+    let now_ms = now_epoch_ms();
+    let delay_ms = end_timestamp_ms.saturating_sub(now_ms);
+    tokio::time::Instant::now() + Duration::from_millis(delay_ms)
 }
 
 /// Emit a `MarketRotation` event, push new token IDs to the Market WS, and

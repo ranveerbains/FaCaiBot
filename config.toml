@@ -42,8 +42,8 @@ max_alloc_per_trade = 9
 min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
 strong_spike_atr_ratio = 75
-# Model output ceiling / 100% allocation threshold (0.015 = 1.5% max target for perfect signal)
-reprice_scale = 0.055
+# Target profit for ideal signal and full allocation; may be increased by time amplification.
+reprice_scale = 0.05
 # Minimum model output to enter a trade (0.015 = 1.5%)
 min_reprice_pct = 0.018
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
@@ -52,15 +52,17 @@ min_alloc_pct = 0.5
 hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
+# Maximum time amplification factor (2.0 = time can at most double the output)
+max_time_factor = 2.0
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 1500
+phase1_timeout_ms = 2500
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
-phase2_timeout_ms = 2000
+phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
 favorable_maker_timeout_ms = 3000

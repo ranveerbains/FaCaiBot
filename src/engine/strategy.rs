@@ -445,6 +445,7 @@ impl StrategyEngine {
                 min_alloc_pct: config.min_alloc_pct,
                 hard_skew_cap: config.hard_skew_cap,
                 time_exponent: config.time_exponent,
+                max_time_factor: config.max_time_factor,
             },
             leg2: Leg2Evaluator {
                 phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
@@ -2709,6 +2710,7 @@ impl StrategyEngine {
                     t_secs,
                     self.leg1.reprice_scale,
                     self.leg1.time_exponent,
+                    self.leg1.max_time_factor,
                 );
                 let t = ProfitTier::from_expected_reprice(c, self.leg1.reprice_scale);
                 let tick = self.state.tick_size;

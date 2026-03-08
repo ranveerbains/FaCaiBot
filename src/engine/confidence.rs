@@ -29,6 +29,7 @@ pub fn compute_expected_repricing(
     time_remaining_secs: u64,
     scale: Decimal,
     time_exponent: f64,
+    max_time_factor: f64,
 ) -> Decimal {
     // norm_spike: [0,1]
     let range = strong_atr_ratio - min_atr_ratio;
@@ -58,7 +59,8 @@ pub fn compute_expected_repricing(
     // (300 / max(T, 10)) ^ time_exponent
     let t = time_remaining_secs.max(10) as f64;
     let time_factor =
-        Decimal::try_from((300.0_f64 / t).powf(time_exponent)).unwrap_or(Decimal::ONE);
+        Decimal::try_from((300.0_f64 / t).powf(time_exponent).min(max_time_factor))
+            .unwrap_or(Decimal::ONE);
 
     (norm_spike * base * alignment * time_factor * scale).max(Decimal::ZERO)
 }
@@ -89,6 +91,7 @@ mod tests {
             300,                  // full 5 min
             Decimal::new(15, 3),  // scale = 0.015
             0.5,                  // time_exponent
+            f64::INFINITY,        // no cap
         );
         // norm=1.0, 4*0.5*0.5=1.0, alignment=1.0 (dist=0), time=1.0
         // → 1.0 * 1.0 * 1.0 * 1.0 * 0.015 = 0.015
@@ -107,6 +110,7 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         // norm=1.0, base=4*0.7*0.3=0.84, dist=0.2, alignment=1.2
         // → 1.0 * 0.84 * 1.2 * 1.0 * 0.015 = 0.01512
@@ -125,6 +129,7 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         // norm=1.0, base=0.84, dist=0.2, alignment=0.8
         // → 1.0 * 0.84 * 0.8 * 1.0 * 0.015 = 0.01008
@@ -143,6 +148,7 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         // base=4*0.9*0.1=0.36, dist=0.4, alignment=0.6
         // → 1.0 * 0.36 * 0.6 * 0.015 = 0.00324
@@ -161,6 +167,7 @@ mod tests {
             30,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         let pct_300s = compute_expected_repricing(
             Decimal::new(50, 0),
@@ -171,6 +178,7 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         assert!(pct_30s > pct_300s * Decimal::new(2, 0), "30s should be >2x of 300s");
     }
@@ -187,6 +195,7 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.5,
+            f64::INFINITY,
         );
         assert_eq!(pct, Decimal::ZERO);
     }
@@ -202,6 +211,7 @@ mod tests {
             30,
             Decimal::new(15, 3),
             0.0, // disabled
+            f64::INFINITY,
         );
         let pct_300s = compute_expected_repricing(
             Decimal::new(50, 0),
@@ -212,8 +222,52 @@ mod tests {
             300,
             Decimal::new(15, 3),
             0.0,
+            f64::INFINITY,
         );
         assert_eq!(pct_30s, pct_300s, "time_exponent=0 should disable amplification");
+    }
+
+    #[test]
+    fn test_max_time_factor_caps_amplification() {
+        // 10s remaining: uncapped time_factor = (300/10)^0.5 = sqrt(30) ≈ 5.47
+        // With max_time_factor=2.0: capped to 2.0
+        let capped = compute_expected_repricing(
+            Decimal::new(50, 0),
+            Decimal::new(20, 0),
+            Decimal::new(75, 0),
+            Decimal::new(50, 2),
+            Direction::Up,
+            10,
+            Decimal::new(15, 3),
+            0.5,
+            2.0,  // cap at 2x
+        );
+        let uncapped = compute_expected_repricing(
+            Decimal::new(50, 0),
+            Decimal::new(20, 0),
+            Decimal::new(75, 0),
+            Decimal::new(50, 2),
+            Direction::Up,
+            10,
+            Decimal::new(15, 3),
+            0.5,
+            f64::INFINITY,
+        );
+        // Uncapped should be ~5.47x baseline, capped should be exactly 2x
+        assert!(uncapped > capped, "uncapped should exceed capped");
+        // Capped at 10s should equal the same result as 75s (where natural factor = 2.0)
+        let at_75s = compute_expected_repricing(
+            Decimal::new(50, 0),
+            Decimal::new(20, 0),
+            Decimal::new(75, 0),
+            Decimal::new(50, 2),
+            Direction::Up,
+            75,
+            Decimal::new(15, 3),
+            0.5,
+            f64::INFINITY, // natural factor at 75s = (300/75)^0.5 = 2.0
+        );
+        assert_eq!(capped, at_75s, "capped at 2.0 should match natural 2.0x at 75s");
     }
 
     #[test]

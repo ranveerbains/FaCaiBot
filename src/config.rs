@@ -152,6 +152,8 @@ pub struct RepricingConfig {
     pub hard_skew_cap: f64,
     /// Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear).
     pub time_exponent: f64,
+    /// Maximum time amplification factor (2.0 = time can at most double the output).
+    pub max_time_factor: f64,
 }
 
 impl Default for RepricingConfig {
@@ -164,6 +166,7 @@ impl Default for RepricingConfig {
             min_alloc_pct: 0.3,
             hard_skew_cap: 0.90,
             time_exponent: 0.5,
+            max_time_factor: 2.0,
         }
     }
 }
@@ -249,6 +252,8 @@ pub struct Config {
     pub hard_skew_cap: Decimal,
     /// Repricing model: exponent for time amplification (stays f64 for powf).
     pub time_exponent: f64,
+    /// Repricing model: maximum time amplification factor.
+    pub max_time_factor: f64,
 }
 
 impl Config {
@@ -352,6 +357,7 @@ impl Config {
         let hard_skew_cap = Decimal::try_from(bot.repricing.hard_skew_cap)
             .context("repricing.hard_skew_cap: invalid decimal")?;
         let time_exponent = bot.repricing.time_exponent;
+        let max_time_factor = bot.repricing.max_time_factor;
 
         let config = Self {
             mode,
@@ -379,6 +385,7 @@ impl Config {
             min_alloc_pct,
             hard_skew_cap,
             time_exponent,
+            max_time_factor,
         };
 
         // ── Validation ───────────────────────────────────────────────
@@ -408,6 +415,7 @@ impl Config {
         let min_alloc_pct = Decimal::try_from(bot.repricing.min_alloc_pct).unwrap();
         let hard_skew_cap = Decimal::try_from(bot.repricing.hard_skew_cap).unwrap();
         let time_exponent = bot.repricing.time_exponent;
+        let max_time_factor = bot.repricing.max_time_factor;
 
         Self {
             mode: Mode::Simulation,
@@ -433,6 +441,7 @@ impl Config {
             min_alloc_pct,
             hard_skew_cap,
             time_exponent,
+            max_time_factor,
         }
     }
 }

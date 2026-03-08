@@ -84,6 +84,7 @@ pub(crate) struct Leg1Evaluator {
     pub min_alloc_pct: Decimal,
     pub hard_skew_cap: Decimal,
     pub time_exponent: f64,
+    pub max_time_factor: f64,
 }
 
 impl Leg1Evaluator {
@@ -250,6 +251,7 @@ impl Leg1Evaluator {
             time_remaining_secs,
             self.reprice_scale,
             self.time_exponent,
+            self.max_time_factor,
         );
         if expected_pct < self.min_reprice_pct {
             debug!(%expected_pct, min = %self.min_reprice_pct, "evaluate() BLOCKED: insufficient repricing");

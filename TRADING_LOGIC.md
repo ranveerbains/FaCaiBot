@@ -150,9 +150,9 @@ adjusted_sensitivity = base × alignment
 
 **Component 3: `time_factor`** — expiry amplification:
 ```
-time_factor = (300.0 / max(time_remaining_secs, 10)) ^ time_exponent
+time_factor = min((300.0 / max(time_remaining_secs, 10)) ^ time_exponent, max_time_factor)
 ```
-Default `time_exponent = 0.5` (sqrt). Set to 0 to disable.
+Default `time_exponent = 0.5` (sqrt). Set to 0 to disable. `max_time_factor` (default 2.0) caps the amplification — at default settings, time can at most double the output (kicks in at ~75s remaining).
 
 **Component 4: `reprice_scale`** — calibration ceiling (default 0.015 = 1.5%).
 

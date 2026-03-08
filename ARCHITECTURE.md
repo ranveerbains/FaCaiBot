@@ -533,7 +533,7 @@ expected_reprice_pct = norm_spike × (4P(1-P) × alignment) × time_factor × re
 
 norm_spike = clamp((atr_ratio - min) / (strong - min), 0, 1)
 alignment = with_consensus ? (1 + |yes_mid - 0.5|) : (1 - |yes_mid - 0.5|)
-time_factor = (300 / max(T, 10)) ^ time_exponent
+time_factor = min((300 / max(T, 10)) ^ time_exponent, max_time_factor)
 ```
 
 The model output IS the Phase 1 profit target (after `round_to_tick()`).
@@ -559,8 +559,8 @@ The model output IS the Phase 1 profit target (after `round_to_tick()`).
   - Pre-fetches YES and NO order books for Market B via REST
   - Caches `MarketInfo` + books in memory, ready for instant switch
 - **Tick size fetch**: After Gamma discovery (both poll and prewarm paths), `fetch_tick_size()` calls `GET /tick-size?token_id={yes_id}` to get the real CLOB tick size. Defaults to `0.01` on failure. The value is included in `IngestorEvent::MarketRotation { tick_size }` and the engine sets `state.tick_size` from it. Mid-market tick_size changes (price >0.96 or <0.04) are handled separately by the `tick_size_change` WS event
-- **Instant switch on expiry**: When `remaining_ms == 0`, emits the pre-warmed `MarketRotation` + book events immediately (zero gap). Market WS resubscribes to new token IDs in parallel
-- **Fallback**: If pre-warming failed (Market B not yet on Gamma, REST error, etc.), falls back to immediate Gamma poll within 5s of expiry
+- **Precise expiry timer**: A dedicated `tokio::time::sleep_until` fires at the exact market boundary (±10ms), replacing the old 5s poll that added 0–5s random latency. On expiry: emits the pre-warmed `MarketRotation` + book events immediately (zero gap), or transitions to marketless state if no prewarm is available. The 5s interval only handles prewarm discovery and marketless retry — never expiry detection
+- **Fallback**: If pre-warming failed (Market B not yet on Gamma, REST error, etc.), the expiry timer transitions to marketless state and the 5s housekeeping timer retries Gamma discovery
 - **`MarketRotation`** uses blocking `send()` (not `try_send()`) to guarantee delivery. Book events use `try_send()` (expendable — WS will provide updates)
 - **Rotation emergency**: If Leg 1 is Filled but Leg 2 is incomplete when rotation arrives, the engine builds an emergency FOK signal at the opposing ask BEFORE resetting state. The main loop sends this signal to the executor before `ExecutorCommand::MarketRotation`, so the position is hedged (or best-effort attempted) instead of force-closed at full loss. Exit reason: `ExitReason::MarketExpiry`. In live mode, a `fire_critical()` Telegram alert is sent with position details (direction, price, size, whether a FOK was submitted) so abandoned positions are never silent
 - **Cutoff window**: After `entry_cutoff_secs` (`entry_cutoff_secs` before expiry), no new Leg 1 entries are allowed (spikes dropped, evaluate() blocked). However, existing open positions continue their Leg 2 hedge phases and emergency exit paths unimpeded until rotation
@@ -568,8 +568,8 @@ The model output IS the Phase 1 profit target (after `round_to_tick()`).
 ```
 Timeline:
   T-180s  Cutoff window — no new Leg 1 entries
-  T-180s  Pre-warm: discover Market B, fetch books
-  T-0     Instant switch: emit pre-warmed MarketRotation + books
+  T-180s  Pre-warm: discover Market B, fetch books (5s housekeeping timer)
+  T-0     Precise expiry timer fires → instant switch: emit pre-warmed MarketRotation + books
           Market WS resubscribes to new tokens
 ```
 
@@ -619,9 +619,9 @@ leg1_timeout_ms, rotation_quiet_ms, trade_cooldown_ms
 [capital]              # 1 param
 max_alloc_per_trade
 
-[repricing]            # 7 params
+[repricing]            # 8 params
 reprice_scale, min_reprice_pct, min_alloc_pct, hard_skew_cap, time_exponent,
-min_spike_atr_ratio, strong_spike_atr_ratio
+max_time_factor, min_spike_atr_ratio, strong_spike_atr_ratio
 
 [risk]                 # 3 params
 phase1_timeout_ms,
