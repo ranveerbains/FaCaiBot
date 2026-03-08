@@ -17,7 +17,7 @@ momentum_ratio_min = 0.75
 
 [entry_guards]
 # Maximum bid-ask spread in dollars
-max_spread = 0.02
+max_spread = 0.025
 # Minimum book depth as fraction of trade size
 depth_min_pct = 0.20
 # No entries within this many seconds of market expiry
@@ -27,7 +27,7 @@ binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 500
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 3000
+leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
@@ -57,7 +57,7 @@ max_time_factor = 2.0
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 2000
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
