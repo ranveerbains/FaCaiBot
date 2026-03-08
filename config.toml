@@ -41,11 +41,11 @@ max_alloc_per_trade = 9
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
 min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
-strong_spike_atr_ratio = 75
+strong_spike_atr_ratio = 50
 # Model output ceiling / 100% allocation threshold (0.015 = 1.5% max target for perfect signal)
 reprice_scale = 0.05
 # Minimum model output to enter a trade (0.015 = 1.5%)
-min_reprice_pct = 0.015
+min_reprice_pct = 0.018
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
 min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model

@@ -19,8 +19,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC
 ```bash
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
-ssh -A -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-  ec2-user@ec2-34-245-184-42.eu-west-1.compute.amazonaws.com
+ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
+ec2-user@ec2-34-245-184-42.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
  ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-34-245-184-42.eu-west-1.compute.amazonaws.com

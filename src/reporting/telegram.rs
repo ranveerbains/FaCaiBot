@@ -479,7 +479,7 @@ mod formatter {
         format!(
             "<b>--- OPPORTUNITY DETECTED ---</b>\n\n\
             Market: {market}\n\
-            Spike: {dir} {sign}{mag:.4}% | {sus}ms sustained\n\
+            Spike: {dir} {sign}{mag:.4}% | ATR: {atr_ratio:.1}x | {sus}ms sustained\n\
             Reprice: {reprice:.2}% ({tier}) | Target: {target:.2}%\n\
             Capital: ${alloc:.2}\n\
             \n\
@@ -496,6 +496,7 @@ mod formatter {
             dir = direction_str,
             sign = spike_sign,
             mag = spike_mag_pct,
+            atr_ratio = signal.spike_info.atr_ratio,
             sus = signal.spike_info.sustained_ms,
             reprice = signal.expected_pct * Decimal::ONE_HUNDRED,
             tier = tier_label,

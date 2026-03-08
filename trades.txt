@@ -1,0 +1,387 @@
+[8/3/26 9:23 PM] facaibot: FaCaiBot live started
+
+Connected to Binance SBE + Polymarket CLOB. Real orders will be placed.
+[8/3/26 9:24 PM] r b: /balance
+[8/3/26 9:24 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $226.322292
+POL: 165.1115
+[8/3/26 9:24 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #27e3b
+Spike: DOWN -0.0161% | 0ms sustained
+Reprice: 5.05% (HIGH) | Target: 5.00%
+Capital: $9.00
+
+Leg 1
+Buy NO  $0.82 × 10.98sh = $9.00
+Top of book (outbid wall) | Depth: $30649
+
+Leg 2 target
+Buy YES  $0.13 | Break-even: $0.18
+Est. profit: 5.00% (~$0.5490) | FOK fee: $0.0031/sh
+
+Status: Watching for hedge...
+[8/3/26 9:24 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #27e3b
+
+Leg 1: Buy NO  $0.82 × 10.98sh = $9.00
+Leg 2: Buy YES  $0.13 × 10.98sh (PHASE-1)
+
+Pair: $0.950/sh × 10.98sh = $10.43
+Profit: +$0.5679 (+$0.0189 est. rebate) (5.44%)
+[8/3/26 9:25 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #27e3b
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:20 - 13:25 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+Trade 1: reprice=5.05% target=HIGH alloc=$9 → YES@0.820 + NO@0.130 = $0.950/sh × 10.98sh → maker+maker → net +$0.5679 USDC (5.44%)
+
+Allocation used: $9.00 / $9.00 (100%)
+Taker fees paid: $0.00 (both legs maker)
+Est. maker rebates: $0.0189
+Gross market PnL: +$0.5490
+Net market PnL: $0.5679
+Capital locked in resolution: $10.43
+[8/3/26 9:26 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #887b1
+Spike: DOWN -0.0128% | 0ms sustained
+Reprice: 1.64% (LOW) | Target: 1.00%
+Capital: $4.50
+
+Leg 1
+Buy NO  $0.39 × 11.54sh = $4.50
+Top of book (outbid wall) | Depth: $40054
+
+Leg 2 target
+Buy YES  $0.60 | Break-even: $0.61
+Est. profit: 1.00% (~$0.1154) | FOK fee: $0.0144/sh
+
+Status: Watching for hedge...
+[8/3/26 9:26 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #887b1
+
+Leg 1: Buy NO  $0.39 × 11.54sh = $4.50
+Leg 2: Buy YES  $0.60 × 11.50sh [FAVORABLE FOK FALLBACK] (PHASE-1)
+
+Pair: $0.990/sh × 11.50sh = $11.40
+Unhedged: 0.04sh NO at $0.39 (pending resolution)
+Gross: +$0.1150 | Fee: -$0.1656 | Rebate: +$0.0326 | Net: $-0.0179 (-0.15%)
+[8/3/26 9:30 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #887b1
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:25 - 13:30 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 1 (post-only: 0)
+Favorable exits: 1 taker / 0 maker
+
+Trade 1: reprice=1.64% target=LOW alloc=$4 → YES@0.390 + NO@0.600 = $0.990/sh × 11.54sh → maker+taker → net $-0.0179 USDC (-0.15%)
+
+Allocation used: $4.50 / $9.00 (50%)
+Taker fees paid: $0.1656
+Est. maker rebates: $0.0326
+Gross market PnL: +$0.1150
+Net market PnL: $-0.0179
+Capital locked in resolution: $11.42
+[8/3/26 9:35 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #09799
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:30 - 13:35 UTC
+
+Signals detected: 0
+Leg 1 fills: 0 (0% fill rate)
+Hedged: 0/0 (0%)
+Walls outbid: 0
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+
+
+Allocation used: $0.00 / $9.00 (0%)
+Taker fees paid: $0.00 (both legs maker)
+Gross market PnL: +$0.0000
+Net market PnL: $0.0000 (zero fees in normal flow)
+Capital locked in resolution: $0.00
+[8/3/26 9:37 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #f752b
+Spike: UP +0.0138% | 0ms sustained
+Reprice: 1.98% (LOW) | Target: 1.00%
+Capital: $4.50
+
+Leg 1
+Buy YES  $0.78 × 5.77sh = $4.50
+Top of book (outbid wall) | Depth: $45374
+
+Leg 2 target
+Buy NO  $0.21 | Break-even: $0.22
+Est. profit: 1.00% (~$0.0577) | FOK fee: $0.0068/sh
+
+Status: Watching for hedge...
+[8/3/26 9:37 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #f752b
+
+Leg 1: Buy YES  $0.78 × 5.77sh = $4.50
+Leg 2: Buy NO  $0.21 × 5.77sh (PHASE-1)
+
+Pair: $0.990/sh × 5.77sh = $5.71
+Profit: +$0.0741 (+$0.0164 est. rebate) (1.29%)
+[8/3/26 9:38 PM] facaibot: Auto-redeem: Redemption complete: 1 redeemed, 2 skipped
+
+Errors:
+- 0xabb6...752b: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+- 0xd8ad...7e3b: receipt timed out
+[8/3/26 9:39 PM] r b: /redeem
+[8/3/26 9:39 PM] facaibot: Redemption complete: 1 redeemed, 1 skipped
+
+Errors:
+- 0xabb6...752b: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+[8/3/26 9:40 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #f752b
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:35 - 13:40 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+Trade 1: reprice=1.98% target=LOW alloc=$4 → YES@0.780 + NO@0.210 = $0.990/sh × 5.77sh → maker+maker → net +$0.0741 USDC (1.29%)
+
+Allocation used: $4.50 / $9.00 (50%)
+Taker fees paid: $0.00 (both legs maker)
+Est. maker rebates: $0.0164
+Gross market PnL: +$0.0577
+Net market PnL: $0.0741
+Capital locked in resolution: $5.71
+[8/3/26 9:41 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #4aa39
+Spike: DOWN -0.0614% | 0ms sustained
+Reprice: 1.96% (LOW) | Target: 1.00%
+Capital: $4.50
+
+Leg 1
+Buy NO  $0.43 × 10.47sh = $4.50
+Top of book (outbid wall) | Depth: $54443
+
+Leg 2 target
+Buy YES  $0.56 | Break-even: $0.57
+Est. profit: 1.00% (~$0.1047) | FOK fee: $0.0151/sh
+
+Status: Watching for hedge...
+[8/3/26 9:41 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #4aa39
+
+Leg 1: Buy NO  $0.43 × 5.09sh = $2.18
+Leg 2: Buy YES  $0.56 × 5.00sh [FAVORABLE FOK FALLBACK] (PHASE-1)
+
+Pair: $0.990/sh × 5.00sh = $4.98
+Unhedged: 0.09sh NO at $0.43 (pending resolution)
+Gross: +$0.0500 | Fee: -$0.0758 | Rebate: +$0.0152 | Net: $-0.0106 (-0.21%)
+[8/3/26 9:45 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #4aa39
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:40 - 13:45 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 1 (post-only: 0)
+Favorable exits: 1 taker / 0 maker
+
+Trade 1: reprice=1.96% target=LOW alloc=$4 → YES@0.430 + NO@0.560 = $0.990/sh × 5.09sh → maker+taker → net $-0.0106 USDC (-0.21%)
+
+Allocation used: $4.50 / $9.00 (50%)
+Taker fees paid: $0.0758
+Est. maker rebates: $0.0152
+Gross market PnL: +$0.0500
+Net market PnL: $-0.0106
+Capital locked in resolution: $5.03
+[8/3/26 9:50 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #6ad23
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:45 - 13:50 UTC
+
+Signals detected: 0
+Leg 1 fills: 0 (0% fill rate)
+Hedged: 0/0 (0%)
+Walls outbid: 0
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+
+
+Allocation used: $0.00 / $9.00 (0%)
+Taker fees paid: $0.00 (both legs maker)
+Gross market PnL: +$0.0000
+Net market PnL: $0.0000 (zero fees in normal flow)
+Capital locked in resolution: $0.00
+[8/3/26 9:53 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #66c7c
+Spike: UP +0.0100% | 0ms sustained
+Reprice: 1.75% (LOW) | Target: 1.00%
+Capital: $4.50
+
+Leg 1
+Buy YES  $0.56 × 8.04sh = $4.50
+Top of book (outbid wall) | Depth: $58380
+
+Leg 2 target
+Buy NO  $0.43 | Break-even: $0.44
+Est. profit: 1.00% (~$0.0804) | FOK fee: $0.0150/sh
+
+Status: Watching for hedge...
+[8/3/26 9:53 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #66c7c
+
+Leg 1: Buy YES  $0.56 × 8.04sh = $4.50 [FILLED MID-CANCEL]
+Leg 2: Buy NO  $0.50 × 8.04sh [PHASE-1 BREACH FOK FALLBACK] (PHASE-1)
+
+Pair: $1.060/sh × 8.04sh = $8.52
+Gross: $-0.4824 | Fee: -$0.1256 | Rebate: +$0.0244 | Net: $-0.5836 (-6.84%)
+[8/3/26 9:54 PM] facaibot: Auto-redeem: Redemption complete: 0 redeemed, 3 skipped
+
+Errors:
+- 0x9766...6c7c: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+- 0xabb6...752b: receipt timed out
+- 0xfe28...aa39: receipt timed out
+[8/3/26 9:55 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #66c7c
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:50 - 13:55 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 1 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+Trade 1: reprice=1.75% target=LOW alloc=$4 → YES@0.560 + NO@0.500 = $1.060/sh × 8.04sh → maker+taker → net $-0.5836 USDC (-6.84%)
+
+Allocation used: $4.50 / $9.00 (50%)
+Taker fees paid: $0.1256
+Est. maker rebates: $0.0244
+Gross market PnL: $-0.4824
+Net market PnL: $-0.5836
+Capital locked in resolution: $8.52
+[8/3/26 10:00 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #0b3ad
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:55 - 14:00 UTC
+
+Signals detected: 0
+Leg 1 fills: 0 (0% fill rate)
+Hedged: 0/0 (0%)
+Walls outbid: 0
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+
+
+Allocation used: $0.00 / $9.00 (0%)
+Taker fees paid: $0.00 (both legs maker)
+Gross market PnL: +$0.0000
+Net market PnL: $0.0000 (zero fees in normal flow)
+Capital locked in resolution: $0.00
+[8/3/26 10:03 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #fa4f7
+Spike: UP +0.0111% | 0ms sustained
+Reprice: 3.38% (MED) | Target: 3.00%
+Capital: $6.09
+
+Leg 1
+Buy YES  $0.31 × 19.65sh = $6.09
+Top of book (outbid wall) | Depth: $45307
+
+Leg 2 target
+Buy NO  $0.66 | Break-even: $0.69
+Est. profit: 3.00% (~$0.5895) | FOK fee: $0.0125/sh
+
+Status: Watching for hedge...
+[8/3/26 10:03 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #fa4f7
+
+Leg 1: Buy YES  $0.31 × 19.65sh = $6.09
+Leg 2: Buy NO  $0.68 × 19.50sh [FAVORABLE FOK FALLBACK] (PHASE-1)
+
+Pair: $0.990/sh × 19.50sh = $19.35
+Unhedged: 0.15sh YES at $0.31 (pending resolution)
+Gross: +$0.1950 | Fee: -$0.2308 | Rebate: +$0.0449 | Net: +$0.0091 (0.04%)
+[8/3/26 10:05 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #fa4f7
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 14:00 - 14:05 UTC
+
+Signals detected: 1
+Leg 1 fills: 1 (100% fill rate)
+Hedged: 1/1 (100%)
+Walls outbid: 1
+Emergency taker fills: 1 (post-only: 0)
+Favorable exits: 1 taker / 0 maker
+
+Trade 1: reprice=3.38% target=MED alloc=$6 → YES@0.310 + NO@0.680 = $0.990/sh × 19.65sh → maker+taker → net +$0.0091 USDC (0.04%)
+
+Allocation used: $6.09 / $9.00 (68%)
+Taker fees paid: $0.2308
+Est. maker rebates: $0.0449
+Gross market PnL: +$0.1950
+Net market PnL: $0.0091
+Capital locked in resolution: $19.45
+[8/3/26 10:09 PM] facaibot: Auto-redeem: Redemption complete: 2 redeemed, 2 skipped
+
+Errors:
+- 0xabb6...752b: server returned an error response: error code 3: nonce too low: next nonce 226, tx nonce 224
+- 0xd9d3...a4f7: server returned an error response: error code -32000: nonce too low: next nonce 226, tx nonce 225
+[8/3/26 10:10 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #afa31
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 14:05 - 14:10 UTC
+
+Signals detected: 0
+Leg 1 fills: 0 (0% fill rate)
+Hedged: 0/0 (0%)
+Walls outbid: 0
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+
+
+Allocation used: $0.00 / $9.00 (0%)
+Taker fees paid: $0.00 (both legs maker)
+Gross market PnL: +$0.0000
+Net market PnL: $0.0000 (zero fees in normal flow)
+Capital locked in resolution: $0.00
