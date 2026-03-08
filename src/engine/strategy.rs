@@ -284,6 +284,9 @@ pub struct StrategyEngine {
     /// after one of the dual orders fills. Cleared on confirmed cancel, rebalance
     /// complete, or market rotation.
     post_trade_orphan: Option<OrphanState>,
+    /// `true` after `take_orphan_cancel()` dispatches a cancel — prevents re-dispatch
+    /// on every main-loop iteration while waiting for the CLOB response.
+    orphan_cancel_sent: bool,
     /// `true` when a rebalance FOK is in progress (double-fill recovery).
     rebalance_in_progress: bool,
     /// Set `true` when the last `evaluate_leg2()` returned a Phase2Alongside signal.
@@ -415,6 +418,7 @@ impl StrategyEngine {
             leg2_phase1_order_id: None,
             leg2_phase2_order_id: None,
             post_trade_orphan: None,
+            orphan_cancel_sent: false,
             rebalance_in_progress: false,
             last_leg2_was_phase2_alongside: false,
             draining: false,
@@ -979,6 +983,7 @@ impl StrategyEngine {
                 self.leg2_phase1_order_id = None;
                 self.leg2_phase2_order_id = None;
                 self.post_trade_orphan = None;
+                self.orphan_cancel_sent = false;
                 self.rebalance_in_progress = false;
                 self.in_cutoff_window = false;
                 self.in_quiet_period = true;
@@ -1175,6 +1180,7 @@ impl StrategyEngine {
                                         condition_id: self.state.active_condition_id.clone().unwrap_or_default(),
                                         tick_size: self.state.tick_size,
                                     });
+                                    self.orphan_cancel_sent = false;
                                     info!(%orphan_id, %orphan_price, "dual-order: storing orphan, emitting cancel");
                                 }
                             }
@@ -1209,6 +1215,7 @@ impl StrategyEngine {
                         TradeStatus::Canceled => {
                             info!(%order_id, "orphan order cancelled — clearing orphan state");
                             self.post_trade_orphan = None;
+                            self.orphan_cancel_sent = false;
                         }
                         _ => {}
                     }
@@ -1639,7 +1646,7 @@ impl StrategyEngine {
 
     /// Returns `true` if there's a pending orphan cancel to send.
     pub fn has_orphan_cancel(&self) -> bool {
-        self.post_trade_orphan.is_some()
+        self.post_trade_orphan.is_some() && !self.orphan_cancel_sent
     }
 
     /// Take the pending spike cancel command (if any).
@@ -2235,6 +2242,7 @@ impl StrategyEngine {
                 if was_cancelled {
                     info!(%order_id, "orphan cancel confirmed — clearing orphan state");
                     self.post_trade_orphan = None;
+                    self.orphan_cancel_sent = false;
                 } else {
                     warn!(%order_id, "orphan cancel NOT confirmed — watching for fill via User WS");
                     // Keep orphan state — may fill via User WS TradeStatusUpdate.
@@ -2256,6 +2264,7 @@ impl StrategyEngine {
     ) {
         self.rebalance_in_progress = false;
         self.post_trade_orphan = None;
+        self.orphan_cancel_sent = false;
         self.diag_rebalance_attempts += 1;
 
         if success {
@@ -2281,6 +2290,7 @@ impl StrategyEngine {
     /// Called by the main loop after `on_trade_complete()` when `post_trade_orphan` is set.
     pub fn take_orphan_cancel(&mut self) -> Option<ExecutorCommand> {
         let orphan = self.post_trade_orphan.as_ref()?;
+        self.orphan_cancel_sent = true;
         Some(ExecutorCommand::CancelLeg2Order {
             order_id: orphan.order_id.clone(),
         })
