@@ -232,7 +232,13 @@ The hedge system uses two phases with a single cancel/repost at the transition �
 
 ### Phase 1 target price computation
 
+**Normal case:**
 `target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)`
+
+**Cancel-race case** (`leg1_cancel_race == true`):
+`target_price = round_to_tick(1.0 - leg1_price - tick, tick)` — breakeven minus 1 tick
+
+When Leg 1 fills mid-cancel (the cancel was not confirmed by the CLOB), the spike that triggered entry has reversed. Pursuing the original profit target is unrealistic, so the hedge targets breakeven instead. The `-tick` ensures pair cost is strictly < $1.00 after tick rounding. The `leg1_cancel_race` flag is set in `on_cancel_result()` before `replay_pending_fills()` and preserved across the `LiveTradeMeta` reset inside replay.
 
 The raw target is sent to the executor as-is (no don't-cross-ask clamping, no smart outbid). If the price would cross the book, the CLOB rejects the post-only order or returns "crosses book", and the executor routes to `attempt_favorable_maker_then_fok()` — which is the correct path for that scenario.
 
@@ -292,7 +298,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 **Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
 
-**Exit reason:** `BreakEvenBreach`
+**Exit reason:** `Phase2PriceBreach`
 
 **Note:** This replaces the old `leg1_price + ask > $1.00` check. The Phase 2 posted price (ask-1tick at posting) is the worst maker price we'll accept. If ask rises above it, exit via FOK.
 
@@ -302,7 +308,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 **Action:** Immediate FOK taker at `round_to_tick(best_ask, tick)`. `sim_was_taker = true`.
 
-**Exit reason:** `BreakEvenBreach` (the market has moved away from the profit target; the timeout is a safety net)
+**Exit reason:** `Phase2Timeout`
 
 ### 7d. Rotation Emergency (Market Expiry)
 
@@ -338,10 +344,11 @@ Handled in the MarketRotation event handler — the engine builds an emergency F
 
 1. Post maker at `best_ask - 1tick` (rests below current ask)
 2. Poll for fill up to `favorable_maker_timeout_ms` (default 1000ms)
-3. If filled → maker fill (no taker fee + rebate = ~$0.37 savings). `fill_method=FavorableMaker`
-4. If not filled → cancel → FOK taker fallback (existing path). `fill_method=FavorableTaker`
+3. **Breakeven breach guard:** Each polling iteration also queries `GET /book` for the current best ask. If `current_ask - tick > breakeven` (ask snapped back above breakeven), the maker is cancelled early and a FOK fallback executes immediately — prevents the maker from sitting while the book deteriorates
+4. If filled → maker fill (no taker fee + rebate = ~$0.37 savings). `fill_method=FavorableMaker`
+5. If not filled → cancel → FOK taker fallback (existing path). `fill_method=FavorableTaker`
 
-5. If cancel NOT confirmed (order may have filled) → send `OrderPosted` with `already_filled=false`, let User WS determine outcome
+6. If cancel NOT confirmed (order may have filled) → send `OrderPosted` with `already_filled=false`, let User WS determine outcome
 
 Guards: `clob_safe_fok_size()` zero-size check and `price × size >= $1` notional minimum. `already_filled` set if sync fill. Emergency FOK paths (`emergency_fok_fallback`) send `fill_method=EmergencyTaker` — distinct from favorable exits. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags even though the executor autonomously converted the signal.
 
@@ -368,10 +375,13 @@ On completion: `leg1_state`, `leg2_state`, and `hedge` all reset to None. `cumul
 ### PnL computation (simulation)
 
 - **Pair cost** = leg1_price + leg2_price (per share)
-- **Gross profit** = (1.0 - pair_cost) × size
+- **Paired size** = min(leg1_size, leg2_size) — the quantity actually hedged
+- **Gross profit** = (1.0 - pair_cost) × paired_size
 - **Maker rebate** = sum of both legs' `compute_maker_rebate(price, size)` (= `compute_taker_fee() × 0.20`; zero for taker fills)
 - **Net profit** = gross_profit - taker_fee + maker_rebate
-- **Profit %** = net_profit / (pair_cost × size) × 100
+- **Total cost** = leg1_price × leg1_size + leg2_price × leg2_size (actual capital deployed — not pair_cost × size)
+- **Profit %** = net_profit / total_cost × 100
+- **Partial fill handling**: When leg sizes differ (e.g., `clob_safe_fok_size()` reduces FOK size), `was_partial = true` is set on the larger leg's `SimFill`. Telegram shows unhedged shares pending resolution
 
 ---
 

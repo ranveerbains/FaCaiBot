@@ -532,6 +532,8 @@ impl LiveExecutor {
                 let poll_interval_ms = 200u64;
                 let max_polls = (self.favorable_maker_timeout_ms / poll_interval_ms).max(1);
                 let mut filled = false;
+                let breakeven = Decimal::ONE
+                    - signal.leg1_fill_price.unwrap_or(Decimal::ONE);
 
                 for _ in 0..max_polls {
                     tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -550,6 +552,26 @@ impl LiveExecutor {
                         Ok(_) => {} // still resting, continue polling
                         Err(e) => {
                             warn!(error = %e, "favorable maker: poll error — continuing");
+                        }
+                    }
+
+                    // Breakeven breach check — if ask snapped back above breakeven,
+                    // cancel the maker early and FOK before the book deteriorates.
+                    match self.poly.get_best_ask(&signal.token_id).await {
+                        Ok(Some(current_ask)) => {
+                            if current_ask - tick > breakeven {
+                                warn!(
+                                    %current_ask, %breakeven,
+                                    "favorable maker: breakeven breach — cancelling maker, FOK fallback"
+                                );
+                                let _ = self.poly.cancel_order(&maker_order_id).await;
+                                self.favorable_exit_fok(signal).await;
+                                return;
+                            }
+                        }
+                        Ok(None) => {} // empty ask side — continue polling
+                        Err(e) => {
+                            warn!(error = %e, "favorable maker: book query failed — continuing");
                         }
                     }
                 }
@@ -670,7 +692,7 @@ impl LiveExecutor {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: signal.price,
-                        size: signal.size,
+                        size: safe_size,
                         fill_method: Some(FillMethod::FavorableTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                         order_tag: None,

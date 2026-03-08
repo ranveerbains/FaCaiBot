@@ -83,7 +83,7 @@ Three feedback types flow from executor → engine via the `ExecutorFeedback` ch
 | `OrderPosted { order_id, price, size, is_leg2, fill_method, already_filled }` | CLOB accepted the order | Overwrite provisional `"sim-..."` ID with real hex hash. If `cancel_leg1_on_feedback` is set, immediately return `CancelLeg1` instead. For Leg 2: apply `fill_method` metadata to `LiveTradeMeta` (favorable exit tags). If `already_filled` (FOK returned `Filled` synchronously), transition directly to `OrderState::Filled` and trigger trade completion — do NOT wait for User WS MATCHED. Replay `pending_fills` buffer |
 | `OrderFailed { is_leg2 }` | CLOB rejected or network error (non-emergency only — emergency FOKs retry internally, never send this) | Reset leg state to `None`. If `cancel_leg1_on_feedback` is set, clear the flag (nothing to cancel) |
 | `CancelResult { order_id, was_cancelled, is_leg2 }` | Executor received CLOB cancel response | If confirmed: clear saved order info. If NOT confirmed: restore `OrderState::Posted` from saved info, replay `pending_fills` buffer (which sends opportunity alert + increments `live_market_signals` for Leg 1 fills), then set `leg1_cancel_race = true` on `LiveTradeMeta` AFTER replay (so it survives the `LiveTradeMeta::default()` reset inside replay) |
-| `RestFillDetected { order_id, price, size, size_matched, original_size }` | REST poll detected Leg 1 fill (~200ms, primary path) | Dedup guard: only process if `leg1_state == Posted` with matching `order_id`. Transition to `Filled`, init Leg 2, send opportunity alert. User WS MATCHED that arrives later is harmlessly ignored (state already Filled) |
+| `RestFillDetected { order_id, price, size, size_matched, original_size }` | REST poll detected Leg 1 fill (~200ms, primary path) | Dedup guard: only process if `leg1_state == Posted` with matching `order_id`. Transition to `Filled` using `actual_size` (= `size_matched` when partial, else `size`), init Leg 2 with actual fill size, send opportunity alert. User WS MATCHED that arrives later is harmlessly ignored (state already Filled) |
 
 **User WS event routing**: The Polymarket User WS sends two event types: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `TradeStatusUpdate` — their `id` field matches the hex hash stored from `OrderPosted` feedback. `"trade"` UUIDs never match and are harmlessly ignored. Actionable statuses forwarded: MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED. Non-actionable statuses (LIVE) are silently skipped by `parse_trade_status()`.
 
@@ -417,7 +417,7 @@ Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows
 3. Executor sends cancel to CLOB, receives response, sends `CancelResult` feedback
 4. Engine `on_cancel_result()`:
    - `was_cancelled = true`: order was actually on the book and is now gone. Clear `cancelled_leg1_info`. Slot freed.
-   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Replay `pending_fills` buffer (sends opportunity alert + increments `live_market_signals` for Leg 1 fills). Set `leg1_cancel_race = true` on `LiveTradeMeta` AFTER replay (so it survives the `LiveTradeMeta::default()` reset inside replay) — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. If the MATCHED was buffered, replay transitions to `Filled` immediately; otherwise the User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds normally.
+   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Set `leg1_cancel_race = true` on `LiveTradeMeta` BEFORE replay (so `init_leg2()` can detect it). Replay `pending_fills` buffer (sends opportunity alert + increments `live_market_signals` for Leg 1 fills). Re-set `leg1_cancel_race = true` AFTER replay (replay resets `LiveTradeMeta` via `Default`, but preserves `leg1_cancel_race` explicitly) — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. If the MATCHED was buffered, replay transitions to `Filled` immediately; otherwise the User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds with **breakeven target** (see below).
 
 **Why not just ignore the CancelResult?** Without restore, the MATCHED event arrives to `leg1_state = None` → unmatched → the fill is silently lost. The bot has an untracked position with no hedge.
 
@@ -434,7 +434,9 @@ If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) 
 
 Triggered when Leg 1 fills. In live mode, fills are detected via dual-path: (1) REST polling (primary, ~200ms deterministic — `poll_leg1_fill()` polls `GET /data/order/{id}` every 200ms, sends `RestFillDetected` feedback), or (2) User WS `"order"` events with MATCHED status (backup, variable latency). Whichever arrives first transitions Leg 1 to `Filled` and starts the 2-phase hedge; the second is deduped. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally (only after `SpikeConfirmed` clears the speculative fill gate).
 
-**Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)`
+**Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)` — except for cancel-race fills (see below).
+
+**Cancel-race breakeven target**: When `leg1_cancel_race` is `true` (Leg 1 filled mid-cancel), `init_leg2()` overrides the profit target with a breakeven target: `round_to_tick(1.0 - leg1_price - tick, tick)`. The thesis is impaired because the spike that triggered entry has reversed (that's why a cancel was attempted), so pursuing the original profit target is unrealistic. Targeting breakeven minus 1 tick gives the best chance of a clean exit. The `leg1_cancel_race` flag is set in `on_cancel_result()` before `replay_pending_fills()` and preserved across the `LiveTradeMeta::default()` reset inside replay.
 
 **2-phase hedge system with dual-order** (all post-only until emergency):
 
@@ -472,8 +474,9 @@ All emergency exits are **immediate FOK taker** at `best_ask` (`sim_was_taker=tr
    - Live mode: `handle_leg2_hedge()` receives `Rejected` or "crosses book" error → `attempt_favorable_maker_then_fok()`:
      1. Post maker at `best_ask - 1tick` (rests below current ask)
      2. Poll for fill up to `favorable_maker_timeout_ms` (default 1000ms)
-     3. If filled → `fill_method=FavorableMaker` (no taker fee + rebate = ~$0.37 savings)
-     4. If not filled → cancel → FOK taker fallback → `fill_method=FavorableTaker`
+     3. **Breakeven breach guard**: each poll also queries `GET /book` — if `current_ask - tick > breakeven`, cancel maker early and FOK immediately
+     4. If filled → `fill_method=FavorableMaker` (no taker fee + rebate = ~$0.37 savings)
+     5. If not filled → cancel → FOK taker fallback → `fill_method=FavorableTaker`
 
 2. **Phase 1 breach with favorable cost**: Phase 1 breach now triggers immediate FOK taker at `best_ask`. If the pair cost is favorable (`< $1.00`), the executor's favorable exit path handles it.
 
@@ -663,7 +666,7 @@ All execution state lives in-memory (no database on the hot path). QuestDB is us
 ### Tuning Analytics
 
 `simulated_trades` carries full context for outcome correlation:
-- `exit_reason` (symbol): `NormalHedge`, `BreakEvenBreach`, `MarketExpiry`, `FavorableTaker`, `Phase1Breach`, `WhipsawReversal` — loss attribution
+- `exit_reason` (symbol): `NormalHedge`, `BreakEvenBreach`, `Phase2Timeout`, `Phase2PriceBreach`, `MarketExpiry`, `FavorableTaker`, `Phase1Breach`, `WhipsawReversal` — loss attribution
 - `spike_magnitude` (f64): spike quality vs. outcome correlation
 - `favorable_taker`, `emergency_maker` (bool): exit type flags
 - `phase1_breach` (bool): `true` if Leg 2 triggered by Phase 1 breach (fast book move during Phase 1)

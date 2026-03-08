@@ -648,7 +648,7 @@ impl Leg2Evaluator {
                         false,
                         best_ask_price,
                         Some(hedge_book.clone()),
-                        Some(ExitReason::BreakEvenBreach),
+                        Some(ExitReason::Phase2Timeout),
                     );
                     signal.sim_was_taker = true;
                     return Some(Leg2Decision::Emergency {
@@ -696,7 +696,7 @@ impl Leg2Evaluator {
                     false,
                     best_ask_price,
                     Some(hedge_book.clone()),
-                    Some(ExitReason::BreakEvenBreach),
+                    Some(ExitReason::Phase2PriceBreach),
                 );
                 signal.sim_was_taker = true;
                 return Some(Leg2Decision::Emergency {
@@ -1173,7 +1173,7 @@ mod tests {
         // Price should be at ask (FOK): 0.51
         assert_eq!(decision.price(), Decimal::new(51, 2));
         let sig = decision.into_signal();
-        assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+        assert_eq!(sig.exit_reason, Some(ExitReason::Phase2PriceBreach));
         assert!(sig.sim_was_taker, "BE breach FOK should be marked as taker");
     }
 
@@ -1200,7 +1200,7 @@ mod tests {
         // Price should be at ask (FOK): 0.49
         assert_eq!(decision.price(), Decimal::new(49, 2));
         let sig = decision.into_signal();
-        assert_eq!(sig.exit_reason, Some(ExitReason::BreakEvenBreach));
+        assert_eq!(sig.exit_reason, Some(ExitReason::Phase2Timeout));
         assert!(sig.sim_was_taker, "phase 2 timeout FOK should be marked as taker");
     }
 

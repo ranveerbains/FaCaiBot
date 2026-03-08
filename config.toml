@@ -31,7 +31,7 @@ leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
-trade_cooldown_ms = 0
+trade_cooldown_ms = 3000
 
 [capital]
 # Maximum USDC per leg per trade
@@ -44,8 +44,8 @@ min_spike_atr_ratio = 20
 strong_spike_atr_ratio = 75
 # Model output ceiling / 100% allocation threshold (0.015 = 1.5% max target for perfect signal)
 reprice_scale = 0.05
-# Minimum model output to enter a trade (0.005 = 0.5%)
-min_reprice_pct = 0.01
+# Minimum model output to enter a trade (0.015 = 1.5%)
+min_reprice_pct = 0.015
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
 min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model
@@ -55,12 +55,12 @@ time_exponent = 0.5
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 1500
 # Book depth > this × avg = competitor wall (outbid by 1 tick)
 depth_wall_multiplier = 4.0
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.03
+phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
-phase2_timeout_ms = 2500
+phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
-favorable_maker_timeout_ms = 2000
+favorable_maker_timeout_ms = 3000

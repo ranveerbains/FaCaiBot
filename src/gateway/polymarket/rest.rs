@@ -26,6 +26,7 @@ use alloy::primitives::U256;
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
+use rust_decimal::Decimal;
 use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::{Credentials, Normal};
@@ -307,6 +308,33 @@ impl PolymarketGateway {
         Ok(())
     }
 
+    /// Query the best (lowest) ask price from the CLOB order book.
+    ///
+    /// Uses the public `GET /book?token_id=` endpoint (no auth needed).
+    /// Returns `Ok(None)` if the asks array is empty.
+    pub async fn get_best_ask(&self, token_id: &str) -> Result<Option<Decimal>> {
+        let url = format!("{}/book?token_id={}", super::CLOB_BASE_URL, token_id);
+        let body = super::tls_helpers::http_get(&url).await?;
+        let text = std::str::from_utf8(&body).context("book response not valid UTF-8")?;
+        let value: serde_json::Value =
+            serde_json::from_str(text).context("book JSON parse error")?;
+
+        let asks = match value.get("asks").and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => return Ok(None),
+        };
+
+        // Find the lowest ask price.
+        let mut best: Option<Decimal> = None;
+        for entry in asks {
+            if let Some(price_str) = entry.get("price").and_then(|v| v.as_str()) {
+                if let Ok(p) = Decimal::from_str(price_str) {
+                    best = Some(best.map_or(p, |cur: Decimal| cur.min(p)));
+                }
+            }
+        }
+        Ok(best)
+    }
 }
 
 // ─── SDK client initialization ───────────────────────────────────────────────

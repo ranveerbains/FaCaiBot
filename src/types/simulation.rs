@@ -259,9 +259,10 @@ pub struct SessionSummary {
     pub total_trades: u32,
     /// Smart outbidding events.
     pub walls_outbid: u32,
-    /// Emergency taker fills breakdown.
-    pub break_even_fok: u32,
-    pub timer_deadline_fok: u32,
+    /// Emergency taker fills breakdown: price breach FOKs (BE, Phase2PriceBreach, Phase1Breach).
+    pub breach_fok: u32,
+    /// Emergency taker fills breakdown: timeout FOKs (Phase2Timeout, MarketExpiry).
+    pub timeout_fok: u32,
     /// Total emergency taker fills.
     pub emergency_taker_fills: u32,
     /// Emergency post-only maker fills (zero fee).
@@ -334,10 +335,10 @@ pub struct SimulationState {
     pub leg1_fills: u32,
     /// Trades where Leg 2 hedge filled (maker).
     pub trades_hedged: u32,
-    /// Trades hedged via break-even breach FOK.
-    pub trades_break_even_fok: u32,
-    /// Trades hedged via deadline FOK.
-    pub trades_deadline_fok: u32,
+    /// Trades hedged via price breach FOK (BE, Phase2PriceBreach, Phase1Breach).
+    pub trades_breach_fok: u32,
+    /// Trades hedged via timeout FOK (Phase2Timeout, MarketExpiry, WhipsawReversal).
+    pub trades_timeout_fok: u32,
     /// Total Leg 2 fills that executed as taker (any emergency reason).
     pub trades_emergency_taker: u32,
     /// Emergency Leg 2 fills that rested as post-only maker (zero fee).
@@ -398,8 +399,8 @@ impl SimulationState {
             signals_detected: 0,
             leg1_fills: 0,
             trades_hedged: 0,
-            trades_break_even_fok: 0,
-            trades_deadline_fok: 0,
+            trades_breach_fok: 0,
+            trades_timeout_fok: 0,
             trades_emergency_taker: 0,
             emergency_maker_fills: 0,
             favorable_taker_fills: 0,
@@ -813,8 +814,8 @@ impl SimulationState {
             trades_hedged: self.trades_hedged,
             total_trades,
             walls_outbid: self.walls_outbid,
-            break_even_fok: self.trades_break_even_fok,
-            timer_deadline_fok: self.trades_deadline_fok,
+            breach_fok: self.trades_breach_fok,
+            timeout_fok: self.trades_timeout_fok,
             emergency_taker_fills: self.trades_emergency_taker,
             emergency_maker_fills: self.emergency_maker_fills,
             favorable_taker_fills: self.favorable_taker_fills,

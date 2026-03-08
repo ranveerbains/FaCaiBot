@@ -526,7 +526,13 @@ mod formatter {
             Direction::Down => ("NO", "YES"),
         };
 
-        let total_cost_usdc = trade.pair_cost * trade.leg1.size;
+        let paired_size = if let Some(ref leg2) = trade.leg2 {
+            trade.leg1.size.min(leg2.size)
+        } else {
+            trade.leg1.size
+        };
+        let total_cost_usdc = trade.leg1.price * trade.leg1.size
+            + trade.leg2.as_ref().map_or(Decimal::ZERO, |l2| l2.price * l2.size);
 
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
             let phase_note = if trade.phase1_dual_fill {
@@ -619,6 +625,23 @@ mod formatter {
             ""
         };
 
+        let unhedged_note = if let Some(ref leg2) = trade.leg2 {
+            if trade.leg1.size != leg2.size {
+                let (diff, side, price) = if trade.leg1.size > leg2.size {
+                    (trade.leg1.size - leg2.size, l1_label, trade.leg1.price)
+                } else {
+                    (leg2.size - trade.leg1.size, l2_label, leg2.price)
+                };
+                format!(
+                    "\nUnhedged: {diff:.2}sh {side} at <code>${price:.2}</code> (pending resolution)"
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         format!(
             "<b>--- TRADE COMPLETED ---</b>\n\n\
             Market: {market}\n\
@@ -626,7 +649,7 @@ mod formatter {
             Leg 1: Buy {l1_side}  <code>${l1_price:.2}</code> \u{00d7} {l1_size:.2}sh = <code>${l1_total:.2}</code>{l1_tag}\n\
             {leg2}\n\
             \n\
-            Pair: <code>${pair:.3}</code>/sh \u{00d7} {l1_size:.2}sh = <code>${total_cost:.2}</code>\n\
+            Pair: <code>${pair:.3}</code>/sh \u{00d7} {paired:.2}sh = <code>${total_cost:.2}</code>{unhedged}\n\
             {profit}",
             market = market_short,
             l1_side = l1_label,
@@ -636,7 +659,9 @@ mod formatter {
             l1_tag = l1_tag,
             leg2 = leg2_str,
             pair = trade.pair_cost,
+            paired = paired_size,
             total_cost = total_cost_usdc,
+            unhedged = unhedged_note,
             profit = profit_line,
         )
     }
@@ -849,8 +874,8 @@ mod formatter {
               Walls outbid: {walls}\n\
             \n\
             <b>Emergency exits (Leg 2):</b>\n\
-              Break-even breach FOK: {break_even}\n\
-              Timer/expiry deadline FOK: {timer}\n\
+              Price breach FOK: {breach}\n\
+              Timeout/expiry FOK: {timeout}\n\
               Emergency post-only (maker): {emergency_maker}\n\
               Favorable exits: {favorable} taker / {favorable_maker} maker\n\
             \n\
@@ -886,8 +911,8 @@ mod formatter {
             hedged = s.trades_hedged,
             hedge_rate = hedge_rate_pct,
             walls = s.walls_outbid,
-            break_even = s.break_even_fok,
-            timer = s.timer_deadline_fok,
+            breach = s.breach_fok,
+            timeout = s.timeout_fok,
             emergency_maker = s.emergency_maker_fills,
             favorable = s.favorable_taker_fills,
             favorable_maker = s.favorable_maker_fills,

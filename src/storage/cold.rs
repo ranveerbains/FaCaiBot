@@ -254,8 +254,8 @@ impl ColdStorage {
     /// - favorable_taker (bool): true if Leg 2 filled via favorable taker crossing
     /// - emergency_maker (bool): true if Leg 2 filled as maker during emergency chase
     /// - spike_magnitude (f64): spike size relative to ATR at entry
-    /// - exit_reason (symbol): "NormalHedge" | "BreakEvenBreach" |
-    ///                         "MarketExpiry" | "FavorableTaker" | "Phase1Breach" | "WhipsawReversal"
+    /// - exit_reason (symbol): "NormalHedge" | "BreakEvenBreach" | "Phase2Timeout" |
+    ///                         "Phase2PriceBreach" | "MarketExpiry" | "FavorableTaker" | "Phase1Breach" | "WhipsawReversal"
     /// - leg1_order_id (symbol): CLOB order ID for Leg 1
     /// - leg2_order_id (symbol): CLOB order ID for Leg 2 ("" if unhedged)
     /// - timestamp (designated timestamp): Leg 1 fill time
@@ -295,6 +295,8 @@ impl ColdStorage {
 
         let exit_reason_str = match exit_reason {
             Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+            Some(ExitReason::Phase2Timeout) => "Phase2Timeout",
+            Some(ExitReason::Phase2PriceBreach) => "Phase2PriceBreach",
             Some(ExitReason::MarketExpiry) => "MarketExpiry",
             Some(ExitReason::FavorableTaker) => "FavorableTaker",
             Some(ExitReason::Phase1Breach) => "Phase1Breach",
@@ -398,6 +400,8 @@ impl ColdStorage {
                 "exit_reason",
                 match trade.exit_reason {
                     Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
+                    Some(ExitReason::Phase2Timeout) => "Phase2Timeout",
+                    Some(ExitReason::Phase2PriceBreach) => "Phase2PriceBreach",
                     Some(ExitReason::MarketExpiry) => "MarketExpiry",
                     Some(ExitReason::FavorableTaker) => "FavorableTaker",
                     Some(ExitReason::Phase1Breach) => "Phase1Breach",

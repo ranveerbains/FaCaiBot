@@ -102,11 +102,14 @@ SAMPLE BY 1m;
 -- ============================================================
 -- 8. Loss attribution by exit reason (last 24h)
 -- THE most important tuning query. Answers: "What is causing losses?"
---   AdverseMovement  → tune risk.adverse_threshold
---   BreakEvenBreach  → tune entry timing (risk.erosion_base_interval_ms)
---   MarketExpiry     → tune entry_guards.entry_cutoff_secs
---   FavorableTaker   → usually a win (opportunistic take)
---   NormalErosion    → happy path
+--   BreakEvenBreach    → Phase 2 entry guard (BE breach at transition)
+--   Phase2Timeout      → Phase 2 resting timed out
+--   Phase2PriceBreach  → ask rose above Phase 2 posted price
+--   Phase1Breach       → pair cost exceeded threshold during Phase 1
+--   MarketExpiry       → tune entry_guards.entry_cutoff_secs
+--   FavorableTaker     → usually a win (opportunistic take)
+--   WhipsawReversal    → opposite spike → immediate FOK
+--   NormalHedge        → happy path
 -- ============================================================
 SELECT
     exit_reason,

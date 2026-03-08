@@ -11,8 +11,12 @@ use super::market::{Direction, OrderBook, SpikeInfo};
 /// can accurately categorize the exit for session statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExitReason {
-    /// Opposing ask worsened beyond break-even tolerance.
+    /// Phase 2 entry guard: ask-1tick > breakeven at Phase 2 transition.
     BreakEvenBreach,
+    /// Phase 2 resting timed out — FOK at ask.
+    Phase2Timeout,
+    /// Phase 2 breach: ask rose above Phase 2 posted price (order staleness).
+    Phase2PriceBreach,
     /// Market rotation arrived while Leg 1 was filled but Leg 2 incomplete.
     /// Emergency FOK to close the position before state reset.
     MarketExpiry,

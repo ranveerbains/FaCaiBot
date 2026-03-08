@@ -216,7 +216,8 @@ pub struct StrategyEngine {
     /// Telegram reporter for live mode. `None` in simulation mode.
     reporter: Option<TelegramReporter>,
     /// Leg 2 metadata for the current live trade (reset on Leg 1 fill).
-    /// Note: `leg1_cancel_race` is set AFTER `replay_pending_fills()` so it survives the reset.
+    /// Note: `leg1_cancel_race` is set BEFORE and AFTER `replay_pending_fills()` —
+    /// before so `init_leg2()` can use breakeven target, after so it survives the reset.
     live_trade_meta: LiveTradeMeta,
     /// Completed trades for the current market window (cleared on rotation).
     live_market_trades: Vec<SimTrade>,
@@ -255,7 +256,9 @@ pub struct StrategyEngine {
     diag_phase_transitions: u64,
     diag_leg2_fills_maker: u64,
     diag_leg2_fills_taker: u64,
-    diag_emg_phase2_breach: u64,
+    diag_emg_be_breach: u64,
+    diag_emg_phase2_timeout: u64,
+    diag_emg_phase2_price_breach: u64,
     diag_emg_expiry: u64,
     diag_favorable_exits: u64,
     diag_emg_maker: u64,  // emergency exits filled as post-only maker
@@ -391,7 +394,9 @@ impl StrategyEngine {
             diag_phase_transitions: 0,
             diag_leg2_fills_maker: 0,
             diag_leg2_fills_taker: 0,
-            diag_emg_phase2_breach: 0,
+            diag_emg_be_breach: 0,
+            diag_emg_phase2_timeout: 0,
+            diag_emg_phase2_price_breach: 0,
             diag_emg_expiry: 0,
             diag_favorable_exits: 0,
             diag_emg_maker: 0,
@@ -1009,13 +1014,19 @@ impl StrategyEngine {
                                     });
                                 }
                             }
+                            // Use actual fill size when partial fill detected.
+                            let actual_size = if let (Some(matched), Some(_orig)) = (size_matched, original_size) {
+                                if matched > Decimal::ZERO && matched < size { matched } else { size }
+                            } else {
+                                size
+                            };
                             self.state.leg1_state = OrderState::Filled {
                                 order_id: order_id.clone(),
                                 price,
-                                size,
+                                size: actual_size,
                                 fill_timestamp_ms: now_ms,
                             };
-                            self.init_leg2(price, size, now_ms);
+                            self.init_leg2(price, actual_size, now_ms);
                             // Reset live trade meta for the new trade.
                             self.live_trade_meta = LiveTradeMeta::default();
 
@@ -1516,7 +1527,9 @@ impl StrategyEngine {
                 _ => (None, false),
             };
             match reason {
-                Some(ExitReason::BreakEvenBreach) => self.diag_emg_phase2_breach += 1,
+                Some(ExitReason::BreakEvenBreach) => self.diag_emg_be_breach += 1,
+                Some(ExitReason::Phase2Timeout) => self.diag_emg_phase2_timeout += 1,
+                Some(ExitReason::Phase2PriceBreach) => self.diag_emg_phase2_price_breach += 1,
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_favorable_exits += 1,
                 Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
@@ -1695,7 +1708,9 @@ impl StrategyEngine {
             phase_transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
             l2_taker = self.diag_leg2_fills_taker,
-            emg_p2_breach = self.diag_emg_phase2_breach,
+            emg_be_breach = self.diag_emg_be_breach,
+            emg_p2_timeout = self.diag_emg_phase2_timeout,
+            emg_p2_price_breach = self.diag_emg_phase2_price_breach,
             emg_expiry = self.diag_emg_expiry,
             fav_exits = self.diag_favorable_exits,
             fav_maker = self.diag_favorable_maker_fills,
@@ -1765,7 +1780,7 @@ impl StrategyEngine {
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
              Favorable: exits={fav_exits}  maker={fav_maker}  maker-timeout={fav_maker_timeout}\n\
-             Emergency — p1-breach: {emg_p1b}  p2-breach: {emg_p2b}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
+             Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
              Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
@@ -1798,7 +1813,9 @@ impl StrategyEngine {
             fav_exits = self.diag_favorable_exits,
             fav_maker = self.diag_favorable_maker_fills,
             fav_maker_timeout = self.diag_favorable_maker_timeouts,
-            emg_p2b = self.diag_emg_phase2_breach,
+            emg_beb = self.diag_emg_be_breach,
+            emg_p2t = self.diag_emg_phase2_timeout,
+            emg_p2pb = self.diag_emg_phase2_price_breach,
             p2_entry_breach = self.diag_phase2_entry_breach,
             emg_exp = self.diag_emg_expiry,
             emg_p1b = self.diag_emg_phase1_breach,
@@ -2030,13 +2047,19 @@ impl StrategyEngine {
         }
 
         // State transition: Posted → Filled.
+        // Use actual fill size when partial fill detected.
+        let actual_size = if size_matched > Decimal::ZERO && size_matched < size {
+            size_matched
+        } else {
+            size
+        };
         self.state.leg1_state = OrderState::Filled {
             order_id,
             price,
-            size,
+            size: actual_size,
             fill_timestamp_ms: now_ms,
         };
-        self.init_leg2(price, size, now_ms);
+        self.init_leg2(price, actual_size, now_ms);
         self.live_trade_meta = LiveTradeMeta::default();
 
         // Send opportunity alert via Telegram in live mode.
@@ -2190,9 +2213,13 @@ impl StrategyEngine {
             debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
         }
 
+        // Set cancel-race flag BEFORE replay so init_leg2() can detect it and
+        // use breakeven target instead of profit target (thesis impaired by reversal).
+        if leg1_restored {
+            self.live_trade_meta.leg1_cancel_race = true;
+        }
         self.replay_pending_fills(now_ms);
-
-        // Set cancel-race flag AFTER replay so it survives LiveTradeMeta::default() reset.
+        // Re-set after replay — replay_pending_fills() resets LiveTradeMeta.
         if leg1_restored {
             self.live_trade_meta.leg1_cancel_race = true;
         }
@@ -2361,7 +2388,12 @@ impl StrategyEngine {
                             fill_timestamp_ms: now_ms,
                         };
                         self.init_leg2(price, size, now_ms);
-                        self.live_trade_meta = LiveTradeMeta::default();
+                        // Preserve cancel-race flag across reset so on_trade_complete sees it.
+                        let cancel_race = self.live_trade_meta.leg1_cancel_race;
+                        self.live_trade_meta = LiveTradeMeta {
+                            leg1_cancel_race: cancel_race,
+                            ..Default::default()
+                        };
 
                         // Send opportunity alert for replayed Leg 1 fill (e.g. cancel-race).
                         if let (Some(reporter), Some(signal)) = (
@@ -2674,10 +2706,23 @@ impl StrategyEngine {
             // opposite spike arrives between Leg 1 fill and init_leg2().
             let direction = self.leg1_direction.unwrap_or(spike.direction);
             let tick = self.state.tick_size;
-            let phase1_target_price = round_to_tick(
-                Decimal::ONE - initial_profit_target - fill_price,
-                tick,
-            );
+            // Mid-cancel (cancel-race): spike reversed, thesis impaired.
+            // Target breakeven minus 1 tick (pair = $0.99) instead of profit target.
+            // This maximises the chance of a maker fill at a reasonable price rather
+            // than waiting for an ambitious profit target that will likely breach.
+            let phase1_target_price = if self.live_trade_meta.leg1_cancel_race {
+                let be_price = round_to_tick(
+                    Decimal::ONE - fill_price - tick,
+                    tick,
+                );
+                info!(%fill_price, %be_price, "cancel-race detected — using breakeven target");
+                be_price
+            } else {
+                round_to_tick(
+                    Decimal::ONE - initial_profit_target - fill_price,
+                    tick,
+                )
+            };
             self.hedge = Some(HedgeState::new(
                 now_ms,
                 fill_price,
@@ -3264,8 +3309,8 @@ impl StrategyEngine {
         let mut worst_market = String::new();
         let mut worst_reprice = Decimal::ZERO;
         let mut walls_outbid: u32 = 0;
-        let mut break_even_fok: u32 = 0;
-        let mut timer_fok: u32 = 0;
+        let mut breach_fok: u32 = 0;
+        let mut timeout_fok: u32 = 0;
         let mut emergency_taker: u32 = 0;
         let mut emergency_maker: u32 = 0;
         let mut favorable_taker: u32 = 0;
@@ -3283,10 +3328,13 @@ impl StrategyEngine {
             if t.favorable_taker { favorable_taker += 1; }
             if t.favorable_maker { favorable_maker += 1; }
             match t.exit_reason {
-                Some(ExitReason::BreakEvenBreach) | Some(ExitReason::Phase1Breach) => {
-                    break_even_fok += 1;
+                Some(ExitReason::BreakEvenBreach)
+                | Some(ExitReason::Phase2PriceBreach)
+                | Some(ExitReason::Phase1Breach) => {
+                    breach_fok += 1;
                 }
-                Some(ExitReason::MarketExpiry) => timer_fok += 1,
+                Some(ExitReason::Phase2Timeout)
+                | Some(ExitReason::MarketExpiry) => timeout_fok += 1,
                 _ => {}
             }
             match t.profit_target_tier {
@@ -3337,8 +3385,8 @@ impl StrategyEngine {
             trades_hedged,
             total_trades,
             walls_outbid,
-            break_even_fok,
-            timer_deadline_fok: timer_fok,
+            breach_fok,
+            timeout_fok,
             emergency_taker_fills: emergency_taker,
             emergency_maker_fills: emergency_maker,
             favorable_taker_fills: favorable_taker,
@@ -3390,7 +3438,8 @@ impl StrategyEngine {
         let signal = self.pending_leg1_signal.as_ref()?;
 
         let pair_cost = l1_price + l2_price;
-        let gross_profit = (Decimal::ONE - pair_cost) * l1_size;
+        let paired_size = l1_size.min(l2_size);
+        let gross_profit = (Decimal::ONE - pair_cost) * paired_size;
         let taker_fee = if self.live_trade_meta.leg2_was_taker {
             SimFill::compute_taker_fee(l2_price, l2_size)
         } else {
@@ -3405,12 +3454,13 @@ impl StrategyEngine {
         };
         let maker_rebate = leg1_rebate + leg2_rebate;
         let net_profit = gross_profit - taker_fee + maker_rebate;
-        let total_cost = pair_cost * l1_size;
+        let total_cost = l1_price * l1_size + l2_price * l2_size;
         let profit_pct = if total_cost.is_zero() {
             Decimal::ZERO
         } else {
             net_profit / total_cost * Decimal::ONE_HUNDRED
         };
+        let sizes_differ = l1_size != l2_size;
 
         let leg1_side = match hedge.direction {
             Direction::Up => crate::types::order::Side::Buy,
@@ -3423,7 +3473,7 @@ impl StrategyEngine {
             price: l1_price,
             size: l1_size,
             timestamp_ms: l1_ts,
-            was_partial: false,
+            was_partial: sizes_differ && l1_size > l2_size,
             was_taker: false,
             taker_fee: Decimal::ZERO,
             maker_rebate: leg1_rebate,
@@ -3433,7 +3483,7 @@ impl StrategyEngine {
             price: l2_price,
             size: l2_size,
             timestamp_ms: now_ms,
-            was_partial: false,
+            was_partial: sizes_differ && l2_size > l1_size,
             was_taker: self.live_trade_meta.leg2_was_taker,
             taker_fee,
             maker_rebate: leg2_rebate,

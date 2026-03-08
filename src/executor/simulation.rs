@@ -292,7 +292,7 @@ impl SimulationExecutor {
                         hedged      = self.state.trades_hedged,
                         emergency   = self.state.trades_emergency_taker,
                         emergency_maker = self.state.emergency_maker_fills,
-                        be_fok      = self.state.trades_break_even_fok,
+                        breach_fok  = self.state.trades_breach_fok,
                         pnl         = %self.state.total_pnl,
                         win_rate    = %self.state.win_rate_pct(),
                         open        = self.state.open_positions.len(),
@@ -445,9 +445,13 @@ impl SimulationExecutor {
         };
 
         match signal.exit_reason {
-            Some(ExitReason::BreakEvenBreach) => {
-                let label = "break-even breach";
-                let reason_ref = ExitReason::BreakEvenBreach;
+            Some(reason @ ExitReason::BreakEvenBreach)
+            | Some(reason @ ExitReason::Phase2PriceBreach) => {
+                let label = match reason {
+                    ExitReason::BreakEvenBreach => "break-even breach",
+                    ExitReason::Phase2PriceBreach => "phase 2 price breach",
+                    _ => unreachable!(),
+                };
                 if is_taker {
                     info!(
                         token_id = %signal.token_id,
@@ -456,7 +460,7 @@ impl SimulationExecutor {
                         position_idx,
                         "Leg 2: {label} FOK fallback"
                     );
-                    self.state.trades_break_even_fok += 1;
+                    self.state.trades_breach_fok += 1;
                     self.state.record_emergency_taker(position_idx, fill);
                 } else {
                     info!(
@@ -468,7 +472,32 @@ impl SimulationExecutor {
                     self.state.record_emergency_maker(
                         position_idx,
                         fill,
-                        &reason_ref,
+                        &reason,
+                    );
+                }
+            }
+            Some(ExitReason::Phase2Timeout) => {
+                if is_taker {
+                    info!(
+                        token_id = %signal.token_id,
+                        taker_price = %fill.price,
+                        taker_fee = %fill.taker_fee,
+                        position_idx,
+                        "Leg 2: phase 2 timeout FOK fallback"
+                    );
+                    self.state.trades_timeout_fok += 1;
+                    self.state.record_emergency_taker(position_idx, fill);
+                } else {
+                    info!(
+                        token_id = %signal.token_id,
+                        price = %fill.price,
+                        position_idx,
+                        "Leg 2: phase 2 timeout post-only (maker)"
+                    );
+                    self.state.record_emergency_maker(
+                        position_idx,
+                        fill,
+                        &ExitReason::Phase2Timeout,
                     );
                 }
             }
@@ -481,7 +510,7 @@ impl SimulationExecutor {
                         position_idx,
                         "Leg 2: market expiry emergency FOK fallback"
                     );
-                    self.state.trades_deadline_fok += 1;
+                    self.state.trades_timeout_fok += 1;
                     self.state.record_emergency_taker(position_idx, fill);
                 } else {
                     warn!(
@@ -531,7 +560,7 @@ impl SimulationExecutor {
                         position_idx,
                         "Leg 2: phase 1 breach FOK fallback"
                     );
-                    self.state.trades_break_even_fok += 1;
+                    self.state.trades_breach_fok += 1;
                     self.state.record_emergency_taker(position_idx, fill);
                 } else {
                     info!(
@@ -551,7 +580,7 @@ impl SimulationExecutor {
                     position_idx,
                     "Leg 2: whipsaw reversal FOK"
                 );
-                self.state.trades_deadline_fok += 1;
+                self.state.trades_timeout_fok += 1;
                 self.state.record_emergency_taker(position_idx, fill);
             }
             None => {
