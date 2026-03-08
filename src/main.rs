@@ -103,6 +103,7 @@ async fn async_main() -> Result<()> {
         bounded(CHANNEL_CAP);
 
     // ── Control plane ────────────────────────────────────────────────
+    let redeem_notify = Arc::new(tokio::sync::Notify::new());
     let notify_flags = Arc::new(NotifyFlags::new());
     let (status_tx, status_rx) = tokio::sync::watch::channel(BotStatus::default());
     let (drain_status_tx, drain_status_rx) = tokio::sync::watch::channel(DrainStatus::Idle);
@@ -211,6 +212,7 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    let redeem_notify_engine = Arc::clone(&redeem_notify);
     let engine_handle = tokio::task::spawn_blocking(move || {
         let mut engine = StrategyEngine::new(&engine_config);
 
@@ -539,6 +541,8 @@ async fn async_main() -> Result<()> {
                     error!(error = %e, "failed to send MarketRotation to executor");
                     break;
                 }
+                // Trigger auto-redeem ~60s after rotation.
+                redeem_notify_engine.notify_one();
             }
 
             // In simulation mode, advance the fill state machine before
@@ -772,7 +776,7 @@ async fn async_main() -> Result<()> {
         info!(user_id, "command listener spawned");
     }
 
-    // ── Auto-Redeem (every 24h) ────────────────────────────────────────
+    // ── Auto-Redeem (on rotation, ~60s delay) ──────────────────────────
     {
         let redeem_tls = crate::reporting::telegram::build_tls_connector();
         let redeem_bot_token = config.telegram_bot_token.clone();
@@ -781,6 +785,7 @@ async fn async_main() -> Result<()> {
             redeem_tls,
             redeem_bot_token,
             redeem_chat_id,
+            redeem_notify,
         ));
     }
 

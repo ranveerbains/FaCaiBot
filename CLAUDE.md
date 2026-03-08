@@ -159,6 +159,7 @@ src/
 - **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
 - **Maker rebate estimates**: `SimFill::compute_maker_rebate(price, size)` = `compute_taker_fee(price, size) × 0.20` — upper-bound estimate of Polymarket daily maker rebate. `SimFill.maker_rebate` non-zero for maker fills, zero for taker. `SimTrade.maker_rebate` = sum of both legs. Net profit = `gross_profit - taker_fee + maker_rebate`. Accumulated on `SimulationState.total_maker_rebates_earned` and `MarketSummary.maker_rebates_earned`. Shown in Telegram trade completion and market/session summaries
 - **Persistent redemption file (`redeems.txt`)**: Newline-delimited condition IDs persisted for redemption. Written once per market at rotation (if traded) and at shutdown (via `send_live_session_summary`). Read + merged with Data API positions in `redeem_inner()`. Cleanup via atomic write-temp-rename after successful redemption. `/redeem <condition_id>` for targeted single redemption. `append_condition_id_sync()` is sync I/O on engine thread (deduplicates before append)
+- **Auto-redeem (rotation-triggered)**: `auto_redeem_loop()` waits on `Arc<tokio::sync::Notify>` signaled by the engine on `MarketRotation`. After notification, waits 60s (for UMA resolution) then calls `handle_redeem()`. No-op results (nothing to redeem) are silently skipped. Replaces the old fixed 15-minute timer
 - **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
 
 ## Key Documents

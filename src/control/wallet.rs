@@ -1,5 +1,6 @@
 //! Wallet management: balance checks, Polymarket positions, and CTF token redemption.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
@@ -484,13 +485,17 @@ async fn redeem_specific_inner(cid_hex: &str) -> Result<String> {
 
 // ─── Auto-Redeem Background Task ────────────────────────────────────────────
 
-/// Runs every 15 minutes, redeems resolved positions, notifies via Telegram.
+/// Runs once per market rotation, ~60s after rotation for UMA resolution.
 /// Failures are graceful — logged and retried next cycle.
-pub async fn auto_redeem_loop(tls_connector: TlsConnector, bot_token: String, chat_id: String) {
-    const INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
-
+pub async fn auto_redeem_loop(
+    tls_connector: TlsConnector,
+    bot_token: String,
+    chat_id: String,
+    rotation_notify: Arc<tokio::sync::Notify>,
+) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(INTERVAL_SECS)).await;
+        rotation_notify.notified().await;
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
         let result = handle_redeem().await;
 
