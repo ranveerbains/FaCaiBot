@@ -5,13 +5,13 @@ prewarm_lead_secs = 20
 
 [spike_detection]
 # ATR multiplier for spike candidate trigger
-multiplier = 25
+multiplier = 30
 # EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
 atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
 # Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
-min_magnitude_pct = 0.01
+min_magnitude_pct = 0.015
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
@@ -39,9 +39,9 @@ max_alloc_per_trade = 15
 
 [repricing]
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
-min_spike_atr_ratio = 20
+min_spike_atr_ratio = 30
 # Spike ATR ratio at which spike quality factor = 1.0
-strong_spike_atr_ratio = 85
+strong_spike_atr_ratio = 75
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
 reprice_scale = 0.05
 # Minimum model output to enter a trade (0.02 = 2.0%)
@@ -51,13 +51,13 @@ phase1_target_dampen = 0.8
 # Minimum OBI alignment (0.2 = reject if Binance book contradicts spike direction)
 min_obi_alignment = 0.3
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 0.25
+min_alloc_pct = 0.3
 # Hard reject: YES mid beyond this regardless of model
 hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
-max_time_factor = 2.5
+max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
