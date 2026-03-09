@@ -39,13 +39,13 @@ max_alloc_per_trade = 15
 
 [repricing]
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
-min_spike_atr_ratio = 25
+min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
 strong_spike_atr_ratio = 85
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
 reprice_scale = 0.05
 # Minimum model output to enter a trade (0.02 = 2.0%)
-min_reprice_pct = 0.02
+min_reprice_pct = 0.015
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
 phase1_target_dampen = 0.8
 # Minimum OBI alignment (0.2 = reject if Binance book contradicts spike direction)
