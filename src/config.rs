@@ -99,8 +99,8 @@ pub struct RiskConfig {
     pub phase1_timeout_ms: u64,
     /// Depth level > X × avg = competitor wall.
     pub depth_wall_multiplier: f64,
-    /// Phase 1 breach threshold: pair cost > this triggers transition to Phase 2.
-    /// Default 1.05 ($1.05). Must be > 1.00.
+    /// Phase 1 breach threshold: pair cost > this triggers immediate FOK taker.
+    /// Must be > 1.00. Default 1.05 (overridden in config.toml).
     pub phase1_breach_threshold: f64,
     /// Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit.
     pub phase2_timeout_ms: u64,
@@ -154,6 +154,11 @@ pub struct RepricingConfig {
     pub time_exponent: f64,
     /// Maximum time amplification factor (2.0 = time can at most double the output).
     pub max_time_factor: f64,
+    /// Phase 1 target dampening factor (0.8 = target 80% of expected repricing).
+    /// Only affects Phase 1 profit target — entry gate and allocation use raw expected_pct.
+    pub phase1_target_dampen: f64,
+    /// Minimum OBI alignment (0.0–0.5). Rejects if Binance book imbalance contradicts spike.
+    pub min_obi_alignment: f64,
 }
 
 impl Default for RepricingConfig {
@@ -167,6 +172,8 @@ impl Default for RepricingConfig {
             hard_skew_cap: 0.90,
             time_exponent: 0.5,
             max_time_factor: 2.0,
+            phase1_target_dampen: 0.8,
+            min_obi_alignment: 0.2,
         }
     }
 }
@@ -254,6 +261,10 @@ pub struct Config {
     pub time_exponent: f64,
     /// Repricing model: maximum time amplification factor.
     pub max_time_factor: f64,
+    /// Phase 1 target dampening factor (only affects profit target, not entry gate or allocation).
+    pub phase1_target_dampen: Decimal,
+    /// Minimum OBI alignment to accept a spike.
+    pub min_obi_alignment: Decimal,
 }
 
 impl Config {
@@ -358,6 +369,10 @@ impl Config {
             .context("repricing.hard_skew_cap: invalid decimal")?;
         let time_exponent = bot.repricing.time_exponent;
         let max_time_factor = bot.repricing.max_time_factor;
+        let phase1_target_dampen = Decimal::try_from(bot.repricing.phase1_target_dampen)
+            .context("repricing.phase1_target_dampen: invalid decimal")?;
+        let min_obi_alignment = Decimal::try_from(bot.repricing.min_obi_alignment)
+            .context("repricing.min_obi_alignment: invalid decimal")?;
 
         let config = Self {
             mode,
@@ -386,6 +401,8 @@ impl Config {
             hard_skew_cap,
             time_exponent,
             max_time_factor,
+            phase1_target_dampen,
+            min_obi_alignment,
         };
 
         // ── Validation ───────────────────────────────────────────────
@@ -416,6 +433,8 @@ impl Config {
         let hard_skew_cap = Decimal::try_from(bot.repricing.hard_skew_cap).unwrap();
         let time_exponent = bot.repricing.time_exponent;
         let max_time_factor = bot.repricing.max_time_factor;
+        let phase1_target_dampen = Decimal::try_from(bot.repricing.phase1_target_dampen).unwrap();
+        let min_obi_alignment = Decimal::try_from(bot.repricing.min_obi_alignment).unwrap();
 
         Self {
             mode: Mode::Simulation,
@@ -442,6 +461,8 @@ impl Config {
             hard_skew_cap,
             time_exponent,
             max_time_factor,
+            phase1_target_dampen,
+            min_obi_alignment,
         }
     }
 }

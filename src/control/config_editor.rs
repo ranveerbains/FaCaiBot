@@ -37,6 +37,8 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "repricing.hard_skew_cap", min: 0.5, max: 0.99 },
     ParamSpec { name: "repricing.time_exponent", min: 0.0, max: 2.0 },
     ParamSpec { name: "repricing.max_time_factor", min: 1.0, max: 10.0 },
+    ParamSpec { name: "repricing.phase1_target_dampen", min: 0.1, max: 1.0 },
+    ParamSpec { name: "repricing.min_obi_alignment", min: 0.0, max: 0.5 },
     // risk
     ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },

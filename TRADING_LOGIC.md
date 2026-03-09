@@ -92,6 +92,16 @@ Three event variants carry spike lifecycle signals:
 
 Normal `BinanceTick` events only update `binance_price` and never trigger spike evaluation.
 
+### OBI (Order Book Imbalance)
+
+`SpikeInfo` carries an `obi` field: Order Book Imbalance from the Binance `@depth20` snapshot at spike time.
+
+```
+obi = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+```
+
+Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish). Computed by `BinanceDepth::obi()` and stored by the spike detector (`last_obi`). Used as an entry guard: spikes whose OBI contradicts the spike direction (e.g., Up spike with strongly bearish OBI) are rejected (`ObiMismatch`). Config: `min_obi_alignment` (default 0.2).
+
 ---
 
 ## 3. Entry Validation (Leg 1 Guards)
@@ -109,8 +119,10 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 | 7 | **Spread** | `(ask - bid) > max_spread` ($0.02) | `SpreadWide` | Book too thin for reliable entry |
 | 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After spread** — `rej_busy` counts only spikes that had a valid book |
 | 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
-| 10 | **Repricing model** | `expected_pct < min_reprice_pct` (0.5%) | `InsufficientRepricing` | Model output too low to justify entry |
-| 11 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
+| 10 | **Repricing model** | `expected_pct < min_reprice_pct` (2.0%) | `InsufficientRepricing` | Model output too low to justify entry |
+| 11 | **OBI alignment** | Binance book imbalance contradicts spike direction | `ObiMismatch` | Spike quality confirmation from order flow |
+| 12 | **Depth** | `book_bid_depth < required_depth × depth_min_pct` (0.20) | `InsufficientDepth` | Not enough liquidity |
+| 13 | **Hedge impossible** | Opposing side best ask - tick > breakeven (1.0 - bid_price) | `HedgeImpossible` | No feasible hedge price at entry time |
 
 ### Direction-aware book selection
 
@@ -131,13 +143,13 @@ When `spike_detected = true`, the evaluator checks every guard in sequence. **Th
 expected_reprice_pct = norm_spike × adjusted_sensitivity × time_factor × reprice_scale
 ```
 
-Output is a decimal fraction (e.g., 0.015 = 1.5%). The model output directly IS the Phase 1 profit target. Tick-size independent — quantization happens via `round_to_tick()`.
+Output is a decimal fraction (e.g., 0.015 = 1.5%). The raw output drives entry gate (min_reprice_pct) and allocation (alloc_fraction). The Phase 1 profit target is **dampened**: `round_to_tick(expected_pct × phase1_target_dampen, tick)` — separating "is this worth trading?" from "what target is achievable?". Default `phase1_target_dampen = 0.8`.
 
 **Component 1: `norm_spike` [0,1]** — ATR-relative spike quality:
 ```
 norm_spike = clamp((atr_ratio - min_spike_atr_ratio) / (strong_spike_atr_ratio - min_spike_atr_ratio), 0, 1)
 ```
-`atr_ratio = |displacement| / ema_atr` (dimensionless, on `SpikeInfo.atr_ratio`). Default range: 20–75.
+`atr_ratio = |displacement| / ema_atr` (dimensionless, on `SpikeInfo.atr_ratio`). Default range: 25–85.
 
 **Component 2: `adjusted_sensitivity`** — binary option delta proxy:
 ```
@@ -159,7 +171,7 @@ Default `time_exponent = 0.5` (sqrt). Set to 0 to disable. `max_time_factor` (de
 ### Three-layer entry guard
 
 1. **Hard skew cap** (`hard_skew_cap`, default 0.90): Reject if YES mid > 0.90 or < 0.10.
-2. **Minimum expected repricing** (`min_reprice_pct`, default 0.005 = 0.5%): Model output must exceed this floor. Rejection reason: `InsufficientRepricing`.
+2. **Minimum expected repricing** (`min_reprice_pct`, default 0.02 = 2.0%): Model output must exceed this floor. Rejection reason: `InsufficientRepricing`.
 3. **Dynamic allocation**: `alloc_fraction = clamp(model_output / reprice_scale, min_alloc_pct, 1.0)`.
 
 ### Allocation
@@ -233,7 +245,7 @@ The hedge system uses two phases with a single cancel/repost at the transition �
 ### Phase 1 target price computation
 
 **Normal case:**
-`target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)`
+`target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)` where `initial_profit_target = round_to_tick(expected_pct × phase1_target_dampen, tick)` — the dampened target from the repricing model (default 80% of raw expected_pct).
 
 **Cancel-race case** (`leg1_cancel_race == true`):
 `target_price = round_to_tick(1.0 - leg1_price - tick, tick)` — breakeven minus 1 tick
@@ -278,7 +290,7 @@ All emergency exits set `emergency_submitted = true` and record an `exit_reason`
 
 ### 7a. Phase 1 Breach
 
-**Trigger:** Pair cost has exceeded `phase1_breach_threshold` ($1.05) during Phase 1. Catches fast book repricing that pushes the pair well above break-even.
+**Trigger:** Pair cost has exceeded `phase1_breach_threshold` during Phase 1. Catches fast book repricing that pushes the pair well above break-even.
 
 **Gates (all must be true):**
 1. `phase == Phase1` (only during Phase 1 — Phase 2 has its own break-even breach check)
@@ -646,7 +658,7 @@ The evaluator's stale book check (500ms threshold) rejects signals based on old 
 
 ### Leg 2 with zero ask depth
 
-If the hedge book has no ask depth within 2 ticks, the emergency FOK size caps to zero. The evaluator returns None and will re-evaluate on the next event.
+Emergency FOK sizing uses full `leg1_size` (no depth cap). The executor's price-escalation loop (`emergency_fok_fallback`) sweeps cumulative depth across multiple price levels — a FOK at $0.60 fills all asks at $0.59 AND $0.60. If `leg1_size` rounds to zero (shouldn't happen in practice), the evaluator returns `None` as a safety net.
 
 ### Double emergency submission
 

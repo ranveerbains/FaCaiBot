@@ -248,6 +248,8 @@ pub struct StrategyEngine {
     diag_rej_spread: u64,  // SpreadWide
     diag_rej_depth: u64,   // InsufficientDepth
     diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
+    diag_rej_obi: u64,    // ObiMismatch: OBI contradicts spike direction
+    diag_rej_hedge_impossible: u64, // HedgeImpossible: opposing ask above breakeven
     diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
@@ -389,6 +391,8 @@ impl StrategyEngine {
             diag_rej_spread: 0,
             diag_rej_depth: 0,
             diag_rej_reprice: 0,
+            diag_rej_obi: 0,
+            diag_rej_hedge_impossible: 0,
             diag_rej_paused: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
@@ -446,6 +450,8 @@ impl StrategyEngine {
                 hard_skew_cap: config.hard_skew_cap,
                 time_exponent: config.time_exponent,
                 max_time_factor: config.max_time_factor,
+                phase1_target_dampen: config.phase1_target_dampen,
+                min_obi_alignment: config.min_obi_alignment,
             },
             leg2: Leg2Evaluator {
                 phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
@@ -1455,6 +1461,8 @@ impl StrategyEngine {
                     Leg1RejectReason::SpreadWide => self.diag_rej_spread += 1,
                     Leg1RejectReason::InsufficientDepth => self.diag_rej_depth += 1,
                     Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
+                    Leg1RejectReason::ObiMismatch => self.diag_rej_obi += 1,
+                    Leg1RejectReason::HedgeImpossible => self.diag_rej_hedge_impossible += 1,
                     Leg1RejectReason::Other => self.diag_rej_other += 1,
                 }
                 None
@@ -1710,6 +1718,8 @@ impl StrategyEngine {
             rej_spread = self.diag_rej_spread,
             rej_depth = self.diag_rej_depth,
             rej_reprice = self.diag_rej_reprice,
+            rej_obi = self.diag_rej_obi,
+            rej_hedge = self.diag_rej_hedge_impossible,
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
@@ -1781,7 +1791,7 @@ impl StrategyEngine {
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Skewed: {skew}\n\
-             Spread: {spread}  Depth: {depth}  Reprice: {reprice}  Other: {other}\n\
+             Spread: {spread}  Depth: {depth}  Reprice: {reprice}  OBI: {obi}  Hedge: {hedge}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
@@ -1809,6 +1819,8 @@ impl StrategyEngine {
             spread = self.diag_rej_spread,
             depth = self.diag_rej_depth,
             reprice = self.diag_rej_reprice,
+            obi = self.diag_rej_obi,
+            hedge = self.diag_rej_hedge_impossible,
             other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
@@ -2342,6 +2354,7 @@ impl StrategyEngine {
                 sustained_ms: 0,
                 timestamp_ms: 0,
                 atr_ratio: Decimal::ZERO,
+                obi: Decimal::ZERO,
             }),
             is_leg2: true,
             leg1_fill_price: Some(orphan.leg1_price),
@@ -2714,7 +2727,7 @@ impl StrategyEngine {
                 );
                 let t = ProfitTier::from_expected_reprice(c, self.leg1.reprice_scale);
                 let tick = self.state.tick_size;
-                let target = round_to_tick(c, tick);
+                let target = round_to_tick(c * self.leg1.phase1_target_dampen, tick);
                 (c, t, target)
             };
             // Use leg1_direction (set at signal generation, survives spike overwrites)
@@ -3677,6 +3690,7 @@ mod tests {
             sustained_ms: 300,
             timestamp_ms: now_epoch_ms() - 200,
             atr_ratio: Decimal::new(50, 0),
+            obi: Decimal::ZERO,
         });
         engine.state.atr = Some(Decimal::new(2, 3));
         engine.state.binance_price = Some(Decimal::new(50_000, 0));
@@ -3897,6 +3911,7 @@ mod tests {
             sustained_ms: 250,
             timestamp_ms: now_ms,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         };
         let leg1_price = Decimal::new(48, 2); // 0.48
         let phase1_target = Decimal::new(495, 3); // 0.495
@@ -3933,6 +3948,7 @@ mod tests {
             sustained_ms: 250,
             timestamp_ms: now_ms,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         };
         let h = HedgeState::new(
             now_ms,
@@ -3966,6 +3982,7 @@ mod tests {
             sustained_ms: 250,
             timestamp_ms: now_ms - 300,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         });
         engine.state.atr = Some(Decimal::new(2, 3));
 
@@ -4862,6 +4879,7 @@ mod tests {
             sustained_ms: 250,
             timestamp_ms: now_ms - 300,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         });
         engine.state.atr = Some(Decimal::new(2, 3));
 
@@ -4942,6 +4960,7 @@ mod tests {
             sustained_ms: 250,
             timestamp_ms: now_ms - 300,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         });
         engine.state.atr = Some(Decimal::new(2, 3));
 

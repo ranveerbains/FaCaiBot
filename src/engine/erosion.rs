@@ -135,6 +135,7 @@ mod tests {
                 sustained_ms: 300,
                 timestamp_ms: 0,
                 atr_ratio: Decimal::ZERO,
+                obi: Decimal::ZERO,
             },
             Decimal::new(7, 1),      // expected_pct = 0.7
             Decimal::new(475, 3),    // phase1_target_price = 0.475

@@ -276,7 +276,7 @@ fn handle_sbe_message(
             // ── Spike detection ───────────────────────────────────────
             if let Some(mid) = depth.mid_price() {
                 let mid_f64 = mid.to_f64().unwrap_or(0.0);
-                match detector.update(mid_f64, depth.timestamp_ms) {
+                match detector.update(mid_f64, depth.timestamp_ms, depth.obi()) {
                     SpikeEvent::Candidate(spike) => {
                         debug!(
                             direction = ?spike.direction,

@@ -177,7 +177,7 @@ On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engi
 
 Three event variants carry spike lifecycle signals:
 
-- **`SpikeCandidate(SpikeInfo)`**: ATR + magnitude passed → triggers speculative Leg 1 posting. Engine sets `spike_detected = true`, stores `last_spike`, and sets `speculative_awaiting_sustain = true`
+- **`SpikeCandidate(SpikeInfo)`**: ATR + magnitude passed → triggers speculative Leg 1 posting. Engine sets `spike_detected = true`, stores `last_spike`, and sets `speculative_awaiting_sustain = true`. `SpikeInfo` carries `atr_ratio` and `obi` (Order Book Imbalance from Binance @depth20)
 - **`SpikeConfirmed(SpikeInfo)`**: Sustain + momentum passed → clears `speculative_awaiting_sustain`, allowing sim fills. Live mode: no-op (fills come from User WS)
 - **`SpikeFailed { timestamp_ms }`**: Spike faded before sustain time → engine cancels speculative Leg 1 if still `Posted`, resets spike state. If already `Filled`: no-op, Leg 2 proceeds normally
 
@@ -388,7 +388,10 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
 | Spread | > `max_spread` ($0.02) | Dollar-based, consistent across tick sizes |
 | Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
+| Repricing model | `expected_pct < min_reprice_pct` (2.0%) | Model output too low |
+| OBI alignment | Binance OBI contradicts spike direction | `ObiMismatch` — rejects if book imbalance strongly against spike |
 | Depth | < `depth_min_pct` (20%) of required | — |
+| Hedge impossible | opposing ask - tick > breakeven | `HedgeImpossible` — no feasible hedge price at entry |
 | Paused/Draining | `paused` or `draining` flag set | `/stop` or `/shutdown` in effect |
 
 **Bidding**: `round_to_tick(best_bid + tick, tick)` → Leg 1 smart outbid walls by 1 tick (>4x avg depth). Submit GTC, post_only=true.
@@ -457,7 +460,7 @@ All emergency exits are **immediate FOK taker** at `best_ask` (`sim_was_taker=tr
 
 | Trigger | Condition | Action |
 |---------|-----------|--------|
-| **Phase 1 breach** | Pair cost (leg1 + opposing ask) > `phase1_breach_threshold` ($1.05) during Phase 1 | **Immediate FOK taker** at `best_ask` |
+| **Phase 1 breach** | Pair cost (leg1 + opposing ask) > `phase1_breach_threshold` during Phase 1 | **Immediate FOK taker** at `best_ask` |
 | **Phase 2 breach** | Opposing ask > `phase2_posted_price` during Phase 2 | **Immediate FOK taker** at `best_ask` |
 | **Phase 2 timeout** | `phase2_timeout_ms` (2000ms) elapsed in Phase 2 without fill | **Immediate FOK taker** at `best_ask` |
 | **Market expiry** | `MarketRotation` while Leg 1 Filled, Leg 2 incomplete | **Last-resort FOK** before state reset |
@@ -536,12 +539,14 @@ alignment = with_consensus ? (1 + |yes_mid - 0.5|) : (1 - |yes_mid - 0.5|)
 time_factor = min((300 / max(T, 10)) ^ time_exponent, max_time_factor)
 ```
 
-The model output IS the Phase 1 profit target (after `round_to_tick()`).
+The raw model output drives entry gate and allocation. Phase 1 profit target is **dampened**: `round_to_tick(expected_pct × phase1_target_dampen, tick)` (default 0.8 = 80% of raw expected_pct). Separates "is this worth trading?" from "what target is achievable?".
 
-**Three-layer entry guard**:
+**Entry guards** (in order):
 1. Hard skew cap: YES mid > `hard_skew_cap` (0.90) or < 0.10 → reject
-2. Min repricing: model output < `min_reprice_pct` (0.5%) → reject (`InsufficientRepricing`)
-3. Dynamic allocation: `clamp(output / reprice_scale, min_alloc_pct, 1.0)`
+2. Min repricing: model output < `min_reprice_pct` (2.0%) → reject (`InsufficientRepricing`)
+3. OBI alignment: Binance book imbalance contradicts spike direction → reject (`ObiMismatch`)
+4. Dynamic allocation: `clamp(output / reprice_scale, min_alloc_pct, 1.0)`
+5. Hedge impossible: opposing side best ask - tick > breakeven → reject (`HedgeImpossible`)
 
 **Allocation**: `alloc = max(round(max_alloc_per_trade × alloc_fraction, 2dp), $0.01)`. Dynamic — better signals get more capital.
 
@@ -586,7 +591,7 @@ Timeline:
 
 | Risk | Mitigation |
 |------|------------|
-| **Legging** | Five independent exit triggers, all immediate FOK taker at ask: (1) Phase 1 breach — pair cost > `phase1_breach_threshold` ($1.05) during Phase 1; (2) Break-even breach — pair cost > $1.00 during Phase 2; (3) Phase 2 timeout — `phase2_timeout_ms` elapsed without fill; (4) Market expiry — rotation while Leg 1 filled; (5) Whipsaw reversal — opposite spike after Leg 1 fill, bypasses hedge phases. Plus favorable taker — when opposing ask drops below posted bid, immediate FOK. 2-phase hedge system: Phase 1 (profit target, `phase1_timeout_ms`), Phase 2 (ask-1tick, hold position — no reposts, `phase2_timeout_ms` deadline). FIFO queue priority preserved |
+| **Legging** | Five independent exit triggers, all immediate FOK taker at ask: (1) Phase 1 breach — pair cost > `phase1_breach_threshold` during Phase 1; (2) Break-even breach — pair cost > $1.00 during Phase 2; (3) Phase 2 timeout — `phase2_timeout_ms` elapsed without fill; (4) Market expiry — rotation while Leg 1 filled; (5) Whipsaw reversal — opposite spike after Leg 1 fill, bypasses hedge phases. Plus favorable taker — when opposing ask drops below posted bid, immediate FOK. 2-phase hedge system: Phase 1 (profit target, `phase1_timeout_ms`), Phase 2 (ask-1tick, hold position — no reposts, `phase2_timeout_ms` deadline). FIFO queue priority preserved |
 | **False positive spikes** | Speculative posting with cancel-on-failure: post Leg 1 immediately on ATR+magnitude, cancel if sustain/momentum fails (~300ms). Post-only = zero cost on cancel. Sustain filter (300ms hold above 2×ATR) + momentum ratio (≥65% of peak) + magnitude gate (1.5 bp). **Whipsaw guard**: opposite spike cancels unfilled Leg 1, or triggers immediate FOK if filled |
 | **Stale book entries** | Post-rotation quiet period (`rotation_quiet_ms`=30000ms) blocks spike entries for 30s after market rotation, preventing trades on stale/repricing books |
 | **Rapid re-entry** | Post-trade cooldown (`trade_cooldown_ms`=5000ms) blocks new entries for 5s after trade completion, preventing rapid-fire losses on the same market |
@@ -619,9 +624,10 @@ leg1_timeout_ms, rotation_quiet_ms, trade_cooldown_ms
 [capital]              # 1 param
 max_alloc_per_trade
 
-[repricing]            # 8 params
+[repricing]            # 10 params
 reprice_scale, min_reprice_pct, min_alloc_pct, hard_skew_cap, time_exponent,
-max_time_factor, min_spike_atr_ratio, strong_spike_atr_ratio
+max_time_factor, min_spike_atr_ratio, strong_spike_atr_ratio,
+phase1_target_dampen, min_obi_alignment
 
 [risk]                 # 3 params
 phase1_timeout_ms,

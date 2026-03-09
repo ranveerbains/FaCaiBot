@@ -97,6 +97,9 @@ pub struct SpikeDetector {
 
     /// Pending diagnostic snapshot, set when the 60s gate fires in `update()`.
     pending_diag: Option<SpikeDiagSnapshot>,
+
+    /// Latest OBI from Binance @depth20 (updated each tick).
+    last_obi: Option<Decimal>,
 }
 
 impl SpikeDetector {
@@ -122,6 +125,7 @@ impl SpikeDetector {
             diag_confirmed: 0,
             last_diag_log_ms: 0,
             pending_diag: None,
+            last_obi: None,
         }
     }
 
@@ -132,7 +136,9 @@ impl SpikeDetector {
     /// - `Confirmed` — sustain + momentum passed at sustain_ms.
     /// - `Failed` — momentum/magnitude failed at sustain_ms → cancel speculative order.
     /// - `None` — normal tick, no action.
-    pub fn update(&mut self, mid: f64, now_ms: u64) -> SpikeEvent {
+    pub fn update(&mut self, mid: f64, now_ms: u64, obi: Option<Decimal>) -> SpikeEvent {
+        self.last_obi = obi;
+
         // ── Initialise on first sample ─────────────────────────────────
         let Some(prev_mid) = self.prev_mid else {
             self.prev_mid = Some(mid);
@@ -248,6 +254,7 @@ impl SpikeDetector {
                             sustained_ms: elapsed,
                             timestamp_ms: spike_start,
                             atr_ratio: Decimal::from_f64(atr_ratio).unwrap_or(Decimal::ZERO),
+                            obi: self.last_obi.unwrap_or(Decimal::ZERO),
                         };
                         info!(
                             direction = ?spike_info.direction,
@@ -318,6 +325,7 @@ impl SpikeDetector {
                 sustained_ms: 0,
                 timestamp_ms: now_ms,
                 atr_ratio: Decimal::from_f64(atr_ratio).unwrap_or(Decimal::ZERO),
+                obi: self.last_obi.unwrap_or(Decimal::ZERO),
             };
             debug!(
                 direction = ?candidate_dir,
@@ -383,7 +391,7 @@ mod tests {
         // All deltas (0.3) are below threshold — no candidates start.
         for i in 0..40 {
             let price = base + ((i % 2) as f64) * 0.3;
-            let result = det.update(price, ts);
+            let result = det.update(price, ts, None);
             ts += 100;
             assert!(
                 matches!(result, SpikeEvent::None),
@@ -401,7 +409,7 @@ mod tests {
 
         // Warm ATR with small stable moves (must exceed MIN_ATR_SAMPLES=10).
         for i in 0..30 {
-            det.update(base + (i as f64 % 2.0) * 1.0, ts);
+            det.update(base + (i as f64 % 2.0) * 1.0, ts, None);
             ts += 100;
         }
 
@@ -409,21 +417,21 @@ mod tests {
         let spike_price = base + 600.0;
 
         // Tick 1: starts the spike candidate → should return Candidate immediately.
-        let candidate = det.update(spike_price, ts);
+        let candidate = det.update(spike_price, ts, None);
         assert!(
             matches!(candidate, SpikeEvent::Candidate(_)),
             "big tick should emit Candidate immediately"
         );
         ts += 100;
         // Tick 2: continues — 100ms elapsed, below sustain_ms=200ms.
-        let mid = det.update(spike_price + 10.0, ts);
+        let mid = det.update(spike_price + 10.0, ts, None);
         assert!(
             matches!(mid, SpikeEvent::None),
             "should be None before sustain elapsed"
         );
         ts += 100;
         // Tick 3: 200ms elapsed — sustain passes, momentum pass → Confirmed.
-        let confirmed = det.update(spike_price + 10.0, ts);
+        let confirmed = det.update(spike_price + 10.0, ts, None);
 
         match confirmed {
             SpikeEvent::Confirmed(spike) => {
@@ -444,17 +452,17 @@ mod tests {
 
         // Warm ATR.
         for i in 0..20 {
-            det.update(base + (i as f64 % 2.0), ts);
+            det.update(base + (i as f64 % 2.0), ts, None);
             ts += 100;
         }
 
         // Single big spike tick — starts candidate, emits Candidate.
-        let candidate = det.update(base + 500.0, ts);
+        let candidate = det.update(base + 500.0, ts, None);
         assert!(matches!(candidate, SpikeEvent::Candidate(_)));
         ts += cfg.sustain_ms + 50; // past sustain
 
         // Price back to base — displacement below threshold at sustain → Failed.
-        let result = det.update(base, ts);
+        let result = det.update(base, ts, None);
         assert!(
             matches!(result, SpikeEvent::Failed { .. }),
             "spike candidate that faded should emit Failed"
@@ -470,12 +478,12 @@ mod tests {
 
         // Warm ATR.
         for i in 0..20 {
-            det.update(base + (i as f64 % 2.0), ts);
+            det.update(base + (i as f64 % 2.0), ts, None);
             ts += 100;
         }
 
         // Big upward tick — should return Candidate with correct direction and magnitude.
-        let result = det.update(base + 600.0, ts);
+        let result = det.update(base + 600.0, ts, None);
         match result {
             SpikeEvent::Candidate(spike) => {
                 assert_eq!(spike.direction, Direction::Up);
@@ -503,13 +511,13 @@ mod tests {
 
         // Warm ATR with small moves.
         for i in 0..20 {
-            det.update(base + (i as f64 % 2.0), ts);
+            det.update(base + (i as f64 % 2.0), ts, None);
             ts += 100;
         }
 
         // Tick exceeds ATR threshold (1.5 × ~1.0 ≈ 1.5) but magnitude is
         // only ~10/52000 ≈ 0.019% — far below the 5% minimum.
-        let result = det.update(base + 10.0, ts);
+        let result = det.update(base + 10.0, ts, None);
         assert!(
             matches!(result, SpikeEvent::None),
             "tick exceeding ATR but failing magnitude should return None"

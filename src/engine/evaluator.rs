@@ -44,6 +44,10 @@ pub(crate) enum Leg1RejectReason {
     InsufficientDepth,
     /// Model output below `min_reprice_pct` — insufficient expected repricing.
     InsufficientRepricing,
+    /// OBI (Order Book Imbalance) contradicts spike direction.
+    ObiMismatch,
+    /// Opposing side best ask already above breakeven — hedge impossible at entry.
+    HedgeImpossible,
     /// Other guard failed (no active market, bid cap invalid, zero size, etc.).
     Other,
 }
@@ -85,6 +89,10 @@ pub(crate) struct Leg1Evaluator {
     pub hard_skew_cap: Decimal,
     pub time_exponent: f64,
     pub max_time_factor: f64,
+    /// Phase 1 target dampening — only affects profit target, not entry gate or allocation.
+    pub phase1_target_dampen: Decimal,
+    /// Minimum OBI alignment — rejects if Binance book imbalance contradicts spike direction.
+    pub min_obi_alignment: Decimal,
 }
 
 impl Leg1Evaluator {
@@ -257,12 +265,26 @@ impl Leg1Evaluator {
             debug!(%expected_pct, min = %self.min_reprice_pct, "evaluate() BLOCKED: insufficient repricing");
             return Leg1Outcome::Rejected(Leg1RejectReason::InsufficientRepricing);
         }
+
+        // OBI gate: reject if Binance book imbalance contradicts spike direction.
+        let obi_aligned = match spike.direction {
+            Direction::Up => spike.obi >= -self.min_obi_alignment,   // Up spike, OBI not strongly bearish
+            Direction::Down => spike.obi <= self.min_obi_alignment,  // Down spike, OBI not strongly bullish
+        };
+        if !obi_aligned {
+            debug!(obi = %spike.obi, direction = ?spike.direction, min = %self.min_obi_alignment,
+                "evaluate() BLOCKED: OBI contradicts spike direction");
+            return Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch);
+        }
+
         let alloc_fraction = (expected_pct / self.reprice_scale)
             .min(Decimal::ONE)
             .max(self.min_alloc_pct);
         let tier = ProfitTier::from_expected_reprice(expected_pct, self.reprice_scale);
         let tick = state.tick_size;
-        let target_pct = round_to_tick(expected_pct, tick);
+        // Dampening: Phase 1 target uses dampened expected_pct for achievable pricing.
+        // Entry gate and allocation use raw expected_pct (undampened).
+        let target_pct = round_to_tick(expected_pct * self.phase1_target_dampen, tick);
 
         // Allocation: dynamic fraction of max_alloc_per_trade, $0.01 floor
         let alloc = (self.max_alloc_per_trade * alloc_fraction)
@@ -322,6 +344,25 @@ impl Leg1Evaluator {
             if outbid < best_ask_price {
                 debug!(%wall_price, %outbid, "Leg 1 smart outbid");
                 bid_price = outbid;
+            }
+        }
+
+        // Guard: reject if opposing best ask is already above breakeven.
+        // Uses bid_price (our posted entry, worst-case fill) — conservative by design.
+        let opposite_book = match direction {
+            Direction::Up => state.poly_no_book.as_ref().or(state.poly_book.as_ref()),
+            Direction::Down => state.poly_yes_book.as_ref().or(state.poly_book.as_ref()),
+        };
+        if let Some(opp_book) = opposite_book {
+            if let Some(opp_ask) = opp_book.best_ask() {
+                let breakeven_hedge = Decimal::ONE - bid_price;
+                if opp_ask.price - tick > breakeven_hedge {
+                    debug!(
+                        %bid_price, opp_ask = %opp_ask.price, %breakeven_hedge,
+                        "evaluate() BLOCKED: opposing ask above breakeven — hedge impossible"
+                    );
+                    return Leg1Outcome::Rejected(Leg1RejectReason::HedgeImpossible);
+                }
             }
         }
 
@@ -426,18 +467,6 @@ impl Leg2Evaluator {
         };
         let hedge_book = hedge_book?;
         let best_ask_price = hedge_book.best_ask().map(|a| a.price);
-        let ask_depth_2tick: Decimal = {
-            let ba = hedge_book
-                .best_ask()
-                .map(|a| a.price)
-                .unwrap_or(Decimal::ONE);
-            hedge_book
-                .asks
-                .iter()
-                .take_while(|l| l.price <= ba + tick * Decimal::TWO)
-                .map(|l| l.size)
-                .sum()
-        };
         let hedge_token_id = match snap.direction {
             Direction::Up => state.active_no_token_id.as_ref()?.clone(),
             Direction::Down => state.active_yes_token_id.as_ref()?.clone(),
@@ -454,9 +483,9 @@ impl Leg2Evaluator {
             if let Some(ask_price) = best_ask_price {
                 if leg1_price + ask_price > self.phase1_breach_threshold {
                     let price = round_to_tick(ask_price, tick);
-                    let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
+                    let fok_size = leg1_size.round_dp(2);
                     if fok_size <= Decimal::ZERO {
-                        warn!(%leg1_price, %ask_price, "phase 1 breach — no ask depth for FOK");
+                        warn!(%leg1_price, %ask_price, "phase 1 breach — zero size for FOK");
                         return None;
                     }
                     warn!(
@@ -513,9 +542,9 @@ impl Leg2Evaluator {
                             "phase 2 entry breach — ask-1tick > breakeven, immediate FOK"
                         );
                         let fok_price = round_to_tick(ask_price, tick);
-                        let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
+                        let fok_size = leg1_size.round_dp(2);
                         if fok_size <= Decimal::ZERO {
-                            warn!("phase 2 entry breach — no ask depth for FOK");
+                            warn!("phase 2 entry breach — zero size for FOK");
                             return None;
                         }
                         let mut signal = make_leg2_signal(
@@ -670,9 +699,9 @@ impl Leg2Evaluator {
                 .is_some_and(|posted| ask_price > posted);
             if breach {
                 let price = round_to_tick(ask_price, tick);
-                let fok_size = leg1_size.min(ask_depth_2tick).round_dp(2);
+                let fok_size = leg1_size.round_dp(2);
                 if fok_size <= Decimal::ZERO {
-                    warn!(%leg1_price, %ask_price, "phase 2 breach — no ask depth for FOK");
+                    warn!(%leg1_price, %ask_price, "phase 2 breach — zero size for FOK");
                     return None;
                 }
                 warn!(
@@ -978,6 +1007,7 @@ mod tests {
             sustained_ms: 200,
             timestamp_ms: 0,
             atr_ratio: Decimal::ZERO,
+            obi: Decimal::ZERO,
         };
         let book = make_book("0.30", "0.32");
         let signal = make_leg2_signal(
@@ -1068,6 +1098,7 @@ mod tests {
                 sustained_ms: 300,
                 timestamp_ms: now_ms - 6_000,
                 atr_ratio: Decimal::ZERO,
+                obi: Decimal::ZERO,
             },
             phase: HedgePhase::Phase1,
             phase1_target_price: Decimal::new(475, 3),
@@ -1114,7 +1145,7 @@ mod tests {
             size: Decimal::new(100, 0),
             timestamp_ms: now_ms - 1_000,
         };
-        // leg1=0.50, ask=0.56 → pair=1.06 > 1.05 threshold → breach
+        // leg1=0.50, ask=0.56 → pair=1.06 > 1.05 test threshold → breach
         let result = evaluator.evaluate_leg2(&state, &snap, now_ms);
         assert!(result.is_some(), "phase 1 breach should trigger FOK");
         let decision = result.unwrap();
@@ -1227,4 +1258,237 @@ mod tests {
         assert!(result.is_none(), "Phase 2 should hold position — no reposts");
     }
 
+    // ── Dampening tests ──────────────────────────────────────────────────
+
+    fn make_leg1_evaluator(dampen: &str, min_obi: &str) -> Leg1Evaluator {
+        Leg1Evaluator {
+            max_spread: Decimal::new(5, 2),      // 0.05
+            entry_cutoff_secs: 25,
+            depth_min_pct: Decimal::new(15, 2),   // 0.15
+            stale_book_ms: 5000,
+            max_alloc_per_trade: Decimal::new(15, 0),
+            depth_wall_multiplier: Decimal::new(4, 0),
+            leg1_timeout_ms: 2500,
+            min_magnitude_pct: Decimal::new(1, 2),
+            min_spike_atr_ratio: Decimal::new(25, 0),
+            strong_spike_atr_ratio: Decimal::new(85, 0),
+            reprice_scale: Decimal::new(5, 2),    // 0.05
+            min_reprice_pct: Decimal::new(1, 3),  // 0.001 — low so tests pass easily
+            min_alloc_pct: Decimal::new(25, 2),   // 0.25
+            hard_skew_cap: Decimal::new(90, 2),   // 0.90
+            time_exponent: 0.5,
+            max_time_factor: 2.0,
+            phase1_target_dampen: dampen.parse().unwrap(),
+            min_obi_alignment: min_obi.parse().unwrap(),
+        }
+    }
+
+    fn make_leg1_test_state(now_ms: u64) -> MarketState {
+        let yes_book = OrderBook {
+            asset_id: "yes".to_string(),
+            bids: vec![PriceLevel {
+                price: Decimal::new(50, 2),  // 0.50
+                size: Decimal::new(500, 0),
+            }],
+            asks: vec![PriceLevel {
+                price: Decimal::new(52, 2),  // 0.52
+                size: Decimal::new(500, 0),
+            }],
+            timestamp_ms: now_ms,
+        };
+        let no_book = OrderBook {
+            asset_id: "no".to_string(),
+            bids: vec![PriceLevel {
+                price: Decimal::new(48, 2),  // 0.48
+                size: Decimal::new(500, 0),
+            }],
+            asks: vec![PriceLevel {
+                price: Decimal::new(49, 2),  // 0.49
+                size: Decimal::new(500, 0),
+            }],
+            timestamp_ms: now_ms,
+        };
+        MarketState {
+            poly_yes_book: Some(yes_book.clone()),
+            poly_no_book: Some(no_book),
+            poly_book: Some(yes_book),
+            binance_price: Some(Decimal::new(50_000, 0)),
+            active_condition_id: Some("cond".to_string()),
+            active_yes_token_id: Some("yes".to_string()),
+            active_no_token_id: Some("no".to_string()),
+            tick_size: Decimal::new(1, 2),
+            market_end_timestamp_ms: now_ms + 240_000,
+            leg1_state: OrderState::None,
+            leg2_state: OrderState::None,
+            spike_detected: true,
+            last_spike: Some(SpikeInfo {
+                direction: Direction::Up,
+                magnitude: Decimal::new(5, 3),
+                sustained_ms: 300,
+                timestamp_ms: now_ms - 200,
+                atr_ratio: Decimal::new(60, 0),  // 60x — strong spike
+                obi: Decimal::new(3, 1),          // 0.3 — bid-heavy
+            }),
+            atr: Some(Decimal::new(2, 3)),
+            ..MarketState::default()
+        }
+    }
+
+    #[test]
+    fn test_dampening_reduces_target_not_allocation() {
+        let now_ms = 100_000;
+        let eval = make_leg1_evaluator("0.8", "0.0");
+        let state = make_leg1_test_state(now_ms);
+
+        let outcome = eval.evaluate(&state, now_ms);
+        match outcome {
+            Leg1Outcome::Signal(sig) => {
+                // profit_target_pct should be less than expected_pct due to dampening
+                assert!(sig.profit_target_pct < sig.expected_pct,
+                    "dampened target ({}) should be < expected_pct ({})",
+                    sig.profit_target_pct, sig.expected_pct);
+                // allocation should be based on raw expected_pct (>0)
+                assert!(sig.alloc_amount > Decimal::ZERO);
+            }
+            other => panic!("expected Signal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dampening_1_0_is_noop() {
+        let now_ms = 100_000;
+        let eval_damped = make_leg1_evaluator("1.0", "0.0");
+        let state = make_leg1_test_state(now_ms);
+
+        let outcome = eval_damped.evaluate(&state, now_ms);
+        match outcome {
+            Leg1Outcome::Signal(sig) => {
+                // With dampen=1.0, profit_target_pct should equal round_to_tick(expected_pct)
+                let expected_target = round_to_tick(sig.expected_pct, Decimal::new(1, 2));
+                assert_eq!(sig.profit_target_pct, expected_target,
+                    "dampen=1.0 should produce target = round_to_tick(expected_pct)");
+            }
+            other => panic!("expected Signal, got {other:?}"),
+        }
+    }
+
+    // ── Hedge impossible guard tests ─────────────────────────────────────
+
+    #[test]
+    fn test_entry_blocked_hedge_impossible() {
+        let now_ms = 100_000;
+        let eval = make_leg1_evaluator("0.8", "0.0");
+        let mut state = make_leg1_test_state(now_ms);
+        // Set NO ask very high — hedge would be impossible.
+        // bid_price for leg1 will be ~0.51 (best_bid 0.50 + tick 0.01).
+        // breakeven_hedge = 1.0 - 0.51 = 0.49.
+        // If NO ask = 0.51, then opp_ask - tick (0.51 - 0.01 = 0.50) > 0.49 → blocked.
+        state.poly_no_book = Some(OrderBook {
+            asset_id: "no".to_string(),
+            bids: vec![PriceLevel {
+                price: Decimal::new(48, 2),
+                size: Decimal::new(500, 0),
+            }],
+            asks: vec![PriceLevel {
+                price: Decimal::new(51, 2),  // 0.51 — above breakeven
+                size: Decimal::new(500, 0),
+            }],
+            timestamp_ms: now_ms,
+        });
+
+        match eval.evaluate(&state, now_ms) {
+            Leg1Outcome::Rejected(Leg1RejectReason::HedgeImpossible) => {} // expected
+            other => panic!("expected HedgeImpossible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_entry_allowed_hedge_feasible() {
+        let now_ms = 100_000;
+        let eval = make_leg1_evaluator("0.8", "0.0");
+        let state = make_leg1_test_state(now_ms);
+        // Default NO ask is 0.49. bid_price ~0.51. breakeven = 0.49.
+        // opp_ask (0.49) - tick (0.01) = 0.48 <= 0.49 → allowed.
+
+        match eval.evaluate(&state, now_ms) {
+            Leg1Outcome::Signal(_) => {} // expected
+            other => panic!("expected Signal, got {other:?}"),
+        }
+    }
+
+    // ── OBI tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_obi_computation() {
+        use crate::types::market::BinanceDepth;
+        let depth = BinanceDepth {
+            symbol: "BTCUSDT",
+            bids: vec![
+                PriceLevel { price: Decimal::new(100, 0), size: Decimal::new(30, 0) },
+                PriceLevel { price: Decimal::new(99, 0), size: Decimal::new(20, 0) },
+            ],
+            asks: vec![
+                PriceLevel { price: Decimal::new(101, 0), size: Decimal::new(10, 0) },
+                PriceLevel { price: Decimal::new(102, 0), size: Decimal::new(40, 0) },
+            ],
+            timestamp_ms: 0,
+        };
+        // bid_depth = 50, ask_depth = 50, total = 100, OBI = 0/100 = 0
+        let obi = depth.obi().unwrap();
+        assert_eq!(obi, Decimal::ZERO, "equal depths should give OBI = 0");
+    }
+
+    #[test]
+    fn test_obi_computation_bullish() {
+        use crate::types::market::BinanceDepth;
+        let depth = BinanceDepth {
+            symbol: "BTCUSDT",
+            bids: vec![
+                PriceLevel { price: Decimal::new(100, 0), size: Decimal::new(80, 0) },
+            ],
+            asks: vec![
+                PriceLevel { price: Decimal::new(101, 0), size: Decimal::new(20, 0) },
+            ],
+            timestamp_ms: 0,
+        };
+        // bid=80, ask=20, total=100, OBI = 60/100 = 0.6
+        let obi = depth.obi().unwrap();
+        assert_eq!(obi, Decimal::new(6, 1));
+    }
+
+    #[test]
+    fn test_obi_gate_rejects_misaligned() {
+        let now_ms = 100_000;
+        let eval = make_leg1_evaluator("0.8", "0.2");
+        let mut state = make_leg1_test_state(now_ms);
+        // Up spike with OBI = -0.3 (ask-heavy, contradicts Up direction).
+        // min_obi_alignment = 0.2, so gate checks obi >= -0.2. -0.3 < -0.2 → reject.
+        state.last_spike = Some(SpikeInfo {
+            direction: Direction::Up,
+            magnitude: Decimal::new(5, 3),
+            sustained_ms: 300,
+            timestamp_ms: now_ms - 200,
+            atr_ratio: Decimal::new(60, 0),
+            obi: Decimal::new(-3, 1),  // -0.3
+        });
+
+        match eval.evaluate(&state, now_ms) {
+            Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch) => {} // expected
+            other => panic!("expected ObiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_obi_gate_allows_aligned() {
+        let now_ms = 100_000;
+        let eval = make_leg1_evaluator("0.8", "0.2");
+        let state = make_leg1_test_state(now_ms);
+        // Default spike has obi = 0.3 (bid-heavy, aligns with Up direction).
+        // Gate checks obi >= -0.2. 0.3 >= -0.2 → passes.
+
+        match eval.evaluate(&state, now_ms) {
+            Leg1Outcome::Signal(_) => {} // expected
+            other => panic!("expected Signal, got {other:?}"),
+        }
+    }
 }

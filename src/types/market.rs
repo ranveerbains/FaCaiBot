@@ -154,6 +154,19 @@ impl BinanceDepth {
             _ => None,
         }
     }
+
+    /// Order Book Imbalance: `(bid_depth - ask_depth) / (bid_depth + ask_depth)`.
+    /// Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish).
+    /// Returns `None` if total depth is zero.
+    pub fn obi(&self) -> Option<Decimal> {
+        let bid_depth: Decimal = self.bids.iter().map(|l| l.size).sum();
+        let ask_depth: Decimal = self.asks.iter().map(|l| l.size).sum();
+        let total = bid_depth + ask_depth;
+        if total.is_zero() {
+            return None;
+        }
+        Some((bid_depth - ask_depth) / total)
+    }
 }
 
 // ─── Spike Info ──────────────────────────────────────────────────────────────
@@ -172,6 +185,9 @@ pub struct SpikeInfo {
     /// Spike displacement in ATR multiples (abs_displacement / ema_atr).
     /// Dimensionless — automatically adapts to volatility regime.
     pub atr_ratio: Decimal,
+    /// Order Book Imbalance from Binance @depth20 at spike time.
+    /// Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish).
+    pub obi: Decimal,
 }
 
 // ─── Market State ────────────────────────────────────────────────────────────
