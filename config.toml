@@ -5,7 +5,7 @@ prewarm_lead_secs = 20
 
 [spike_detection]
 # ATR multiplier for spike candidate trigger
-multiplier = 20
+multiplier = 25
 # EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
 atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
@@ -21,13 +21,13 @@ max_spread = 0.025
 # Minimum book depth as fraction of trade size
 depth_min_pct = 0.20
 # No entries within this many seconds of market expiry
-entry_cutoff_secs = 25
+entry_cutoff_secs = 20
 # Max age (ms) of Binance SBE event before discard
 binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
-stale_book_ms = 500
+stale_book_ms = 850
 # Cancel unfilled Leg 1 after this many ms
-leg1_timeout_ms = 2000
+leg1_timeout_ms = 2500
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
