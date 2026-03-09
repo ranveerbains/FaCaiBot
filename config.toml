@@ -11,7 +11,7 @@ atr_alpha = 0.02
 # Sustain duration (ms) before spike confirmation
 sustain_ms = 300
 # Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
-min_magnitude_pct = 0.015
+min_magnitude_pct = 0.0125
 # Minimum displacement/peak ratio at sustain time
 momentum_ratio_min = 0.75
 
@@ -39,7 +39,7 @@ max_alloc_per_trade = 15
 
 [repricing]
 # Minimum spike ATR ratio to trade (spikes below → f1 = 0)
-min_spike_atr_ratio = 30
+min_spike_atr_ratio = 20
 # Spike ATR ratio at which spike quality factor = 1.0
 strong_spike_atr_ratio = 75
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
