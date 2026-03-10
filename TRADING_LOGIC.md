@@ -30,17 +30,19 @@ This document covers FaCaiBot's trading logic: signal detection, entry validatio
 FaCaiBot exploits the repricing lag between Binance (source of truth) and Polymarket's CLOB (5-minute BTC prediction markets). When BTC spikes on Binance, Polymarket market makers take seconds to adjust quotes. The bot enters before repricing and hedges with the opposite side:
 
 ```
-Binance spike UP → Buy YES cheap (Leg 1, post-only, $0 fee)
+Binance spike UP → Buy YES (Leg 1, batch FAK taker at 3 price levels)
                  → CLOB reprices
-                 → Buy NO (Leg 2, post-only, $0 fee)
+                 → Buy NO (Leg 2, post-only maker, $0 fee)
                  → Paired position: e.g. $0.48 + $0.495 = $0.975
                  → Market resolves → pays $1.00 → 2.5% profit
 ```
 
 **Key economics:**
-- Both legs target post-only execution (maker, zero fee)
-- Taker fees apply only to FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, whipsaw reversal, market expiry) — max 1.56% at p=0.50; at 50 shares ~$0.78 per FOK fill
-- Unfilled post-only orders cost nothing — failed signals are free
+- Leg 1 uses batch FAK taker orders — incurs taker fees but has higher fill rate
+- Leg 2 targets post-only execution (maker, zero fee) where possible
+- Additional taker fees apply to Leg 2 FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, whipsaw reversal, market expiry) and favorable taker fills
+- Taker fee formula: `C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50
+- FAK orders that find no liquidity cancel automatically — zero cost for unfilled levels
 
 **One trade at a time.** The engine self-gates after emitting a Leg 1 signal: no new spikes are evaluated until the current trade completes or resets.
 
@@ -196,25 +198,26 @@ Entry size: `round_dp(alloc / bid_price, 2)`. If entry_size rounds to 0, the sig
 
 ### Pricing logic
 
-1. **Base bid:** `round_to_tick(best_bid + tick, tick)` — one tick above current best bid
-2. **Post-only cap:** If `bid_price >= best_ask`, cap at `best_ask - tick` (must not cross spread)
-3. **Smart outbidding:** If a depth wall is detected (single level with > 4x average depth), outbid it by 1 tick, as long as the outbid price is below the ask
+The evaluator sets `signal.price = best_ask` — the best ask on the directional book (YES for Up spikes, NO for Down). This is the anchor for the FAK batch ladder. The `size = (alloc / ask_price).round_dp(2)` per order.
+
+### Batch FAK execution
+
+Leg 1 uses a batch of 3 Fill-And-Kill (FAK) taker orders placed in parallel via `tokio::join!`:
+
+1. **Price levels:** `[ask - N×tick, ask, ask + N×tick]` where N = `fak_price_offset_ticks` (default 1)
+2. **Size adjustment:** Each order's size is adjusted via `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB constraint for FAK/FOK orders)
+3. **Parallel placement:** All 3 orders are submitted simultaneously (~1.2s total round-trip)
+4. **Fill query:** After placement, `get_order_status()` is called for each order in parallel to retrieve `size_matched`
+5. **Aggregation:** VWAP = `Σ(price × size_matched) / Σ(size_matched)`, rounded to 2dp
+6. **Feedback:** `OrderPosted { already_filled: true, price: vwap, size: total_filled }` — the engine transitions directly to `Filled` and starts the hedge
+
+If all 3 orders have zero fills, `OrderFailed` feedback is sent and the slot is freed for the next spike. FAK orders that find no liquidity at their price level cancel automatically — zero cost.
 
 ### Fill models
 
-**Speculative posting**: Leg 1 is posted on `SpikeCandidate` (before sustain confirmation), gaining ~300ms of CLOB queue priority. If `SpikeFailed` arrives before fill, the order is cancelled at zero cost (post-only). If `SpikeFailed` arrives after fill, the fill is valid and Leg 2 proceeds normally.
+**Simulation:** The engine simulates FAK taker fills. On each loop iteration, it checks if `ask <= fill_price` (our limit) and `near_ask_depth > 0` within 2 ticks. If both pass, transitions to `Filled` instantly (no timing gate) and initializes the hedge.
 
-**Simulation:** The engine acts as the simulated CLOB. On each event loop iteration, it checks post-only validity (bid < ask) and near-ask depth within 2 ticks. If both pass, transitions `leg1_state` from `Posted` to `Filled`, initializes the hedge (`init_leg2()`), and emits a confirmed fill signal. **Speculative fill gate**: fills are blocked while `speculative_awaiting_sustain = true` (set on `SpikeCandidate`, cleared on `SpikeConfirmed`). This ensures sim fills only happen after the spike is confirmed (~300ms).
-
-**Live:** The executor builds a post-only GTC order and submits via the `polymarket-client-sdk` (which handles EIP-712 signing, fee rate lookup, and tick size validation internally). On acceptance, it sends `OrderPosted` feedback (with the CLOB order ID) back to the engine, then enters a REST fill polling loop (`poll_leg1_fill()`): every 200ms it calls `GET /data/order/{id}` via the SDK's `order()` method. On detecting `Filled` status, it sends `RestFillDetected` feedback — the engine transitions Leg 1 to `Filled` and starts the hedge system (~200ms deterministic latency). The User WS remains as backup: if the REST poll doesn't detect the fill (network error, order cancelled externally, max polls reached), the User WS `TradeStatusUpdate` with MATCHED status will handle it. If REST detects the fill first, the later User WS event is deduped (`leg1_state` is already `Filled`, not `Posted`). During polling, the executor checks for incoming commands via `rx.try_recv()`: `CancelLeg1` is executed inline, other commands (MarketRotation, etc.) are buffered in `deferred_cmd` and processed in the next `run()` loop iteration.
-
-### Leg 1 staleness timeout
-
-If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) of actual book resting time, the engine cancels it and frees the slot for the next spike. Without this, an unfilled Leg 1 blocks all subsequent spikes until market rotation.
-
-**Sim mode:** Checked in `advance_simulation()` before fill check. Rarely fires (instant fills). Uses the provisional `timestamp_ms` from `evaluate()`, which is correct since there's no CLOB round-trip.
-
-**Live mode:** `check_leg1_staleness()` runs each engine loop iteration. It **skips provisional order IDs** (`"sim-..."`) — the CLOB round-trip (~1.2s) would consume the entire timeout before the order reaches the book. The timer starts when `on_order_posted()` resets `timestamp_ms` with the real CLOB ID. This ensures the full `leg1_timeout_ms` is actual book resting time. If `SpikeFailed` or staleness fires while the ID is still provisional, a `cancel_leg1_on_feedback` flag defers the cancel until the real CLOB ID arrives via `ExecutorFeedback::OrderPosted`.
+**Live:** The executor places the FAK batch, queries fill status, computes VWAP, and sends `OrderPosted { already_filled: true }`. The engine's `on_order_posted()` transitions Leg 1 directly to `Filled`, calls `init_leg2()`, and sends the Telegram opportunity alert. No REST fill polling or User WS backup needed — fills are confirmed synchronously via `get_order_status()`.
 
 ---
 

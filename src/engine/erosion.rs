@@ -27,6 +27,7 @@ pub(crate) struct HedgeState {
     pub leg1_fill_ms: u64,
     pub initial_profit_target: Decimal,
     pub leg1_fill_price: Decimal,
+    pub leg1_taker_fee: Decimal,
     pub tier: ProfitTier,
     pub direction: Direction,
     pub spike_info: SpikeInfo,
@@ -51,6 +52,7 @@ impl HedgeState {
     pub fn new(
         leg1_fill_ms: u64,
         leg1_fill_price: Decimal,
+        leg1_taker_fee: Decimal,
         tier: ProfitTier,
         initial_profit_target: Decimal,
         direction: Direction,
@@ -62,6 +64,7 @@ impl HedgeState {
             leg1_fill_ms,
             initial_profit_target,
             leg1_fill_price,
+            leg1_taker_fee,
             tier,
             direction,
             spike_info,
@@ -77,7 +80,7 @@ impl HedgeState {
     }
 
     pub fn break_even(&self) -> Decimal {
-        Decimal::ONE - self.leg1_fill_price
+        Decimal::ONE - self.leg1_fill_price - self.leg1_taker_fee
     }
 }
 
@@ -100,6 +103,8 @@ pub(crate) struct HedgeSnap {
     pub emergency_submitted: bool,
     #[allow(dead_code)] // populated for diagnostic logging
     pub break_even: Decimal,
+    #[allow(dead_code)] // used in upcoming FAK hedge phases
+    pub leg1_taker_fee: Decimal,
     pub initial_profit_target: Decimal,
     pub direction: Direction,
     pub fill_ms: u64,
@@ -126,6 +131,7 @@ mod tests {
         HedgeState::new(
             0,
             Decimal::new(50, 2),    // leg1_fill_price = 0.50
+            Decimal::ZERO,          // leg1_taker_fee
             ProfitTier::High,
             Decimal::new(25, 3),     // initial_profit_target = 0.025
             Direction::Up,

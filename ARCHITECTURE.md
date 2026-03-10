@@ -5,18 +5,18 @@
 FaCaiBot exploits the repricing lag on Polymarket's CLOB. When Binance BTC/USDT spikes, Polymarket market makers take seconds to adjust quotes. The bot detects the spike, enters before repricing, and hedges with the opposite side:
 
 ```
-Binance spike → Buy directional shares cheap (Leg 1, post-only, $0 fee)
+Binance spike → Buy directional shares (Leg 1, batch FAK taker at 3 price levels)
              → CLOB reprices
-             → Buy opposite shares (Leg 2, post-only, $0 fee)
+             → Buy opposite shares (Leg 2, post-only maker, $0 fee)
              → Paired position: e.g. $0.48 + $0.495 = $0.975 → pays $1.00 → 2.5% profit
 ```
 
-Both legs are `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply only to FOK fills: emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, market expiry, whipsaw reversal) and favorable taker fills (opposing ask dropped below posted bid). Maker fills earn an estimated rebate of 20% of the fee-equivalent (same formula as taker fee) — computed per fill via `SimFill::compute_maker_rebate()` and included in net PnL calculations and Telegram messages.
+Leg 1 uses Fill-And-Kill (FAK) taker orders at 3 price levels (`ask - N×tick`, `ask`, `ask + N×tick`) placed in parallel via `tokio::join!`. FAK orders fill whatever is available and cancel the remainder — no resting orders. Leg 2 targets `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply to Leg 1 FAK fills and Leg 2 FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, market expiry, whipsaw reversal) and favorable taker fills. Maker fills earn an estimated rebate of 20% of the fee-equivalent — computed per fill via `SimFill::compute_maker_rebate()` and included in net PnL calculations and Telegram messages.
 
-**Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. Post-only entry preserves the full spread at the cost of lower fill rate (~30-50%). Unfilled signals cost nothing.
+**Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. FAK batch entry has higher fill probability (3 price levels) and lower latency (~1.2s parallel) compared to post-only resting orders.
 
 **Modes** (`MODE` env var):
-- **`live`**: Submits real orders via polymarket-client-sdk (EIP-712 signing handled internally), detects fills via REST polling (primary, ~200ms) + User WS (backup)
+- **`live`**: Submits real orders via polymarket-client-sdk (EIP-712 signing handled internally), Leg 1 fills confirmed via `get_order_status()` after FAK batch, Leg 2 fills detected via User WS
 - **`simulation`**: Full pipeline against live data, but engine simulates fills internally. Reports via Telegram + QuestDB
 
 ---
@@ -139,9 +139,8 @@ Handles the full trade lifecycle via the SDK-backed `PolymarketGateway`:
 
 | Signal | Action |
 |--------|--------|
-| Leg 1 | Post-only GTC → feedback `OrderPosted` to engine → REST poll for fill (`poll_leg1_fill()`: 200ms intervals, max 13 polls) → `RestFillDetected` feedback on fill |
-| Leg 1 rejected | CLOB returns `Rejected` → feedback `OrderFailed` to engine |
-| CancelLeg1 | Send cancel → `CancelResult { was_cancelled }` feedback to engine |
+| Leg 1 | Batch FAK: 3 parallel orders at `[ask-N×tick, ask, ask+N×tick]` → `get_order_status()` per order → VWAP + total fill → `OrderPosted { already_filled: true }` to engine |
+| Leg 1 zero fills | All FAK orders empty → feedback `OrderFailed` to engine |
 | Leg 2 hedge (Phase 1 initial) | Post once at profit target. Cancel block is defensive-only (Phase 1 doesn't repost). If rejected/crosses-book → `attempt_favorable_maker_then_fok()` |
 | Leg 2 hedge rejected | Post-only rejected or "crosses book" → `attempt_favorable_maker_then_fok()`: try maker at ask-1tick (poll up to `favorable_maker_timeout_ms`), then FOK fallback. `fill_method=FavorableMaker` or `FavorableTaker` |
 | Leg 2 emergency | Cancel ALL resting Leg 2 orders (Phase 1 + Phase 2) → confirmed: `emergency_fok_fallback()`. NOT confirmed: `CancelResult` feedback, skip replacement |
@@ -161,25 +160,16 @@ On placement failure or CLOB rejection, sends `OrderFailed` feedback so the engi
 
 ### Spike Detection (`gateway/binance/spike.rs`)
 
-**Speculative posting model**: The detector emits a `SpikeCandidate` immediately when ATR + magnitude pass, allowing the engine to post a Leg 1 order ~300ms before confirmation. If the spike fails to sustain, the speculative order is cancelled (post-only = zero cost). This gains ~300ms of CLOB queue priority vs waiting for full confirmation.
+**Immediate confirmation**: The detector emits `SpikeConfirmed` immediately when ATR threshold + magnitude gate both pass — no sustain window, no momentum check. This minimizes latency for the FAK batch entry.
 
 1. **Mid-price**: `(best_bid + best_ask) / 2` from `@depth20` updates (SBE binary, 50ms cadence)
 2. **Rolling EMA-ATR**: alpha=0.01 (~100 ticks / ~5s memory at 50ms/tick). No spikes emitted for first 10 ticks while ATR warms up
-3. **Spike trigger + magnitude gate** (immediate): `|delta| > multiplier * ATR` (2x) AND `displacement / origin_price >= min_magnitude_pct` (1.5 bp). If both pass → emit `SpikeCandidate` immediately → engine posts speculative Leg 1
-4. **Sustain + momentum check** (at `sustain_ms` = 300ms):
-   - **Displacement held**: price must still be displaced above threshold at sustain time
-   - **Momentum ratio**: displacement at sustain must be ≥65% of peak (filters fading spikes)
-   - If both pass → emit `SpikeConfirmed` (gates sim fills)
-   - If either fails → emit `SpikeFailed` (engine cancels speculative Leg 1)
-5. **One attempt**: Each spike evaluates exactly once. `spike_detected` cleared regardless of outcome
+3. **Spike trigger + magnitude gate**: `|delta| > multiplier * ATR` AND `displacement / origin_price >= min_magnitude_pct`. If both pass → emit `SpikeConfirmed` immediately
+4. **One attempt**: Each spike evaluates exactly once. `spike_detected` cleared regardless of outcome
 
 ### Spike Signal Delivery
 
-Three event variants carry spike lifecycle signals:
-
-- **`SpikeCandidate(SpikeInfo)`**: ATR + magnitude passed → triggers speculative Leg 1 posting. Engine sets `spike_detected = true`, stores `last_spike`, and sets `speculative_awaiting_sustain = true`. `SpikeInfo` carries `atr_ratio` and `obi` (Order Book Imbalance from Binance @depth20)
-- **`SpikeConfirmed(SpikeInfo)`**: Sustain + momentum passed → clears `speculative_awaiting_sustain`, allowing sim fills. Live mode: no-op (fills come from User WS)
-- **`SpikeFailed { timestamp_ms }`**: Spike faded before sustain time → engine cancels speculative Leg 1 if still `Posted`, resets spike state. If already `Filled`: no-op, Leg 2 proceeds normally
+Single event variant: **`SpikeConfirmed(SpikeInfo)`** — ATR + magnitude passed → engine sets `spike_detected = true`, stores `last_spike`, and evaluates entry. `SpikeInfo` carries `atr_ratio` and `obi` (Order Book Imbalance from Binance @depth20).
 
 Normal `BinanceTick` events only update `binance_price` — they never trigger spike evaluation.
 
@@ -374,7 +364,7 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
 
 ### Leg 1: Entry
 
-**Speculative entry**: Leg 1 is posted speculatively on `SpikeCandidate` (before sustain confirmation). `evaluate(&mut self)` clears `spike_detected`, sets `leg1_state = Posted` with a provisional `"sim-leg1-{ts}"` ID, and increments `cumulative_used`. One trade at a time. If `SpikeFailed` arrives before fill, the order is cancelled and state reset (post-only = zero cost).
+**Batch FAK entry**: On `SpikeConfirmed`, `evaluate()` clears `spike_detected`, sets `leg1_state = Posted` with a provisional `"sim-leg1-{ts}"` ID, and increments `cumulative_used`. One trade at a time. The evaluator sets `signal.price = best_ask` (anchor for FAK ladder).
 
 **Pre-entry guards** (abort if any fail):
 
@@ -385,61 +375,35 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
 | No Binance price | `binance_price` absent | — |
 | Stale book | book age > `stale_book_ms` (500ms) | — |
 | Price skew | YES mid > 0.80 or < 0.20 | Near-certain-resolution, Leg 2 fill collapses |
-| Spread | > `max_spread` ($0.02) | Dollar-based, consistent across tick sizes |
-| Active trade | `leg1_state != None` | Checked **after** spread — `rej_busy` counts only valid-book spikes lost to a busy executor |
+| Active trade | `leg1_state != None` | `rej_busy` counts valid-book spikes lost to busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Repricing model | `expected_pct < min_reprice_pct` (2.0%) | Model output too low |
 | OBI alignment | Binance OBI contradicts spike direction | `ObiMismatch` — rejects if book imbalance strongly against spike |
-| Depth | < `depth_min_pct` (20%) of required | — |
-| Hedge impossible | opposing ask - tick > breakeven | `HedgeImpossible` — no feasible hedge price at entry |
 | Paused/Draining | `paused` or `draining` flag set | `/stop` or `/shutdown` in effect |
 
-**Bidding**: `round_to_tick(best_bid + tick, tick)` → Leg 1 smart outbid walls by 1 tick (>4x avg depth). Submit GTC, post_only=true.
+**Pricing**: `signal.price = best_ask`. Executor builds 3 FAK orders at `[ask - N×tick, ask, ask + N×tick]` where N = `fak_price_offset_ticks` (default 1).
 
-**Sizing**: Confidence-weighted allocation (see Section 5).
+**Sizing**: `(alloc / ask_price).round_dp(2)` per order. Each adjusted via `clob_safe_fok_size()` for CLOB `price × size ≤ 2dp` constraint.
 
-**Provisional ID lifecycle** (live mode only):
+**Execution flow** (live mode):
 
 ```
-evaluate() sets:      leg1_state = Posted("sim-leg1-{ts}")    ← provisional
-Executor places:      POST /order → CLOB returns hex hash
-OrderPosted feedback: leg1_state = Posted("0x13828d75...")     ← real
+evaluate() sets:          leg1_state = Posted("sim-leg1-{ts}")
+Executor: tokio::join!    3 × place_order(FAK) at [ask-tick, ask, ask+tick]  (~1.2s parallel)
+Executor: tokio::join!    3 × get_order_status()                             (~200ms parallel)
+Executor computes:        VWAP + total_filled
+OrderPosted feedback:     leg1_state → Filled(vwap, total_filled, already_filled=true)
 ```
 
-Three things can happen to the provisional ID before `OrderPosted` arrives:
-1. **SpikeFailed**: Set `cancel_leg1_on_feedback` flag. When `OrderPosted` arrives later, immediately return `CancelLeg1` with the real ID instead of resurrecting state.
-2. **Staleness timeout**: Same as SpikeFailed — `check_leg1_staleness()` skips provisional IDs, so this can't fire until the real ID is set. But if the engine code path reaches it while provisional, the flag mechanism applies.
-3. **OrderFailed**: Placement failed at the CLOB — clear the flag (nothing to cancel), state already `None`.
+If all 3 FAK orders have zero fills, `OrderFailed` resets state to `None`. FAK orders that find no liquidity cancel automatically — zero cost.
 
-### Leg 1 Cancel Edge Cases
-
-Every Leg 1 cancel path (SpikeFailed, staleness, /stop, /shutdown, /set) follows the **save-then-clear** pattern:
-
-1. If the order has a real CLOB ID: save `(order_id, price, size)` in `cancelled_leg1_info`, send `CancelLeg1` to executor, set `leg1_state = None`
-2. If the order has a provisional ID: set `cancel_leg1_on_feedback = true`, set `leg1_state = None` (cancel deferred until real ID arrives)
-3. Executor sends cancel to CLOB, receives response, sends `CancelResult` feedback
-4. Engine `on_cancel_result()`:
-   - `was_cancelled = true`: order was actually on the book and is now gone. Clear `cancelled_leg1_info`. Slot freed.
-   - `was_cancelled = false`: order filled before the cancel reached CLOB. Restore `leg1_state = Posted` from saved info. Set `leg1_cancel_race = true` on `LiveTradeMeta` BEFORE replay (so `init_leg2()` can detect it). Replay `pending_fills` buffer (sends opportunity alert + increments `live_market_signals` for Leg 1 fills). Re-set `leg1_cancel_race = true` AFTER replay (replay resets `LiveTradeMeta` via `Default`, but preserves `leg1_cancel_race` explicitly) — this propagates to `SimTrade` and shows as `[FILLED MID-CANCEL]` in Telegram. If the MATCHED was buffered, replay transitions to `Filled` immediately; otherwise the User WS MATCHED event will arrive and transition to `Filled`. Leg 2 proceeds with **breakeven target** (see below).
-
-**Why not just ignore the CancelResult?** Without restore, the MATCHED event arrives to `leg1_state = None` → unmatched → the fill is silently lost. The bot has an untracked position with no hedge.
-
-### Leg 1 Staleness Timeout
-
-If a posted Leg 1 order is not filled within `leg1_timeout_ms` (default 2500ms) of actual book resting time, the engine cancels it and frees the slot for the next spike.
-
-- **Timer start**: Begins when `on_order_posted()` sets the real CLOB ID (resets `timestamp_ms`). The ~1.2s CLOB round-trip does NOT count.
-- **Provisional skip**: `check_leg1_staleness()` returns `None` for `"sim-..."` IDs — the order hasn't reached the book yet.
-- **Save-then-clear**: Order info saved in `cancelled_leg1_info` before clearing state.
-- **Sim mode**: `advance_simulation()` handles staleness directly (no CLOB round-trip, provisional timing is correct).
+**Whipsaw guard**: If an opposite spike arrives while Leg 1 is `Posted` (unfilled), the engine resets `leg1_state = None` immediately — FAK orders are already cancelled on the CLOB (Fill-And-Kill). If Leg 1 is `Filled`, triggers emergency FOK exit.
 
 ### Leg 2: Hedge
 
-Triggered when Leg 1 fills. In live mode, fills are detected via dual-path: (1) REST polling (primary, ~200ms deterministic — `poll_leg1_fill()` polls `GET /data/order/{id}` every 200ms, sends `RestFillDetected` feedback), or (2) User WS `"order"` events with MATCHED status (backup, variable latency). Whichever arrives first transitions Leg 1 to `Filled` and starts the 2-phase hedge; the second is deduped. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally (only after `SpikeConfirmed` clears the speculative fill gate).
+Triggered when Leg 1 fills. In live mode, the batch FAK executor sends `OrderPosted { already_filled: true }` — the engine's `on_order_posted()` transitions directly to `Filled`, calls `init_leg2()`, and fires the Telegram opportunity alert. In sim mode, `advance_simulation()` transitions `Posted → Filled` internally when `ask <= fill_price` and ask depth > 0.
 
-**Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)` — except for cancel-race fills (see below).
-
-**Cancel-race breakeven target**: When `leg1_cancel_race` is `true` (Leg 1 filled mid-cancel), `init_leg2()` overrides the profit target with a breakeven target: `round_to_tick(1.0 - leg1_price - tick, tick)`. The thesis is impaired because the spike that triggered entry has reversed (that's why a cancel was attempted), so pursuing the original profit target is unrealistic. Targeting breakeven minus 1 tick gives the best chance of a clean exit. The `leg1_cancel_race` flag is set in `on_cancel_result()` before `replay_pending_fills()` and preserved across the `LiveTradeMeta::default()` reset inside replay.
+**Target price**: `round_to_tick(1.0 - target_profit - leg1_price, tick)`.
 
 **2-phase hedge system with dual-order** (all post-only until emergency):
 

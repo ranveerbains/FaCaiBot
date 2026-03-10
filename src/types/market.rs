@@ -361,24 +361,15 @@ pub enum IngestorEvent {
     /// Depth snapshot from SBE `@depth20` stream (50ms cadence).
     BinanceDepth(BinanceDepth),
 
-    /// Spike candidate from the Binance spike detector (ATR + magnitude passed).
-    /// Emitted immediately on the initial big tick — triggers speculative Leg 1 posting.
-    SpikeCandidate(SpikeInfo),
-
     /// Spike confirmed after sustain + momentum check passed.
     /// Gates sim Leg 1 fills; live mode no-op (fills come from User WS).
     SpikeConfirmed(SpikeInfo),
-
-    /// Spike candidate failed momentum/sustain check — cancel speculative Leg 1.
-    SpikeFailed { timestamp_ms: u64 },
 
     /// Periodic spike detector diagnostics (every 60s).
     SpikeDiagnostic {
         atr: f64,
         threshold: f64,
         mid: f64,
-        candidates: u64,
-        rej_momentum: u64,
         rej_magnitude: u64,
         confirmed: u64,
         stale: u64,

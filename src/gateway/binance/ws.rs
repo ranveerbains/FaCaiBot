@@ -12,9 +12,8 @@
 //! Subscription confirmations arrive as JSON text frames (logged, not parsed).
 //!
 //! # Spike detection output
-//! Uses speculative Leg 1 posting: emits [`IngestorEvent::SpikeCandidate`] immediately
-//! when ATR + magnitude pass, then [`IngestorEvent::SpikeConfirmed`] or
-//! [`IngestorEvent::SpikeFailed`] after the sustain + momentum check.
+//! Emits [`IngestorEvent::SpikeConfirmed`] immediately when ATR + magnitude pass.
+//! No sustain window or momentum check — confirmation is instant.
 //!
 //! # Thread model
 //! This module runs on a **dedicated OS thread** with its own single-threaded
@@ -277,37 +276,14 @@ fn handle_sbe_message(
             if let Some(mid) = depth.mid_price() {
                 let mid_f64 = mid.to_f64().unwrap_or(0.0);
                 match detector.update(mid_f64, depth.timestamp_ms, depth.obi()) {
-                    SpikeEvent::Candidate(spike) => {
-                        debug!(
-                            direction = ?spike.direction,
-                            magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                            "Binance spike candidate — speculative Leg 1"
-                        );
-                        if tx.try_send(IngestorEvent::SpikeCandidate(spike)).is_err() {
-                            warn!("ingestor channel full — SpikeCandidate dropped");
-                        }
-                    }
                     SpikeEvent::Confirmed(spike) => {
                         debug!(
                             direction = ?spike.direction,
                             magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                            sustained_ms = spike.sustained_ms,
-                            "Binance spike confirmed — sim fill gate open"
+                            "Binance spike confirmed"
                         );
                         if tx.try_send(IngestorEvent::SpikeConfirmed(spike)).is_err() {
                             warn!("ingestor channel full — SpikeConfirmed dropped");
-                        }
-                    }
-                    SpikeEvent::Failed { timestamp_ms } => {
-                        debug!(
-                            timestamp_ms,
-                            "Binance spike failed — cancelling speculative Leg 1"
-                        );
-                        if tx
-                            .try_send(IngestorEvent::SpikeFailed { timestamp_ms })
-                            .is_err()
-                        {
-                            warn!("ingestor channel full — SpikeFailed dropped");
                         }
                     }
                     SpikeEvent::None => {}
@@ -319,8 +295,6 @@ fn handle_sbe_message(
                         atr: snap.atr,
                         threshold: snap.threshold,
                         mid: snap.mid,
-                        candidates: snap.candidates,
-                        rej_momentum: snap.rej_momentum,
                         rej_magnitude: snap.rej_magnitude,
                         confirmed: snap.confirmed,
                         stale: snap.stale,

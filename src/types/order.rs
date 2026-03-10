@@ -169,6 +169,10 @@ pub struct TradeSignal {
     /// Whether a competitor depth wall was detected during signal generation.
     pub bot_contested: bool,
 
+    /// Taker fee per share at Leg 1 ask price.
+    /// Used by init_leg2() for buffer-aware hedge math.
+    pub leg1_taker_fee: Decimal,
+
     // ── Book snapshot ────────────────────────────────────────────────────
     /// Best ask price on the hedge book at signal generation time.
     /// Used by the executor for favorable maker try-first pricing.
@@ -210,8 +214,6 @@ pub enum ExecutorCommand {
         /// End timestamp of the outgoing market (epoch ms). 0 if no prior market.
         outgoing_end_timestamp_ms: u64,
     },
-    /// Cancel a stale Leg 1 order that wasn't filled in time.
-    CancelLeg1 { order_id: String },
     /// Post a Phase 2 order alongside the existing Phase 1 order (dual-order).
     /// Does NOT cancel Phase 1.
     PostLeg2Phase2 { signal: TradeSignal },
@@ -272,6 +274,19 @@ impl OrderRequest {
         }
     }
 
+    /// Convenience constructor for a FAK (Fill-And-Kill) taker order.
+    #[allow(dead_code)] // used in upcoming FAK execution phase
+    pub fn fak(token_id: String, side: Side, price: Decimal, size: Decimal) -> Self {
+        Self {
+            token_id,
+            side,
+            price,
+            size,
+            order_type: OrderType::Fak,
+            post_only: false,
+            expiration: None,
+        }
+    }
 }
 
 // ─── Order Response ──────────────────────────────────────────────────────────
@@ -362,15 +377,6 @@ pub enum ExecutorFeedback {
         order_id: String,
         was_cancelled: bool,
         is_leg2: bool,
-    },
-    /// REST poll detected a Leg 1 fill before the User WS MATCHED event.
-    /// Primary fill detection path (~200ms deterministic). User WS is backup.
-    RestFillDetected {
-        order_id: String,
-        price: Decimal,
-        size: Decimal,
-        size_matched: Decimal,
-        original_size: Decimal,
     },
     /// Result of cancelling a specific Leg 2 order (from dual-order system).
     Leg2OrderCancelResult {

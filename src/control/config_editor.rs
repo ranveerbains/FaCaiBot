@@ -14,16 +14,11 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     // spike_detection
     ParamSpec { name: "spike_detection.multiplier", min: 1.0, max: 1000.0 },
     ParamSpec { name: "spike_detection.atr_alpha", min: 0.0001, max: 1.0 },
-    ParamSpec { name: "spike_detection.sustain_ms", min: 50.0, max: 5000.0 },
     ParamSpec { name: "spike_detection.min_magnitude_pct", min: 0.001, max: 0.5 },
-    ParamSpec { name: "spike_detection.momentum_ratio_min", min: 0.0, max: 1.0 },
     // entry_guards
-    ParamSpec { name: "entry_guards.max_spread", min: 0.001, max: 0.10 },
-    ParamSpec { name: "entry_guards.depth_min_pct", min: 0.01, max: 1.0 },
     ParamSpec { name: "entry_guards.entry_cutoff_secs", min: 30.0, max: 600.0 },
     ParamSpec { name: "entry_guards.binance_stale_event_ms", min: 10.0, max: 1000.0 },
     ParamSpec { name: "entry_guards.stale_book_ms", min: 50.0, max: 5000.0 },
-    ParamSpec { name: "entry_guards.leg1_timeout_ms", min: 500.0, max: 30000.0 },
     ParamSpec { name: "entry_guards.rotation_quiet_ms", min: 0.0, max: 120000.0 },
     ParamSpec { name: "entry_guards.trade_cooldown_ms", min: 0.0, max: 60000.0 },
     // capital
@@ -41,10 +36,10 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "repricing.min_obi_alignment", min: 0.0, max: 0.5 },
     // risk
     ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
-    ParamSpec { name: "risk.depth_wall_multiplier", min: 1.0, max: 50.0 },
-    ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
+ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     ParamSpec { name: "risk.phase2_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.favorable_maker_timeout_ms", min: 200.0, max: 5000.0 },
+    ParamSpec { name: "risk.fak_price_offset_ticks", min: 1.0, max: 5.0 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
 ];

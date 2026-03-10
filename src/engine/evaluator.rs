@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeInfo};
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
+use crate::types::simulation::SimFill;
 
 use super::confidence::{compute_expected_repricing, round_to_tick};
 use super::erosion::{HedgePhase, HedgeSnap};
@@ -38,16 +39,10 @@ pub(crate) enum Leg1RejectReason {
     StaleBook,
     /// YES mid-price outside the tradeable range (too skewed toward resolution).
     PriceSkewed,
-    /// Bid-ask spread exceeds `max_spread`.
-    SpreadWide,
-    /// Book depth insufficient relative to required trade size.
-    InsufficientDepth,
     /// Model output below `min_reprice_pct` — insufficient expected repricing.
     InsufficientRepricing,
     /// OBI (Order Book Imbalance) contradicts spike direction.
     ObiMismatch,
-    /// Opposing side best ask already above breakeven — hedge impossible at entry.
-    HedgeImpossible,
     /// Other guard failed (no active market, bid cap invalid, zero size, etc.).
     Other,
 }
@@ -71,13 +66,9 @@ pub(crate) enum Leg1Outcome {
 /// Holds only the config fields required for Leg 1 guard checks and signal building.
 /// All reads are from borrowed `&MarketState`; no mutation occurs here.
 pub(crate) struct Leg1Evaluator {
-    pub max_spread: Decimal,
     pub entry_cutoff_secs: u64,
-    pub depth_min_pct: Decimal,
     pub stale_book_ms: u64,
     pub max_alloc_per_trade: Decimal,
-    pub depth_wall_multiplier: Decimal,
-    pub leg1_timeout_ms: u64,
     #[allow(dead_code)] // kept as hard floor backstop — checked in spike detector
     pub min_magnitude_pct: Decimal,
     pub min_spike_atr_ratio: Decimal,
@@ -226,14 +217,7 @@ impl Leg1Evaluator {
             }
         };
 
-        // Guard: spread too wide (dollar-based)
-        let spread = best_ask_price - best_bid_price;
-        if spread > self.max_spread {
-            debug!(%spread, "evaluate() BLOCKED: spread too wide");
-            return Leg1Outcome::Rejected(Leg1RejectReason::SpreadWide);
-        }
-
-        // Guard: active trade — checked AFTER book/spread so rej_busy only counts spikes
+        // Guard: active trade — checked AFTER book so rej_busy only counts spikes
         // that had a valid, tight book. Separates "genuinely good signal, executor busy"
         // from "spike on a bad book that would have been rejected anyway".
         if !matches!(state.leg1_state, OrderState::None) {
@@ -291,17 +275,6 @@ impl Leg1Evaluator {
             .round_dp(2)
             .max(Decimal::new(1, 2));
 
-        // Guard: liquidity
-        let required_depth = if !best_bid_price.is_zero() {
-            alloc / best_bid_price
-        } else {
-            return Leg1Outcome::Rejected(Leg1RejectReason::NoBook);
-        };
-        if book.total_bid_depth() < required_depth * self.depth_min_pct {
-            debug!("evaluate() BLOCKED: insufficient poly book depth");
-            return Leg1Outcome::Rejected(Leg1RejectReason::InsufficientDepth);
-        }
-
         // Token selection
         let token_id = match direction {
             Direction::Up => match state.active_yes_token_id.as_ref() {
@@ -314,61 +287,23 @@ impl Leg1Evaluator {
             },
         };
 
-        // Leg 1 bid price — post just above the current best bid of the direction book.
-        let mut bid_price = round_to_tick(best_bid_price + tick, tick);
-
-        // Cap at one tick below ask if bid would cross (post-only constraint).
-        if bid_price >= best_ask_price {
-            let capped = round_to_tick(best_ask_price - tick, tick);
-            if capped <= Decimal::ZERO || capped >= best_ask_price {
-                debug!(%bid_price, %best_ask_price, "bid cap is zero or invalid — skipping");
-                return Leg1Outcome::Rejected(Leg1RejectReason::Other);
-            }
-            bid_price = capped;
-        }
+        // Leg 1 ask price — anchor for FAK ladder (taker at the ask).
+        let ask_price = best_ask_price;
 
         debug!(
             spike_direction = ?direction,
             token = %token_id,
             %best_bid_price,
             %best_ask_price,
-            %bid_price,
+            %ask_price,
             "Leg 1 evaluating entry"
         );
 
-        // Smart outbidding
-        let wall = detect_depth_wall(book, Side::Buy, self.depth_wall_multiplier);
-        let bot_contested = wall.is_some();
-        if let Some(wall_price) = wall.filter(|&wp| wp >= bid_price) {
-            let outbid = round_to_tick(wall_price + tick, tick);
-            if outbid < best_ask_price {
-                debug!(%wall_price, %outbid, "Leg 1 smart outbid");
-                bid_price = outbid;
-            }
-        }
-
-        // Guard: reject if opposing best ask is already above breakeven.
-        // Uses bid_price (our posted entry, worst-case fill) — conservative by design.
-        let opposite_book = match direction {
-            Direction::Up => state.poly_no_book.as_ref().or(state.poly_book.as_ref()),
-            Direction::Down => state.poly_yes_book.as_ref().or(state.poly_book.as_ref()),
-        };
-        if let Some(opp_book) = opposite_book {
-            if let Some(opp_ask) = opp_book.best_ask() {
-                let breakeven_hedge = Decimal::ONE - bid_price;
-                if opp_ask.price - tick > breakeven_hedge {
-                    debug!(
-                        %bid_price, opp_ask = %opp_ask.price, %breakeven_hedge,
-                        "evaluate() BLOCKED: opposing ask above breakeven — hedge impossible"
-                    );
-                    return Leg1Outcome::Rejected(Leg1RejectReason::HedgeImpossible);
-                }
-            }
-        }
+        let bot_contested = false;
 
         // Entry size — rounded to 2dp (Polymarket share precision).
-        let entry_size = if !bid_price.is_zero() {
-            (alloc / bid_price).round_dp(2)
+        let entry_size = if !ask_price.is_zero() {
+            (alloc / ask_price).round_dp(2)
         } else {
             return Leg1Outcome::Rejected(Leg1RejectReason::Other);
         };
@@ -378,7 +313,7 @@ impl Leg1Evaluator {
 
         info!(
             direction = ?spike.direction, %expected_pct, %target_pct, tier = tier.label(),
-            %yes_mid, %bid_price, %entry_size, %alloc, bot_contested, time_remaining_secs,
+            %yes_mid, %ask_price, %entry_size, %alloc, bot_contested, time_remaining_secs,
             "Leg 1 signal generated"
         );
 
@@ -387,7 +322,7 @@ impl Leg1Evaluator {
             side: Side::Buy,
             token_id: token_id.clone(),
             condition_id: state.active_condition_id.clone().unwrap_or_default(),
-            price: bid_price,
+            price: ask_price,
             size: entry_size,
             reference_price,
             expected_pct,
@@ -403,13 +338,14 @@ impl Leg1Evaluator {
             tick_size: tick,
             atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
-            best_ask: None,
+            leg1_taker_fee: SimFill::compute_taker_fee_per_share(ask_price),
+            best_ask: Some(best_ask_price),
             book_snapshot: match direction {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
                 Direction::Down => state.poly_no_book.clone().or(state.poly_book.clone()),
             },
             sim_confirmed_fill: false,
-            sim_was_taker: false,
+            sim_was_taker: true,
         })
     }
 }
@@ -859,51 +795,12 @@ pub(crate) fn make_leg2_signal(
         tick_size,
         atr,
         bot_contested,
+        leg1_taker_fee: Decimal::ZERO,
         best_ask,
         book_snapshot,
         sim_confirmed_fill: false,
         sim_was_taker: false,
     }
-}
-
-// ─── Depth wall detection ─────────────────────────────────────────────────────
-
-/// Detect a depth wall on the given side of the order book.
-///
-/// A wall is a single price level whose size exceeds `wall_multiplier` times the
-/// average size of all OTHER levels on the same side — indicating a competitor's
-/// intentional liquidity wall.
-pub fn detect_depth_wall(
-    book: &OrderBook,
-    side: Side,
-    wall_multiplier: Decimal,
-) -> Option<Decimal> {
-    let levels = match side {
-        Side::Buy => &book.bids,
-        Side::Sell => &book.asks,
-    };
-    if levels.len() < 2 {
-        return None;
-    }
-    let total_size: Decimal = levels.iter().map(|l| l.size).sum();
-    let n = Decimal::from(levels.len());
-
-    for level in levels {
-        let others_sum = total_size - level.size;
-        let others_count = n - Decimal::ONE;
-        if others_count.is_zero() {
-            continue;
-        }
-        let avg_others = others_sum / others_count;
-        if avg_others.is_zero() {
-            continue;
-        }
-        if level.size > wall_multiplier * avg_others {
-            debug!(price = %level.price, size = %level.size, avg_others = %avg_others, "depth wall detected");
-            return Some(level.price);
-        }
-    }
-    None
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -926,77 +823,6 @@ mod tests {
             }],
             timestamp_ms: 0,
         }
-    }
-
-    // ── detect_depth_wall ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_no_wall_uniform_book() {
-        let book = OrderBook {
-            asset_id: "t".into(),
-            bids: vec![
-                PriceLevel {
-                    price: Decimal::new(50, 2),
-                    size: Decimal::new(100, 0),
-                },
-                PriceLevel {
-                    price: Decimal::new(49, 2),
-                    size: Decimal::new(90, 0),
-                },
-                PriceLevel {
-                    price: Decimal::new(48, 2),
-                    size: Decimal::new(110, 0),
-                },
-            ],
-            asks: vec![],
-            timestamp_ms: 0,
-        };
-        assert!(detect_depth_wall(&book, Side::Buy, Decimal::new(4, 0)).is_none());
-    }
-
-    #[test]
-    fn test_wall_detected() {
-        let book = OrderBook {
-            asset_id: "t".into(),
-            bids: vec![
-                PriceLevel {
-                    price: Decimal::new(52, 2),
-                    size: Decimal::new(500, 0),
-                }, // wall
-                PriceLevel {
-                    price: Decimal::new(51, 2),
-                    size: Decimal::new(20, 0),
-                },
-                PriceLevel {
-                    price: Decimal::new(50, 2),
-                    size: Decimal::new(15, 0),
-                },
-                PriceLevel {
-                    price: Decimal::new(49, 2),
-                    size: Decimal::new(25, 0),
-                },
-            ],
-            asks: vec![],
-            timestamp_ms: 0,
-        };
-        assert_eq!(
-            detect_depth_wall(&book, Side::Buy, Decimal::new(4, 0)),
-            Some(Decimal::new(52, 2))
-        );
-    }
-
-    #[test]
-    fn test_single_level_no_wall() {
-        let book = OrderBook {
-            asset_id: "t".into(),
-            bids: vec![PriceLevel {
-                price: Decimal::new(50, 2),
-                size: Decimal::new(100, 0),
-            }],
-            asks: vec![],
-            timestamp_ms: 0,
-        };
-        assert!(detect_depth_wall(&book, Side::Buy, Decimal::new(4, 0)).is_none());
     }
 
     #[test]
@@ -1087,6 +913,7 @@ mod tests {
         let snap = HedgeSnap {
             emergency_submitted: false,
             break_even: Decimal::new(50, 2),
+            leg1_taker_fee: Decimal::ZERO,
             initial_profit_target: Decimal::new(25, 3), // 2.5%
             direction: Direction::Up,
             fill_ms: now_ms - 5_000,
@@ -1262,13 +1089,9 @@ mod tests {
 
     fn make_leg1_evaluator(dampen: &str, min_obi: &str) -> Leg1Evaluator {
         Leg1Evaluator {
-            max_spread: Decimal::new(5, 2),      // 0.05
             entry_cutoff_secs: 25,
-            depth_min_pct: Decimal::new(15, 2),   // 0.15
             stale_book_ms: 5000,
             max_alloc_per_trade: Decimal::new(15, 0),
-            depth_wall_multiplier: Decimal::new(4, 0),
-            leg1_timeout_ms: 2500,
             min_magnitude_pct: Decimal::new(1, 2),
             min_spike_atr_ratio: Decimal::new(25, 0),
             strong_spike_atr_ratio: Decimal::new(85, 0),
@@ -1368,50 +1191,6 @@ mod tests {
                 assert_eq!(sig.profit_target_pct, expected_target,
                     "dampen=1.0 should produce target = round_to_tick(expected_pct)");
             }
-            other => panic!("expected Signal, got {other:?}"),
-        }
-    }
-
-    // ── Hedge impossible guard tests ─────────────────────────────────────
-
-    #[test]
-    fn test_entry_blocked_hedge_impossible() {
-        let now_ms = 100_000;
-        let eval = make_leg1_evaluator("0.8", "0.0");
-        let mut state = make_leg1_test_state(now_ms);
-        // Set NO ask very high — hedge would be impossible.
-        // bid_price for leg1 will be ~0.51 (best_bid 0.50 + tick 0.01).
-        // breakeven_hedge = 1.0 - 0.51 = 0.49.
-        // If NO ask = 0.51, then opp_ask - tick (0.51 - 0.01 = 0.50) > 0.49 → blocked.
-        state.poly_no_book = Some(OrderBook {
-            asset_id: "no".to_string(),
-            bids: vec![PriceLevel {
-                price: Decimal::new(48, 2),
-                size: Decimal::new(500, 0),
-            }],
-            asks: vec![PriceLevel {
-                price: Decimal::new(51, 2),  // 0.51 — above breakeven
-                size: Decimal::new(500, 0),
-            }],
-            timestamp_ms: now_ms,
-        });
-
-        match eval.evaluate(&state, now_ms) {
-            Leg1Outcome::Rejected(Leg1RejectReason::HedgeImpossible) => {} // expected
-            other => panic!("expected HedgeImpossible, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_entry_allowed_hedge_feasible() {
-        let now_ms = 100_000;
-        let eval = make_leg1_evaluator("0.8", "0.0");
-        let state = make_leg1_test_state(now_ms);
-        // Default NO ask is 0.49. bid_price ~0.51. breakeven = 0.49.
-        // opp_ask (0.49) - tick (0.01) = 0.48 <= 0.49 → allowed.
-
-        match eval.evaluate(&state, now_ms) {
-            Leg1Outcome::Signal(_) => {} // expected
             other => panic!("expected Signal, got {other:?}"),
         }
     }

@@ -17,16 +17,12 @@ pub enum Mode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SpikeDetectionConfig {
-    /// `|delta| > multiplier × ATR` triggers spike candidate.
+    /// `|delta| > multiplier × ATR` triggers spike confirmation.
     pub multiplier: f64,
     /// EMA smoothing alpha for ATR. No spikes emitted for first MIN_ATR_SAMPLES ticks (warmup).
     pub atr_alpha: f64,
-    /// Minimum sustain duration (ms) before spike confirmation.
-    pub sustain_ms: u64,
     /// Minimum spike magnitude (%) to emit a signal. Below this → discard.
     pub min_magnitude_pct: f64,
-    /// Minimum momentum ratio (displacement/peak) at sustain time. Below this → discard.
-    pub momentum_ratio_min: f64,
 }
 
 impl Default for SpikeDetectionConfig {
@@ -34,9 +30,7 @@ impl Default for SpikeDetectionConfig {
         Self {
             multiplier: 2.0,
             atr_alpha: 0.002,
-            sustain_ms: 300,
             min_magnitude_pct: 0.01,
-            momentum_ratio_min: 0.5,
         }
     }
 }
@@ -44,18 +38,12 @@ impl Default for SpikeDetectionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EntryGuardsConfig {
-    /// Max bid-ask spread in absolute dollars (e.g. 0.025 = $0.025).
-    pub max_spread: f64,
-    /// Min book depth as fraction of required depth.
-    pub depth_min_pct: f64,
     /// No entries within this many seconds of market expiry.
     pub entry_cutoff_secs: u64,
     /// Max age (ms) of a Binance SBE event before it is discarded.
     pub binance_stale_event_ms: u64,
     /// Max book age (ms) before blocking entry.
     pub stale_book_ms: u64,
-    /// Maximum time (ms) a Leg 1 post-only order can rest unfilled before cancellation.
-    pub leg1_timeout_ms: u64,
     /// Quiet period (ms) after market rotation — no new Leg 1 entries.
     pub rotation_quiet_ms: u64,
     /// Cooldown (ms) after trade completion before allowing new entries.
@@ -65,12 +53,9 @@ pub struct EntryGuardsConfig {
 impl Default for EntryGuardsConfig {
     fn default() -> Self {
         Self {
-            max_spread: 0.025,
-            depth_min_pct: 0.15,
             entry_cutoff_secs: 180,
             binance_stale_event_ms: 50,
             stale_book_ms: 1000,
-            leg1_timeout_ms: 5000,
             rotation_quiet_ms: 30000,
             trade_cooldown_ms: 5000,
         }
@@ -97,8 +82,6 @@ impl Default for CapitalConfig {
 pub struct RiskConfig {
     /// Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2.
     pub phase1_timeout_ms: u64,
-    /// Depth level > X × avg = competitor wall.
-    pub depth_wall_multiplier: f64,
     /// Phase 1 breach threshold: pair cost > this triggers immediate FOK taker.
     /// Must be > 1.00. Default 1.05 (overridden in config.toml).
     pub phase1_breach_threshold: f64,
@@ -106,16 +89,19 @@ pub struct RiskConfig {
     pub phase2_timeout_ms: u64,
     /// Timeout (ms) for favorable maker try before FOK fallback on crosses-book.
     pub favorable_maker_timeout_ms: u64,
+    /// Number of ticks above/below best ask for the FAK batch ladder.
+    /// Default 1: orders at [ask - N×tick, ask, ask + N×tick].
+    pub fak_price_offset_ticks: u32,
 }
 
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             phase1_timeout_ms: 2000,
-            depth_wall_multiplier: 4.0,
             phase1_breach_threshold: 1.05,
             phase2_timeout_ms: 2000,
             favorable_maker_timeout_ms: 1000,
+            fak_price_offset_ticks: 1,
         }
     }
 }

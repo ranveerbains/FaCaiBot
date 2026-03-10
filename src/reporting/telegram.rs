@@ -620,11 +620,7 @@ mod formatter {
             )
         };
 
-        let l1_tag = if trade.leg1_cancel_race {
-            " [FILLED MID-CANCEL]"
-        } else {
-            ""
-        };
+        let l1_tag = "";
 
         let unhedged_note = if let Some(ref leg2) = trade.leg2 {
             if trade.leg1.size != leg2.size {

@@ -255,9 +255,6 @@ impl SimulationExecutor {
                             outgoing_end_timestamp_ms,
                         );
                     }
-                    ExecutorCommand::CancelLeg1 { order_id } => {
-                        debug!(%order_id, "SimExecutor: Leg 1 cancel (handled by engine)");
-                    }
                     ExecutorCommand::TickSizeChanged { new_tick_size, .. } => {
                         self.tick_size = new_tick_size;
                         debug!(%new_tick_size, "SimExecutor: tick_size updated");
@@ -721,6 +718,7 @@ mod tests {
             tick_size: d("0.01"),
             atr: Decimal::ZERO,
             bot_contested: false,
+            leg1_taker_fee: Decimal::ZERO,
             best_ask: None,
             book_snapshot: None,
             sim_confirmed_fill: false,

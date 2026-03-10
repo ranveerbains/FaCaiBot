@@ -11,10 +11,9 @@
 //! - No I/O in the hot path (no Redis reads, no HTTP calls).
 //! - Latency target: <2ms from event pull to signal emit.
 //!
-//! # Spike detection (speculative Leg 1 posting)
-//! The Binance gateway emits `SpikeCandidate` immediately when ATR + magnitude pass.
-//! The engine speculatively posts a Leg 1 order, then waits for `SpikeConfirmed`
-//! (sustain passed → sim fill gate opens) or `SpikeFailed` (cancel speculative order).
+//! # Spike detection
+//! The Binance gateway emits `SpikeConfirmed` when ATR + magnitude + sustain pass.
+//! The engine posts a Leg 1 order on confirmed spikes only (no speculative posting).
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -59,8 +58,6 @@ struct SpikeDiagData {
     atr: f64,
     threshold: f64,
     mid: f64,
-    candidates: u64,
-    rej_momentum: u64,
     rej_magnitude: u64,
     confirmed: u64,
     stale: u64,
@@ -82,22 +79,6 @@ struct LiveTradeMeta {
     /// `true` if Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
     phase1_dual_fill: bool,
     exit_reason: Option<ExitReason>,
-    /// `true` if Leg 1 filled via the cancel-not-confirmed replay path.
-    leg1_cancel_race: bool,
-}
-
-// ─── Saved Leg 1 info for cancel confirmation tracking ──────────────────────
-
-/// State saved before clearing Leg 1 for a cancel. Restored if the CLOB reports
-/// the cancel was NOT confirmed (order had already filled).
-#[derive(Debug, Clone)]
-struct CancelledLeg1 {
-    order_id: String,
-    price: Decimal,
-    size: Decimal,
-    signal: Option<TradeSignal>,
-    direction: Option<Direction>,
-    spike: Option<SpikeInfo>,
 }
 
 // ─── Orphan state for dual-order double-fill recovery ───────────────────────
@@ -175,17 +156,9 @@ pub struct StrategyEngine {
     /// still open. Drained by main loop before sending the rotation command.
     rotation_emergency_buffer: Vec<TradeSignal>,
 
-    /// Cancel command for a speculative Leg 1 order when SpikeFailed arrives.
-    /// Drained by main loop after on_event().
-    pending_spike_cancel: Option<ExecutorCommand>,
-
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
     pending_tick_size_cmd: Option<ExecutorCommand>,
-
-    /// Gates sim Leg 1 fills until `SpikeConfirmed` clears it.
-    /// Set `true` on `SpikeCandidate`, cleared on `SpikeConfirmed` or `SpikeFailed`.
-    speculative_awaiting_sustain: bool,
 
     /// Set `true` when an emergency Leg 2 signal is dispatched to the executor.
     /// Cleared on feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete).
@@ -216,8 +189,6 @@ pub struct StrategyEngine {
     /// Telegram reporter for live mode. `None` in simulation mode.
     reporter: Option<TelegramReporter>,
     /// Leg 2 metadata for the current live trade (reset on Leg 1 fill).
-    /// Note: `leg1_cancel_race` is set BEFORE and AFTER `replay_pending_fills()` —
-    /// before so `init_leg2()` can use breakeven target, after so it survives the reset.
     live_trade_meta: LiveTradeMeta,
     /// Completed trades for the current market window (cleared on rotation).
     live_market_trades: Vec<SimTrade>,
@@ -245,11 +216,8 @@ pub struct StrategyEngine {
     diag_rej_no_binance: u64, // NoBinance: no Binance reference price
     diag_rej_stale: u64,   // StaleBook
     diag_rej_skew: u64,    // PriceSkewed
-    diag_rej_spread: u64,  // SpreadWide
-    diag_rej_depth: u64,   // InsufficientDepth
     diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
     diag_rej_obi: u64,    // ObiMismatch: OBI contradicts spike direction
-    diag_rej_hedge_impossible: u64, // HedgeImpossible: opposing ask above breakeven
     diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
@@ -271,8 +239,6 @@ pub struct StrategyEngine {
     diag_rebalance_attempts: u64,
     diag_rebalance_successes: u64,
     diag_phase2_entry_breach: u64,
-    diag_leg1_timeouts: u64,
-    diag_spike_sustain_cancel: u64,
     diag_spike_failures: u64,
     diag_order_failures: u64,
     last_diag_ms: u64,
@@ -303,15 +269,6 @@ pub struct StrategyEngine {
     /// Set by `/stop`, cleared by `/resume`. Unlike `draining`, does not exit.
     paused: bool,
 
-    /// When `true`, the next Leg 1 `OrderPosted` feedback will be cancelled
-    /// instead of resurrecting `leg1_state`. Set by `SpikeFailed` / staleness
-    /// when the order_id is still provisional ("sim-...").
-    pub cancel_leg1_on_feedback: bool,
-
-    /// Saved Leg 1 order info after pre-clearing state for a cancel.
-    /// Restored if CancelResult reports the cancel was not confirmed.
-    cancelled_leg1_info: Option<CancelledLeg1>,
-
     /// Saved previous Leg 2 order info before evaluate_leg2() overwrites
     /// with a provisional ID. Restored if CancelResult reports not confirmed.
     prev_leg2_order: Option<(String, Decimal, Decimal)>,
@@ -337,12 +294,6 @@ impl StrategyEngine {
     pub fn new(config: &Config) -> Self {
         let state = MarketState::new();
 
-        let max_spread = Decimal::try_from(config.bot.entry_guards.max_spread)
-            .unwrap_or(Decimal::new(25, 3));
-        let depth_min_pct =
-            Decimal::try_from(config.bot.entry_guards.depth_min_pct).unwrap_or(Decimal::new(15, 2));
-        let depth_wall_multiplier =
-            Decimal::try_from(config.bot.risk.depth_wall_multiplier).unwrap_or(Decimal::new(4, 0));
         Self {
             state,
             hedge: None,
@@ -359,9 +310,7 @@ impl StrategyEngine {
             whipsaw_fok_pending: false,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
-            pending_spike_cancel: None,
             pending_tick_size_cmd: None,
-            speculative_awaiting_sustain: false,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
             last_spike_diag: None,
@@ -388,11 +337,8 @@ impl StrategyEngine {
             diag_rej_no_binance: 0,
             diag_rej_stale: 0,
             diag_rej_skew: 0,
-            diag_rej_spread: 0,
-            diag_rej_depth: 0,
             diag_rej_reprice: 0,
             diag_rej_obi: 0,
-            diag_rej_hedge_impossible: 0,
             diag_rej_paused: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
@@ -414,8 +360,6 @@ impl StrategyEngine {
             diag_rebalance_attempts: 0,
             diag_rebalance_successes: 0,
             diag_phase2_entry_breach: 0,
-            diag_leg1_timeouts: 0,
-            diag_spike_sustain_cancel: 0,
             diag_spike_failures: 0,
             diag_order_failures: 0,
             last_diag_ms: 0,
@@ -427,20 +371,14 @@ impl StrategyEngine {
             last_leg2_was_phase2_alongside: false,
             draining: false,
             paused: false,
-            cancel_leg1_on_feedback: false,
-            cancelled_leg1_info: None,
             prev_leg2_order: None,
             pending_fills: std::collections::VecDeque::with_capacity(4),
             pending_partial_fills: std::collections::HashMap::new(),
             start_ms: now_epoch_ms(),
             leg1: Leg1Evaluator {
-                max_spread,
                 entry_cutoff_secs: config.bot.entry_guards.entry_cutoff_secs,
-                depth_min_pct,
                 stale_book_ms: config.bot.entry_guards.stale_book_ms,
                 max_alloc_per_trade: config.max_alloc_per_trade,
-                depth_wall_multiplier,
-                leg1_timeout_ms: config.bot.entry_guards.leg1_timeout_ms,
                 min_magnitude_pct: config.min_magnitude_pct,
                 min_spike_atr_ratio: config.min_spike_atr_ratio,
                 strong_spike_atr_ratio: config.strong_spike_atr_ratio,
@@ -459,15 +397,6 @@ impl StrategyEngine {
                 phase2_timeout_ms: config.bot.risk.phase2_timeout_ms,
             },
         }
-    }
-
-    // ─── Provisional Order ID ──────────────────────────────────────────────
-
-    /// Returns `true` if `order_id` is a provisional ID set by `evaluate()`.
-    /// Provisional IDs start with `"sim-"` and are replaced by the real CLOB ID
-    /// when `OrderPosted` feedback arrives from the executor.
-    pub fn is_provisional_order_id(order_id: &str) -> bool {
-        order_id.starts_with("sim-")
     }
 
     // ─── Public Interface ─────────────────────────────────────────────────
@@ -710,72 +639,35 @@ impl StrategyEngine {
                 self.state.last_update_ms = depth.timestamp_ms;
             }
 
-            // ── Spike candidate — speculative Leg 1 posting ──────────────
-            IngestorEvent::SpikeCandidate(spike) => {
+            // ── Spike confirmed — immediate entry ─────────────────────────
+            IngestorEvent::SpikeConfirmed(spike) => {
                 self.diag_spikes_received += 1;
                 // Drop spike if within post-rotation quiet period.
                 if self.in_quiet_period {
                     self.diag_spikes_dropped_quiet += 1;
-                    debug!("spike candidate ignored — within rotation quiet period");
+                    debug!("spike ignored — within rotation quiet period");
                     return;
                 }
                 // Drop spike if within entry_cutoff window — no new trades allowed.
                 if self.in_cutoff_window {
                     self.diag_spikes_dropped_cutoff += 1;
-                    debug!("spike candidate ignored — within cutoff window");
+                    debug!("spike ignored — within cutoff window");
                     return;
                 }
 
-                info!(
-                    direction = ?spike.direction,
-                    magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                    spike_detected_ms = spike.timestamp_ms,
-                    "spike candidate received — speculative Leg 1"
-                );
                 self.state.spike_detected = true;
-                self.state.last_spike = Some(spike);
-                self.speculative_awaiting_sustain = true;
-            }
-
-            // ── Spike confirmed — sustain passed, sim fill gate opens ────
-            IngestorEvent::SpikeConfirmed(spike) => {
-                self.speculative_awaiting_sustain = false;
-                // Update spike info with the confirmed (sustain-time) magnitude.
                 self.state.last_spike = Some(spike);
 
                 // ── Whipsaw guard: opposite spike while Leg 1 is active ──
                 if let Some(leg1_dir) = self.leg1_direction {
                     if spike.direction != leg1_dir {
                         match &self.state.leg1_state {
-                            OrderState::Posted { order_id, price, size, .. } => {
+                            OrderState::Posted { .. } => {
                                 self.diag_whipsaw_cancels += 1;
-                                let saved = CancelledLeg1 {
-                                    order_id: order_id.clone(),
-                                    price: *price,
-                                    size: *size,
-                                    signal: self.pending_leg1_signal.clone(),
-                                    direction: self.leg1_direction,
-                                    spike: self.state.last_spike,
-                                };
-                                if Self::is_provisional_order_id(order_id) {
-                                    warn!(
-                                        spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
-                                        %order_id,
-                                        "whipsaw — deferring Leg 1 cancel (provisional ID)"
-                                    );
-                                    self.cancel_leg1_on_feedback = true;
-                                    self.cancelled_leg1_info = Some(saved);
-                                } else {
-                                    warn!(
-                                        spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
-                                        %order_id,
-                                        "whipsaw — cancelling unfilled Leg 1"
-                                    );
-                                    self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
-                                        order_id: order_id.clone(),
-                                    });
-                                    self.cancelled_leg1_info = Some(saved);
-                                }
+                                warn!(
+                                    spike_dir = ?spike.direction, leg1_dir = ?leg1_dir,
+                                    "whipsaw — resetting unfilled Leg 1 (FAK, no cancel needed)"
+                                );
                                 self.state.leg1_state = OrderState::None;
                                 self.pending_leg1_signal = None;
                                 self.leg1_direction = None;
@@ -799,65 +691,9 @@ impl StrategyEngine {
                 info!(
                     direction = ?spike.direction,
                     magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                    sustained_ms = spike.sustained_ms,
                     spike_detected_ms = spike.timestamp_ms,
-                    "spike sustained — sim fill gate open"
+                    "spike CONFIRMED"
                 );
-            }
-
-            // ── Spike failed — cancel speculative Leg 1 ─────────────────
-            IngestorEvent::SpikeFailed { timestamp_ms } => {
-                self.speculative_awaiting_sustain = false;
-                self.diag_spike_failures += 1;
-
-                match &self.state.leg1_state {
-                    OrderState::Posted { order_id, price, size, .. } => {
-                        self.diag_spike_sustain_cancel += 1;
-                        // Save signal+direction+spike before clearing — needed if cancel not confirmed.
-                        let saved = CancelledLeg1 {
-                            order_id: order_id.clone(),
-                            price: *price,
-                            size: *size,
-                            signal: self.pending_leg1_signal.clone(),
-                            direction: self.leg1_direction,
-                            spike: self.state.last_spike,
-                        };
-                        if Self::is_provisional_order_id(order_id) {
-                            // Real CLOB ID hasn't arrived yet — defer cancel to feedback.
-                            info!(
-                                %order_id, timestamp_ms,
-                                "spike FAILED — deferring cancel to feedback (provisional ID)"
-                            );
-                            self.cancel_leg1_on_feedback = true;
-                            self.cancelled_leg1_info = Some(saved);
-                        } else {
-                            // Real CLOB ID is available — cancel immediately.
-                            info!(%order_id, timestamp_ms, "spike FAILED — cancelling speculative Leg 1");
-                            self.pending_spike_cancel = Some(ExecutorCommand::CancelLeg1 {
-                                order_id: order_id.clone(),
-                            });
-                            self.cancelled_leg1_info = Some(saved);
-                        }
-                        self.state.leg1_state = OrderState::None;
-                        self.pending_leg1_signal = None;
-                        self.leg1_direction = None;
-                        self.state.spike_detected = false;
-                        self.state.last_spike = None;
-                    }
-                    OrderState::Filled { .. } => {
-                        // Already filled — proceed with Leg 2 normally.
-                        debug!(
-                            timestamp_ms,
-                            "spike failed but Leg 1 already filled — no-op"
-                        );
-                    }
-                    OrderState::None => {
-                        // Evaluator rejected the candidate — no order was posted.
-                        debug!(timestamp_ms, "spike failed but no Leg 1 posted — no-op");
-                        self.state.spike_detected = false;
-                        self.state.last_spike = None;
-                    }
-                }
             }
 
             // ── Market rotation ───────────────────────────────────────────
@@ -975,14 +811,10 @@ impl StrategyEngine {
                 self.avg_book_depth = None;
                 self.leg1_direction = None;
                 self.pending_leg1_signal = None;
-                self.pending_spike_cancel = None;
                 self.pending_tick_size_cmd = None;
-                self.speculative_awaiting_sustain = false;
                 self.whipsaw_fok_pending = false;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
-                self.cancel_leg1_on_feedback = false;
-                self.cancelled_leg1_info = None;
                 self.prev_leg2_order = None;
                 self.pending_fills.clear();
                 self.pending_partial_fills.clear();
@@ -1073,8 +905,6 @@ impl StrategyEngine {
                             warn!(%order_id, "Leg 1 CANCELED by CLOB — resetting");
                             self.state.leg1_state = OrderState::None;
                             self.pending_leg1_signal = None;
-                            self.speculative_awaiting_sustain = false;
-                            self.cancelled_leg1_info = None;
                         }
                         TradeStatus::Retrying => {
                             debug!(%order_id, "Leg 1 RETRYING");
@@ -1329,8 +1159,6 @@ impl StrategyEngine {
                 atr,
                 threshold,
                 mid,
-                candidates,
-                rej_momentum,
                 rej_magnitude,
                 confirmed,
                 stale,
@@ -1339,8 +1167,6 @@ impl StrategyEngine {
                     atr,
                     threshold,
                     mid,
-                    candidates,
-                    rej_momentum,
                     rej_magnitude,
                     confirmed,
                     stale,
@@ -1458,11 +1284,8 @@ impl StrategyEngine {
                     Leg1RejectReason::NoBinance => self.diag_rej_no_binance += 1,
                     Leg1RejectReason::StaleBook => self.diag_rej_stale += 1,
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
-                    Leg1RejectReason::SpreadWide => self.diag_rej_spread += 1,
-                    Leg1RejectReason::InsufficientDepth => self.diag_rej_depth += 1,
                     Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
                     Leg1RejectReason::ObiMismatch => self.diag_rej_obi += 1,
-                    Leg1RejectReason::HedgeImpossible => self.diag_rej_hedge_impossible += 1,
                     Leg1RejectReason::Other => self.diag_rej_other += 1,
                 }
                 None
@@ -1501,6 +1324,7 @@ impl StrategyEngine {
             Some(e) => HedgeSnap {
                 emergency_submitted: e.emergency_submitted,
                 break_even: e.break_even(),
+                leg1_taker_fee: e.leg1_taker_fee,
                 initial_profit_target: e.initial_profit_target,
                 direction: e.direction,
                 fill_ms: e.leg1_fill_ms,
@@ -1554,8 +1378,6 @@ impl StrategyEngine {
                 None => {}
             }
             // Track for live mode trade-completed Telegram message.
-            // Preserve leg1_cancel_race — it was set on Leg 1 fill, before Leg 2 emergency.
-            let cancel_race = self.live_trade_meta.leg1_cancel_race;
             self.live_trade_meta = LiveTradeMeta {
                 leg2_was_taker: was_taker,
                 exit_reason: reason,
@@ -1564,7 +1386,6 @@ impl StrategyEngine {
                 favorable_maker: false,
                 phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
                 phase1_dual_fill: false,
-                leg1_cancel_race: cancel_race,
             };
             if let Some(e) = self.hedge.as_mut() {
                 e.emergency_submitted = true;
@@ -1658,12 +1479,6 @@ impl StrategyEngine {
         self.post_trade_orphan.is_some() && !self.orphan_cancel_sent
     }
 
-    /// Take the pending spike cancel command (if any).
-    /// Called by the main loop after `on_event()` to send `CancelLeg1` to the executor.
-    pub fn take_spike_cancel(&mut self) -> Option<ExecutorCommand> {
-        self.pending_spike_cancel.take()
-    }
-
     /// Take the pending tick size change command (if any).
     /// Called by the main loop after `on_event()` to forward to the executor.
     pub fn take_tick_size_change(&mut self) -> Option<ExecutorCommand> {
@@ -1715,11 +1530,8 @@ impl StrategyEngine {
             rej_no_bnc = self.diag_rej_no_binance,
             rej_stale = self.diag_rej_stale,
             rej_skew = self.diag_rej_skew,
-            rej_spread = self.diag_rej_spread,
-            rej_depth = self.diag_rej_depth,
             rej_reprice = self.diag_rej_reprice,
             rej_obi = self.diag_rej_obi,
-            rej_hedge = self.diag_rej_hedge_impossible,
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
@@ -1740,8 +1552,6 @@ impl StrategyEngine {
             rebal_attempts = self.diag_rebalance_attempts,
             rebal_success = self.diag_rebalance_successes,
             p2_entry_breach = self.diag_phase2_entry_breach,
-            leg1_timeout = self.diag_leg1_timeouts,
-            sustain_cancel = self.diag_spike_sustain_cancel,
             spike_fail = self.diag_spike_failures,
             order_fail = self.diag_order_failures,
             "engine 60s"
@@ -1766,15 +1576,13 @@ impl StrategyEngine {
             format!(
                 "<b>Spike Detector</b>\n\
                  ATR: <code>{atr:.4}</code>  Threshold: <code>{thr:.4}</code>  Mid: <code>${mid:.2}</code>\n\
-                 Candidates: {cand}  Confirmed: {conf}  Stale: {stale}\n\
-                 Rejected — momentum: {rej_mom}  magnitude: {rej_mag}",
+                 Confirmed: {conf}  Stale: {stale}\n\
+                 Rejected — magnitude: {rej_mag}",
                 atr = s.atr,
                 thr = s.threshold,
                 mid = s.mid,
-                cand = s.candidates,
                 conf = s.confirmed,
                 stale = s.stale,
-                rej_mom = s.rej_momentum,
                 rej_mag = s.rej_magnitude,
             )
         } else {
@@ -1791,10 +1599,10 @@ impl StrategyEngine {
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Skewed: {skew}\n\
-             Spread: {spread}  Depth: {depth}  Reprice: {reprice}  OBI: {obi}  Hedge: {hedge}  Other: {other}\n\
+             Reprice: {reprice}  OBI: {obi}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
-             Signals: {sig}  Fills: {fill}  Failed: {failed}  Timeouts: {timeout}  Sustain cancel: {sus_cancel}\n\
+             Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
@@ -1816,17 +1624,12 @@ impl StrategyEngine {
             no_bnc = self.diag_rej_no_binance,
             stale = self.diag_rej_stale,
             skew = self.diag_rej_skew,
-            spread = self.diag_rej_spread,
-            depth = self.diag_rej_depth,
             reprice = self.diag_rej_reprice,
             obi = self.diag_rej_obi,
-            hedge = self.diag_rej_hedge_impossible,
             other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
             failed = self.diag_order_failures,
-            timeout = self.diag_leg1_timeouts,
-            sus_cancel = self.diag_spike_sustain_cancel,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -1863,60 +1666,7 @@ impl StrategyEngine {
         &self.state
     }
 
-    /// Check if Leg 1 has been posted too long without filling.
-    /// Returns a `CancelLeg1` command if timed out, or `None`.
-    ///
-    /// Skips the check while the order ID is still provisional (`"sim-..."`),
-    /// because the CLOB round-trip (~1.2s) would consume the timeout before
-    /// the order even reaches the book. The timer starts when
-    /// `on_order_posted()` resets `timestamp_ms` with the real CLOB ID.
-    pub fn check_leg1_staleness(&mut self) -> Option<ExecutorCommand> {
-        let now_ms = now_epoch_ms();
-        if let OrderState::Posted {
-            order_id,
-            price,
-            size,
-            timestamp_ms,
-        } = &self.state.leg1_state
-        {
-            // Order still in transit to the CLOB — don't count transit time as resting time.
-            if Self::is_provisional_order_id(order_id) {
-                return None;
-            }
-
-            if now_ms.saturating_sub(*timestamp_ms) > self.leg1.leg1_timeout_ms {
-                info!(
-                    elapsed_ms = now_ms.saturating_sub(*timestamp_ms),
-                    timeout_ms = self.leg1.leg1_timeout_ms,
-                    "Leg 1 stale — cancelling unfilled order"
-                );
-                // Save order info + signal + direction + spike before clearing — restored if cancel not confirmed.
-                self.cancelled_leg1_info = Some(CancelledLeg1 {
-                    order_id: order_id.clone(),
-                    price: *price,
-                    size: *size,
-                    signal: self.pending_leg1_signal.clone(),
-                    direction: self.leg1_direction,
-                    spike: self.state.last_spike,
-                });
-                let cmd = Some(ExecutorCommand::CancelLeg1 {
-                    order_id: order_id.clone(),
-                });
-                self.state.leg1_state = OrderState::None;
-                self.pending_leg1_signal = None;
-                self.leg1_direction = None;
-                self.pending_spike_cancel = None;
-                self.speculative_awaiting_sustain = false;
-                self.diag_leg1_timeouts += 1;
-                return cmd;
-            }
-        }
-        None
-    }
-
     /// Called by the Executor when an order is successfully posted to the CLOB.
-    /// Returns `Some(CancelLeg1)` if the order should be immediately cancelled
-    /// (deferred cancel from SpikeFailed/staleness while the ID was provisional).
     pub fn on_order_posted(
         &mut self,
         is_leg2: bool,
@@ -1926,22 +1676,7 @@ impl StrategyEngine {
         fill_method: Option<FillMethod>,
         already_filled: bool,
         order_tag: Option<OrderTag>,
-    ) -> Option<ExecutorCommand> {
-        // Deferred cancel: SpikeFailed/staleness arrived while ID was provisional.
-        // Now we have the real CLOB ID — cancel it instead of resurrecting state.
-        if !is_leg2 && self.cancel_leg1_on_feedback {
-            self.cancel_leg1_on_feedback = false;
-            // Update saved info with the real CLOB ID so on_cancel_result() can match.
-            if let Some(ref mut saved) = self.cancelled_leg1_info {
-                saved.order_id = order_id.clone();
-                saved.price = price;
-                saved.size = size;
-            }
-            info!(%order_id, "deferred cancel: cancelling real CLOB order");
-            return Some(ExecutorCommand::CancelLeg1 { order_id });
-            // leg1_state stays None — do NOT resurrect.
-        }
-
+    ) {
         // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
         // has been reset (e.g., stale hedge command processed after trade completed).
         if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
@@ -1949,7 +1684,7 @@ impl StrategyEngine {
                 "ignoring stale Leg 2 OrderPosted — no active Leg 1 fill");
             self.emergency_signal_in_flight = false;
             self.leg2_command_pending = false;
-            return None;
+            return;
         }
 
         let now_ms = now_epoch_ms();
@@ -2011,8 +1746,45 @@ impl StrategyEngine {
                 }
                 // Don't replay pending fills — go straight to trade completion
                 // (checked by main loop after feedback drain).
-                return None;
+                return;
             }
+        }
+
+        // Leg 1 already_filled: batch FAK fills are confirmed synchronously.
+        // Transition directly to Filled, init Leg 2 hedge, and send opportunity alert.
+        if !is_leg2 && already_filled {
+            info!(%order_id, %price, %size, "Leg 1 FAK batch filled — direct transition to Filled");
+            self.state.leg1_state = OrderState::Filled {
+                order_id,
+                price,
+                size,
+                fill_timestamp_ms: now_ms,
+            };
+            self.init_leg2(price, size, now_ms);
+            self.live_trade_meta = LiveTradeMeta::default();
+
+            // Send opportunity alert via Telegram in live mode.
+            if let (Some(reporter), Some(signal)) = (
+                self.reporter.clone(),
+                self.pending_leg1_signal.clone(),
+            ) {
+                let book = signal
+                    .book_snapshot
+                    .clone()
+                    .or_else(|| self.state.poly_book.clone())
+                    .unwrap_or_else(|| OrderBook {
+                        asset_id: signal.token_id.clone(),
+                        bids: vec![],
+                        asks: vec![],
+                        timestamp_ms: now_ms,
+                    });
+                reporter.send_opportunity_alert(&signal, price, size, &book);
+                self.live_market_signals += 1;
+                if signal.bot_contested {
+                    self.live_market_walls += 1;
+                }
+            }
+            return;
         }
 
         let leg = if is_leg2 {
@@ -2027,96 +1799,12 @@ impl StrategyEngine {
             timestamp_ms: now_ms,
         };
         self.replay_pending_fills(now_ms);
-        None
     }
 
-    /// Called when the live executor's REST poll detects a Leg 1 fill.
-    /// Primary fill detection path (~200ms deterministic). User WS remains
-    /// as backup but will be deduped (leg1_state already Filled).
-    pub fn on_rest_fill_detected(
-        &mut self,
-        order_id: String,
-        price: Decimal,
-        size: Decimal,
-        size_matched: Decimal,
-        original_size: Decimal,
-    ) {
-        // Dedup guard: only transition if Leg 1 is Posted with matching order_id.
-        let is_match = matches!(
-            &self.state.leg1_state,
-            OrderState::Posted { order_id: oid, .. } if *oid == order_id
-        );
-        if !is_match {
-            info!(%order_id, "REST fill deduped — Leg 1 not Posted or order_id mismatch");
-            return;
-        }
-
-        let now_ms = now_epoch_ms();
-        info!(%order_id, %price, %size, %size_matched, %original_size, "Leg 1 fill via REST poll");
-
-        // Partial fill tracking.
-        if size_matched < original_size {
-            warn!(%order_id, %size_matched, %original_size, "partial fill on Leg 1 (REST) — deferring alert to MINED");
-            self.pending_partial_fills.insert(
-                order_id.clone(),
-                PendingPartialFill {
-                    leg: "Leg 1",
-                    size_matched,
-                    original_size,
-                },
-            );
-        }
-
-        // State transition: Posted → Filled.
-        // Use actual fill size when partial fill detected.
-        // Truncate to 2dp — CLOB max lot precision is 2 decimal places, and
-        // REST API size_matched can return arbitrary precision.
-        let actual_size = if size_matched > Decimal::ZERO && size_matched < size {
-            size_matched.round_dp(2)
-        } else {
-            size.round_dp(2)
-        };
-        self.state.leg1_state = OrderState::Filled {
-            order_id,
-            price,
-            size: actual_size,
-            fill_timestamp_ms: now_ms,
-        };
-        self.init_leg2(price, actual_size, now_ms);
-        self.live_trade_meta = LiveTradeMeta::default();
-
-        // Send opportunity alert via Telegram in live mode.
-        if let (Some(reporter), Some(signal)) = (
-            self.reporter.clone(),
-            self.pending_leg1_signal.clone(),
-        ) {
-            let book = signal
-                .book_snapshot
-                .clone()
-                .or_else(|| self.state.poly_book.clone())
-                .unwrap_or_else(|| OrderBook {
-                    asset_id: signal.token_id.clone(),
-                    bids: vec![],
-                    asks: vec![],
-                    timestamp_ms: now_ms,
-                });
-            reporter.send_opportunity_alert(&signal, price, size, &book);
-            self.live_market_signals += 1;
-            if signal.bot_contested {
-                self.live_market_walls += 1;
-            }
-        }
-    }
 
     /// Called by the live executor (via feedback channel) when order placement fails.
     /// Resets the affected leg state to `None` so the engine can re-evaluate.
     pub fn on_order_failed(&mut self, is_leg2: bool) {
-        if !is_leg2 && self.cancel_leg1_on_feedback {
-            // SpikeFailed/staleness already reset state — nothing to cancel.
-            self.cancel_leg1_on_feedback = false;
-            info!("deferred cancel: order placement failed — flag cleared (no cancel needed)");
-            return;
-        }
         // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
         // has been reset (e.g., stale hedge command processed after trade completed).
         if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
@@ -2168,8 +1856,6 @@ impl StrategyEngine {
         if was_cancelled {
             if is_leg2 {
                 self.prev_leg2_order = None;
-            } else {
-                self.cancelled_leg1_info = None;
             }
             debug!(%order_id, is_leg2, "cancel confirmed by CLOB");
             return;
@@ -2177,75 +1863,39 @@ impl StrategyEngine {
 
         // NOT cancelled — order may have filled. Restore state so User WS events match.
         let now_ms = now_epoch_ms();
-        let mut leg1_restored = false;
-        if !is_leg2 {
-            if let Some(saved) = self.cancelled_leg1_info.take()
-                && saved.order_id == order_id
-                && matches!(self.state.leg1_state, OrderState::None)
+        if is_leg2 {
+            if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
+                && saved_id == order_id
             {
-                warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
-                self.state.leg1_state = OrderState::Posted {
-                    order_id: saved.order_id,
-                    price: saved.price,
-                    size: saved.size,
-                    timestamp_ms: now_ms,
-                };
-                // Restore signal and direction so on_trade_complete() can build Telegram message.
-                if self.pending_leg1_signal.is_none() {
-                    self.pending_leg1_signal = saved.signal;
+                let is_provisional = matches!(
+                    &self.state.leg2_state,
+                    OrderState::Posted { order_id: oid, .. } if oid.starts_with("sim-")
+                );
+                if is_provisional || matches!(self.state.leg2_state, OrderState::None) {
+                    warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
+                    self.state.leg2_state = OrderState::Posted {
+                        order_id: saved_id,
+                        price,
+                        size,
+                        timestamp_ms: now_ms,
+                    };
+                    // The original post-only order filled as a maker — not an emergency exit.
+                    // Reset live_trade_meta so the trade is correctly classified.
+                    self.live_trade_meta = LiveTradeMeta::default();
+                    // Also reset hedge emergency state so it doesn't taint subsequent evaluation.
+                    if let Some(e) = self.hedge.as_mut() {
+                        e.emergency_submitted = false;
+                        e.exit_reason = None;
+                    }
                 }
-                if self.leg1_direction.is_none() {
-                    self.leg1_direction = saved.direction;
-                }
-                if self.state.last_spike.is_none() {
-                    self.state.last_spike = saved.spike;
-                }
-                leg1_restored = true;
             } else {
                 debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
             }
-        } else if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
-            && saved_id == order_id
-        {
-            let is_provisional = matches!(
-                &self.state.leg2_state,
-                OrderState::Posted { order_id: oid, .. } if oid.starts_with("sim-")
-            );
-            if is_provisional || matches!(self.state.leg2_state, OrderState::None) {
-                warn!(%order_id, is_leg2, "cancel NOT confirmed — restoring Posted state");
-                self.state.leg2_state = OrderState::Posted {
-                    order_id: saved_id,
-                    price,
-                    size,
-                    timestamp_ms: now_ms,
-                };
-                // The original post-only order filled as a maker — not an emergency exit.
-                // Reset live_trade_meta so the trade is correctly classified.
-                let cancel_race = self.live_trade_meta.leg1_cancel_race;
-                self.live_trade_meta = LiveTradeMeta {
-                    leg1_cancel_race: cancel_race,
-                    ..Default::default()
-                };
-                // Also reset hedge emergency state so it doesn't taint subsequent evaluation.
-                if let Some(e) = self.hedge.as_mut() {
-                    e.emergency_submitted = false;
-                    e.exit_reason = None;
-                }
-            }
         } else {
-            debug!(%order_id, is_leg2, "cancel NOT confirmed — no saved state to restore (trade may have completed)");
+            debug!(%order_id, is_leg2, "Leg 1 cancel NOT confirmed — no restore logic (speculative posting removed)");
         }
 
-        // Set cancel-race flag BEFORE replay so init_leg2() can detect it and
-        // use breakeven target instead of profit target (thesis impaired by reversal).
-        if leg1_restored {
-            self.live_trade_meta.leg1_cancel_race = true;
-        }
         self.replay_pending_fills(now_ms);
-        // Re-set after replay — replay_pending_fills() resets LiveTradeMeta.
-        if leg1_restored {
-            self.live_trade_meta.leg1_cancel_race = true;
-        }
     }
 
     /// Called when the executor confirms a specific Leg 2 order cancel (dual-order).
@@ -2366,6 +2016,7 @@ impl StrategyEngine {
             sim_was_taker: true,
             atr: Decimal::ZERO,
             bot_contested: false,
+            leg1_taker_fee: Decimal::ZERO,
             best_ask: None,
             book_snapshot: book,
         };
@@ -2416,14 +2067,9 @@ impl StrategyEngine {
                             fill_timestamp_ms: now_ms,
                         };
                         self.init_leg2(price, fill_size, now_ms);
-                        // Preserve cancel-race flag across reset so on_trade_complete sees it.
-                        let cancel_race = self.live_trade_meta.leg1_cancel_race;
-                        self.live_trade_meta = LiveTradeMeta {
-                            leg1_cancel_race: cancel_race,
-                            ..Default::default()
-                        };
+                        self.live_trade_meta = LiveTradeMeta::default();
 
-                        // Send opportunity alert for replayed Leg 1 fill (e.g. cancel-race).
+                        // Send opportunity alert for replayed Leg 1 fill.
                         if let (Some(reporter), Some(signal)) = (
                             self.reporter.clone(),
                             self.pending_leg1_signal.clone(),
@@ -2450,7 +2096,6 @@ impl StrategyEngine {
                     }
                     TradeStatus::Canceled => {
                         self.state.leg1_state = OrderState::None;
-                        self.cancelled_leg1_info = None;
                     }
                     TradeStatus::Retrying => {}
                 }
@@ -2670,14 +2315,10 @@ impl StrategyEngine {
         self.hedge = None;
         self.leg1_direction = None;
         self.pending_leg1_signal = None;
-        self.pending_spike_cancel = None;
         self.pending_tick_size_cmd = None;
-        self.speculative_awaiting_sustain = false;
         self.whipsaw_fok_pending = false;
         self.emergency_signal_in_flight = false;
         self.leg2_command_pending = false;
-        self.cancel_leg1_on_feedback = false;
-        self.cancelled_leg1_info = None;
         self.prev_leg2_order = None;
         self.pending_fills.clear();
         // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
@@ -2735,26 +2376,17 @@ impl StrategyEngine {
             // opposite spike arrives between Leg 1 fill and init_leg2().
             let direction = self.leg1_direction.unwrap_or(spike.direction);
             let tick = self.state.tick_size;
-            // Mid-cancel (cancel-race): spike reversed, thesis impaired.
-            // Target breakeven minus 1 tick (pair = $0.99) instead of profit target.
-            // This maximises the chance of a maker fill at a reasonable price rather
-            // than waiting for an ambitious profit target that will likely breach.
-            let phase1_target_price = if self.live_trade_meta.leg1_cancel_race {
-                let be_price = round_to_tick(
-                    Decimal::ONE - fill_price - tick,
-                    tick,
-                );
-                info!(%fill_price, %be_price, "cancel-race detected — using breakeven target");
-                be_price
-            } else {
-                round_to_tick(
-                    Decimal::ONE - initial_profit_target - fill_price,
-                    tick,
-                )
-            };
+            let phase1_target_price = round_to_tick(
+                Decimal::ONE - initial_profit_target - fill_price,
+                tick,
+            );
+            let leg1_taker_fee = self.pending_leg1_signal.as_ref()
+                .map(|s| s.leg1_taker_fee)
+                .unwrap_or(Decimal::ZERO);
             self.hedge = Some(HedgeState::new(
                 now_ms,
                 fill_price,
+                leg1_taker_fee,
                 tier,
                 initial_profit_target,
                 direction,
@@ -2826,7 +2458,6 @@ impl StrategyEngine {
         signal.sim_was_taker = true;
 
         // Set up emergency dispatch state (mirrors evaluate_leg2 dispatch)
-        let cancel_race = self.live_trade_meta.leg1_cancel_race;
         self.live_trade_meta = LiveTradeMeta {
             leg2_was_taker: true,
             exit_reason: Some(ExitReason::WhipsawReversal),
@@ -2835,7 +2466,6 @@ impl StrategyEngine {
             favorable_maker: false,
             phase1_breach: false,
             phase1_dual_fill: false,
-            leg1_cancel_race: cancel_race,
         };
         if let Some(e) = self.hedge.as_mut() {
             e.emergency_submitted = true;
@@ -2889,34 +2519,12 @@ impl StrategyEngine {
         {
             let fill_price = *price;
             let fill_size = *size;
-            let posted_ts = *timestamp_ms;
-
-            // ── Speculative fill gate: wait for SpikeConfirmed ───────────
-            // Don't simulate fills until the spike has been confirmed.
-            // This prevents fills during the sustain window (T=0 to T=~300ms).
-            if self.speculative_awaiting_sustain {
-                return signals;
-            }
-
-            // ── Leg 1 staleness: cancel if resting too long ──────────────
-            if now_ms.saturating_sub(posted_ts) > self.leg1.leg1_timeout_ms {
-                info!(
-                    elapsed_ms = now_ms.saturating_sub(posted_ts),
-                    timeout_ms = self.leg1.leg1_timeout_ms,
-                    "Leg 1 stale — cancelling unfilled order"
-                );
-                self.state.leg1_state = OrderState::None;
-                self.pending_leg1_signal = None;
-                self.leg1_direction = None;
-                self.diag_leg1_timeouts += 1;
-                return signals;
-            }
 
             let tick = self.state.tick_size;
             let two_ticks = tick * Decimal::TWO;
 
-            // Leg 1 fill check: post-only valid + depth exists. No timing gate —
-            // we simulate instant fill (execution speed is the priority).
+            // Leg 1 fill check: FAK taker — fills if ask depth exists at or below
+            // our limit price. No timing gate — instant fill.
             let should_fill = match self.leg1_direction {
                 Some(Direction::Up) => {
                     let book_opt = self
@@ -2927,14 +2535,15 @@ impl StrategyEngine {
                     match book_opt {
                         Some(book) => {
                             let ask = book.best_ask().map(|a| a.price);
-                            let post_only_valid = ask.is_some_and(|a| fill_price < a);
+                            // FAK: fills as taker when ask <= our limit price
+                            let taker_valid = ask.is_some_and(|a| a <= fill_price);
                             let near_ask_depth: Decimal = book
                                 .asks
                                 .iter()
                                 .filter(|lvl| lvl.price <= fill_price + two_ticks)
                                 .map(|lvl| lvl.size)
                                 .sum();
-                            post_only_valid && near_ask_depth > Decimal::ZERO
+                            taker_valid && near_ask_depth > Decimal::ZERO
                         }
                         None => false,
                     }
@@ -2942,14 +2551,15 @@ impl StrategyEngine {
                 Some(Direction::Down) => match self.state.poly_no_book.as_ref() {
                     Some(book) => {
                         let ask = book.best_ask().map(|a| a.price);
-                        let post_only_valid = ask.is_some_and(|a| fill_price < a);
+                        // FAK: fills as taker when ask <= our limit price
+                        let taker_valid = ask.is_some_and(|a| a <= fill_price);
                         let near_ask_depth: Decimal = book
                             .asks
                             .iter()
                             .filter(|lvl| lvl.price <= fill_price + two_ticks)
                             .map(|lvl| lvl.size)
                             .sum();
-                        post_only_valid && near_ask_depth > Decimal::ZERO
+                        taker_valid && near_ask_depth > Decimal::ZERO
                     }
                     None => false,
                 },
@@ -2960,14 +2570,14 @@ impl StrategyEngine {
                 self.diag_leg1_fills += 1;
                 info!(
                     %fill_price, %fill_size,
-                    "advance_simulation: Leg 1 simulated fill (counterparty sold into bid)"
+                    "advance_simulation: Leg 1 simulated fill (FAK taker at ask)"
                 );
                 if let Some(mut sig) = self.pending_leg1_signal.take() {
                     sig.sim_confirmed_fill = true;
                     signals.push(sig);
                 }
                 self.state.leg1_state = OrderState::Filled {
-                    order_id: format!("sim-leg1-{}", posted_ts),
+                    order_id: format!("sim-leg1-{}", timestamp_ms),
                     price: fill_price,
                     size: fill_size,
                     fill_timestamp_ms: now_ms,
@@ -3469,19 +3079,21 @@ impl StrategyEngine {
         let pair_cost = l1_price + l2_price;
         let paired_size = l1_size.min(l2_size);
         let gross_profit = (Decimal::ONE - pair_cost) * paired_size;
-        let taker_fee = if self.live_trade_meta.leg2_was_taker {
+        // Leg 1 always taker (FAK batch); Leg 2 taker only if emergency/favorable.
+        let leg1_taker_fee = SimFill::compute_taker_fee(l1_price, l1_size);
+        let leg2_taker_fee = if self.live_trade_meta.leg2_was_taker {
             SimFill::compute_taker_fee(l2_price, l2_size)
         } else {
             Decimal::ZERO
         };
-        // Leg 1 always maker; Leg 2 maker only if not taker.
-        let leg1_rebate = SimFill::compute_maker_rebate(l1_price, l1_size);
+        let taker_fee = leg1_taker_fee + leg2_taker_fee;
+        // Leg 1 no rebate (taker); Leg 2 rebate only if maker fill.
         let leg2_rebate = if self.live_trade_meta.leg2_was_taker {
             Decimal::ZERO
         } else {
             SimFill::compute_maker_rebate(l2_price, l2_size)
         };
-        let maker_rebate = leg1_rebate + leg2_rebate;
+        let maker_rebate = leg2_rebate;
         let net_profit = gross_profit - taker_fee + maker_rebate;
         let total_cost = l1_price * l1_size + l2_price * l2_size;
         let profit_pct = if total_cost.is_zero() {
@@ -3503,9 +3115,9 @@ impl StrategyEngine {
             size: l1_size,
             timestamp_ms: l1_ts,
             was_partial: sizes_differ && l1_size > l2_size,
-            was_taker: false,
-            taker_fee: Decimal::ZERO,
-            maker_rebate: leg1_rebate,
+            was_taker: true,
+            taker_fee: leg1_taker_fee,
+            maker_rebate: Decimal::ZERO,
         };
         let leg2_fill = SimFill {
             side: leg2_side,
@@ -3514,7 +3126,7 @@ impl StrategyEngine {
             timestamp_ms: now_ms,
             was_partial: sizes_differ && l2_size > l1_size,
             was_taker: self.live_trade_meta.leg2_was_taker,
-            taker_fee,
+            taker_fee: leg2_taker_fee,
             maker_rebate: leg2_rebate,
         };
 
@@ -3542,7 +3154,7 @@ impl StrategyEngine {
             emergency_maker: self.live_trade_meta.emergency_maker,
             exit_reason: self.live_trade_meta.exit_reason,
             spike_magnitude: hedge.spike_info.magnitude,
-            leg1_cancel_race: self.live_trade_meta.leg1_cancel_race,
+            leg1_cancel_race: false,
             phase1_breach: self.live_trade_meta.phase1_breach,
             phase1_dual_fill: self.live_trade_meta.phase1_dual_fill,
             whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
@@ -3569,33 +3181,13 @@ impl StrategyEngine {
         self.paused
     }
 
-    /// Set the deferred Leg 1 cancel flag (used when Shutdown/DrainAndRestart
-    /// encounters a provisional order ID that can't be cancelled yet).
-    pub fn set_cancel_leg1_on_feedback(&mut self, v: bool) {
-        self.cancel_leg1_on_feedback = v;
-    }
-
     /// Reset Leg 1 state to `None` and clear associated tracking fields.
-    /// Saves order info + signal + direction for cancel confirmation tracking (non-provisional IDs only).
     pub fn reset_leg1_state(&mut self) {
-        if let OrderState::Posted { ref order_id, price, size, .. } = self.state.leg1_state
-            && !Self::is_provisional_order_id(order_id)
-        {
-            self.cancelled_leg1_info = Some(CancelledLeg1 {
-                order_id: order_id.clone(),
-                price,
-                size,
-                signal: self.pending_leg1_signal.clone(),
-                direction: self.leg1_direction,
-                spike: self.state.last_spike,
-            });
-        }
         self.state.leg1_state = OrderState::None;
         self.pending_leg1_signal = None;
         self.leg1_direction = None;
         self.state.spike_detected = false;
         self.state.last_spike = None;
-        self.speculative_awaiting_sustain = false;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).
@@ -3825,14 +3417,6 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_aborts_on_wide_spread() {
-        let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.30", "0.70");
-        inject_spike(&mut engine, Direction::Up);
-        assert!(engine.evaluate().is_none());
-    }
-
-    #[test]
     fn test_evaluate_aborts_near_expiry() {
         let mut engine = make_engine_with_market(60);
         set_book(&mut engine, "0.48", "0.52");
@@ -3849,7 +3433,8 @@ mod tests {
         assert!(!s.is_leg2);
         assert_eq!(s.side, Side::Buy);
         assert_eq!(s.token_id, "yes"); // UP → YES
-        assert_eq!(s.price, Decimal::new(50, 2));
+        // FAK: signal price = ask price
+        assert_eq!(s.price, Decimal::new(505, 3));
     }
 
     #[test]
@@ -3918,6 +3503,7 @@ mod tests {
         let mut h = HedgeState::new(
             now_ms,
             leg1_price,
+            Decimal::ZERO,
             ProfitTier::High,
             ProfitTier::High.target_pct(),
             Direction::Up,
@@ -3953,6 +3539,7 @@ mod tests {
         let h = HedgeState::new(
             now_ms,
             Decimal::new(48, 2),
+            Decimal::ZERO,
             ProfitTier::High,
             ProfitTier::High.target_pct(),
             Direction::Up,
@@ -3960,7 +3547,7 @@ mod tests {
             Decimal::ZERO,
             Decimal::new(495, 3),
         );
-        // break_even = 1.0 - leg1_fill_price = 0.52
+        // break_even = 1.0 - leg1_fill_price - leg1_taker_fee = 0.52
         assert_eq!(h.break_even(), Decimal::new(52, 2));
     }
 
@@ -4536,137 +4123,6 @@ mod tests {
         );
     }
 
-    // ── Speculative Leg 1: SpikeFailed cancels Posted order ──────────
-
-    #[test]
-    fn test_spike_failed_cancels_posted_leg1() {
-        let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.495", "0.505");
-        inject_spike(&mut engine, Direction::Up);
-
-        // evaluate() should generate a Leg 1 signal.
-        let signal = engine.evaluate().expect("should generate Leg 1 signal");
-        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
-        assert!(signal.token_id == "yes");
-
-        // Simulate speculative_awaiting_sustain = true (would be set by SpikeCandidate handler).
-        engine.speculative_awaiting_sustain = true;
-
-        // SpikeFailed → should cancel the speculative Leg 1 order.
-        engine.on_event(IngestorEvent::SpikeFailed {
-            timestamp_ms: now_epoch_ms(),
-        });
-
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::None),
-            "Leg 1 should be reset to None after spike failed"
-        );
-        assert!(
-            !engine.state.spike_detected,
-            "spike_detected should be cleared"
-        );
-        assert!(
-            engine.state.last_spike.is_none(),
-            "last_spike should be cleared"
-        );
-        assert!(
-            engine.pending_leg1_signal.is_none(),
-            "pending signal should be cleared"
-        );
-        assert!(
-            engine.leg1_direction.is_none(),
-            "leg1_direction should be cleared"
-        );
-        assert!(
-            !engine.speculative_awaiting_sustain,
-            "speculative gate should be cleared"
-        );
-
-        // Provisional ID → cancel is deferred to feedback, not immediate.
-        assert!(
-            engine.take_spike_cancel().is_none(),
-            "provisional ID should NOT produce immediate spike cancel"
-        );
-        assert!(
-            engine.cancel_leg1_on_feedback,
-            "cancel_leg1_on_feedback should be set for provisional ID"
-        );
-
-        // Simulate real CLOB ID arriving via feedback.
-        let cancel_cmd = engine.on_order_posted(false, "real-clob-id-123".into(), Decimal::new(49, 2), Decimal::new(10, 0), None, false, None);
-        assert!(cancel_cmd.is_some(), "should return CancelLeg1 for deferred cancel");
-        match cancel_cmd.unwrap() {
-            ExecutorCommand::CancelLeg1 { order_id } => {
-                assert_eq!(order_id, "real-clob-id-123", "should cancel with real CLOB ID");
-            }
-            other => panic!("expected CancelLeg1, got {other:?}"),
-        }
-        assert!(!engine.cancel_leg1_on_feedback, "flag should be cleared after deferred cancel");
-    }
-
-    #[test]
-    fn test_spike_failed_noop_when_filled() {
-        let mut engine = engine_with_filled_leg1();
-
-        // Set up NO book for the Leg 2 side.
-        engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
-            asset_id: "no".to_string(),
-            bids: vec![PriceLevel {
-                price: Decimal::new(45, 2),
-                size: Decimal::new(100, 0),
-            }],
-            asks: vec![PriceLevel {
-                price: Decimal::new(50, 2),
-                size: Decimal::new(100, 0),
-            }],
-            timestamp_ms: now_epoch_ms(),
-        }));
-
-        // SpikeFailed after Leg 1 is already filled → should be no-op.
-        engine.on_event(IngestorEvent::SpikeFailed {
-            timestamp_ms: now_epoch_ms(),
-        });
-
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Filled { .. }),
-            "Leg 1 should remain Filled"
-        );
-        assert!(
-            engine.take_spike_cancel().is_none(),
-            "no cancel command when already filled"
-        );
-    }
-
-    #[test]
-    fn test_speculative_gate_blocks_sim_fills() {
-        let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.495", "0.505");
-        inject_spike(&mut engine, Direction::Up);
-
-        let _signal = engine.evaluate().expect("should generate signal");
-        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
-
-        // Simulate speculative awaiting sustain.
-        engine.speculative_awaiting_sustain = true;
-
-        // advance_simulation() should NOT fill while gate is closed.
-        engine.advance_simulation();
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Posted { .. }),
-            "Leg 1 should still be Posted — gate is closed"
-        );
-
-        // Open the gate (SpikeConfirmed).
-        engine.speculative_awaiting_sustain = false;
-
-        // Now advance_simulation() should fill.
-        engine.advance_simulation();
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Filled { .. }),
-            "Leg 1 should be Filled after gate opens"
-        );
-    }
-
     // ── Phase 1 → Phase 2 transition via timeout ─────────────────────
 
     #[test]
@@ -4783,203 +4239,4 @@ mod tests {
         assert!(engine.has_no_open_position());
     }
 
-    // ── Cancel-not-confirmed signal restoration ──────────────────────────
-
-    #[test]
-    fn test_staleness_cancel_saves_signal_and_direction() {
-        let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.495", "0.505");
-        inject_spike(&mut engine, Direction::Up);
-
-        let signal = engine.evaluate().expect("should generate Leg 1 signal");
-        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
-        assert!(engine.pending_leg1_signal.is_some());
-        assert_eq!(engine.leg1_direction, Some(Direction::Up));
-
-        // Simulate real CLOB ID arriving (staleness skips provisional IDs).
-        engine.on_order_posted(false, "real-id-1".into(), signal.price, signal.size, None, false, None);
-        assert!(engine.pending_leg1_signal.is_some());
-
-        // Force staleness: set timestamp far in the past so elapsed > timeout.
-        if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {
-            *timestamp_ms = 1000; // far in the past
-        }
-        engine.leg1.leg1_timeout_ms = 0;
-        let cancel_cmd = engine.check_leg1_staleness();
-        assert!(cancel_cmd.is_some(), "should return CancelLeg1");
-
-        // Signal and direction should be cleared from active state...
-        assert!(engine.pending_leg1_signal.is_none());
-        assert!(engine.leg1_direction.is_none());
-
-        // ...but saved in cancelled_leg1_info.
-        let saved = engine.cancelled_leg1_info.as_ref().expect("should have saved info");
-        assert_eq!(saved.order_id, "real-id-1");
-        assert!(saved.signal.is_some(), "signal should be saved");
-        assert_eq!(saved.direction, Some(Direction::Up), "direction should be saved");
-        assert!(saved.spike.is_some(), "spike should be saved");
-    }
-
-    #[test]
-    fn test_cancel_not_confirmed_restores_signal_and_direction() {
-        let mut engine = make_engine_with_market(600);
-        set_book(&mut engine, "0.495", "0.505");
-        inject_spike(&mut engine, Direction::Up);
-
-        let signal = engine.evaluate().expect("should generate Leg 1 signal");
-        assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
-
-        // Simulate real CLOB ID arriving.
-        engine.on_order_posted(false, "real-id-2".into(), signal.price, signal.size, None, false, None);
-
-        // Force staleness: set timestamp far in the past so elapsed > timeout.
-        if let OrderState::Posted { ref mut timestamp_ms, .. } = engine.state.leg1_state {
-            *timestamp_ms = 1000; // far in the past
-        }
-        engine.leg1.leg1_timeout_ms = 0;
-        let _cancel_cmd = engine.check_leg1_staleness();
-        assert!(engine.pending_leg1_signal.is_none(), "signal cleared after staleness");
-        assert!(engine.leg1_direction.is_none(), "direction cleared after staleness");
-
-        // Cancel NOT confirmed — order had already filled.
-        engine.on_cancel_result("real-id-2".into(), false, false);
-
-        // State should be fully restored.
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Posted { ref order_id, .. } if order_id == "real-id-2"),
-            "leg1_state should be restored to Posted"
-        );
-        assert!(
-            engine.pending_leg1_signal.is_some(),
-            "pending_leg1_signal should be restored"
-        );
-        assert_eq!(
-            engine.leg1_direction,
-            Some(Direction::Up),
-            "leg1_direction should be restored"
-        );
-        assert!(engine.state.last_spike.is_some(), "last_spike should be restored");
-    }
-
-    // ── REST fill detection ──────────────────────────────────────────────
-
-    #[test]
-    fn test_rest_fill_transitions_posted_to_filled() {
-        let mut engine = make_engine_with_market(600);
-        let now_ms = now_epoch_ms();
-        engine.state.leg1_state = OrderState::Posted {
-            order_id: "rest-ord-1".to_string(),
-            price: Decimal::new(48, 2),
-            size: Decimal::new(100, 0),
-            timestamp_ms: now_ms - 500,
-        };
-        engine.state.last_spike = Some(SpikeInfo {
-            direction: Direction::Up,
-            magnitude: Decimal::new(5, 3),
-            sustained_ms: 250,
-            timestamp_ms: now_ms - 300,
-            atr_ratio: Decimal::ZERO,
-            obi: Decimal::ZERO,
-        });
-        engine.state.atr = Some(Decimal::new(2, 3));
-
-        engine.on_rest_fill_detected(
-            "rest-ord-1".into(),
-            Decimal::new(48, 2),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-        );
-
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "rest-ord-1"),
-            "leg1_state should transition to Filled"
-        );
-        assert!(engine.hedge.is_some(), "hedge should be initialised");
-    }
-
-    #[test]
-    fn test_rest_fill_deduped_when_already_filled() {
-        let mut engine = make_engine_with_market(600);
-        let now_ms = now_epoch_ms();
-        // Already filled (e.g., User WS beat REST poll).
-        engine.state.leg1_state = OrderState::Filled {
-            order_id: "already-filled".to_string(),
-            price: Decimal::new(48, 2),
-            size: Decimal::new(100, 0),
-            fill_timestamp_ms: now_ms - 100,
-        };
-
-        // REST fill arrives for the same order — should be ignored.
-        engine.on_rest_fill_detected(
-            "already-filled".into(),
-            Decimal::new(48, 2),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-        );
-
-        // State unchanged — still Filled, no double init_leg2.
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Filled { ref order_id, .. } if order_id == "already-filled"),
-        );
-    }
-
-    #[test]
-    fn test_rest_fill_deduped_when_state_is_none() {
-        let mut engine = make_engine_with_market(600);
-        // State is None (e.g., staleness already cancelled the order).
-        assert!(matches!(engine.state.leg1_state, OrderState::None));
-
-        engine.on_rest_fill_detected(
-            "stale-order".into(),
-            Decimal::new(48, 2),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-            Decimal::new(100, 0),
-        );
-
-        // State stays None.
-        assert!(matches!(engine.state.leg1_state, OrderState::None));
-        assert!(engine.hedge.is_none());
-    }
-
-    #[test]
-    fn test_rest_fill_partial_tracked() {
-        let mut engine = make_engine_with_market(600);
-        let now_ms = now_epoch_ms();
-        engine.state.leg1_state = OrderState::Posted {
-            order_id: "partial-ord".to_string(),
-            price: Decimal::new(48, 2),
-            size: Decimal::new(100, 0),
-            timestamp_ms: now_ms - 500,
-        };
-        engine.state.last_spike = Some(SpikeInfo {
-            direction: Direction::Up,
-            magnitude: Decimal::new(5, 3),
-            sustained_ms: 250,
-            timestamp_ms: now_ms - 300,
-            atr_ratio: Decimal::ZERO,
-            obi: Decimal::ZERO,
-        });
-        engine.state.atr = Some(Decimal::new(2, 3));
-
-        // size_matched < original_size → partial fill.
-        engine.on_rest_fill_detected(
-            "partial-ord".into(),
-            Decimal::new(48, 2),
-            Decimal::new(100, 0),
-            Decimal::new(50, 0),  // only 50 matched
-            Decimal::new(100, 0), // of 100 original
-        );
-
-        assert!(
-            matches!(engine.state.leg1_state, OrderState::Filled { .. }),
-            "should still transition to Filled"
-        );
-        assert!(
-            engine.pending_partial_fills.contains_key("partial-ord"),
-            "partial fill should be tracked"
-        );
-    }
 }

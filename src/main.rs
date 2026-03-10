@@ -87,9 +87,7 @@ async fn async_main() -> Result<()> {
         mode = ?config.mode,
         max_alloc_per_trade = %config.max_alloc_per_trade,
         spike_multiplier = config.bot.spike_detection.multiplier,
-        max_spread = config.bot.entry_guards.max_spread,
         stale_book_ms = config.bot.entry_guards.stale_book_ms,
-        sustain_ms = config.bot.spike_detection.sustain_ms,
         "FaCaiBot starting"
     );
 
@@ -250,11 +248,7 @@ async fn async_main() -> Result<()> {
                         already_filled,
                         order_tag,
                     } => {
-                        if let Some(cancel_cmd) =
-                            engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled, order_tag)
-                        {
-                            let _ = executor_tx.send(cancel_cmd);
-                        }
+                        engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled, order_tag);
                         // Bug 3 fix: if FOK returned Filled synchronously, leg2 is
                         // already in Filled state. Trigger trade completion now.
                         if is_leg2 && already_filled
@@ -289,21 +283,6 @@ async fn async_main() -> Result<()> {
                     } => {
                         engine.on_leg2_order_cancel_result(order_id, was_cancelled);
                     }
-                    ExecutorFeedback::RestFillDetected {
-                        order_id,
-                        price,
-                        size,
-                        size_matched,
-                        original_size,
-                    } => {
-                        engine.on_rest_fill_detected(
-                            order_id,
-                            price,
-                            size,
-                            size_matched,
-                            original_size,
-                        );
-                    }
                     ExecutorFeedback::BalanceExhausted => {
                         engine.on_balance_exhausted();
                     }
@@ -333,29 +312,18 @@ async fn async_main() -> Result<()> {
                         });
                         break;
                     }
-                    // Cancel posted-but-unfilled Leg 1 if applicable.
-                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
-                        if StrategyEngine::is_provisional_order_id(order_id) {
-                            engine.set_cancel_leg1_on_feedback(true);
-                        } else {
-                            let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
-                            let _ = executor_tx.send(cmd);
-                        }
+                    // Reset posted-but-unfilled Leg 1 if applicable (FAK orders don't rest).
+                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
                         engine.reset_leg1_state();
-                        // If only Leg 1 was posted (not filled), we can exit after cancel.
                         if matches!(engine.state().leg2_state, OrderState::None) {
                             if engine_mode == Mode::Live {
                                 engine.send_live_session_summary();
                             }
                             let _ = drain_status_tx.send(DrainStatus::Complete {
                                 exit_code: 0,
-                                summary: "Cancelled unfilled Leg 1. Bot stopped.".into(),
+                                summary: "Reset unfilled Leg 1. Bot stopped.".into(),
                             });
-                            // Don't break immediately — allow feedback loop to process
-                            // the deferred cancel if the ID was provisional.
-                            if !engine.cancel_leg1_on_feedback {
-                                break;
-                            }
+                            break;
                         }
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
@@ -377,13 +345,7 @@ async fn async_main() -> Result<()> {
                         });
                         break;
                     }
-                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
-                        if StrategyEngine::is_provisional_order_id(order_id) {
-                            engine.set_cancel_leg1_on_feedback(true);
-                        } else {
-                            let cmd = ExecutorCommand::CancelLeg1 { order_id: order_id.clone() };
-                            let _ = executor_tx.send(cmd);
-                        }
+                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
                         engine.reset_leg1_state();
                         if matches!(engine.state().leg2_state, OrderState::None) {
                             if engine_mode == Mode::Live {
@@ -391,11 +353,9 @@ async fn async_main() -> Result<()> {
                             }
                             let _ = drain_status_tx.send(DrainStatus::Complete {
                                 exit_code: 42,
-                                summary: "Cancelled unfilled Leg 1. Restarting...".into(),
+                                summary: "Reset unfilled Leg 1. Restarting...".into(),
                             });
-                            if !engine.cancel_leg1_on_feedback {
-                                break;
-                            }
+                            break;
                         }
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
@@ -406,15 +366,8 @@ async fn async_main() -> Result<()> {
                 }
                 IngestorEvent::PauseTrading => {
                     engine.set_paused(true);
-                    // Cancel unfilled Leg 1 if posted (but not filled).
-                    if let OrderState::Posted { ref order_id, .. } = engine.state().leg1_state {
-                        if StrategyEngine::is_provisional_order_id(order_id) {
-                            engine.set_cancel_leg1_on_feedback(true);
-                        } else {
-                            let _ = executor_tx.send(ExecutorCommand::CancelLeg1 {
-                                order_id: order_id.clone(),
-                            });
-                        }
+                    // Reset posted-but-unfilled Leg 1 (FAK orders don't rest).
+                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
                         engine.reset_leg1_state();
                     }
                     info!("trading PAUSED — new entries blocked, Leg 2 continues if open");
@@ -557,25 +510,11 @@ async fn async_main() -> Result<()> {
                 }
             }
 
-            // Drain spike cancel (speculative Leg 1 cancelled after SpikeFailed).
-            if let Some(cancel_cmd) = engine.take_spike_cancel()
-                && let Err(e) = executor_tx.send(cancel_cmd)
-            {
-                error!(error = %e, "failed to send spike cancel to executor");
-            }
-
             // Drain tick size change (forward to executor to update SDK cache).
             if let Some(tick_cmd) = engine.take_tick_size_change()
                 && let Err(e) = executor_tx.send(tick_cmd)
             {
                 error!(error = %e, "failed to send tick size change to executor");
-            }
-
-            // Check for stale Leg 1 orders (applies in both sim and live modes).
-            if let Some(cancel_cmd) = engine.check_leg1_staleness() {
-                if let Err(e) = executor_tx.send(cancel_cmd) {
-                    error!(error = %e, "failed to send CancelLeg1 to executor");
-                }
             }
 
             // Evaluate Leg 1 signals.
@@ -749,6 +688,7 @@ async fn async_main() -> Result<()> {
                     reporter,
                     cold,
                     config.bot.risk.favorable_maker_timeout_ms,
+                    config.bot.risk.fak_price_offset_ticks,
                 );
 
                 if let Err(e) = live_executor.run(executor_rx).await {

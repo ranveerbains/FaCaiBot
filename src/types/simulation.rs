@@ -61,6 +61,14 @@ impl SimFill {
         size * factor * inner * inner
     }
 
+    /// Taker fee per share at the given price (not multiplied by size).
+    /// Used for buffer-aware hedge math on TradeSignal.
+    pub fn compute_taker_fee_per_share(price: Decimal) -> Decimal {
+        let factor = Decimal::new(25, 2); // 0.25
+        let inner = price * (Decimal::ONE - price);
+        factor * inner * inner
+    }
+
     /// Estimated maker rebate for a fill at this price and size.
     /// Approximation: 20% of fee-equivalent (same formula as taker fee).
     /// Actual rebate depends on daily pool distribution; this is an upper-bound estimate.
@@ -173,8 +181,7 @@ pub struct SimTrade {
     pub exit_reason: Option<ExitReason>,
     /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
     pub spike_magnitude: Decimal,
-    /// `true` if Leg 1 was supposed to be cancelled but filled mid-cancel
-    /// (cancel-not-confirmed replay path in live mode).
+    /// Deprecated — always `false`. Kept for QuestDB backward compatibility.
     pub leg1_cancel_race: bool,
     /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
     pub phase1_breach: bool,
