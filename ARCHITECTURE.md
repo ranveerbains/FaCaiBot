@@ -11,9 +11,9 @@ Binance spike → Buy directional shares (Leg 1, batch FAK taker at 3 price leve
              → Paired position: e.g. $0.48 + $0.495 = $0.975 → pays $1.00 → 2.5% profit
 ```
 
-Leg 1 uses Fill-And-Kill (FAK) taker orders at 3 price levels (`ask - N×tick`, `ask`, `ask + N×tick`) placed in parallel via `tokio::join!`. FAK orders fill whatever is available and cancel the remainder — no resting orders. Leg 2 targets `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply to Leg 1 FAK fills and Leg 2 FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, market expiry, whipsaw reversal) and favorable taker fills. Maker fills earn an estimated rebate of 20% of the fee-equivalent — computed per fill via `SimFill::compute_maker_rebate()` and included in net PnL calculations and Telegram messages.
+Leg 1 uses Fill-And-Kill (FAK) taker orders at 3 price levels (`ask - N×tick`, `ask`, `ask + N×tick`) placed in a single CLOB batch request (`POST /orders`). FAK orders fill whatever is available and cancel the remainder — no resting orders. Leg 2 targets `post_only=true` (maker, zero fee). Taker fees (`C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50) apply to Leg 1 FAK fills and Leg 2 FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, market expiry, whipsaw reversal) and favorable taker fills. Maker fills earn an estimated rebate of 20% of the fee-equivalent — computed per fill via `SimFill::compute_maker_rebate()` and included in net PnL calculations and Telegram messages.
 
-**Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. FAK batch entry has higher fill probability (3 price levels) and lower latency (~1.2s parallel) compared to post-only resting orders.
+**Why it works**: Binance is the largest liquidity venue. >95% correlation with Chainlink for moves >1%. FAK batch entry has higher fill probability (3 price levels) and lower latency (single HTTP request via batch API) compared to post-only resting orders.
 
 **Modes** (`MODE` env var):
 - **`live`**: Submits real orders via polymarket-client-sdk (EIP-712 signing handled internally), Leg 1 fills confirmed via `get_order_status()` after FAK batch, Leg 2 fills detected via User WS
@@ -389,8 +389,8 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
 
 ```
 evaluate() sets:          leg1_state = Posted("sim-leg1-{ts}")
-Executor: tokio::join!    3 × place_order(FAK) at [ask-tick, ask, ask+tick]  (~1.2s parallel)
-Executor: tokio::join!    3 × get_order_status()                             (~200ms parallel)
+Executor: batch POST      3 × FAK at [ask-tick, ask, ask+tick] (single HTTP request)
+Executor: sequential      get_order_status() per order                       (~200ms each)
 Executor computes:        VWAP + total_filled
 OrderPosted feedback:     leg1_state → Filled(vwap, total_filled, already_filled=true)
 ```

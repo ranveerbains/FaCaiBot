@@ -243,47 +243,27 @@ impl LiveExecutor {
             return;
         }
 
-        // Step 1: Place FAK orders in parallel (always 3 levels).
-        // Use tokio::join! with Option-wrapped futures for 1-3 orders.
-        let f0 = self.poly.place_order(&orders[0].2);
-        let f1 = if orders.len() > 1 {
-            Some(self.poly.place_order(&orders[1].2))
-        } else {
-            None
-        };
-        let f2 = if orders.len() > 2 {
-            Some(self.poly.place_order(&orders[2].2))
-        } else {
-            None
-        };
-
-        let (r0, r1, r2) = tokio::join!(
-            f0,
-            async { match f1 { Some(f) => Some(f.await), None => None } },
-            async { match f2 { Some(f) => Some(f.await), None => None } },
-        );
-
-        let placement_results: Vec<Option<Result<_, _>>> = vec![Some(r0), r1, r2];
+        // Step 1: Place FAK orders as a single batch request.
+        let order_requests: Vec<OrderRequest> = orders.iter().map(|(_, _, req)| req.clone()).collect();
+        let batch_results = self.poly.place_orders_batch(&order_requests).await;
 
         // Collect successful order IDs for status query.
         let mut order_ids: Vec<(usize, String)> = Vec::new();
-        for (i, result_opt) in placement_results.into_iter().enumerate() {
-            if let Some(result) = result_opt {
-                let (price, size, _) = &orders[i];
-                match result {
-                    Ok(resp) => {
-                        info!(
-                            order_id = %resp.order_id,
-                            status = ?resp.status,
-                            price = %price, size = %size,
-                            "FAK order {}/{} placed", i + 1, orders.len(),
-                        );
-                        order_ids.push((i, resp.order_id));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, price = %price, size = %size,
-                            "FAK order {}/{} FAILED", i + 1, orders.len());
-                    }
+        for (i, result) in batch_results.into_iter().enumerate() {
+            let (price, size, _) = &orders[i];
+            match result {
+                Ok(resp) => {
+                    info!(
+                        order_id = %resp.order_id,
+                        status = ?resp.status,
+                        price = %price, size = %size,
+                        "FAK order {}/{} placed", i + 1, orders.len(),
+                    );
+                    order_ids.push((i, resp.order_id));
+                }
+                Err(e) => {
+                    warn!(error = %e, price = %price, size = %size,
+                        "FAK order {}/{} FAILED", i + 1, orders.len());
                 }
             }
         }
@@ -297,54 +277,30 @@ impl LiveExecutor {
             return;
         }
 
-        // Step 2: Query fill status for each order in parallel.
-        let s0 = self.poly.get_order_status(&order_ids[0].1);
-        let s1 = if order_ids.len() > 1 {
-            Some(self.poly.get_order_status(&order_ids[1].1))
-        } else {
-            None
-        };
-        let s2 = if order_ids.len() > 2 {
-            Some(self.poly.get_order_status(&order_ids[2].1))
-        } else {
-            None
-        };
-
-        let (sr0, sr1, sr2) = tokio::join!(
-            s0,
-            async { match s1 { Some(f) => Some(f.await), None => None } },
-            async { match s2 { Some(f) => Some(f.await), None => None } },
-        );
-
-        let status_results: Vec<Option<Result<_, _>>> = vec![Some(sr0), sr1, sr2];
-
-        // Step 3: Accumulate fills — compute VWAP.
+        // Step 2: Query fill status for each order (sequential — at most 3 × ~200ms).
         let mut total_filled = Decimal::ZERO;
         let mut weighted_price_sum = Decimal::ZERO;
         let mut first_order_id: Option<String> = None;
 
-        for (j, status_opt) in status_results.into_iter().enumerate() {
-            if let Some(status_result) = status_opt {
-                let (order_idx, ref oid) = order_ids[j];
-                match status_result {
-                    Ok((status, size_matched, _original_size)) => {
-                        if size_matched > Decimal::ZERO {
-                            info!(
-                                order_id = %oid,
-                                ?status, %size_matched,
-                                "FAK fill: order {} matched", j + 1,
-                            );
-                            let fill_price = orders[order_idx].0;
-                            weighted_price_sum += fill_price * size_matched;
-                            total_filled += size_matched;
-                            if first_order_id.is_none() {
-                                first_order_id = Some(oid.clone());
-                            }
+        for (j, (order_idx, oid)) in order_ids.iter().enumerate() {
+            match self.poly.get_order_status(oid).await {
+                Ok((status, size_matched, _original_size)) => {
+                    if size_matched > Decimal::ZERO {
+                        info!(
+                            order_id = %oid,
+                            ?status, %size_matched,
+                            "FAK fill: order {} matched", j + 1,
+                        );
+                        let fill_price = orders[*order_idx].0;
+                        weighted_price_sum += fill_price * size_matched;
+                        total_filled += size_matched;
+                        if first_order_id.is_none() {
+                            first_order_id = Some(oid.clone());
                         }
                     }
-                    Err(e) => {
-                        warn!(order_id = %oid, error = %e, "FAK status query failed");
-                    }
+                }
+                Err(e) => {
+                    warn!(order_id = %oid, error = %e, "FAK status query failed");
                 }
             }
         }

@@ -202,12 +202,12 @@ The evaluator sets `signal.price = best_ask` — the best ask on the directional
 
 ### Batch FAK execution
 
-Leg 1 uses a batch of 3 Fill-And-Kill (FAK) taker orders placed in parallel via `tokio::join!`:
+Leg 1 uses a batch of 3 Fill-And-Kill (FAK) taker orders placed in a single CLOB batch request (`POST /orders` via `place_orders_batch()`):
 
 1. **Price levels:** `[ask - N×tick, ask, ask + N×tick]` where N = `fak_price_offset_ticks` (default 1)
 2. **Size adjustment:** Each order's size is adjusted via `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB constraint for FAK/FOK orders)
-3. **Parallel placement:** All 3 orders are submitted simultaneously (~1.2s total round-trip)
-4. **Fill query:** After placement, `get_order_status()` is called for each order in parallel to retrieve `size_matched`
+3. **Batch placement:** All 3 orders are submitted in a single HTTP request (builds + signs each, then `sdk.post_orders()`)
+4. **Fill query:** After placement, `get_order_status()` is called sequentially for each order to retrieve `size_matched`
 5. **Aggregation:** VWAP = `Σ(price × size_matched) / Σ(size_matched)`, rounded to 2dp
 6. **Feedback:** `OrderPosted { already_filled: true, price: vwap, size: total_filled }` — the engine transitions directly to `Filled` and starts the hedge
 

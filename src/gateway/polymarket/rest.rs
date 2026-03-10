@@ -243,6 +243,123 @@ impl PolymarketGateway {
         })
     }
 
+    /// Place multiple orders in a single CLOB request (`POST /orders`).
+    ///
+    /// Builds and signs each order individually, then submits them as a batch.
+    /// Returns one `OrderResponse` per input order (in the same order).
+    /// If the batch request itself fails, all orders get the error.
+    pub async fn place_orders_batch(&self, orders: &[OrderRequest]) -> Vec<Result<OrderResponse>> {
+        let sdk = match self.sdk_client.as_ref() {
+            Some(s) => s,
+            None => {
+                return orders
+                    .iter()
+                    .map(|_| Err(anyhow!("SDK client not initialized")))
+                    .collect();
+            }
+        };
+        let signer = match self.signer.as_ref() {
+            Some(s) => s,
+            None => {
+                return orders
+                    .iter()
+                    .map(|_| Err(anyhow!("no private key configured")))
+                    .collect();
+            }
+        };
+
+        // Build and sign each order.
+        let mut signed_orders = Vec::with_capacity(orders.len());
+        let mut build_errors: Vec<Option<anyhow::Error>> = Vec::with_capacity(orders.len());
+        for order in orders {
+            let token_id = match U256::from_str(&order.token_id) {
+                Ok(t) => t,
+                Err(e) => {
+                    build_errors.push(Some(anyhow!("bad token_id: {e}")));
+                    continue;
+                }
+            };
+            let sdk_side = to_sdk_side(order.side);
+            let sdk_order_type = to_sdk_order_type(order.order_type);
+
+            let mut builder = sdk
+                .limit_order()
+                .token_id(token_id)
+                .side(sdk_side)
+                .price(order.price)
+                .size(order.size)
+                .order_type(sdk_order_type)
+                .post_only(order.post_only);
+
+            if let Some(exp_ms) = order.expiration {
+                if let Some(dt) =
+                    polymarket_client_sdk::types::DateTime::from_timestamp((exp_ms / 1000) as i64, 0)
+                {
+                    builder = builder.expiration(dt);
+                }
+            }
+
+            match builder.build().await {
+                Ok(signable) => match sdk.sign(signer, signable).await {
+                    Ok(signed) => {
+                        signed_orders.push(signed);
+                        build_errors.push(None);
+                    }
+                    Err(e) => build_errors.push(Some(anyhow!("sign failed: {e}"))),
+                },
+                Err(e) => build_errors.push(Some(anyhow!("build failed: {e}"))),
+            }
+        }
+
+        // If nothing was built successfully, return all build errors.
+        if signed_orders.is_empty() {
+            return build_errors
+                .into_iter()
+                .map(|e| Err(e.unwrap_or_else(|| anyhow!("no orders built"))))
+                .collect();
+        }
+
+        // Post the batch.
+        let batch_result = sdk.post_orders(signed_orders).await;
+        let responses = match batch_result {
+            Ok(resps) => resps,
+            Err(e) => {
+                let msg = format!("batch post_orders failed: {e}");
+                return orders.iter().map(|_| Err(anyhow!("{msg}"))).collect();
+            }
+        };
+
+        // Map responses back, interleaving build errors with batch results.
+        let mut resp_iter = responses.into_iter();
+        let ts = now_ms();
+        build_errors
+            .into_iter()
+            .map(|err_opt| {
+                if let Some(err) = err_opt {
+                    return Err(err);
+                }
+                let resp = resp_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("batch response shorter than expected"))?;
+                let status = if !resp.success {
+                    OrderStatus::Rejected
+                } else {
+                    map_sdk_status(&resp.status)
+                };
+                if let Some(ref msg) = resp.error_msg {
+                    if !msg.is_empty() {
+                        warn!(error_msg = %msg, "CLOB batch order error_msg");
+                    }
+                }
+                Ok(OrderResponse {
+                    order_id: resp.order_id,
+                    status,
+                    timestamp_ms: ts,
+                })
+            })
+            .collect()
+    }
+
     /// Cancel an open order by its ID.
     ///
     /// Uses the SDK's authenticated `cancel_order` method (DELETE `/order`).
