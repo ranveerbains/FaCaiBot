@@ -9,21 +9,26 @@ use rust_decimal::Decimal;
 
 use crate::types::market::Direction;
 
-/// Compute expected repricing percentage from spike and market context.
+/// Compute expected repricing percentage from signal strength and market context.
 ///
 /// Output is a decimal fraction (e.g., 0.015 = 1.5% expected movement).
 /// Tick-size independent — quantization happens later via `round_to_tick()`.
 ///
 /// # Components
-/// 1. `norm_spike` [0,1]: ATR-relative spike quality (same as old f1)
+/// 1. `norm_signal` [0,1]: signal strength normalized to [min_strength, strong_strength]
 /// 2. `adjusted_sensitivity`: 4P(1-P) × consensus alignment
 /// 3. `time_factor`: (300/max(T,10))^time_exponent
 /// 4. `scale`: calibration ceiling
+///
+/// # Signal strength semantics
+/// - Phase A (entry): composite buildup score [0,1]
+/// - Phase B (hedge targeting): max(observed_norm, composite) [0,1]
+/// - ATR backstop: normalized spike ATR ratio [0,1]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_expected_repricing(
-    atr_ratio: Decimal,
-    min_atr_ratio: Decimal,
-    strong_atr_ratio: Decimal,
+    signal_strength: Decimal,
+    min_strength: Decimal,
+    strong_strength: Decimal,
     yes_mid: Decimal,
     spike_direction: Direction,
     time_remaining_secs: u64,
@@ -31,12 +36,12 @@ pub fn compute_expected_repricing(
     time_exponent: f64,
     max_time_factor: f64,
 ) -> Decimal {
-    // norm_spike: [0,1]
-    let range = strong_atr_ratio - min_atr_ratio;
-    let norm_spike = if range.is_zero() {
+    // norm_signal: [0,1]
+    let range = strong_strength - min_strength;
+    let norm_signal = if range.is_zero() {
         Decimal::ONE
     } else {
-        ((atr_ratio - min_atr_ratio) / range)
+        ((signal_strength - min_strength) / range)
             .max(Decimal::ZERO)
             .min(Decimal::ONE)
     };
@@ -62,7 +67,7 @@ pub fn compute_expected_repricing(
         Decimal::try_from((300.0_f64 / t).powf(time_exponent).min(max_time_factor))
             .unwrap_or(Decimal::ONE);
 
-    (norm_spike * base * alignment * time_factor * scale).max(Decimal::ZERO)
+    (norm_signal * base * alignment * time_factor * scale).max(Decimal::ZERO)
 }
 
 /// Round `price` down to the nearest `tick_size` multiple (floor rounding).

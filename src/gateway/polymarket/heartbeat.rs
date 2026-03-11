@@ -1,7 +1,6 @@
 //! Heartbeat loop — sends `POST /v1/heartbeats` every 5 seconds via SDK.
 //!
 //! Tracks consecutive failures and logs alerts on 2+ consecutive misses.
-//! Skipped in simulation mode.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,24 +31,16 @@ use crate::utils::signing::build_signer;
 /// - Tracks `heartbeat_id`: `None` on first call; updated from server response.
 /// - Emits `IngestorEvent::HeartbeatStatus` after each attempt.
 /// - Logs an error if 2 consecutive heartbeats fail (Section 5.4).
-/// - Skipped in simulation mode.
 ///
 /// This method is intended to run as a standalone `tokio::spawn`-ed task.
 pub(super) async fn run_heartbeat(
     shutdown: Arc<AtomicBool>,
-    sim_mode: bool,
     api_key: Option<String>,
     secret: Option<String>,
     passphrase: Option<String>,
     private_key: Option<String>,
     tx: Sender<IngestorEvent>,
 ) -> Result<()> {
-    if sim_mode {
-        info!("simulation mode — heartbeat loop skipped");
-        std::future::pending::<()>().await;
-        return Ok(());
-    }
-
     // Initialize SDK client for authenticated heartbeat calls.
     let api_key = api_key.context("api_key required for heartbeat")?;
     let secret = secret.context("secret required for heartbeat")?;

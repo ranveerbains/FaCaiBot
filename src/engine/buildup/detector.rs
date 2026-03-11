@@ -1,0 +1,509 @@
+//! Composite buildup detector — combines 6 metrics into a single score.
+//!
+//! Evaluation pipeline:
+//! 1. Compute normalized [0,1] value for each metric (0 if stale)
+//! 2. Direction consensus: dominant direction from fresh metrics; veto if >1 disagrees
+//! 3. Causal ordering: at least 1 leading (CVD, basis) AND 1 confirming (spot flow, OBI)
+//! 4. Weighted sum: composite = sum(weight_i × normalized_i)
+//! 5. Return (composite, direction) or (0, None) if vetoed
+
+use rust_decimal::Decimal;
+
+use crate::types::market::{
+    BuildupInfo, Direction, FuturesAggTrade, FuturesBookTicker, FuturesForceOrder, SpotTrade,
+};
+
+use super::metrics::{
+    AtrDisplacementTracker, BasisDeltaTracker, CvdAccelTracker, LiqPressureTracker,
+    ObiVelocityTracker, SpotFlowTracker,
+};
+
+// ─── BuildupDetector ─────────────────────────────────────────────────────────
+
+pub struct BuildupDetector {
+    // Individual metrics
+    pub(crate) cvd: CvdAccelTracker,
+    pub(crate) spot_flow: SpotFlowTracker,
+    pub(crate) obi_velocity: ObiVelocityTracker,
+    pub(crate) basis_delta: BasisDeltaTracker,
+    pub(crate) liq_pressure: LiqPressureTracker,
+    pub(crate) atr_displacement: AtrDisplacementTracker,
+
+    // Weights
+    w_cvd: f64,
+    w_spot_flow: f64,
+    w_obi: f64,
+    w_basis: f64,
+    w_liq: f64,
+    w_atr: f64,
+
+    // Thresholds
+    entry_threshold: f64,
+    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    cancel_threshold: f64,
+
+    // Spot reference for Phase B
+    current_spot_mid: f64,
+
+    /// Last raw OBI value from Binance depth (for BuildupInfo.obi).
+    last_obi: f64,
+
+    // Diagnostic counters
+    diag_signals_emitted: u64,
+    diag_direction_vetoes: u64,
+    diag_causal_vetoes: u64,
+}
+
+/// Configuration for the BuildupDetector.
+pub struct BuildupConfig {
+    // Weights
+    pub w_cvd: f64,
+    pub w_spot_flow: f64,
+    pub w_obi: f64,
+    pub w_basis: f64,
+    pub w_liq: f64,
+    pub w_atr: f64,
+
+    // Thresholds
+    pub entry_threshold: f64,
+    pub cancel_threshold: f64,
+
+    // CVD params
+    pub cvd_fast_halflife_ms: f64,
+    pub cvd_slow_halflife_ms: f64,
+    pub freshness_cvd_ms: u64,
+    pub cvd_min: f64,
+    pub cvd_saturation: f64,
+
+    // Spot flow params
+    pub spot_flow_halflife_ms: f64,
+    pub freshness_spot_flow_ms: u64,
+    pub spot_flow_min: f64,
+    pub spot_flow_saturation: f64,
+
+    // OBI velocity params
+    pub obi_velocity_halflife_ms: f64,
+    pub freshness_obi_ms: u64,
+    pub obi_min: f64,
+    pub obi_saturation: f64,
+
+    // Basis delta params
+    pub basis_halflife_ms: f64,
+    pub freshness_basis_ms: u64,
+    pub basis_min: f64,
+    pub basis_saturation: f64,
+
+    // Liquidation params
+    pub liq_half_life_ms: f64,
+    pub freshness_liq_ms: u64,
+    pub liq_min: f64,
+    pub liq_saturation: f64,
+
+    // ATR displacement params
+    pub atr_alpha: f64,
+    pub freshness_atr_ms: u64,
+    pub atr_min: f64,
+    pub atr_saturation: f64,
+    pub atr_warmup: u32,
+}
+
+impl BuildupConfig {
+    /// Create from the TOML config section.
+    pub fn from_toml(cfg: &crate::config::BuildupTomlConfig) -> Self {
+        Self {
+            w_cvd: cfg.w_cvd,
+            w_spot_flow: cfg.w_spot_flow,
+            w_obi: cfg.w_obi,
+            w_basis: cfg.w_basis,
+            w_liq: cfg.w_liq,
+            w_atr: cfg.w_atr,
+            entry_threshold: cfg.entry_threshold,
+            cancel_threshold: cfg.cancel_threshold,
+            cvd_fast_halflife_ms: cfg.cvd_fast_halflife_ms,
+            cvd_slow_halflife_ms: cfg.cvd_slow_halflife_ms,
+            freshness_cvd_ms: cfg.freshness_cvd_ms,
+            cvd_min: cfg.cvd_min,
+            cvd_saturation: cfg.cvd_saturation,
+            spot_flow_halflife_ms: cfg.spot_flow_halflife_ms,
+            freshness_spot_flow_ms: cfg.freshness_spot_flow_ms,
+            spot_flow_min: cfg.spot_flow_min,
+            spot_flow_saturation: cfg.spot_flow_saturation,
+            obi_velocity_halflife_ms: cfg.obi_velocity_halflife_ms,
+            freshness_obi_ms: cfg.freshness_obi_ms,
+            obi_min: cfg.obi_min,
+            obi_saturation: cfg.obi_saturation,
+            basis_halflife_ms: cfg.basis_halflife_ms,
+            freshness_basis_ms: cfg.freshness_basis_ms,
+            basis_min: cfg.basis_min,
+            basis_saturation: cfg.basis_saturation,
+            // Liq and ATR params not exposed in TOML yet — use defaults.
+            liq_half_life_ms: 2000.0,
+            freshness_liq_ms: cfg.freshness_liq_ms,
+            liq_min: cfg.liq_min,
+            liq_saturation: cfg.liq_saturation,
+            atr_alpha: 0.002,
+            freshness_atr_ms: cfg.freshness_atr_ms,
+            atr_min: cfg.atr_min,
+            atr_saturation: cfg.atr_saturation,
+            atr_warmup: 50,
+        }
+    }
+}
+
+impl Default for BuildupConfig {
+    fn default() -> Self {
+        Self {
+            w_cvd: 0.30,
+            w_spot_flow: 0.15,
+            w_obi: 0.20,
+            w_basis: 0.20,
+            w_liq: 0.05,
+            w_atr: 0.10,
+            entry_threshold: 0.40,
+            cancel_threshold: 0.25,
+            cvd_fast_halflife_ms: 150.0,
+            cvd_slow_halflife_ms: 700.0,
+            freshness_cvd_ms: 300,
+            cvd_min: 0.0,
+            cvd_saturation: 1.0,
+            spot_flow_halflife_ms: 300.0,
+            freshness_spot_flow_ms: 200,
+            spot_flow_min: 0.0,
+            spot_flow_saturation: 1.0,
+            obi_velocity_halflife_ms: 300.0,
+            freshness_obi_ms: 100,
+            obi_min: 0.0,
+            obi_saturation: 0.5,
+            basis_halflife_ms: 300.0,
+            freshness_basis_ms: 300,
+            basis_min: 0.0,
+            basis_saturation: 2.0,
+            liq_half_life_ms: 2000.0,
+            freshness_liq_ms: 3000,
+            liq_min: 0.0,
+            liq_saturation: 10.0,
+            atr_alpha: 0.002,
+            freshness_atr_ms: 100,
+            atr_min: 0.0,
+            atr_saturation: 15.0,
+            atr_warmup: 50,
+        }
+    }
+}
+
+impl BuildupDetector {
+    pub fn new(cfg: &BuildupConfig) -> Self {
+        Self {
+            cvd: CvdAccelTracker::new(
+                cfg.cvd_fast_halflife_ms,
+                cfg.cvd_slow_halflife_ms,
+                cfg.freshness_cvd_ms,
+                cfg.cvd_min,
+                cfg.cvd_saturation,
+            ),
+            spot_flow: SpotFlowTracker::new(
+                cfg.spot_flow_halflife_ms,
+                cfg.freshness_spot_flow_ms,
+                cfg.spot_flow_min,
+                cfg.spot_flow_saturation,
+            ),
+            obi_velocity: ObiVelocityTracker::new(
+                cfg.obi_velocity_halflife_ms,
+                cfg.freshness_obi_ms,
+                cfg.obi_min,
+                cfg.obi_saturation,
+            ),
+            basis_delta: BasisDeltaTracker::new(
+                cfg.basis_halflife_ms,
+                cfg.freshness_basis_ms,
+                cfg.basis_min,
+                cfg.basis_saturation,
+            ),
+            liq_pressure: LiqPressureTracker::new(
+                cfg.liq_half_life_ms,
+                cfg.freshness_liq_ms,
+                cfg.liq_min,
+                cfg.liq_saturation,
+            ),
+            atr_displacement: AtrDisplacementTracker::new(
+                cfg.atr_alpha,
+                cfg.freshness_atr_ms,
+                cfg.atr_min,
+                cfg.atr_saturation,
+                cfg.atr_warmup,
+            ),
+            w_cvd: cfg.w_cvd,
+            w_spot_flow: cfg.w_spot_flow,
+            w_obi: cfg.w_obi,
+            w_basis: cfg.w_basis,
+            w_liq: cfg.w_liq,
+            w_atr: cfg.w_atr,
+            entry_threshold: cfg.entry_threshold,
+            cancel_threshold: cfg.cancel_threshold,
+            current_spot_mid: 0.0,
+            last_obi: 0.0,
+            diag_signals_emitted: 0,
+            diag_direction_vetoes: 0,
+            diag_causal_vetoes: 0,
+        }
+    }
+
+    // ── Feed methods ─────────────────────────────────────────────────────
+
+    pub fn on_futures_agg_trade(&mut self, trade: &FuturesAggTrade, now_ms: u64) {
+        let qty = trade.quantity.to_string().parse::<f64>().unwrap_or(0.0);
+        self.cvd.update(qty, trade.is_buyer_maker, now_ms);
+    }
+
+    pub fn on_futures_book_ticker(&mut self, ticker: &FuturesBookTicker, now_ms: u64) {
+        let bid = ticker.bid_price.to_string().parse::<f64>().unwrap_or(0.0);
+        let ask = ticker.ask_price.to_string().parse::<f64>().unwrap_or(0.0);
+        self.basis_delta.update_futures_mid(bid, ask, now_ms);
+    }
+
+    pub fn on_futures_force_order(&mut self, order: &FuturesForceOrder, now_ms: u64) {
+        let qty = order.quantity.to_string().parse::<f64>().unwrap_or(0.0);
+        self.liq_pressure.update(&order.side, qty, now_ms);
+    }
+
+    pub fn on_spot_trade(&mut self, trade: &SpotTrade, now_ms: u64) {
+        let qty = trade.quantity.to_string().parse::<f64>().unwrap_or(0.0);
+        self.spot_flow.update(qty, trade.is_buyer_maker, now_ms);
+    }
+
+    pub fn on_spot_depth(&mut self, mid: f64, obi: f64, now_ms: u64) {
+        self.obi_velocity.update(obi, now_ms);
+        self.atr_displacement.update(mid, now_ms);
+        self.current_spot_mid = mid;
+        self.last_obi = obi;
+        self.basis_delta.update_spot_mid(mid, now_ms);
+    }
+
+    pub fn on_spot_bba(&mut self, mid: f64, _now_ms: u64) {
+        self.current_spot_mid = mid;
+    }
+
+    // ── Evaluation ───────────────────────────────────────────────────────
+
+    /// Compute composite score. Returns (score, direction) or (0, None) if vetoed.
+    pub fn evaluate(&mut self, now_ms: u64) -> (f64, Option<Direction>) {
+        // 1. Collect normalized values and directions from fresh metrics.
+        let metrics: [(f64, f64, Option<Direction>); 6] = [
+            (self.w_cvd, self.cvd.normalized(now_ms), self.cvd.direction()),
+            (self.w_spot_flow, self.spot_flow.normalized(now_ms), self.spot_flow.direction()),
+            (self.w_obi, self.obi_velocity.normalized(now_ms), self.obi_velocity.direction()),
+            (self.w_basis, self.basis_delta.normalized(now_ms), self.basis_delta.direction()),
+            (self.w_liq, self.liq_pressure.normalized(now_ms), self.liq_pressure.direction()),
+            (self.w_atr, self.atr_displacement.normalized(now_ms), self.atr_displacement.direction()),
+        ];
+
+        // 2. Direction consensus.
+        let mut up_count = 0u32;
+        let mut down_count = 0u32;
+        for &(_, norm, dir) in &metrics {
+            if norm > 0.0 {
+                match dir {
+                    Some(Direction::Up) => up_count += 1,
+                    Some(Direction::Down) => down_count += 1,
+                    None => {}
+                }
+            }
+        }
+
+        let (dominant, minority) = if up_count >= down_count {
+            (Direction::Up, down_count)
+        } else {
+            (Direction::Down, up_count)
+        };
+
+        // If >1 metric disagrees with dominant → veto.
+        if minority > 1 {
+            self.diag_direction_vetoes += 1;
+            return (0.0, None);
+        }
+
+        // 3. Causal ordering: at least 1 leading AND 1 confirming must be fresh + non-zero.
+        // Leading: CVD (index 0), basis delta (index 3) — futures-derived.
+        let has_leading = metrics[0].1 > 0.0 || metrics[3].1 > 0.0;
+        // Confirming: spot flow (index 1), OBI velocity (index 2) — spot-derived.
+        let has_confirming = metrics[1].1 > 0.0 || metrics[2].1 > 0.0;
+
+        if !has_leading || !has_confirming {
+            self.diag_causal_vetoes += 1;
+            return (0.0, None);
+        }
+
+        // 4. Weighted sum.
+        let composite: f64 = metrics.iter().map(|(w, n, _)| w * n).sum();
+
+        (composite, Some(dominant))
+    }
+
+    /// Check if composite exceeds entry threshold.
+    pub fn check_entry(&mut self, now_ms: u64) -> Option<BuildupInfo> {
+        let (score, direction) = self.evaluate(now_ms);
+        let direction = direction?;
+
+        if score < self.entry_threshold {
+            return None;
+        }
+
+        self.diag_signals_emitted += 1;
+
+        let d = |v: f64| Decimal::try_from(v).unwrap_or(Decimal::ZERO);
+
+        Some(BuildupInfo {
+            composite_score: d(score),
+            direction,
+            cvd_accel: d(self.cvd.raw()),
+            spot_flow: d(self.spot_flow.raw()),
+            obi_velocity: d(self.obi_velocity.raw()),
+            basis_delta: d(self.basis_delta.raw()),
+            liq_pressure: d(self.liq_pressure.raw()),
+            atr_displacement: d(self.atr_displacement.raw()),
+            spot_mid_at_entry: d(self.current_spot_mid),
+            ema_atr: d(self.atr_displacement.ema_atr()),
+            signal_atr_ratio: d(self.atr_displacement.raw()),
+            obi: d(self.last_obi),
+            timestamp_ms: now_ms,
+        })
+    }
+
+    /// Check if composite has dropped below cancel threshold.
+    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    pub fn below_cancel_threshold(&mut self, now_ms: u64) -> bool {
+        let (score, _) = self.evaluate(now_ms);
+        score < self.cancel_threshold
+    }
+
+    /// Get current composite score (for flow monitoring after Leg 1 fill).
+    pub fn current_score(&mut self, now_ms: u64) -> (f64, Option<Direction>) {
+        self.evaluate(now_ms)
+    }
+
+    /// Diagnostic counters.
+    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    pub fn diag_signals_emitted(&self) -> u64 {
+        self.diag_signals_emitted
+    }
+    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    pub fn diag_direction_vetoes(&self) -> u64 {
+        self.diag_direction_vetoes
+    }
+    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    pub fn diag_causal_vetoes(&self) -> u64 {
+        self.diag_causal_vetoes
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_detector() -> BuildupDetector {
+        BuildupDetector::new(&BuildupConfig::default())
+    }
+
+    #[test]
+    fn test_empty_returns_zero() {
+        let mut det = default_detector();
+        let (score, dir) = det.evaluate(0);
+        assert_eq!(score, 0.0);
+        assert!(dir.is_none());
+    }
+
+    #[test]
+    fn test_causal_veto_spot_only() {
+        // Only spot metrics → no leading metric → veto.
+        let mut det = default_detector();
+        for i in 0..50u64 {
+            det.obi_velocity.update(0.01 * i as f64, i * 50);
+            det.spot_flow.update(1.0, false, i * 50);
+        }
+        let (score, _) = det.evaluate(2500);
+        // Should be 0 due to causal veto (no leading).
+        assert_eq!(score, 0.0);
+        assert_eq!(det.diag_causal_vetoes, 1);
+    }
+
+    #[test]
+    fn test_causal_veto_futures_only() {
+        // Only futures metrics → no confirming metric → veto.
+        let mut det = default_detector();
+        for i in 0..50u64 {
+            det.cvd.update(1.0, false, i * 10);
+            det.basis_delta.update_spot_mid(50000.0, i * 10);
+            det.basis_delta.update_futures_mid(50000.5, 50001.5, i * 10);
+        }
+        let (score, _) = det.evaluate(500);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_direction_consensus_veto() {
+        let mut det = default_detector();
+        // Push 3 metrics bullish, 2 metrics bearish → minority=2 > 1 → veto.
+        // We need to carefully set directions.
+        for i in 0..50u64 {
+            let t = i * 10;
+            det.cvd.update(1.0, false, t);       // bullish
+            det.spot_flow.update(1.0, false, t);  // bullish
+            det.obi_velocity.update(0.01 * i as f64, t); // bullish (rising OBI)
+            // Basis bearish (futures mid dropping).
+            det.basis_delta.update_spot_mid(50000.0, t);
+            det.basis_delta.update_futures_mid(49999.0 - i as f64, 49999.5 - i as f64, t);
+            // Liq bearish (long liquidations).
+            det.liq_pressure.update("SELL", 1.0, t);
+        }
+        let (score, dir) = det.evaluate(500);
+        // Majority is Up (3 up), minority is Down (2) > 1 → should be vetoed.
+        assert_eq!(score, 0.0);
+        assert!(dir.is_none());
+        assert!(det.diag_direction_vetoes > 0);
+    }
+
+    #[test]
+    fn test_full_agreement_produces_score() {
+        let mut det = default_detector();
+        // All metrics bullish + both leading and confirming present.
+        for i in 0..50u64 {
+            let t = i * 10;
+            // Leading: CVD bullish.
+            det.cvd.update(2.0, false, t);
+            // Leading: basis bullish.
+            det.basis_delta.update_spot_mid(50000.0, t);
+            det.basis_delta.update_futures_mid(50001.0 + i as f64 * 0.1, 50002.0 + i as f64 * 0.1, t);
+            // Confirming: spot flow bullish.
+            det.spot_flow.update(2.0, false, t);
+            // Confirming: OBI velocity bullish.
+            det.obi_velocity.update(0.01 * i as f64, t);
+        }
+        let (score, dir) = det.evaluate(500);
+        assert!(score > 0.0, "score should be positive: {score}");
+        assert_eq!(dir, Some(Direction::Up));
+    }
+
+    #[test]
+    fn test_check_entry_below_threshold() {
+        let mut det = default_detector();
+        // Very weak signals → below entry threshold.
+        for i in 0..15u64 {
+            let t = i * 10;
+            det.cvd.update(0.01, false, t);
+            det.spot_flow.update(0.01, false, t);
+            det.basis_delta.update_spot_mid(50000.0, t);
+            det.basis_delta.update_futures_mid(50000.001, 50000.002, t);
+            det.obi_velocity.update(0.0001 * i as f64, t);
+        }
+        assert!(det.check_entry(150).is_none());
+    }
+
+    #[test]
+    fn test_below_cancel_threshold_when_stale() {
+        let mut det = default_detector();
+        // No data → all metrics stale → score=0 < cancel_threshold.
+        assert!(det.below_cancel_threshold(0));
+    }
+}

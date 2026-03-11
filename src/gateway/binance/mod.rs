@@ -1,9 +1,10 @@
 //! Binance gateway sub-modules.
 //!
-//! - [`spike`] — EMA-ATR spike detector (`SpikeDetector`)
-//! - [`ws`]    — WebSocket gateway (`BinanceGateway`) and JSON parsing helpers
+//! - [`ws`]         — Spot SBE WebSocket gateway (`BinanceGateway`)
+//! - [`futures_ws`] — Futures JSON WebSocket gateway (`FuturesGateway`)
 
-pub mod spike;
+pub mod futures_ws;
 pub mod ws;
 
+pub use futures_ws::FuturesGateway;
 pub use ws::BinanceGateway;

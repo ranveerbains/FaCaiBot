@@ -3,14 +3,6 @@
 # Seconds before expiry to discover and pre-fetch the next market
 prewarm_lead_secs = 20
 
-[spike_detection]
-# ATR multiplier for spike confirmation trigger
-multiplier = 30
-# EMA smoothing for ATR (0.02 = 2.5s memory at 50ms ticks)
-atr_alpha = 0.02
-# Minimum spike magnitude in bps (0.01 = 1 bp hard floor)
-min_magnitude_pct = 0.0125
-
 [entry_guards]
 # No entries within this many seconds of market expiry
 entry_cutoff_secs = 20
@@ -28,10 +20,6 @@ trade_cooldown_ms = 3000
 max_alloc_per_trade = 9
 
 [repricing]
-# Minimum spike ATR ratio to trade (spikes below → f1 = 0)
-min_spike_atr_ratio = 20
-# Spike ATR ratio at which spike quality factor = 1.0
-strong_spike_atr_ratio = 50
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
 reprice_scale = 0.05
 # Minimum model output to enter a trade (0.02 = 2.0%)
@@ -51,12 +39,64 @@ max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2000
+phase1_timeout_ms = 2500
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
 favorable_maker_timeout_ms = 2500
-# Number of ticks above/below best ask for Leg 1 FAK batch ladder
-fak_price_offset_ticks = 1
+
+[buildup]
+# Entry threshold — composite must exceed to trigger Leg 1 entry
+entry_threshold = 0.40
+# Cancel threshold — cancel unfilled Leg 1 if composite drops below
+cancel_threshold = 0.25
+# Max wait (ms) for Leg 1 maker fill before cancelling
+cancel_window_ms = 500
+# Repost Leg 1 maker if ask moves this many ticks while composite > cancel_threshold (0 = disabled)
+leg1_repost_tick_threshold = 1
+
+# Metric weights (must sum to 1.0)
+# Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
+w_basis = 0.35
+# Net aggressive buying/selling acceleration on futures — SUPPORTING, empirical (no peer review)
+w_cvd = 0.20
+# Rate of change of bid/ask depth imbalance on spot — CONFIRMING, academically validated
+w_obi = 0.20
+# Net aggressive buy vs sell flow on spot trades — CONFIRMING, VPIN-backed but lags futures
+w_spot_flow = 0.15
+# Forced liquidation volume on futures — REACTIVE risk gauge, not predictive
+w_liq = 0.05
+# Spot displacement from EMA normalized by ATR — VOLATILITY only, no direction prediction
+w_atr = 0.05
+
+# Freshness gates (ms) — metric treated as stale after this
+freshness_basis_ms = 200
+freshness_cvd_ms = 200
+freshness_spot_flow_ms = 200
+freshness_obi_ms = 100
+freshness_liq_ms = 3000
+freshness_atr_ms = 100
+
+# Normalization: [min_threshold, saturation] for each metric
+cvd_min = 0.0
+cvd_saturation = 1.0
+spot_flow_min = 0.0
+spot_flow_saturation = 1.0
+obi_min = 0.0
+obi_saturation = 0.5
+basis_min = 0.0
+basis_saturation = 2.0
+liq_min = 0.0
+liq_saturation = 10.0
+atr_min = 0.0
+atr_saturation = 15.0
+
+# EMA half-lives (ms) — time for old value to decay to 50% weight
+# Time-based: consistent smoothing regardless of data arrival rate
+cvd_fast_halflife_ms = 150
+cvd_slow_halflife_ms = 700
+spot_flow_halflife_ms = 300
+obi_velocity_halflife_ms = 300
+basis_halflife_ms = 300

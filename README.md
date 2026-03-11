@@ -2,7 +2,7 @@
 
 Polymarket arbitrage bot for BTC 5-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC.md](TRADING_LOGIC.md) for trading logic details.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [trading_logic/](trading_logic/README.md) for trading logic details.
 
 ---
 
@@ -20,10 +20,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [TRADING_LOGIC
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-63-35-221-168.eu-west-1.compute.amazonaws.com
+ec2-user@ec2-54-76-238-203.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-63-35-221-168.eu-west-1.compute.amazonaws.com
+ ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-54-76-238-203.eu-west-1.compute.amazonaws.com
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
@@ -178,7 +178,7 @@ Set `TELEGRAM_ALLOWED_USER_ID` in `.env` to enable remote control — no SSH nee
 |---------|--------|
 | `/status` | Uptime, mode, market, counters |
 | `/config [section]` | Show current config |
-| `/set <param> <value>` | Update config + restart (e.g. `/set spike_detection.multiplier 4.0`) |
+| `/set <param> <value>` | Update config + restart (e.g. `/set repricing.reprice_scale 0.05`) |
 | `/trades on\|off` | Toggle trade notifications |
 | `/summary on\|off` | Toggle market summary notifications |
 | `/diag on\|off` | Toggle 60s diagnostic forwarding |

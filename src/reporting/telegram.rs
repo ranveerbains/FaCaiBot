@@ -1,4 +1,4 @@
-// Telegram reporter — formats and sends simulation alerts via HTTP POST to the
+// Telegram reporter — formats and sends alerts via HTTP POST to the
 // Telegram Bot API (https://api.telegram.org/bot{token}/sendMessage).
 //
 // Transport: hyper 1.x + tokio-rustls (direct connection, no legacy Client).
@@ -6,7 +6,7 @@
 // API to send a single HTTP/1.1 request per message.
 //
 // All sends are fire-and-forget: spawned as detached tokio tasks so they never
-// block the simulation executor. Failures are logged via `tracing` and silently
+// block the executor. Failures are logged via `tracing` and silently
 // dropped.
 //
 // Message format: HTML parse_mode (bold via <b>, code via <code>).
@@ -29,7 +29,7 @@ use tracing::{debug, error, warn};
 use crate::control::types::NotifyFlags;
 use crate::types::market::OrderBook;
 use crate::types::order::TradeSignal;
-use crate::types::simulation::{MarketSummary, SessionSummary, SimTrade};
+use crate::types::order::{MarketSummary, SessionSummary, LiveTradeReport};
 
 // ─── TelegramReporter ────────────────────────────────────────────────────────
 
@@ -106,18 +106,7 @@ impl TelegramReporter {
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
-    /// Send a startup notice — "FaCaiBot simulation started".
-    pub fn send_startup_message(&self) {
-        let text = concat!(
-            "<b>FaCaiBot simulation started</b>\n\n",
-            "Listening for signals on live Binance + Polymarket feeds. ",
-            "No real orders will be placed.",
-        )
-        .to_owned();
-        self.fire_and_forget(text);
-    }
-
-    /// Send a live-mode startup notice — "FaCaiBot live started".
+    /// Send a startup notice — "FaCaiBot live started".
     pub fn send_live_startup_message(&self) {
         let text = concat!(
             "<b>FaCaiBot live started</b>\n\n",
@@ -154,7 +143,7 @@ impl TelegramReporter {
     ///
     /// Sent after Leg 2 fill (or emergency taker) completes the paired trade.
     /// Gated by `NotifyFlags::trades_enabled`.
-    pub fn send_trade_completed(&self, trade: &SimTrade) {
+    pub fn send_trade_completed(&self, trade: &LiveTradeReport) {
         if let Some(ref flags) = self.inner.notify_flags {
             if !flags.trades_on() {
                 return;
@@ -418,11 +407,11 @@ mod formatter {
 
     use crate::types::market::OrderBook;
     use crate::types::order::TradeSignal;
-    use crate::types::simulation::{MarketSummary, SessionSummary, SimTrade};
+    use crate::types::order::{MarketSummary, SessionSummary, LiveTradeReport};
 
     // ─── Public formatters (called by TelegramReporter) ──────────────────────
 
-    /// Tier 1 — opportunity detected + Leg 1 simulated fill.
+    /// Tier 1 — opportunity detected + Leg 1 fill.
     pub(super) fn format_opportunity_alert(
         signal: &TradeSignal,
         leg1_fill_price: Decimal,
@@ -435,12 +424,6 @@ mod formatter {
             Direction::Up => "UP",
             Direction::Down => "DOWN",
         };
-        let spike_sign = if signal.direction == Direction::Up {
-            "+"
-        } else {
-            "-"
-        };
-        let spike_mag_pct = signal.spike_info.magnitude * Decimal::ONE_HUNDRED;
         let tier_label = signal.profit_target_tier.label();
         let profit_target_pct = signal.profit_target_pct * Decimal::ONE_HUNDRED;
         let tick = signal.tick_size;
@@ -476,14 +459,19 @@ mod formatter {
             "Top of book"
         };
 
+        let signal_line = format!(
+            "Buildup: {dir} | Reprice: {comp:.2}%",
+            dir = direction_str,
+            comp = signal.expected_pct * Decimal::ONE_HUNDRED,
+        );
+
         format!(
             "<b>--- OPPORTUNITY DETECTED ---</b>\n\n\
             Market: {market}\n\
-            Spike: {dir} {sign}{mag:.4}% | ATR: {atr_ratio:.1}x | {sus}ms sustained\n\
-            Reprice: {reprice:.2}% ({tier}) | Target: {target:.2}%\n\
-            Capital: ${alloc:.2}\n\
+            {signal_line}\n\
+            Target: {target:.2}% ({tier}) | Capital: ${alloc:.2}\n\
             \n\
-            <b>Leg 1</b>\n\
+            <b>Leg 1 [MAKER]</b>\n\
             Buy {l1_side}  <code>${price:.2}</code> \u{00d7} {size:.2}sh = <code>${l1_total:.2}</code>\n\
             {bid_ctx} | Depth: ${depth:.0}\n\
             \n\
@@ -493,14 +481,9 @@ mod formatter {
             \n\
             Status: Watching for hedge...",
             market = market_short,
-            dir = direction_str,
-            sign = spike_sign,
-            mag = spike_mag_pct,
-            atr_ratio = signal.spike_info.atr_ratio,
-            sus = signal.spike_info.sustained_ms,
-            reprice = signal.expected_pct * Decimal::ONE_HUNDRED,
-            tier = tier_label,
+            signal_line = signal_line,
             target = profit_target_pct,
+            tier = tier_label,
             alloc = signal.alloc_amount,
             l1_side = leg1_side,
             price = leg1_fill_price,
@@ -517,7 +500,7 @@ mod formatter {
     }
 
     /// Tier 1 — trade completion (both legs simulated).
-    pub(super) fn format_trade_completed(trade: &SimTrade) -> String {
+    pub(super) fn format_trade_completed(trade: &LiveTradeReport) -> String {
         use crate::types::market::Direction;
 
         let market_short = short_market_id(&trade.market_id);
@@ -545,6 +528,8 @@ mod formatter {
             };
             let taker_tag = if trade.whipsaw_reversal {
                 " [WHIPSAW FOK]".to_owned()
+            } else if matches!(trade.exit_reason, Some(crate::types::order::ExitReason::FlowCollapse)) {
+                " [FLOW COLLAPSE FOK]".to_owned()
             } else if trade.phase1_breach && trade.emergency_maker {
                 " [PHASE-1 BREACH POST-ONLY]".to_owned()
             } else if trade.phase1_breach {
@@ -620,7 +605,7 @@ mod formatter {
             )
         };
 
-        let l1_tag = "";
+        let l1_tag = " [MAKER]";
 
         let unhedged_note = if let Some(ref leg2) = trade.leg2 {
             if trade.leg1.size != leg2.size {

@@ -11,10 +11,6 @@ struct ParamSpec {
 
 /// Allowlist of all tunable parameters with valid ranges.
 const ALLOWED_PARAMS: &[ParamSpec] = &[
-    // spike_detection
-    ParamSpec { name: "spike_detection.multiplier", min: 1.0, max: 1000.0 },
-    ParamSpec { name: "spike_detection.atr_alpha", min: 0.0001, max: 1.0 },
-    ParamSpec { name: "spike_detection.min_magnitude_pct", min: 0.001, max: 0.5 },
     // entry_guards
     ParamSpec { name: "entry_guards.entry_cutoff_secs", min: 30.0, max: 600.0 },
     ParamSpec { name: "entry_guards.binance_stale_event_ms", min: 10.0, max: 1000.0 },
@@ -24,8 +20,6 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
     // repricing
-    ParamSpec { name: "repricing.min_spike_atr_ratio", min: 5.0, max: 200.0 },
-    ParamSpec { name: "repricing.strong_spike_atr_ratio", min: 10.0, max: 500.0 },
     ParamSpec { name: "repricing.reprice_scale", min: 0.001, max: 0.10 },
     ParamSpec { name: "repricing.min_reprice_pct", min: 0.001, max: 0.10 },
     ParamSpec { name: "repricing.min_alloc_pct", min: 0.01, max: 1.0 },
@@ -39,9 +33,42 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
 ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     ParamSpec { name: "risk.phase2_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.favorable_maker_timeout_ms", min: 200.0, max: 5000.0 },
-    ParamSpec { name: "risk.fak_price_offset_ticks", min: 1.0, max: 5.0 },
     // rotation
     ParamSpec { name: "rotation.prewarm_lead_secs", min: 5.0, max: 300.0 },
+    // buildup
+    ParamSpec { name: "buildup.entry_threshold", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.cancel_threshold", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.cancel_window_ms", min: 100.0, max: 5000.0 },
+    ParamSpec { name: "buildup.leg1_repost_tick_threshold", min: 0.0, max: 10.0 },
+    ParamSpec { name: "buildup.w_cvd", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.w_spot_flow", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.w_obi", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.w_basis", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.w_liq", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.w_atr", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.freshness_cvd_ms", min: 50.0, max: 5000.0 },
+    ParamSpec { name: "buildup.freshness_spot_flow_ms", min: 50.0, max: 5000.0 },
+    ParamSpec { name: "buildup.freshness_obi_ms", min: 50.0, max: 5000.0 },
+    ParamSpec { name: "buildup.freshness_basis_ms", min: 50.0, max: 5000.0 },
+    ParamSpec { name: "buildup.freshness_liq_ms", min: 100.0, max: 30000.0 },
+    ParamSpec { name: "buildup.freshness_atr_ms", min: 50.0, max: 5000.0 },
+    ParamSpec { name: "buildup.cvd_min", min: 0.0, max: 10.0 },
+    ParamSpec { name: "buildup.cvd_saturation", min: 0.01, max: 100.0 },
+    ParamSpec { name: "buildup.spot_flow_min", min: 0.0, max: 10.0 },
+    ParamSpec { name: "buildup.spot_flow_saturation", min: 0.01, max: 100.0 },
+    ParamSpec { name: "buildup.obi_min", min: 0.0, max: 1.0 },
+    ParamSpec { name: "buildup.obi_saturation", min: 0.01, max: 1.0 },
+    ParamSpec { name: "buildup.basis_min", min: 0.0, max: 10.0 },
+    ParamSpec { name: "buildup.basis_saturation", min: 0.01, max: 100.0 },
+    ParamSpec { name: "buildup.liq_min", min: 0.0, max: 100.0 },
+    ParamSpec { name: "buildup.liq_saturation", min: 0.01, max: 1000.0 },
+    ParamSpec { name: "buildup.atr_min", min: 0.0, max: 100.0 },
+    ParamSpec { name: "buildup.atr_saturation", min: 0.01, max: 1000.0 },
+    ParamSpec { name: "buildup.cvd_fast_halflife_ms", min: 10.0, max: 5000.0 },
+    ParamSpec { name: "buildup.cvd_slow_halflife_ms", min: 50.0, max: 10000.0 },
+    ParamSpec { name: "buildup.spot_flow_halflife_ms", min: 10.0, max: 5000.0 },
+    ParamSpec { name: "buildup.obi_velocity_halflife_ms", min: 10.0, max: 5000.0 },
+    ParamSpec { name: "buildup.basis_halflife_ms", min: 10.0, max: 5000.0 },
 ];
 
 /// Validate a parameter name against the allowlist and check value range.
@@ -75,7 +102,7 @@ pub fn update_config_file(path: &Path, param_name: &str, value: f64) -> Result<(
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
-    // param_name is "section.key" e.g. "spike_detection.multiplier"
+    // param_name is "section.key" e.g. "repricing.reprice_scale"
     let (_section, key) = param_name
         .split_once('.')
         .with_context(|| format!("invalid param format: {param_name}"))?;
@@ -207,8 +234,8 @@ mod tests {
 
     #[test]
     fn test_validate_known_param() {
-        let v = validate_param("spike_detection.multiplier", "3.5").unwrap();
-        assert!((v - 3.5).abs() < f64::EPSILON);
+        let v = validate_param("repricing.reprice_scale", "0.05").unwrap();
+        assert!((v - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -218,13 +245,13 @@ mod tests {
 
     #[test]
     fn test_validate_out_of_range() {
-        assert!(validate_param("spike_detection.multiplier", "1001.0").is_err());
-        assert!(validate_param("spike_detection.multiplier", "0.5").is_err());
+        assert!(validate_param("repricing.reprice_scale", "0.5").is_err());
+        assert!(validate_param("repricing.reprice_scale", "0.0001").is_err());
     }
 
     #[test]
     fn test_validate_not_a_number() {
-        assert!(validate_param("spike_detection.multiplier", "abc").is_err());
+        assert!(validate_param("repricing.reprice_scale", "abc").is_err());
     }
 
     #[test]
@@ -234,15 +261,15 @@ mod tests {
         let path = dir.join("config_test.toml");
         std::fs::write(
             &path,
-            "[spike_detection]\nmultiplier = 2.0\natr_alpha = 0.02\n",
+            "[risk]\nphase1_timeout_ms = 2000\nphase2_timeout_ms = 2000\n",
         )
         .unwrap();
 
-        update_config_file(&path, "spike_detection.multiplier", 4.0).unwrap();
+        update_config_file(&path, "risk.phase1_timeout_ms", 3000.0).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("multiplier = 4"));
-        assert!(contents.contains("atr_alpha = 0.02"));
+        assert!(contents.contains("phase1_timeout_ms = 3000"));
+        assert!(contents.contains("phase2_timeout_ms = 2000"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -254,16 +281,16 @@ mod tests {
         let path = dir.join("config_comments.toml");
         std::fs::write(
             &path,
-            "[spike_detection]\nmultiplier = 2.0  # ATR multiplier\natr_alpha = 0.02\n",
+            "[risk]\nphase1_timeout_ms = 2000  # Phase 1 timeout\nphase2_timeout_ms = 2000\n",
         )
         .unwrap();
 
-        update_config_file(&path, "spike_detection.multiplier", 5.0).unwrap();
+        update_config_file(&path, "risk.phase1_timeout_ms", 3000.0).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("multiplier = 5"));
-        assert!(contents.contains("# ATR multiplier"));
-        assert!(contents.contains("atr_alpha = 0.02"));
+        assert!(contents.contains("phase1_timeout_ms = 3000"));
+        assert!(contents.contains("# Phase 1 timeout"));
+        assert!(contents.contains("phase2_timeout_ms = 2000"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -275,16 +302,16 @@ mod tests {
         let path = dir.join("config_read.toml");
         std::fs::write(
             &path,
-            "[spike_detection]\nmultiplier = 3.0\n\n[risk]\nphase1_timeout_ms = 2000\n",
+            "[entry_guards]\nentry_cutoff_secs = 20\n\n[risk]\nphase1_timeout_ms = 2000\n",
         )
         .unwrap();
 
-        let section = read_config_section(&path, "spike_detection").unwrap();
-        assert!(section.contains("multiplier"));
+        let section = read_config_section(&path, "entry_guards").unwrap();
+        assert!(section.contains("entry_cutoff_secs"));
         assert!(!section.contains("phase1_timeout_ms"));
 
         let all = read_config_all(&path).unwrap();
-        assert!(all.contains("spike_detection"));
+        assert!(all.contains("entry_guards"));
         assert!(all.contains("risk"));
 
         std::fs::remove_dir_all(&dir).ok();

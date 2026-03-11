@@ -4,45 +4,31 @@
 
 **Every session, without exception, must follow this workflow:**
 
-1. **Read & Orient**: Before doing ANY work, read this `CLAUDE.md` file and then read whichever referenced documents (`ARCHITECTURE.md`, `TRADING_LOGIC.md`, `config.toml`, relevant source files) pertain to the question or task at hand. Build a full picture of the current state before touching anything.
+1. **Read & Orient**: Read this file first. Then use the Task Routing table below to identify which docs and source files to read for the task at hand. Don't read everything — read only what's relevant.
 
-2. **Plan First**: Write a plan (use plan mode) before executing any code changes. The plan must reference specific files, functions, and conventions from the documents read in step 1. No code changes without a plan.
+2. **Plan First**: Write a plan (use plan mode) before executing any code changes. The plan must reference specific files, functions, and conventions from the documents read in step 1.
 
 3. **Execute**: Implement the plan.
 
-4. **Update Documentation**: After completing any work, update ALL relevant documentation to reflect the changes:
-   - `CLAUDE.md` — Update conventions, source file descriptions, key patterns, or any section affected by the change
-   - `ARCHITECTURE.md` — Update system design, trade lifecycle, risk controls, or configuration docs if affected
-   - `TRADING_LOGIC.md` — Update if trading logic, evaluation, hedge phases, or execution flow changed
-   - Any other referenced `.md` files that are affected
-
-   **This is critical.** Future sessions rely on these docs to understand the system. Missing or outdated details cause bugs. Every behavioral change, new flag, new state transition, new guard, or new edge case MUST be documented in the appropriate file so the next session has full context.
+4. **Update Documentation (Cascade)**: After completing any work, update ALL affected documentation. See the Documentation Cascade section below for the exact rules. **This is critical.** Future sessions rely on these docs. Every behavioral change, new flag, new state transition, new guard, or new edge case MUST be documented.
 
 ## Project Overview
 
-FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets. It detects Binance price spikes in real-time, buys cheap directional shares on the Polymarket CLOB before it reprices, then hedges with the opposite side — locking in a sub-$1.00 pair that pays $1.00 on resolution. See `ARCHITECTURE.md` for full system design.
+FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets. It uses composite buildup detection (6 Binance spot + futures metrics) to predict imminent price spikes, posts maker orders on the Polymarket CLOB before the move materializes, then hedges with the opposite side — locking in a sub-$1.00 pair that pays $1.00 on resolution. See `ARCHITECTURE.md` for full system design.
 
-## Build Commands
-
-```bash
-cargo build              # Build (debug)
-cargo build --release    # Build (release — LTO, single codegen unit)
-cargo run                # Run the bot
-cargo test               # Run all tests (149 tests)
-cargo clippy             # Lint
-cargo fmt                # Format code
-```
-
-## Local Infrastructure
+## Build & Run
 
 ```bash
-docker-compose up -d     # Start QuestDB
-docker-compose down      # Stop
+cargo build                  # Debug build
+cargo build --release        # Release (LTO, single codegen unit)
+cargo run                    # Run the bot
+cargo test                   # All tests (153)
+cargo clippy                 # Lint
+cargo fmt                    # Format
+docker-compose up -d         # Start QuestDB (analytics only)
 ```
 
-- **QuestDB**: localhost:9000 (console), :9009 (ILP ingestion), :8812 (Postgres wire) — analytics only, not on execution path
-
-Copy `.env.example` → `.env` and fill credentials before running. Tuning params live in `config.toml`.
+Copy `.env.example` → `.env` and fill credentials. Tuning params live in `config.toml`.
 
 ## Production Deployment (AWS)
 
@@ -53,116 +39,173 @@ bash deploy/deploy.sh                                        # Deploy/update
 ```
 
 - **Instance**: `c7i.xlarge` in `eu-west-2` (London) — co-located with Polymarket CLOB
-- **OS**: Amazon Linux 2023
 - See `README.md` for full deployment guide and `deploy/` for scripts
 
-## Architecture
+## Architecture (Brief)
 
 Three-layer lock-free pipeline connected by crossbeam SPSC channels:
 
 ```
 Ingestor (gateway/) ──▶ Engine (engine/) ──▶ Executor (executor/)
-  Binance SBE WS          MarketState          MODE=live: CLOB API
-  Polymarket WS            Spike→Signal         MODE=sim: Telegram+QuestDB
-  Gamma API (REST)        Hedge phases
+  Binance Spot SBE WS       MarketState          MODE=live: CLOB API
+  Binance Futures JSON WS   Buildup→Signal       MODE=sim: Telegram+QuestDB
+  Polymarket WS             Hedge phases
+  Gamma API (REST)
 ```
 
-- **Ingestor**: Dedicated OS thread, CPU-pinned core 0, single-threaded tokio runtime
-- **Engine**: Runs on `spawn_blocking` thread (off the tokio worker pool). Evaluates arbitrage, emits TradeSignal. In sim mode also runs `advance_simulation()` fill state machine
-- **Executor**: Live mode submits orders via polymarket-client-sdk; sim mode reports via Telegram+QuestDB
+Full details in `ARCHITECTURE.md`.
 
 ## Source Files
 
 ```
-deploy/
-├── facaibot.service               # systemd unit (auto-restart, CPU affinity, security)
-├── sysctl.conf                    # Kernel network tuning for low-latency trading
-├── setup.sh                       # One-time EC2 server provisioning
-├── deploy.sh                      # Update deployment (git pull, build, restart)
-└── healthcheck.sh                 # Cron health check with Telegram alerts
-
 src/
-├── main.rs                        # Entry point: jemalloc, manual tokio runtime (2 workers), engine on spawn_blocking, channel wiring
+├── main.rs                        # Entry point: jemalloc, tokio runtime (2 workers), channel wiring
 ├── config.rs                      # Hybrid config: config.toml (tuning) + .env (secrets)
 ├── engine/
-│   ├── strategy.rs                # StrategyEngine: event routing, state, simulation FSM
+│   ├── strategy.rs                # StrategyEngine: event routing, state, simulation FSM (largest file)
 │   ├── evaluator.rs               # Leg1Evaluator + Leg2Evaluator (pure, no state mutation)
 │   ├── confidence.rs              # Repricing model (compute_expected_repricing), round_to_tick()
-│   └── erosion.rs                 # HedgeState/HedgeSnap/HedgePhase: Leg 2 two-phase hedge FSM
+│   ├── erosion.rs                 # HedgeState/HedgeSnap/HedgePhase: Leg 2 hedge FSM
+│   └── buildup/
+│       ├── detector.rs            # BuildupDetector: composite 6-metric score, direction consensus
+│       └── metrics.rs             # 6 metric trackers (CVD, spot flow, OBI, basis, liq, ATR)
 ├── executor/
-│   ├── live.rs                    # LiveExecutor: CLOB order placement, cancel/repost, FOK emergency
-│   ├── simulation.rs              # SimulationExecutor: simulated fills, Telegram reporting
-│   └── fill_engine.rs             # Utility helpers: compute_fill_size, opposite_side
+│   ├── live.rs                    # LiveExecutor: CLOB order placement, cancel, FOK emergency
+│   └── fill_engine.rs             # Utility: compute_taker_fee, compute_maker_rebate, round_to_tick
 ├── gateway/
 │   ├── binance/
-│   │   ├── ws.rs                  # BinanceGateway: fastwebsockets TLS, SBE binary decoding (50ms depth + real-time bestBidAsk)
-│   │   └── spike.rs               # SpikeDetector: EMA-ATR with sustain + momentum filter
+│   │   ├── ws.rs                  # Spot SBE WS: depth20 + bestBidAsk + @trade
+│   │   └── futures_ws.rs          # Futures JSON WS: @aggTrade, @bookTicker, @forceOrder
 │   └── polymarket/
-│       ├── mod.rs                 # Facade, shared constants
-│       ├── rest.rs                # CLOB REST: SDK-based order placement, cancellation, get_best_ask (public book query)
+│       ├── rest.rs                # CLOB REST: order placement, cancellation, book query
 │       ├── market_ws.rs           # Public Market WS: book, price, tick events
-│       ├── user_ws.rs             # Authenticated User WS: "order" events → fill detection, "trade" events → logged only
+│       ├── user_ws.rs             # Authenticated User WS: fill detection (order events)
 │       ├── heartbeat.rs           # POST /heartbeat every 5s (live only)
-│       ├── rotation.rs            # Gamma API market discovery + rotation
-│       └── tls_helpers.rs         # Shared TLS/HTTP helpers
+│       └── rotation.rs            # Gamma API market discovery + rotation timer
 ├── reporting/
-│   └── telegram.rs                # Fire-and-forget Telegram Bot API via hyper
+│   └── telegram.rs                # Telegram Bot API (fire-and-forget, rate-limited)
 ├── storage/
-│   └── cold.rs                    # QuestDB: 5 ILP tables, batch flush (analytics only)
+│   └── cold.rs                    # QuestDB ILP ingestion (analytics only, not on execution path)
 ├── control/
-│   ├── mod.rs                     # Module declarations
-│   ├── types.rs                   # NotifyFlags, BotStatus, DrainStatus
-│   ├── listener.rs                # TelegramCommandListener: getUpdates polling, auth, dispatch. Wallet commands spawned as independent tasks
-│   ├── handlers.rs                # Command handlers (pure logic, returns reply strings)
-│   ├── config_editor.rs           # TOML read/write, param allowlist with min/max ranges
-│   └── wallet.rs                  # /balance, /polybalance, /redeem — Polygon RPC + CTF contract. CachedNonceManager for sequential txs. Per-tx receipt timeout (8s). Persistent redeems.txt: append_condition_id_sync (engine thread), read/cleanup (async redeem)
+│   ├── listener.rs                # Telegram command listener (getUpdates polling)
+│   ├── handlers.rs                # Command handlers (pure logic)
+│   ├── config_editor.rs           # TOML read/write, param allowlist with ranges
+│   └── wallet.rs                  # /balance, /polybalance, /redeem (Polygon RPC + CTF)
 ├── types/
-│   ├── market.rs                  # IngestorEvent (11 variants), MarketState, OrderBook
-│   ├── order.rs                   # TradeSignal (incl. leg1_taker_fee), ProfitTier, ExecutorCommand (incl. PostLeg2Phase2, CancelLeg2Order, RebalanceLeg1), ExecutorFeedback (incl. Leg2OrderCancelResult, RebalanceResult), FillMethod (3 variants: FavorableMaker, FavorableTaker, EmergencyTaker), OrderTag (Leg2Phase1, Leg2Phase2), Side, ExitReason (7 variants), OrderRequest (incl. fak() constructor)
+│   ├── market.rs                  # IngestorEvent, MarketState, OrderBook, BuildupInfo
+│   ├── order.rs                   # TradeSignal, ExecutorCommand, ExecutorFeedback, OrderRequest
 │   └── simulation.rs              # SimulationState, SimPosition, SimTrade
 └── utils/
-    ├── signing.rs                 # build_signer() helper (hex private key → PrivateKeySigner)
-    ├── time.rs                    # epoch_ms() — single source of truth for millisecond timestamps
-    └── tls.rs                     # Shared TLS config (build_tls_config) + SpawnExecutor for fastwebsockets
+    ├── signing.rs                 # build_signer() (hex key → PrivateKeySigner)
+    ├── time.rs                    # epoch_ms() — single timestamp source
+    └── tls.rs                     # Shared TLS config + SpawnExecutor
 ```
 
-## Key Conventions
+## How to Work
 
-- **jemalloc allocator**: Global allocator via `tikv-jemallocator` — eliminates glibc malloc latency spikes from arena contention. Conditional on `cfg(not(target_env = "msvc"))`
-- **Tokio runtime**: Manual `Builder::new_multi_thread()` with 2 worker threads pinned to cores 1-2 via `on_thread_start`. Core 0 reserved for ingestor. Engine loop runs on `tokio::task::spawn_blocking` (off the worker pool) so that async tasks (command listener, auto-redeem, Telegram sends) always have a free worker thread — prevents thread starvation in live mode where the executor also blocks a worker
+### Change Hierarchy (follow this order)
+
+When making any code change, work through these layers top-down. Each layer can reveal dependencies the next layer needs.
+
+1. **Types first** (`types/market.rs`, `types/order.rs`): If the change needs new data, new enum variants, new fields on structs — add them here first. This is the foundation; everything else depends on these types.
+
+2. **Config second** (`config.rs`, `config.toml`): If the change needs new tunable params — add the config struct fields, TOML section, and defaults. Add to `config_editor.rs` allowlist if it should be `/set`-able.
+
+3. **Core logic third** (`engine/evaluator.rs`, `engine/erosion.rs`, `engine/confidence.rs`, `engine/buildup/`): Pure computation. These files should never touch IO or external state. Implement the logic using types from step 1 and config from step 2.
+
+4. **State management fourth** (`engine/strategy.rs`): Wire the new logic into the event loop. This is where state transitions happen. `strategy.rs` is the largest file (3800+ lines) — use grep to find the exact function/section before editing. Key entry points: `on_event()`, `evaluate()`, `evaluate_leg2()`, `on_order_posted()`, `on_trade_complete()`, `handle_buildup_confirmed()`.
+
+5. **Executor fifth** (`executor/live.rs`): If the change affects CLOB interaction — order placement, cancellation, or feedback. Must match the `ExecutorCommand`/`ExecutorFeedback` types from step 1.
+
+6. **Gateway/reporting last** (`gateway/`, `reporting/`, `storage/`): Ingestor changes, Telegram formatting, QuestDB columns. These are leaf nodes — they emit events or consume results, rarely affect upstream logic.
+
+### Dependency Awareness
+
+Before modifying any function or struct, **trace its callers and consumers**:
+
+- **Grep for the function/field name** across the codebase before changing its signature or semantics. A field on `TradeSignal` is used in `evaluator.rs`, `strategy.rs`, `live.rs`, `cold.rs`, and `telegram.rs` — miss one and it silently breaks.
+- **Check both directions**: who produces this data (upstream) and who consumes it (downstream). The channel boundary (`engine → executor`) is a common blind spot — a type change in `order.rs` affects both sides.
+- **strategy.rs is the hub**: Almost every behavioral change touches this file. If you think your change doesn't need strategy.rs edits, double-check — it probably does.
+- **Flags and guards cascade**: Adding a new boolean flag (e.g., `some_new_guard`) requires: (a) initialization, (b) set logic, (c) clear logic on trade complete, (d) clear logic on rotation, (e) documentation. Missing any of (c)/(d) causes state leaks between trades/markets.
+
+### Iterative Verification
+
+After implementing, verify in this order:
+
+1. **`cargo build`** — Catch type errors, missing imports, signature mismatches. Fix all errors before proceeding.
+2. **`cargo test`** — Run the full test suite (153 tests). If tests fail, fix them before touching docs. Tests cover evaluator guards, repricing math, fill engine utilities, buildup normalization, and more.
+3. **`cargo clippy`** — Fix warnings. Common ones: collapsible if-statements, derivable impls, too many function arguments.
+4. **Manual trace** — For behavioral changes, mentally walk through a complete trade lifecycle (buildup → Leg 1 → hedge → completion) to verify no state leaks or missed transitions. Use `trading_logic/state_machines.md` as reference.
+
+### When to Use Subagents
+
+- **Broad codebase search** (e.g., "find all places that reference `leg1_state`"): Use an Explore agent. Don't grep manually across 20+ files.
+- **Parallel independent research** (e.g., reading 3 unrelated docs simultaneously): Spin up multiple agents in parallel.
+- **Testing after code changes**: Run build/test via bash directly — don't delegate to an agent unless the task is complex (e.g., diagnosing a test failure that requires reading multiple files).
+- **Don't use agents for**: Reading a single known file, making a targeted edit, or running a simple command. Use the direct tools.
+
+### Common Pitfalls
+
+- **strategy.rs size**: At 3800+ lines, it's easy to miss existing logic. Always grep for related function names before adding new code.
+- **Sim vs live divergence**: Changes to engine logic often need parallel changes for simulation mode (`advance_simulation()`) and live mode (executor feedback handlers). See `trading_logic/edge_cases.md` §16.
+- **State reset completeness**: `on_trade_complete()` and the `MarketRotation` handler both reset state. New fields must be cleared in BOTH places.
+- **Channel ordering**: Feedback is drained BEFORE `on_event()` in the main loop. Emergency signals must be sent BEFORE rotation commands. Violating these orderings causes subtle race conditions.
+- **CLOB constraints**: `price × size` must have ≤2 decimal places for FOK orders. Maker rebate is an estimate (20% of taker fee). Post-only orders can be rejected if price crosses book.
+
+## Code Conventions (Cross-Cutting Rules)
+
+These are codebase-wide rules that apply regardless of which module you're working in:
+
 - **Decimal arithmetic**: All pricing uses `rust_decimal::Decimal` — never f32/f64 for prices or sizes
-- **Channel-based data flow**: crossbeam bounded(8192) SPSC channels between layers — no Arc<Mutex>. Reverse `ExecutorFeedback` channel sends CLOB order IDs from live executor back to engine.
+- **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — no duplicates
+- **Channel-based data flow**: crossbeam bounded(8192) SPSC between layers — no `Arc<Mutex>`. Reverse `ExecutorFeedback` channel for CLOB order IDs
+- **Evaluator pattern**: `Leg1Evaluator`/`Leg2Evaluator` are pure (no state mutation) — caller applies mutations
+- **Self-gating**: `buildup_detected` is cleared on both signal emission AND rejection — each buildup gets exactly 1 evaluation attempt
 - **Hybrid config**: `config.toml` for tuning params (serde + `#[serde(default)]`), `.env` for secrets only. Override path with `CONFIG_FILE` env var
-- **Evaluator pattern**: `Leg1Evaluator`/`Leg2Evaluator` are pure (no state mutation) — caller applies mutations after receiving results
-- **Self-gating**: `evaluate(&mut self)` clears `spike_detected` on both success AND failure — each spike gets exactly 1 attempt
-- **Repricing model**: `compute_expected_repricing()` in `confidence.rs` computes expected repricing percentage. `expected_pct = norm_spike × 4P(1-P) × alignment × time_factor × reprice_scale`. `time_factor = min((300/max(T,10))^time_exponent, max_time_factor)` — capped to prevent runaway amplification at low time remaining. Raw output drives entry gate and allocation. Phase 1 profit target is **dampened**: `round_to_tick(expected_pct × phase1_target_dampen, tick)` — separates "is this worth trading?" from "what target is achievable?" (default 0.8 = 80%). Stored as `expected_pct` field on `TradeSignal`, `HedgeState`/`HedgeSnap`, `SimPosition`, `SimTrade`. Three-layer entry guard: hard skew cap (`hard_skew_cap`, default 0.90), min repricing (`min_reprice_pct`, default 2.0%), dynamic allocation (`clamp(output/reprice_scale, min_alloc_pct, 1.0)`). `ProfitTier::from_expected_reprice()` is display-only (HIGH/MED/LOW labels). Config: `[repricing]` section with `min_spike_atr_ratio`, `strong_spike_atr_ratio`, `reprice_scale`, `min_reprice_pct`, `min_alloc_pct`, `hard_skew_cap`, `time_exponent`, `max_time_factor`, `phase1_target_dampen`, `min_obi_alignment`
-- **Binance SBE**: Binary market data via `stream-sbe.binance.com` (Ed25519 API key required). `@depth20` at 50ms cadence + `@bestBidAsk` real-time. Zero-copy decode: `i64::from_le_bytes()` at known offsets → `Decimal::new(mantissa, -exponent)`. Schema `stream_1_0.xml`, templates 10001 (BestBidAsk) and 10002 (DepthSnapshot)
-- **Spike delivery**: Confirmed spikes delivered as `IngestorEvent::SpikeConfirmed(SpikeInfo)` — dedicated event variant, not encoded in BinanceTick fields. Immediate confirmation (no sustain window). `SpikeInfo` carries `atr_ratio: Decimal` (abs_displacement / ema_atr, computed in spike detector) — used by repricing model's `norm_spike` factor. Also carries `obi: Decimal` — Order Book Imbalance from Binance `@depth20` at spike time (`(bid_depth - ask_depth) / total_depth`, range [-1,+1]). OBI gate in evaluator rejects spikes whose book imbalance contradicts direction (config: `min_obi_alignment`, default 0.2). `BinanceDepth::obi()` computes OBI, stored in `SpikeDetector::last_obi`
-- **Leg 1 batch FAK**: Evaluator sets `signal.price = best_ask`, `signal.size = (alloc / ask_price).round_dp(2)`. Executor places 3 FAK orders at `[ask - N×tick, ask, ask + N×tick]` where N = `fak_price_offset_ticks` (default 1) in a single CLOB batch request (`POST /orders` via `place_orders_batch()`). After placement, queries `get_order_status()` sequentially for each to get `size_matched`. Computes VWAP and total filled size. Sends `OrderPosted { already_filled: true, price: vwap, size: total_filled }`. Engine transitions Leg 1 directly to `Filled`, calls `init_leg2()`, sends opportunity alert. Zero fills → `OrderFailed`. `clob_safe_fok_size()` adjusts each order's size so `price × size` has ≤2dp. `signal.leg1_taker_fee = SimFill::compute_taker_fee_per_share(ask_price)` — used by HedgeState for breakeven computation
-- **Hedge model (2-phase dual-order)**: `HedgeState`/`HedgeSnap`/`HedgePhase` in `erosion.rs`. **Phase 1 (Profit, post-once-and-wait)**: post once at confidence-scaled profit target (raw price, no clamping — executor handles crosses-book via `attempt_favorable_maker_then_fok()`), wait `phase1_timeout_ms` (default 2000ms). Evaluator returns `None` if `leg2_state` is `Posted` or `Filled` — no reposts, no outbidding. `OrderFailed` resets `leg2_state` to `None`, allowing retry. Phase 1 breach (pair cost > `phase1_breach_threshold`) → **immediate FOK taker** at ask. Phase 1 timeout → transition to Phase 2. **Phase 2 (Dual-order)**: post at `best_ask - 1 tick` **without cancelling Phase 1** — two maker orders rest simultaneously. Whichever fills first → cancel the other → trade complete. `phase2_timeout_ms` (default 2000ms) deadline → FOK taker. Phase 2 breach (`ask > phase2_posted_price`) → **immediate FOK taker** (requires `phase2_posted_price` to be `Some`, which is always set at Phase 2 entry). Phase 2 entry guard: if `ask - tick > breakeven`, skip posting → immediate FOK. **Double-fill rebalance**: Rare race where both orders fill (~3ms window) → FOK taker buy on Leg 1 side. `post_trade_orphan` persists across `on_trade_complete()`, `rebalance_in_progress` gates evaluation. **Orphan cancel dispatch guard**: `orphan_cancel_sent` flag prevents `take_orphan_cancel()` from re-dispatching on every main-loop iteration — set `true` on dispatch, reset `false` when orphan is stored, cleared, or rotation resets state. Without this, unconfirmed cancels (order already CANCELED by CLOB) cause infinite cancel loops. **Dual-order tracking**: `leg2_phase1_order_id` / `leg2_phase2_order_id` on engine, `active_leg2_phase1_id` / `active_leg2_phase2_id` on executor. `OrderTag` enum (`Leg2Phase1`, `Leg2Phase2`, `Rebalance`) on `OrderPosted` feedback routes IDs correctly
-- **Emergency exits**: All emergency exits are immediate FOK taker at ask, sized at full `leg1_size` (no depth cap — the executor's price-escalation loop sweeps cumulative depth across multiple levels). **FOK dedup**: Once a FOK is emitted (`fok_emitted=true` on `HedgeState`), subsequent evaluations return `None` — the executor's retry loop handles persistence. **Signal stacking prevention**: `emergency_signal_in_flight` flag on engine gates `evaluate_leg2()` while an emergency signal is in the executor channel — set on dispatch, cleared on feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete, rotation). **Leg 2 command pending gate**: `leg2_command_pending` flag on engine gates `evaluate_leg2()` while ANY Leg 2 command (hedge or emergency) is being processed by the executor — prevents stale hedge commands from queuing while the executor is processing a multi-step favorable exit. Set on dispatch (live mode only, gated by `reporter.is_some()`), cleared on ANY Leg 2 feedback. **Stale feedback guard**: Defense in depth — `on_order_posted()` and `on_order_failed()` ignore Leg 2 feedback when `leg1_state` is not `Filled` (trade has already been reset). Four triggers: (1) Phase 1 breach — pair cost > `phase1_breach_threshold` during Phase 1, **immediate FOK taker** at ask; (2) Phase 2 breach — `ask > phase2_posted_price` during Phase 2, **immediate FOK taker**; (3) Market expiry — market approaching resolution cutoff; (4) Whipsaw reversal — opposite spike detected after Leg 1 fill, immediate FOK at best ask bypassing hedge phases entirely. **FOK price escalation**: Emergency FOK orders (`emergency_fok_fallback`) escalate price +1 tick per attempt on liquidity failure (Rejected or non-transient Err), sweeping the book up to a hard cap of `$1.00`. No fixed retry count — the natural ceiling is ~23 ticks from any starting price (~2.3s to sweep). Non-transient SDK errors ("decimal places", "Validation", "balance", "allowance") abort immediately. `clob_safe_fok_size()` recomputed each iteration (price changes → size constraint changes) — truncates size to 2dp then decrements by 0.01 until `price × size` has ≤2dp. **Zero-size guard**: If `clob_safe_fok_size()` returns zero at any price, the sweep aborts with `OrderFailed`. **Price cap guard**: If escalated price exceeds `$1.00`, aborts with `OrderFailed`. **Sync FOK fill detection**: All FOK `OrderPosted` feedback includes `already_filled=true` when `resp.status == OrderStatus::Filled` — the engine transitions Leg 2 directly to `Filled` and triggers immediate trade completion, bypassing the User WS wait that previously caused double-fill bugs. **$1 notional check**: Favorable exits check `price × size >= $1` before attempting (CLOB minimum for marketable orders). **"Crosses book" routing**: Leg 2 hedge `Err` containing "crosses book" (or `Ok(Rejected)`) routes to `attempt_favorable_maker_then_fok()` instead of `OrderFailed`. **Favorable try-maker-first**: `attempt_favorable_maker_then_fok()` posts a maker at `best_ask - 1tick`, polls `GET /data/order/{id}` every 200ms for up to `favorable_maker_timeout_ms` (1000ms). **Breakeven breach guard**: each poll iteration also queries `GET /book` via `get_best_ask()` — if `current_ask - tick > breakeven`, cancel maker early and FOK immediately (prevents blind waiting while the book deteriorates). If filled → `fill_method=FavorableMaker` (no taker fee + rebate). If not filled → cancel: if cancel confirmed → FOK taker fallback (`fill_method=FavorableTaker`); if cancel NOT confirmed → send `OrderPosted` with `already_filled=false` (let User WS determine outcome). Emergency FOK paths send `fill_method=EmergencyTaker`. **EmergencyTaker handling**: Sets `leg2_was_taker=true` and `emergency_maker=false` on `LiveTradeMeta`. **Leg 2 cancel-not-confirmed meta reset**: When a Leg 2 cancel returns `was_cancelled=false` and Posted state is restored, `LiveTradeMeta` is reset (preserving `leg1_cancel_race`) and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared — prevents successful maker fills from being mislabeled as emergency exits. **Balance exhaustion**: `balance_exhausted` flag on `LiveExecutor` — set when "balance"/"allowance" error detected during Leg 2 placement. All subsequent Leg 2 commands immediately return `OrderFailed` without calling CLOB. Cleared on rotation. Executor sends `BalanceExhausted` feedback → engine fires critical Telegram alert with position details. **Rotation Telegram**: When `leg1_filled && !leg2_filled` at rotation, `fire_critical()` sends position details (direction, price, size, FOK status) so abandoned positions are never silent
-- **Dual-timer rotation**: `rotation.rs` uses a precise `tokio::time::sleep_until` that fires at the exact market expiry boundary (±10ms), plus a 5s `tokio::time::interval` for prewarm discovery and marketless retry. The expiry timer is armed when a market is discovered (via prewarm instant-switch or marketless Gamma poll) and parked at far-future when marketless. `expiry_instant()` helper converts epoch-ms to `tokio::time::Instant` via delta from `now_epoch_ms()`
-- **Rotation quiet period**: After `MarketRotation`, spike candidates are dropped for `rotation_quiet_ms` (default 30000ms). `in_quiet_period` flag set on rotation, cleared when elapsed time exceeds config. Prevents entries on stale-book repricing during the first ~30s of a new market. Modeled on `in_cutoff_window` pattern. Diagnostic counter: `diag_spikes_dropped_quiet`
-- **Trade cooldown**: After trade completion, new Leg 1 entries are blocked for `trade_cooldown_ms` (default 5000ms). `in_trade_cooldown` flag set in `on_trade_complete()`, cleared when elapsed time exceeds config (checked in `update_phase()`). Cleared on `MarketRotation` (new market shouldn't inherit stale cooldown). Guard lives in `evaluate()` — spikes flow through normally but entry is rejected. Prevents rapid-fire re-entry after completing a trade. Diagnostic counter: `diag_spikes_dropped_cooldown`
-- **Whipsaw spike guard**: When `SpikeConfirmed` arrives with opposite direction to `leg1_direction`: (a) Leg 1 Posted (unfilled) → reset `leg1_state = None` (FAK orders already cancelled by CLOB); (b) Leg 1 Filled → set `whipsaw_fok_pending = true`, triggering immediate emergency exit via `emit_whipsaw_fok()` with `ExitReason::WhipsawReversal` and `sim_was_taker = true` (direct FOK, no post-only attempt — speed is critical during active reversal). The existing price-escalating FOK loop in the executor handles the exit. Diagnostic counters: `diag_whipsaw_cancels` (Posted resets), `diag_whipsaw_foks` (Filled Leg 1 emergency exits)
-- **init_leg2 direction safety**: Uses `self.leg1_direction.unwrap_or(spike.direction)` instead of `spike.direction` — survives spike overwrites between Leg 1 fill and hedge init, preventing YES/NO label swap in trade completion messages
-- **User WS fill detection (live)**: The Polymarket User WS sends two event types for fills: `"order"` events (hex order hash, e.g. `0x13828d75...`) and `"trade"` events (UUID trade ID, e.g. `89f124e7-...`). Only `"order"` events are forwarded to the engine as `IngestorEvent::TradeStatusUpdate` — their hex hash matches the format stored by the engine from `ExecutorFeedback::OrderPosted`. `"trade"` UUIDs never match any stored order ID and are harmlessly ignored. Actionable statuses (MATCHED, MINED, CONFIRMED, FAILED, RETRYING, CANCELED) are forwarded via `parse_trade_status()`; non-actionable statuses (LIVE, etc.) are silently skipped. This covers all order types: Leg 1 entry, Leg 2 hedge, Leg 2 emergency, and Leg 2 favorable exits. **Exception**: FOK orders that return `Filled` synchronously from the REST API bypass User WS entirely — the `already_filled` flag on `OrderPosted` feedback triggers immediate `Filled` state transition + trade completion in the engine
-- **Fire-and-confirm cancels (Leg 2 only)**: All Leg 2 cancel operations return `Result<bool>` from the CLOB. The executor sends `CancelResult { was_cancelled, is_leg2 }` feedback to the engine. If the cancel was NOT confirmed (order may have filled before the cancel reached the CLOB), the engine restores the Leg 2 Posted state from `prev_leg2_order` so User WS MATCHED events can still match. `LiveTradeMeta` is reset and hedge `emergency_submitted`/`exit_reason` are cleared — prevents maker fills from being mislabeled as emergency exits. Unmatched `TradeStatusUpdate` events are buffered (up to 8) and replayed when state changes (OrderPosted, CancelResult) make them matchable. Leg 1 has no cancel path (FAK orders are instant fill-or-cancel)
-- **Tick size sync**: At rotation, `rotation.rs` fetches `GET /tick-size?token_id={yes_id}` from the CLOB and includes it in `IngestorEvent::MarketRotation { tick_size }`. The engine sets `state.tick_size` from this value. Mid-market changes are handled by `tick_size_change` WS events. Default `0.01` on fetch failure
-- **SDK cache pre-warm (hard gate)**: On every `MarketRotation`, `LiveExecutor` calls `sdk.tick_size()`, `sdk.neg_risk()`, and `sdk.fee_rate_bps()` for both tokens — populating the SDK's `DashMap` caches with real CLOB values. `caches_warm: bool` gates all order placement: if any fetch fails, ALL signals are rejected with `OrderFailed` feedback until the next rotation. Eliminates the ~150ms first-order latency penalty from auto-fetch while guaranteeing correctness (no hardcoded values)
-- **Connection pre-warming**: After SDK cache pre-warm, `LiveExecutor` calls `sdk.order("0x0000...0000")` to establish a TLS+TCP connection in the reqwest pool. The 404 is ignored — the pool is warm for subsequent `post_order()` and `get_order_status()` calls
-- **Leg 1 fill detection**: Batch FAK fills are confirmed synchronously — after placing 3 FAK orders in parallel, the executor calls `get_order_status()` for each to retrieve `size_matched`, computes VWAP, and sends `OrderPosted { already_filled: true }`. No REST polling loop or User WS backup needed for Leg 1
-- **Deferred partial fill alerts**: The CLOB splits large fills across multiple rapid MATCHED events (~3ms apart). Partial fill checks (`size_matched < original_size`) are NOT alerted on MATCHED — instead stored in `pending_partial_fills` (HashMap keyed by order_id). Resolved when subsequent MATCHED shows fully filled (silent) or MINED/CONFIRMED arrives with final size (alert if still partial). Cleared on `MarketRotation` but NOT `on_trade_complete()` — MINED events may arrive after trade reset
-- **Actual fill size tracking**: Leg 1 batch FAK uses `size_matched` from `get_order_status()` per order, VWAP and total filled size sent in `OrderPosted` feedback. Leg 2 `favorable_exit_fok()` sends `safe_size` (from `clob_safe_fok_size()`) in `OrderPosted` feedback, not the original `signal.size`. This ensures downstream PnL and Leg 2 sizing use actual filled quantities
-- **Paired size PnL**: `build_live_sim_trade()` uses `paired_size = min(l1_size, l2_size)` for gross profit: `(1 - pair_cost) × paired_size`. Total cost = `l1_price × l1_size + l2_price × l2_size` (actual capital deployed). `was_partial = true` set on the larger leg's `SimFill` when sizes differ. Telegram `format_trade_completed()` shows paired quantity on Pair line and an "Unhedged" note for size mismatches
-- **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — single implementation, no duplicates
-- **Maker rebate estimates**: `SimFill::compute_maker_rebate(price, size)` = `compute_taker_fee(price, size) × 0.20` — upper-bound estimate of Polymarket daily maker rebate. `SimFill.maker_rebate` non-zero for maker fills, zero for taker. `SimTrade.maker_rebate` = sum of both legs. Net profit = `gross_profit - taker_fee + maker_rebate`. Accumulated on `SimulationState.total_maker_rebates_earned` and `MarketSummary.maker_rebates_earned`. Shown in Telegram trade completion and market/session summaries
-- **Persistent redemption file (`redeems.txt`)**: Newline-delimited condition IDs persisted for redemption. Written once per market at rotation (if traded) and at shutdown (via `send_live_session_summary`). Read + merged with Data API positions in `redeem_inner()`. Cleanup via atomic write-temp-rename after successful redemption. `/redeem <condition_id>` for targeted single redemption. `append_condition_id_sync()` is sync I/O on engine thread (deduplicates before append)
-- **Auto-redeem (rotation-triggered)**: `auto_redeem_loop()` waits on `Arc<tokio::sync::Notify>` signaled by the engine on `MarketRotation`. After notification, waits 60s (for UMA resolution) then calls `handle_redeem()`. No-op results (nothing to redeem) are silently skipped. Replaces the old fixed 15-minute timer
-- **Telegram rate limit**: 5s `AtomicU64` rate limiter; `fire_critical()` bypasses for trade completions
+- **jemalloc**: Global allocator via `tikv-jemallocator`, conditional on `cfg(not(target_env = "msvc"))`
+- **Tokio runtime**: Manual 2-worker multi-thread, pinned cores 1-2. Core 0 reserved for ingestor. Engine on `spawn_blocking` (off worker pool)
 
-## Key Documents
+## Task Routing
 
-- `ARCHITECTURE.md` — System design, trade lifecycle, risk controls, configuration, deployment
-- `queries.sql` — QuestDB analytics queries (fill rate, PnL by tier, pruning)
-- `config.toml` — All tunable parameters with comments
+**Use this table to decide what to read before making changes.** Read only what's relevant to your task.
+
+| If working on... | Read these docs | Key source files |
+|-------------------|----------------|-----------------|
+| **BuildupDetector, metrics, weights** | `trading_logic/signal_and_entry.md` §1-2, `config.toml` `[buildup]` | `engine/buildup/detector.rs`, `engine/buildup/metrics.rs` |
+| **Entry guards, repricing model** | `trading_logic/signal_and_entry.md` §3-4 | `engine/evaluator.rs`, `engine/confidence.rs` |
+| **Leg 1 execution, sustain, maker orders** | `trading_logic/signal_and_entry.md` §5 | `engine/strategy.rs`, `executor/live.rs` |
+| **Leg 2 hedge phases, flow monitoring** | `trading_logic/leg2_hedge.md` §6 | `engine/erosion.rs`, `engine/evaluator.rs`, `engine/strategy.rs` |
+| **Emergency exits, FOK, favorable exits** | `trading_logic/leg2_hedge.md` §7-8 | `executor/live.rs`, `engine/evaluator.rs` |
+| **Trade completion, PnL, state reset** | `trading_logic/lifecycle.md` §9 | `engine/strategy.rs` |
+| **Market rotation, cutoff, quiet period** | `trading_logic/lifecycle.md` §10-11c | `gateway/polymarket/rotation.rs`, `engine/strategy.rs` |
+| **Capital management** | `trading_logic/lifecycle.md` §12 | `engine/evaluator.rs`, `engine/strategy.rs` |
+| **State machines, transitions** | `trading_logic/state_machines.md` | `types/order.rs`, `engine/erosion.rs` |
+| **Race conditions, edge cases** | `trading_logic/edge_cases.md` §14 | `engine/strategy.rs`, `executor/live.rs` |
+| **Sim vs live differences** | `trading_logic/edge_cases.md` §16 | `engine/strategy.rs` |
+| **Binance data feeds (spot SBE)** | `ARCHITECTURE.md` (Ingestor section) | `gateway/binance/ws.rs` |
+| **Binance futures feeds** | `ARCHITECTURE.md` (Ingestor section) | `gateway/binance/futures_ws.rs` |
+| **Polymarket WS / REST / SDK** | `ARCHITECTURE.md` (Executor section) | `gateway/polymarket/rest.rs`, `user_ws.rs`, `market_ws.rs` |
+| **Telegram commands, bot control** | `ARCHITECTURE.md` (Control section) | `control/listener.rs`, `control/handlers.rs` |
+| **Wallet, redemption, /redeem** | `ARCHITECTURE.md` (Control section) | `control/wallet.rs` |
+| **QuestDB, analytics** | `ARCHITECTURE.md` (Storage section) | `storage/cold.rs` |
+| **Config params, /set command** | `config.toml` (comments), `ARCHITECTURE.md` (Config section) | `config.rs`, `control/config_editor.rs` |
+| **Deployment, systemd, AWS** | `README.md`, `ARCHITECTURE.md` (Deployment section) | `deploy/` scripts |
+
+## Documentation Cascade
+
+After **every** change, update docs in this order. Skip files that aren't affected.
+
+1. **`CLAUDE.md`** — Only if: source file tree changed, new cross-cutting convention added, or task routing table needs updating. Do NOT add domain-specific definitions here.
+
+2. **`trading_logic/<relevant_file>.md`** — Update the specific file that covers the changed behavior:
+   - Signal detection or entry logic changed → `signal_and_entry.md`
+   - Hedge phases, emergency exits, or favorable exits changed → `leg2_hedge.md`
+   - Completion, rotation, cutoff, cooldown, or capital changed → `lifecycle.md`
+   - State transitions changed → `state_machines.md`
+   - New race condition or edge case discovered → `edge_cases.md`
+
+3. **`ARCHITECTURE.md`** — Only if: system design, layer boundaries, data flow, infrastructure, or deployment changed.
+
+4. **`config.toml`** — If new params added or defaults changed, update the inline comments.
+
+**Rule**: Definitions live in `trading_logic/` and `ARCHITECTURE.md`. `CLAUDE.md` routes you to them. Don't duplicate definitions here.

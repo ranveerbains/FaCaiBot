@@ -4,9 +4,7 @@ use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use crate::types::BinanceTick;
-use crate::types::market::Direction;
 use crate::types::order::ExitReason;
-use crate::types::simulation::SimTrade;
 
 // ─── Flush Thresholds ─────────────────────────────────────────────────────────
 
@@ -207,6 +205,7 @@ impl ColdStorage {
         alloc_amount: Decimal,
         action: &str,
         spike_detected_ms: u64,
+        composite_score: Decimal,
     ) -> Result<()> {
         self.buffer
             .table("trade_signals")?
@@ -220,6 +219,7 @@ impl ColdStorage {
             .column_i64("time_remaining", time_remaining_secs)?
             .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
             .column_i64("spike_detected_ms", spike_detected_ms as i64)?
+            .column_f64("composite_score", composite_score.try_into().unwrap_or(0.0))?
             .at_now()?;
 
         // Flush immediately — signals are rare, we want them durable right away.
@@ -254,6 +254,7 @@ impl ColdStorage {
     /// - favorable_taker (bool): true if Leg 2 filled via favorable taker crossing
     /// - emergency_maker (bool): true if Leg 2 filled as maker during emergency chase
     /// - spike_magnitude (f64): spike size relative to ATR at entry
+    /// - maker_rebate (f64): estimated total maker rebate earned (both legs)
     /// - exit_reason (symbol): "NormalHedge" | "BreakEvenBreach" | "Phase2Timeout" |
     ///                         "Phase2PriceBreach" | "MarketExpiry" | "FavorableTaker" | "Phase1Breach" | "WhipsawReversal"
     /// - leg1_order_id (symbol): CLOB order ID for Leg 1
@@ -288,6 +289,7 @@ impl ColdStorage {
         favorable_taker: bool,
         emergency_maker: bool,
         spike_magnitude: Decimal,
+        maker_rebate: Decimal,
     ) -> Result<()> {
         let leg2_price_f64: f64 = leg2_price.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
         let leg2_size_f64: f64 = leg2_size.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
@@ -301,6 +303,7 @@ impl ColdStorage {
             Some(ExitReason::FavorableTaker) => "FavorableTaker",
             Some(ExitReason::Phase1Breach) => "Phase1Breach",
             Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
+            Some(ExitReason::FlowCollapse) => "FlowCollapse",
             None => "NormalHedge",
         };
 
@@ -329,6 +332,7 @@ impl ColdStorage {
             .column_bool("favorable_taker", favorable_taker)?
             .column_bool("emergency_maker", emergency_maker)?
             .column_f64("spike_magnitude", spike_magnitude.try_into().unwrap_or(0.0))?
+            .column_f64("maker_rebate", maker_rebate.try_into().unwrap_or(0.0))?
             .column_ts(
                 "leg1_fill_time",
                 TimestampMicros::new(leg1_fill_timestamp_ms as i64 * 1000),
@@ -342,109 +346,7 @@ impl ColdStorage {
         Ok(())
     }
 
-    // ─── 5. simulated_trades ──────────────────────────────────────────────────
-
-    /// Write a completed simulated trade to the `simulated_trades` table.
-    ///
-    /// Schema mirrors `SimTrade` from `src/types/simulation.rs`:
-    /// - market_id (symbol)
-    /// - direction (symbol): "Up" or "Down"
-    /// - leg1_price (f64), leg2_price (f64), leg1_size (f64), leg2_size (f64)
-    /// - confidence (f64), profit_tier (symbol), alloc_amount (f64)
-    /// - pair_cost (f64), gross_profit (f64), taker_fee (f64)
-    /// - net_profit (f64), profit_pct (f64)
-    /// - resolution (symbol): "YES" | "NO" | "PENDING"
-    /// - resolution_ts_ms (i64): epoch ms of UMA resolution (0 if pending)
-    /// - hedge_phase (i64)
-    /// - leg2_was_taker (bool)
-    /// - favorable_taker (bool)
-    /// - bot_contested (bool)
-    /// - leg1_was_partial (bool), leg2_was_partial (bool)
-    /// - open_ts_ms (i64): epoch ms of Leg 1 fill
-    /// - close_ts_ms (i64): epoch ms of Leg 2 fill or market expiry
-    /// - timestamp (designated timestamp): trade close time
-    ///
-    /// Flushes immediately.
-    pub fn record_simulated_trade(&mut self, trade: &SimTrade) -> Result<()> {
-        let direction_str = match trade.direction {
-            Direction::Up => "YES",
-            Direction::Down => "NO",
-        };
-        let profit_tier_label = trade.profit_target_tier.label();
-
-        let leg2_price: f64 = trade
-            .leg2
-            .as_ref()
-            .and_then(|f| f.price.try_into().ok())
-            .unwrap_or(0.0);
-        let leg2_size: f64 = trade
-            .leg2
-            .as_ref()
-            .and_then(|f| f.size.try_into().ok())
-            .unwrap_or(0.0);
-        let leg2_was_partial: bool = trade.leg2.as_ref().map(|f| f.was_partial).unwrap_or(false);
-
-        let resolution_str = trade.resolution.as_deref().unwrap_or("PENDING");
-        let resolution_ts: i64 = trade
-            .resolution_timestamp_ms
-            .map(|ms| ms as i64)
-            .unwrap_or(0);
-
-        self.buffer
-            .table("simulated_trades")?
-            .symbol("market_id", &trade.market_id)?
-            .symbol("direction", &direction_str)?
-            .symbol("profit_tier", profit_tier_label)?
-            .symbol("resolution", resolution_str)?
-            .symbol(
-                "exit_reason",
-                match trade.exit_reason {
-                    Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
-                    Some(ExitReason::Phase2Timeout) => "Phase2Timeout",
-                    Some(ExitReason::Phase2PriceBreach) => "Phase2PriceBreach",
-                    Some(ExitReason::MarketExpiry) => "MarketExpiry",
-                    Some(ExitReason::FavorableTaker) => "FavorableTaker",
-                    Some(ExitReason::Phase1Breach) => "Phase1Breach",
-                    Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
-                    None => "NormalHedge",
-                },
-            )?
-            .column_f64("leg1_price", trade.leg1.price.try_into().unwrap_or(0.0))?
-            .column_f64("leg2_price", leg2_price)?
-            .column_f64("leg1_size", trade.leg1.size.try_into().unwrap_or(0.0))?
-            .column_f64("leg2_size", leg2_size)?
-            .column_f64("confidence", trade.expected_pct.try_into().unwrap_or(0.0))?
-            .column_f64("alloc_amount", trade.alloc_amount.try_into().unwrap_or(0.0))?
-            .column_f64("pair_cost", trade.pair_cost.try_into().unwrap_or(0.0))?
-            .column_f64("gross_profit", trade.gross_profit.try_into().unwrap_or(0.0))?
-            .column_f64("taker_fee", trade.taker_fee.try_into().unwrap_or(0.0))?
-            .column_f64("net_profit", trade.net_profit.try_into().unwrap_or(0.0))?
-            .column_f64("profit_pct", trade.profit_pct.try_into().unwrap_or(0.0))?
-            .column_i64("resolution_ts_ms", resolution_ts)?
-            .column_i64("hedge_phase", i64::from(trade.hedge_phase))?
-            .column_bool("leg2_was_taker", trade.leg2_was_taker)?
-            .column_bool("bot_contested", trade.bot_contested)?
-            .column_bool("leg1_was_partial", trade.leg1.was_partial)?
-            .column_bool("leg2_was_partial", leg2_was_partial)?
-            .column_bool("favorable_taker", trade.favorable_taker)?
-            .column_bool("emergency_maker", trade.emergency_maker)?
-            .column_bool("leg1_cancel_race", trade.leg1_cancel_race)?
-            .column_f64(
-                "spike_magnitude",
-                trade.spike_magnitude.try_into().unwrap_or(0.0),
-            )?
-            .column_i64("open_ts_ms", trade.open_timestamp_ms as i64)?
-            .column_i64("close_ts_ms", trade.close_timestamp_ms as i64)?
-            .at_now()?;
-
-        // Flush immediately — simulated trades are rare, durability matters.
-        self.sender
-            .flush(&mut self.buffer)
-            .context("QuestDB flush (simulated_trades) failed")?;
-        Ok(())
-    }
-
-    // ─── 6. Explicit Flush ────────────────────────────────────────────────────
+    // ─── 5. Explicit Flush ─────────────────────────────────────────────────────
 
     /// Flush any remaining buffered `binance_ticks` data.
     ///

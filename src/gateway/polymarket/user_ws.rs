@@ -2,8 +2,6 @@
 //!
 //! Implements the Polymarket User WS:
 //! `wss://ws-subscriptions-clob.polymarket.com/ws/user`
-//!
-//! Skipped in simulation mode (no credentials required).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,24 +22,14 @@ use super::{BACKOFF_INITIAL_MS, BACKOFF_MAX_MS, USER_WS_URL};
 
 /// Connect to the authenticated User WS and stream trade / order events.
 ///
-/// Skipped automatically in simulation mode (no credentials → no connection).
 /// Runs forever with exponential-backoff reconnection.
 pub(super) async fn run_user_ws(
     shutdown: Arc<AtomicBool>,
-    sim_mode: bool,
     api_key: Option<String>,
     secret: Option<String>,
     passphrase: Option<String>,
     tx: Sender<IngestorEvent>,
 ) -> Result<()> {
-    if sim_mode {
-        info!("simulation mode — User WS skipped");
-        // Park indefinitely so callers can `tokio::select!` on this without
-        // immediate completion.
-        std::future::pending::<()>().await;
-        return Ok(());
-    }
-
     let api_key = api_key
         .as_deref()
         .context("api_key required for User WS")?

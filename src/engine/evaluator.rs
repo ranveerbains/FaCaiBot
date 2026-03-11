@@ -15,8 +15,8 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeInfo};
+use crate::executor::fill_engine::compute_maker_rebate;
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
-use crate::types::simulation::SimFill;
 
 use super::confidence::{compute_expected_repricing, round_to_tick};
 use super::erosion::{HedgePhase, HedgeSnap};
@@ -71,8 +71,6 @@ pub(crate) struct Leg1Evaluator {
     pub max_alloc_per_trade: Decimal,
     #[allow(dead_code)] // kept as hard floor backstop — checked in spike detector
     pub min_magnitude_pct: Decimal,
-    pub min_spike_atr_ratio: Decimal,
-    pub strong_spike_atr_ratio: Decimal,
     // Repricing model fields
     pub reprice_scale: Decimal,
     pub min_reprice_pct: Decimal,
@@ -90,26 +88,26 @@ impl Leg1Evaluator {
     /// Evaluate whether to emit a Leg 1 signal given the current market state.
     ///
     /// Returns [`Leg1Outcome::Signal`] when all pre-entry guards pass, [`Leg1Outcome::Rejected`]
-    /// when a confirmed spike is present but blocked, or [`Leg1Outcome::Skipped`] when no
-    /// spike is present (common case — caller should do nothing).
+    /// when a confirmed buildup/spike is present but blocked, or [`Leg1Outcome::Skipped`] when no
+    /// buildup is present (common case — caller should do nothing).
     ///
     /// # Important
-    /// On `Signal` or `Rejected`, the caller **must** clear `spike_detected = false`.
+    /// On `Signal` or `Rejected`, the caller **must** clear `buildup_detected = false`.
     /// On `Signal`, the caller must also apply:
     /// - `state.leg1_state = OrderState::Posted { … }`
     /// - `state.cumulative_used += alloc`
-    /// - `leg1_direction = Some(spike.direction)`
+    /// - `leg1_direction = Some(buildup.direction)`
     pub fn evaluate(
         &self,
         state: &MarketState,
         now_ms: u64,
     ) -> Leg1Outcome {
-        // Fast path: no spike — nothing to count or clear.
-        if !state.spike_detected {
+        // Fast path: no buildup — nothing to count or clear.
+        if !state.buildup_detected {
             return Leg1Outcome::Skipped;
         }
-        let spike = match state.last_spike {
-            Some(s) => s,
+        let buildup = match &state.last_buildup {
+            Some(b) => b,
             None => return Leg1Outcome::Skipped,
         };
 
@@ -124,22 +122,22 @@ impl Leg1Evaluator {
             }
         };
 
-        // ── Diagnostic: log all guard states on spike detection ──────────
+        // ── Diagnostic: log all guard states on buildup detection ─────────
         let time_remaining_secs = state.time_remaining_ms(now_ms) / 1_000;
         let has_book = state.poly_book.is_some();
         let has_binance = state.binance_price.is_some();
         debug!(
             %cond_id,
-            direction = ?spike.direction,
+            direction = ?buildup.direction,
             has_book,
             has_binance,
             time_remaining_secs,
             available_capital = %state.available_capital,
-            "evaluate() — spike detected, checking guards"
+            "evaluate() — buildup detected, checking guards"
         );
 
         // Direction-aware book selection: use the book for the token we're buying.
-        let direction = spike.direction;
+        let direction = buildup.direction;
         let (book, best_bid_price, best_ask_price): (&OrderBook, Decimal, Decimal) = {
             let dir_book_opt = match direction {
                 Direction::Up => state.poly_yes_book.as_ref().or(state.poly_book.as_ref()),
@@ -233,13 +231,15 @@ impl Leg1Evaluator {
             return Leg1Outcome::Rejected(Leg1RejectReason::Other);
         }
 
-        // Repricing model — computes expected repricing percentage
+        // Repricing model Phase A — uses composite score as signal strength.
+        // The composite score is already [0,1]-normalized by the BuildupDetector,
+        // so we pass min=0, strong=1 (identity pass-through to norm_signal).
         let expected_pct = compute_expected_repricing(
-            spike.atr_ratio,
-            self.min_spike_atr_ratio,
-            self.strong_spike_atr_ratio,
+            buildup.composite_score,
+            Decimal::ZERO,
+            Decimal::ONE,
             yes_mid,
-            spike.direction,
+            buildup.direction,
             time_remaining_secs,
             self.reprice_scale,
             self.time_exponent,
@@ -250,14 +250,14 @@ impl Leg1Evaluator {
             return Leg1Outcome::Rejected(Leg1RejectReason::InsufficientRepricing);
         }
 
-        // OBI gate: reject if Binance book imbalance contradicts spike direction.
-        let obi_aligned = match spike.direction {
-            Direction::Up => spike.obi >= -self.min_obi_alignment,   // Up spike, OBI not strongly bearish
-            Direction::Down => spike.obi <= self.min_obi_alignment,  // Down spike, OBI not strongly bullish
+        // OBI gate: reject if Binance book imbalance contradicts buildup direction.
+        let obi_aligned = match buildup.direction {
+            Direction::Up => buildup.obi >= -self.min_obi_alignment,   // Up signal, OBI not strongly bearish
+            Direction::Down => buildup.obi <= self.min_obi_alignment,  // Down signal, OBI not strongly bullish
         };
         if !obi_aligned {
-            debug!(obi = %spike.obi, direction = ?spike.direction, min = %self.min_obi_alignment,
-                "evaluate() BLOCKED: OBI contradicts spike direction");
+            debug!(obi = %buildup.obi, direction = ?buildup.direction, min = %self.min_obi_alignment,
+                "evaluate() BLOCKED: OBI contradicts buildup direction");
             return Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch);
         }
 
@@ -287,7 +287,7 @@ impl Leg1Evaluator {
             },
         };
 
-        // Leg 1 ask price — anchor for FAK ladder (taker at the ask).
+        // Leg 1 ask price — maker post-only order posted at the ask.
         let ask_price = best_ask_price;
 
         debug!(
@@ -312,10 +312,22 @@ impl Leg1Evaluator {
         }
 
         info!(
-            direction = ?spike.direction, %expected_pct, %target_pct, tier = tier.label(),
+            direction = ?buildup.direction, %expected_pct, %target_pct, tier = tier.label(),
             %yes_mid, %ask_price, %entry_size, %alloc, bot_contested, time_remaining_secs,
+            composite_score = %buildup.composite_score,
             "Leg 1 signal generated"
         );
+
+        // Synthesize SpikeInfo from BuildupInfo for downstream backward compatibility
+        // (HedgeState, Telegram, executor logging). Removed in Phase 11.
+        let spike_compat = SpikeInfo {
+            direction: buildup.direction,
+            magnitude: buildup.atr_displacement,
+            timestamp_ms: buildup.timestamp_ms,
+            atr_ratio: buildup.signal_atr_ratio,
+            obi: buildup.obi,
+            sustained_ms: 0,
+        };
 
         Leg1Outcome::Signal(TradeSignal {
             exit_reason: None,
@@ -329,8 +341,8 @@ impl Leg1Evaluator {
             profit_target_tier: tier,
             profit_target_pct: target_pct,
             alloc_amount: alloc,
-            direction: spike.direction,
-            spike_info: spike,
+            direction: buildup.direction,
+            spike_info: spike_compat,
             is_leg2: false,
             leg1_fill_price: None,
             entry_timestamp_ms: now_ms,
@@ -338,14 +350,12 @@ impl Leg1Evaluator {
             tick_size: tick,
             atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
-            leg1_taker_fee: SimFill::compute_taker_fee_per_share(ask_price),
+            leg1_fee: -compute_maker_rebate(ask_price, entry_size),
             best_ask: Some(best_ask_price),
             book_snapshot: match direction {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
                 Direction::Down => state.poly_no_book.clone().or(state.poly_book.clone()),
             },
-            sim_confirmed_fill: false,
-            sim_was_taker: true,
         })
     }
 }
@@ -362,6 +372,10 @@ pub(crate) struct Leg2Evaluator {
     pub phase1_timeout_ms: u64,
     pub phase1_breach_threshold: Decimal,
     pub phase2_timeout_ms: u64,
+    /// Buildup entry threshold (from BuildupConfig) — flow below this triggers Phase 2 tighten.
+    pub entry_threshold: Decimal,
+    /// Cancel threshold — flow below this triggers emergency FOK.
+    pub cancel_threshold: Decimal,
 }
 
 impl Leg2Evaluator {
@@ -428,7 +442,7 @@ impl Leg2Evaluator {
                         %leg1_price, %ask_price, threshold = %self.phase1_breach_threshold,
                         %fok_size, %price, "phase 1 breach — immediate FOK taker"
                     );
-                    let mut signal = make_leg2_signal(
+                    let signal = make_leg2_signal(
                         &hedge_token_id,
                         state.active_condition_id.as_deref().unwrap_or(""),
                         price,
@@ -449,12 +463,111 @@ impl Leg2Evaluator {
                         Some(hedge_book.clone()),
                         Some(ExitReason::Phase1Breach),
                     );
-                    signal.sim_was_taker = true;
                     return Some(Leg2Decision::Emergency {
                         signal,
                         price,
                         size: fok_size,
                     });
+                }
+            }
+
+            // ── Flow-based graduated response (fires faster than time-based backstops) ──
+            if snap.flow_monitoring_active {
+                let score = snap.last_flow_score;
+
+                // Flow reversal → immediate emergency FOK (faster whipsaw detection).
+                if let Some(flow_dir) = snap.last_flow_direction {
+                    if flow_dir != snap.direction && score > self.cancel_threshold {
+                        if let Some(ask_price) = best_ask_price {
+                            let price = round_to_tick(ask_price, tick);
+                            let fok_size = leg1_size.round_dp(2);
+                            if fok_size > Decimal::ZERO {
+                                warn!(
+                                    %score, flow_direction = ?flow_dir, hedge_direction = ?snap.direction,
+                                    %price, "flow reversal — immediate FOK"
+                                );
+                                let signal = make_leg2_signal(
+                                    &hedge_token_id,
+                                    state.active_condition_id.as_deref().unwrap_or(""),
+                                    price, fok_size, reference_price,
+                                    snap.expected_pct, snap.tier, Decimal::ZERO,
+                                    snap.direction, snap.spike_info, leg1_price,
+                                    now_ms, market_end_ms, tick, atr, false,
+                                    best_ask_price, Some(hedge_book.clone()),
+                                    Some(ExitReason::WhipsawReversal),
+                                );
+                                return Some(Leg2Decision::Emergency { signal, price, size: fok_size });
+                            }
+                        }
+                    }
+                }
+
+                // Flow collapsed → emergency FOK.
+                if score < self.cancel_threshold {
+                    if let Some(ask_price) = best_ask_price {
+                        let price = round_to_tick(ask_price, tick);
+                        let fok_size = leg1_size.round_dp(2);
+                        if fok_size > Decimal::ZERO {
+                            warn!(
+                                %score, threshold = %self.cancel_threshold,
+                                %price, "flow collapsed — immediate FOK"
+                            );
+                            let signal = make_leg2_signal(
+                                &hedge_token_id,
+                                state.active_condition_id.as_deref().unwrap_or(""),
+                                price, fok_size, reference_price,
+                                snap.expected_pct, snap.tier, Decimal::ZERO,
+                                snap.direction, snap.spike_info, leg1_price,
+                                now_ms, market_end_ms, tick, atr, false,
+                                best_ask_price, Some(hedge_book.clone()),
+                                Some(ExitReason::FlowCollapse),
+                            );
+                            return Some(Leg2Decision::Emergency { signal, price, size: fok_size });
+                        }
+                    }
+                }
+
+                // Flow weakening → tighten (Phase 2 alongside Phase 1).
+                if score < self.entry_threshold {
+                    if let Some(ask_price) = best_ask_price {
+                        let phase2_price = round_to_tick(ask_price - tick, tick);
+                        let breakeven_hedge_price = Decimal::ONE - leg1_price;
+                        if phase2_price > breakeven_hedge_price {
+                            // Entry guard: Phase 2 price > breakeven → FOK.
+                            let fok_price = round_to_tick(ask_price, tick);
+                            let fok_size = leg1_size.round_dp(2);
+                            if fok_size > Decimal::ZERO {
+                                let signal = make_leg2_signal(
+                                    &hedge_token_id,
+                                    state.active_condition_id.as_deref().unwrap_or(""),
+                                    fok_price, fok_size, reference_price,
+                                    snap.expected_pct, snap.tier, Decimal::ZERO,
+                                    snap.direction, snap.spike_info, leg1_price,
+                                    now_ms, market_end_ms, tick, atr, false,
+                                    best_ask_price, Some(hedge_book.clone()),
+                                    Some(ExitReason::BreakEvenBreach),
+                                );
+                                return Some(Leg2Decision::Emergency { signal, price: fok_price, size: fok_size });
+                            }
+                        } else {
+                            info!(%score, threshold = %self.entry_threshold, %phase2_price,
+                                "flow weakening — posting Phase 2 alongside");
+                            let signal = make_leg2_signal(
+                                &hedge_token_id,
+                                state.active_condition_id.as_deref().unwrap_or(""),
+                                phase2_price, leg1_size, reference_price,
+                                snap.expected_pct, snap.tier, Decimal::ZERO,
+                                snap.direction, snap.spike_info, leg1_price,
+                                now_ms, market_end_ms, tick, atr, false,
+                                best_ask_price, Some(hedge_book.clone()),
+                                None,
+                            );
+                            return Some(Leg2Decision::Phase2Alongside {
+                                signal, price: phase2_price, size: leg1_size,
+                                reason: TransitionReason::FlowWeakening,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -483,7 +596,7 @@ impl Leg2Evaluator {
                             warn!("phase 2 entry breach — zero size for FOK");
                             return None;
                         }
-                        let mut signal = make_leg2_signal(
+                        let signal = make_leg2_signal(
                             &hedge_token_id,
                             state.active_condition_id.as_deref().unwrap_or(""),
                             fok_price,
@@ -504,7 +617,7 @@ impl Leg2Evaluator {
                             Some(hedge_book.clone()),
                             Some(ExitReason::BreakEvenBreach),
                         );
-                        signal.sim_was_taker = true;
+
                         return Some(Leg2Decision::Emergency {
                             signal,
                             price: fok_price,
@@ -596,7 +709,7 @@ impl Leg2Evaluator {
                 if let Some(ask_price) = best_ask_price {
                     let price = round_to_tick(ask_price, tick);
                     warn!(elapsed_ms = elapsed, %price, "phase 2 timeout — FOK taker");
-                    let mut signal = make_leg2_signal(
+                    let signal = make_leg2_signal(
                         &hedge_token_id,
                         state.active_condition_id.as_deref().unwrap_or(""),
                         price,
@@ -617,7 +730,7 @@ impl Leg2Evaluator {
                         Some(hedge_book.clone()),
                         Some(ExitReason::Phase2Timeout),
                     );
-                    signal.sim_was_taker = true;
+    
                     return Some(Leg2Decision::Emergency {
                         signal,
                         price,
@@ -644,7 +757,7 @@ impl Leg2Evaluator {
                     %leg1_price, %ask_price, phase2_posted = ?snap.phase2_posted_price,
                     %fok_size, %price, "phase 2 breach — immediate FOK taker"
                 );
-                let mut signal = make_leg2_signal(
+                let signal = make_leg2_signal(
                     &hedge_token_id,
                     state.active_condition_id.as_deref().unwrap_or(""),
                     price,
@@ -665,7 +778,7 @@ impl Leg2Evaluator {
                     Some(hedge_book.clone()),
                     Some(ExitReason::Phase2PriceBreach),
                 );
-                signal.sim_was_taker = true;
+
                 return Some(Leg2Decision::Emergency {
                     signal,
                     price,
@@ -714,6 +827,8 @@ pub(crate) enum Leg2Decision {
 pub(crate) enum TransitionReason {
     /// Phase 1 timeout elapsed without fill.
     Timeout,
+    /// Composite flow score dropped below entry threshold (flow weakening).
+    FlowWeakening,
 }
 
 impl Leg2Decision {
@@ -795,11 +910,9 @@ pub(crate) fn make_leg2_signal(
         tick_size,
         atr,
         bot_contested,
-        leg1_taker_fee: Decimal::ZERO,
+        leg1_fee: Decimal::ZERO,
         best_ask,
         book_snapshot,
-        sim_confirmed_fill: false,
-        sim_was_taker: false,
     }
 }
 
@@ -808,7 +921,7 @@ pub(crate) fn make_leg2_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::market::PriceLevel;
+    use crate::types::market::{BuildupInfo, PriceLevel};
 
     fn make_book(bid: &str, ask: &str) -> OrderBook {
         OrderBook {
@@ -913,7 +1026,7 @@ mod tests {
         let snap = HedgeSnap {
             emergency_submitted: false,
             break_even: Decimal::new(50, 2),
-            leg1_taker_fee: Decimal::ZERO,
+            leg1_fee: Decimal::ZERO,
             initial_profit_target: Decimal::new(25, 3), // 2.5%
             direction: Direction::Up,
             fill_ms: now_ms - 5_000,
@@ -931,12 +1044,21 @@ mod tests {
             phase1_target_price: Decimal::new(475, 3),
             phase2_start_ms: None,
             phase2_posted_price: None,
+            phase_a_pct: Decimal::ZERO,
+            phase_b_pct: Decimal::ZERO,
+            spot_mid_at_entry: Decimal::ZERO,
+            entry_ema_atr: Decimal::ZERO,
+            flow_monitoring_active: false,
+            last_flow_score: Decimal::ZERO,
+            last_flow_direction: None,
         };
 
         let evaluator = Leg2Evaluator {
             phase1_timeout_ms: 2000,
             phase1_breach_threshold: Decimal::new(105, 2),
             phase2_timeout_ms: 2000,
+            entry_threshold: Decimal::new(40, 2),
+            cancel_threshold: Decimal::new(25, 2),
         };
 
         (state, snap, evaluator)
@@ -981,7 +1103,7 @@ mod tests {
         assert_eq!(decision.price(), Decimal::new(56, 2));
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::Phase1Breach));
-        assert!(sig.sim_was_taker, "phase 1 breach FOK should be marked as taker");
+
     }
 
     // ── Phase 1 timeout triggers transition ───────────────────────────
@@ -1034,7 +1156,6 @@ mod tests {
         assert_eq!(decision.price(), Decimal::new(51, 2));
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::Phase2PriceBreach));
-        assert!(sig.sim_was_taker, "BE breach FOK should be marked as taker");
     }
 
     // ── Phase 2 timeout triggers FOK ───────────────────────────────────
@@ -1061,7 +1182,6 @@ mod tests {
         assert_eq!(decision.price(), Decimal::new(49, 2));
         let sig = decision.into_signal();
         assert_eq!(sig.exit_reason, Some(ExitReason::Phase2Timeout));
-        assert!(sig.sim_was_taker, "phase 2 timeout FOK should be marked as taker");
     }
 
     // ── Phase 2 holds position (no repost) ──────────────────────────────
@@ -1093,8 +1213,6 @@ mod tests {
             stale_book_ms: 5000,
             max_alloc_per_trade: Decimal::new(15, 0),
             min_magnitude_pct: Decimal::new(1, 2),
-            min_spike_atr_ratio: Decimal::new(25, 0),
-            strong_spike_atr_ratio: Decimal::new(85, 0),
             reprice_scale: Decimal::new(5, 2),    // 0.05
             min_reprice_pct: Decimal::new(1, 3),  // 0.001 — low so tests pass easily
             min_alloc_pct: Decimal::new(25, 2),   // 0.25
@@ -1103,6 +1221,25 @@ mod tests {
             max_time_factor: 2.0,
             phase1_target_dampen: dampen.parse().unwrap(),
             min_obi_alignment: min_obi.parse().unwrap(),
+        }
+    }
+
+    /// Helper to build a test BuildupInfo with sensible defaults.
+    fn test_buildup_info(direction: Direction, now_ms: u64) -> BuildupInfo {
+        BuildupInfo {
+            composite_score: Decimal::new(7, 1),  // 0.70
+            direction,
+            cvd_accel: Decimal::ZERO,
+            spot_flow: Decimal::ZERO,
+            obi_velocity: Decimal::ZERO,
+            basis_delta: Decimal::ZERO,
+            liq_pressure: Decimal::ZERO,
+            atr_displacement: Decimal::new(5, 3),
+            spot_mid_at_entry: Decimal::new(50_000, 0),
+            ema_atr: Decimal::new(2, 3),
+            signal_atr_ratio: Decimal::new(60, 0),  // 60x — matches old spike tests
+            obi: Decimal::new(3, 1),                 // 0.3 — bid-heavy
+            timestamp_ms: now_ms.saturating_sub(200),
         }
     }
 
@@ -1143,15 +1280,8 @@ mod tests {
             market_end_timestamp_ms: now_ms + 240_000,
             leg1_state: OrderState::None,
             leg2_state: OrderState::None,
-            spike_detected: true,
-            last_spike: Some(SpikeInfo {
-                direction: Direction::Up,
-                magnitude: Decimal::new(5, 3),
-                sustained_ms: 300,
-                timestamp_ms: now_ms - 200,
-                atr_ratio: Decimal::new(60, 0),  // 60x — strong spike
-                obi: Decimal::new(3, 1),          // 0.3 — bid-heavy
-            }),
+            buildup_detected: true,
+            last_buildup: Some(test_buildup_info(Direction::Up, now_ms)),
             atr: Some(Decimal::new(2, 3)),
             ..MarketState::default()
         }
@@ -1240,16 +1370,11 @@ mod tests {
         let now_ms = 100_000;
         let eval = make_leg1_evaluator("0.8", "0.2");
         let mut state = make_leg1_test_state(now_ms);
-        // Up spike with OBI = -0.3 (ask-heavy, contradicts Up direction).
+        // Up buildup with OBI = -0.3 (ask-heavy, contradicts Up direction).
         // min_obi_alignment = 0.2, so gate checks obi >= -0.2. -0.3 < -0.2 → reject.
-        state.last_spike = Some(SpikeInfo {
-            direction: Direction::Up,
-            magnitude: Decimal::new(5, 3),
-            sustained_ms: 300,
-            timestamp_ms: now_ms - 200,
-            atr_ratio: Decimal::new(60, 0),
-            obi: Decimal::new(-3, 1),  // -0.3
-        });
+        let mut buildup = test_buildup_info(Direction::Up, now_ms);
+        buildup.obi = Decimal::new(-3, 1);  // -0.3
+        state.last_buildup = Some(buildup);
 
         match eval.evaluate(&state, now_ms) {
             Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch) => {} // expected
@@ -1262,7 +1387,7 @@ mod tests {
         let now_ms = 100_000;
         let eval = make_leg1_evaluator("0.8", "0.2");
         let state = make_leg1_test_state(now_ms);
-        // Default spike has obi = 0.3 (bid-heavy, aligns with Up direction).
+        // Default buildup has obi = 0.3 (bid-heavy, aligns with Up direction).
         // Gate checks obi >= -0.2. 0.3 >= -0.2 → passes.
 
         match eval.evaluate(&state, now_ms) {

@@ -59,7 +59,7 @@ impl Default for BotStatus {
     fn default() -> Self {
         Self {
             uptime_secs: 0,
-            mode: "simulation".into(),
+            mode: "live".into(),
             current_market: None,
             leg1_state: "None".into(),
             leg2_state: "None".into(),

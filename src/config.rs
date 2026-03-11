@@ -3,37 +3,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::info;
 
-/// Operating mode of the bot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Live trading — real orders submitted to Polymarket CLOB.
-    Live,
-    /// Simulation — same pipeline, but executor simulates fills + reports to Telegram.
-    Simulation,
-}
-
 // ─── TOML Config Sub-structs ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct SpikeDetectionConfig {
-    /// `|delta| > multiplier × ATR` triggers spike confirmation.
-    pub multiplier: f64,
-    /// EMA smoothing alpha for ATR. No spikes emitted for first MIN_ATR_SAMPLES ticks (warmup).
-    pub atr_alpha: f64,
-    /// Minimum spike magnitude (%) to emit a signal. Below this → discard.
-    pub min_magnitude_pct: f64,
-}
-
-impl Default for SpikeDetectionConfig {
-    fn default() -> Self {
-        Self {
-            multiplier: 2.0,
-            atr_alpha: 0.002,
-            min_magnitude_pct: 0.01,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -89,9 +59,6 @@ pub struct RiskConfig {
     pub phase2_timeout_ms: u64,
     /// Timeout (ms) for favorable maker try before FOK fallback on crosses-book.
     pub favorable_maker_timeout_ms: u64,
-    /// Number of ticks above/below best ask for the FAK batch ladder.
-    /// Default 1: orders at [ask - N×tick, ask, ask + N×tick].
-    pub fak_price_offset_ticks: u32,
 }
 
 impl Default for RiskConfig {
@@ -101,7 +68,6 @@ impl Default for RiskConfig {
             phase1_breach_threshold: 1.05,
             phase2_timeout_ms: 2000,
             favorable_maker_timeout_ms: 1000,
-            fak_price_offset_ticks: 1,
         }
     }
 }
@@ -124,10 +90,6 @@ impl Default for RotationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RepricingConfig {
-    /// Minimum spike ATR ratio to trade. Spikes below this → f1 = 0.
-    pub min_spike_atr_ratio: f64,
-    /// Spike ATR ratio at which spike quality factor = 1.0.
-    pub strong_spike_atr_ratio: f64,
     /// Model output ceiling / 100% allocation threshold (0.015 = 1.5%).
     pub reprice_scale: f64,
     /// Minimum model output to enter a trade (0.005 = 0.5%).
@@ -150,8 +112,6 @@ pub struct RepricingConfig {
 impl Default for RepricingConfig {
     fn default() -> Self {
         Self {
-            min_spike_atr_ratio: 25.0,
-            strong_spike_atr_ratio: 75.0,
             reprice_scale: 0.015,
             min_reprice_pct: 0.005,
             min_alloc_pct: 0.3,
@@ -164,28 +124,115 @@ impl Default for RepricingConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BuildupTomlConfig {
+    /// Entry threshold — composite must exceed to trigger Leg 1 entry.
+    pub entry_threshold: f64,
+    /// Cancel threshold — cancel unfilled Leg 1 if composite drops below.
+    pub cancel_threshold: f64,
+    /// Max wait (ms) for Leg 1 maker fill before cancelling.
+    pub cancel_window_ms: u64,
+    /// Repost threshold — if ask moves ≥ this many ticks while composite > cancel_threshold,
+    /// cancel and repost at new best_ask (0 = disabled).
+    pub leg1_repost_tick_threshold: u32,
+    // Metric weights (must sum to 1.0)
+    pub w_cvd: f64,
+    pub w_spot_flow: f64,
+    pub w_obi: f64,
+    pub w_basis: f64,
+    pub w_liq: f64,
+    pub w_atr: f64,
+    // Freshness gates (ms)
+    pub freshness_cvd_ms: u64,
+    pub freshness_spot_flow_ms: u64,
+    pub freshness_obi_ms: u64,
+    pub freshness_basis_ms: u64,
+    pub freshness_liq_ms: u64,
+    pub freshness_atr_ms: u64,
+    // Normalization bounds
+    pub cvd_min: f64,
+    pub cvd_saturation: f64,
+    pub spot_flow_min: f64,
+    pub spot_flow_saturation: f64,
+    pub obi_min: f64,
+    pub obi_saturation: f64,
+    pub basis_min: f64,
+    pub basis_saturation: f64,
+    pub liq_min: f64,
+    pub liq_saturation: f64,
+    pub atr_min: f64,
+    pub atr_saturation: f64,
+    // EMA half-lives (ms) — time for old value to decay to 50% weight
+    pub cvd_fast_halflife_ms: f64,
+    pub cvd_slow_halflife_ms: f64,
+    pub spot_flow_halflife_ms: f64,
+    pub obi_velocity_halflife_ms: f64,
+    pub basis_halflife_ms: f64,
+}
+
+impl Default for BuildupTomlConfig {
+    fn default() -> Self {
+        Self {
+            entry_threshold: 0.40,
+            cancel_threshold: 0.25,
+            cancel_window_ms: 500,
+            leg1_repost_tick_threshold: 1,
+            w_cvd: 0.30,
+            w_spot_flow: 0.15,
+            w_obi: 0.20,
+            w_basis: 0.20,
+            w_liq: 0.05,
+            w_atr: 0.10,
+            freshness_cvd_ms: 300,
+            freshness_spot_flow_ms: 200,
+            freshness_obi_ms: 100,
+            freshness_basis_ms: 300,
+            freshness_liq_ms: 3000,
+            freshness_atr_ms: 100,
+            cvd_min: 0.0,
+            cvd_saturation: 1.0,
+            spot_flow_min: 0.0,
+            spot_flow_saturation: 1.0,
+            obi_min: 0.0,
+            obi_saturation: 0.5,
+            basis_min: 0.0,
+            basis_saturation: 2.0,
+            liq_min: 0.0,
+            liq_saturation: 10.0,
+            atr_min: 0.0,
+            atr_saturation: 15.0,
+            cvd_fast_halflife_ms: 150.0,
+            cvd_slow_halflife_ms: 700.0,
+            spot_flow_halflife_ms: 300.0,
+            obi_velocity_halflife_ms: 300.0,
+            basis_halflife_ms: 300.0,
+        }
+    }
+}
+
 // ─── Top-level TOML config ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BotConfig {
     pub rotation: RotationConfig,
-    pub spike_detection: SpikeDetectionConfig,
     pub entry_guards: EntryGuardsConfig,
     pub capital: CapitalConfig,
     pub risk: RiskConfig,
     pub repricing: RepricingConfig,
+    pub buildup: BuildupTomlConfig,
 }
 
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
             rotation: RotationConfig::default(),
-            spike_detection: SpikeDetectionConfig::default(),
             entry_guards: EntryGuardsConfig::default(),
             capital: CapitalConfig::default(),
             risk: RiskConfig::default(),
             repricing: RepricingConfig::default(),
+            buildup: BuildupTomlConfig::default(),
         }
     }
 }
@@ -195,9 +242,6 @@ impl Default for BotConfig {
 /// Bot-wide configuration loaded from `.env` (secrets/infra) + `config.toml` (tuning).
 #[derive(Debug, Clone)]
 pub struct Config {
-    // ── Operating mode ────────────────────────────────────────────────
-    pub mode: Mode,
-
     // ── Polymarket CLOB credentials (L2 auth) ─────────────────────────
     pub polymarket_api_key: String,
     pub polymarket_secret: String,
@@ -214,6 +258,8 @@ pub struct Config {
     pub binance_sbe_ws_url: String,
     /// Binance Ed25519 API key string for SBE stream authentication.
     pub binance_ed25519_api_key: String,
+    /// Binance USDT-M Futures WebSocket endpoint (JSON streams).
+    pub binance_futures_ws_url: String,
 
     // ── Telegram ──────────────────────────────────────────────────────
     pub telegram_bot_token: String,
@@ -229,12 +275,6 @@ pub struct Config {
     pub max_alloc_per_trade: Decimal,
     pub phase1_breach_threshold: Decimal,
     pub stale_event_threshold_ms: u64,
-    /// Minimum spike magnitude (from spike_detection config), as Decimal.
-    pub min_magnitude_pct: Decimal,
-    /// Minimum spike ATR ratio to trade, as Decimal.
-    pub min_spike_atr_ratio: Decimal,
-    /// Spike ATR ratio at which spike quality factor = 1.0, as Decimal.
-    pub strong_spike_atr_ratio: Decimal,
     /// Repricing model: output ceiling / 100% allocation threshold.
     pub reprice_scale: Decimal,
     /// Repricing model: minimum output to enter a trade.
@@ -280,54 +320,19 @@ impl Config {
             BotConfig::default()
         };
 
-        // ── Mode ──────────────────────────────────────────────────────
-        let mode_str = std::env::var("MODE").unwrap_or_else(|_| "simulation".into());
-        let mode = match mode_str.to_lowercase().as_str() {
-            "live" | "production" => Mode::Live,
-            _ => Mode::Simulation,
-        };
-
         // ── Secrets & infrastructure from env ─────────────────────────
-        let polymarket_api_key = if mode == Mode::Live {
-            std::env::var("POLYMARKET_API_KEY")
-                .context("POLYMARKET_API_KEY not set (required for live mode)")?
-        } else {
-            std::env::var("POLYMARKET_API_KEY").unwrap_or_default()
-        };
-
-        let polymarket_secret = if mode == Mode::Live {
-            std::env::var("POLYMARKET_SECRET")
-                .context("POLYMARKET_SECRET not set (required for live mode)")?
-        } else {
-            std::env::var("POLYMARKET_SECRET").unwrap_or_default()
-        };
-
-        let polymarket_passphrase = if mode == Mode::Live {
-            std::env::var("POLYMARKET_PASSPHRASE")
-                .context("POLYMARKET_PASSPHRASE not set (required for live mode)")?
-        } else {
-            std::env::var("POLYMARKET_PASSPHRASE").unwrap_or_default()
-        };
-
-        let private_key = if mode == Mode::Live {
-            std::env::var("PRIVATE_KEY").context("PRIVATE_KEY not set (required for live mode)")?
-        } else {
-            std::env::var("PRIVATE_KEY").unwrap_or_default()
-        };
-
-        let telegram_bot_token = if mode == Mode::Simulation {
-            std::env::var("TELEGRAM_BOT_TOKEN")
-                .context("TELEGRAM_BOT_TOKEN not set (required for simulation mode)")?
-        } else {
-            std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default()
-        };
-
-        let telegram_chat_id = if mode == Mode::Simulation {
-            std::env::var("TELEGRAM_CHAT_ID")
-                .context("TELEGRAM_CHAT_ID not set (required for simulation mode)")?
-        } else {
-            std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default()
-        };
+        let polymarket_api_key = std::env::var("POLYMARKET_API_KEY")
+            .context("POLYMARKET_API_KEY not set (required)")?;
+        let polymarket_secret = std::env::var("POLYMARKET_SECRET")
+            .context("POLYMARKET_SECRET not set (required)")?;
+        let polymarket_passphrase = std::env::var("POLYMARKET_PASSPHRASE")
+            .context("POLYMARKET_PASSPHRASE not set (required)")?;
+        let private_key = std::env::var("PRIVATE_KEY")
+            .context("PRIVATE_KEY not set (required)")?;
+        let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+            .context("TELEGRAM_BOT_TOKEN not set (required)")?;
+        let telegram_chat_id = std::env::var("TELEGRAM_CHAT_ID")
+            .context("TELEGRAM_CHAT_ID not set (required)")?;
 
         let telegram_allowed_user_id = std::env::var("TELEGRAM_ALLOWED_USER_ID")
             .ok()
@@ -339,12 +344,6 @@ impl Config {
         let phase1_breach_threshold = Decimal::try_from(bot.risk.phase1_breach_threshold)
             .context("risk.phase1_breach_threshold: invalid decimal")?;
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
-        let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct)
-            .context("spike_detection.min_magnitude_pct: invalid decimal")?;
-        let min_spike_atr_ratio = Decimal::try_from(bot.repricing.min_spike_atr_ratio)
-            .context("repricing.min_spike_atr_ratio: invalid decimal")?;
-        let strong_spike_atr_ratio = Decimal::try_from(bot.repricing.strong_spike_atr_ratio)
-            .context("repricing.strong_spike_atr_ratio: invalid decimal")?;
         let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale)
             .context("repricing.reprice_scale: invalid decimal")?;
         let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct)
@@ -361,7 +360,6 @@ impl Config {
             .context("repricing.min_obi_alignment: invalid decimal")?;
 
         let config = Self {
-            mode,
             polymarket_api_key,
             polymarket_secret,
             polymarket_passphrase,
@@ -371,6 +369,8 @@ impl Config {
                 .unwrap_or_else(|_| "wss://stream-sbe.binance.com:9443".into()),
             binance_ed25519_api_key: std::env::var("BINANCE_ED25519_API_KEY")
                 .context("BINANCE_ED25519_API_KEY not set (required for SBE market data)")?,
+            binance_futures_ws_url: std::env::var("BINANCE_FUTURES_WS_URL")
+                .unwrap_or_else(|_| "wss://fstream.binance.com".into()),
             telegram_bot_token,
             telegram_chat_id,
             telegram_allowed_user_id,
@@ -378,9 +378,6 @@ impl Config {
             max_alloc_per_trade,
             phase1_breach_threshold,
             stale_event_threshold_ms,
-            min_magnitude_pct,
-            min_spike_atr_ratio,
-            strong_spike_atr_ratio,
             reprice_scale,
             min_reprice_pct,
             min_alloc_pct,
@@ -395,14 +392,10 @@ impl Config {
         if config.max_alloc_per_trade <= Decimal::ZERO {
             anyhow::bail!("capital.max_alloc_per_trade must be positive");
         }
-        if config.bot.spike_detection.multiplier <= 0.0 {
-            anyhow::bail!("spike_detection.multiplier must be positive");
-        }
         Ok(config)
     }
 
-    /// Test-only constructor using the same defaults as config.toml.
-    /// Secrets are empty strings; mode is Simulation.
+    /// Test-only constructor with defaults. Secrets are empty strings.
     #[cfg(test)]
     pub fn test_defaults() -> Self {
         let bot = BotConfig::default();
@@ -410,9 +403,6 @@ impl Config {
         let max_alloc_per_trade = Decimal::try_from(bot.capital.max_alloc_per_trade).unwrap();
         let phase1_breach_threshold = Decimal::try_from(bot.risk.phase1_breach_threshold).unwrap();
         let stale_event_threshold_ms = bot.entry_guards.binance_stale_event_ms;
-        let min_magnitude_pct = Decimal::try_from(bot.spike_detection.min_magnitude_pct).unwrap();
-        let min_spike_atr_ratio = Decimal::try_from(bot.repricing.min_spike_atr_ratio).unwrap();
-        let strong_spike_atr_ratio = Decimal::try_from(bot.repricing.strong_spike_atr_ratio).unwrap();
         let reprice_scale = Decimal::try_from(bot.repricing.reprice_scale).unwrap();
         let min_reprice_pct = Decimal::try_from(bot.repricing.min_reprice_pct).unwrap();
         let min_alloc_pct = Decimal::try_from(bot.repricing.min_alloc_pct).unwrap();
@@ -423,7 +413,6 @@ impl Config {
         let min_obi_alignment = Decimal::try_from(bot.repricing.min_obi_alignment).unwrap();
 
         Self {
-            mode: Mode::Simulation,
             polymarket_api_key: String::new(),
             polymarket_secret: String::new(),
             polymarket_passphrase: String::new(),
@@ -431,6 +420,7 @@ impl Config {
             questdb_url: "127.0.0.1:9009".into(),
             binance_sbe_ws_url: "wss://stream-sbe.binance.com:9443".into(),
             binance_ed25519_api_key: "test-key".into(),
+            binance_futures_ws_url: "wss://fstream.binance.com".into(),
             telegram_bot_token: "test-token".into(),
             telegram_chat_id: "test-chat".into(),
             telegram_allowed_user_id: None,
@@ -438,9 +428,6 @@ impl Config {
             max_alloc_per_trade,
             phase1_breach_threshold,
             stale_event_threshold_ms,
-            min_magnitude_pct,
-            min_spike_atr_ratio,
-            strong_spike_atr_ratio,
             reprice_scale,
             min_reprice_pct,
             min_alloc_pct,

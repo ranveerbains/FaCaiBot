@@ -27,7 +27,7 @@ pub(crate) struct HedgeState {
     pub leg1_fill_ms: u64,
     pub initial_profit_target: Decimal,
     pub leg1_fill_price: Decimal,
-    pub leg1_taker_fee: Decimal,
+    pub leg1_fee: Decimal,
     pub tier: ProfitTier,
     pub direction: Direction,
     pub spike_info: SpikeInfo,
@@ -46,25 +46,45 @@ pub(crate) struct HedgeState {
     pub phase2_posted_price: Option<Decimal>,
     /// Epoch ms when Phase 2 started (for Phase 2 timeout).
     pub phase2_start_ms: Option<u64>,
+    /// Phase A repricing estimate (composite-based, at entry).
+    pub phase_a_pct: Decimal,
+    /// Phase B repricing estimate (refined after fill, max of observed and composite).
+    pub phase_b_pct: Decimal,
+    /// Spot mid price when buildup triggered (for Phase B displacement calc).
+    pub spot_mid_at_entry: Decimal,
+    /// EMA ATR at entry (for Phase B displacement normalization).
+    pub entry_ema_atr: Decimal,
+    /// `true` while composite flow data is fresh and usable for graduated response.
+    pub flow_monitoring_active: bool,
+    /// Latest composite score snapshot (updated by engine on each event).
+    pub last_flow_score: Decimal,
+    /// Latest composite direction (updated by engine on each event).
+    pub last_flow_direction: Option<Direction>,
+    /// Epoch ms of last flow score update.
+    pub last_flow_update_ms: u64,
 }
 
 impl HedgeState {
     pub fn new(
         leg1_fill_ms: u64,
         leg1_fill_price: Decimal,
-        leg1_taker_fee: Decimal,
+        leg1_fee: Decimal,
         tier: ProfitTier,
         initial_profit_target: Decimal,
         direction: Direction,
         spike_info: SpikeInfo,
         expected_pct: Decimal,
         phase1_target_price: Decimal,
+        phase_a_pct: Decimal,
+        phase_b_pct: Decimal,
+        spot_mid_at_entry: Decimal,
+        entry_ema_atr: Decimal,
     ) -> Self {
         Self {
             leg1_fill_ms,
             initial_profit_target,
             leg1_fill_price,
-            leg1_taker_fee,
+            leg1_fee,
             tier,
             direction,
             spike_info,
@@ -76,11 +96,19 @@ impl HedgeState {
             phase1_target_price,
             phase2_posted_price: None,
             phase2_start_ms: None,
+            phase_a_pct,
+            phase_b_pct,
+            spot_mid_at_entry,
+            entry_ema_atr,
+            flow_monitoring_active: false,
+            last_flow_score: Decimal::ZERO,
+            last_flow_direction: None,
+            last_flow_update_ms: 0,
         }
     }
 
     pub fn break_even(&self) -> Decimal {
-        Decimal::ONE - self.leg1_fill_price - self.leg1_taker_fee
+        Decimal::ONE - self.leg1_fill_price - self.leg1_fee
     }
 }
 
@@ -103,8 +131,8 @@ pub(crate) struct HedgeSnap {
     pub emergency_submitted: bool,
     #[allow(dead_code)] // populated for diagnostic logging
     pub break_even: Decimal,
-    #[allow(dead_code)] // used in upcoming FAK hedge phases
-    pub leg1_taker_fee: Decimal,
+    #[allow(dead_code)] // used in hedge phase breakeven computation
+    pub leg1_fee: Decimal,
     pub initial_profit_target: Decimal,
     pub direction: Direction,
     pub fill_ms: u64,
@@ -119,6 +147,24 @@ pub(crate) struct HedgeSnap {
     pub phase2_start_ms: Option<u64>,
     /// The price at which Phase 2 order was posted (for Phase 2 breach guard).
     pub phase2_posted_price: Option<Decimal>,
+    /// Phase A repricing estimate (composite-based, at entry).
+    #[allow(dead_code)]
+    pub phase_a_pct: Decimal,
+    /// Phase B repricing estimate (refined after fill).
+    #[allow(dead_code)]
+    pub phase_b_pct: Decimal,
+    /// Spot mid price when buildup triggered.
+    #[allow(dead_code)]
+    pub spot_mid_at_entry: Decimal,
+    /// EMA ATR at entry.
+    #[allow(dead_code)]
+    pub entry_ema_atr: Decimal,
+    /// Whether composite flow data is fresh and usable.
+    pub flow_monitoring_active: bool,
+    /// Latest composite score snapshot.
+    pub last_flow_score: Decimal,
+    /// Latest composite direction.
+    pub last_flow_direction: Option<Direction>,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -131,7 +177,7 @@ mod tests {
         HedgeState::new(
             0,
             Decimal::new(50, 2),    // leg1_fill_price = 0.50
-            Decimal::ZERO,          // leg1_taker_fee
+            Decimal::ZERO,          // leg1_fee
             ProfitTier::High,
             Decimal::new(25, 3),     // initial_profit_target = 0.025
             Direction::Up,
@@ -145,6 +191,10 @@ mod tests {
             },
             Decimal::new(7, 1),      // expected_pct = 0.7
             Decimal::new(475, 3),    // phase1_target_price = 0.475
+            Decimal::ZERO,           // phase_a_pct
+            Decimal::ZERO,           // phase_b_pct
+            Decimal::ZERO,           // spot_mid_at_entry
+            Decimal::ZERO,           // entry_ema_atr
         )
     }
 

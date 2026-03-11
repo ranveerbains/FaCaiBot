@@ -2,18 +2,13 @@
 //!
 //! Maintains a persistent combined stream connection to Binance's SBE endpoint,
 //! decodes binary `@depth20` (50ms cadence) and `@bestBidAsk` (real-time) events,
-//! runs inline spike detection with EMA-ATR, and pushes [`IngestorEvent`]s to the
-//! Engine via a crossbeam channel.
+//! and pushes [`IngestorEvent`]s to the Engine via a crossbeam channel.
 //!
 //! # SBE protocol
 //! Messages arrive as binary WebSocket frames containing raw SBE-encoded data
 //! (schema `stream_1_0.xml`, schemaId=1, version=0). Each message starts with an
 //! 8-byte header: `blockLength(u16) | templateId(u16) | schemaId(u16) | version(u16)`.
 //! Subscription confirmations arrive as JSON text frames (logged, not parsed).
-//!
-//! # Spike detection output
-//! Emits [`IngestorEvent::SpikeConfirmed`] immediately when ATR + magnitude pass.
-//! No sustain window or momentum check — confirmation is instant.
 //!
 //! # Thread model
 //! This module runs on a **dedicated OS thread** with its own single-threaded
@@ -36,22 +31,18 @@ use hyper::upgrade::Upgraded;
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
-use crate::config::SpikeDetectionConfig;
 use crate::types::IngestorEvent;
-use crate::types::market::{BinanceDepth, BinanceTick, DataSource, PriceLevel};
-
-use super::spike::{SpikeDetector, SpikeEvent};
+use crate::types::market::{BinanceDepth, BinanceTick, DataSource, PriceLevel, SpotTrade};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// Binance SBE combined stream: depth20 (50ms) + bestBidAsk (real-time).
-const BTCUSDT_STREAM: &str = "/stream?streams=btcusdt@depth20/btcusdt@bestBidAsk";
+/// Binance SBE combined stream: depth20 (50ms) + bestBidAsk (real-time) + trade (per-trade).
+const BTCUSDT_STREAM: &str = "/stream?streams=btcusdt@depth20/btcusdt@bestBidAsk/btcusdt@trade";
 
 /// SBE message header size (bytes): blockLength(u16) + templateId(u16) + schemaId(u16) + version(u16).
 const SBE_HEADER_SIZE: usize = 8;
@@ -61,6 +52,9 @@ const SBE_TEMPLATE_BEST_BID_ASK: u16 = 10001;
 
 /// SBE template ID for DepthSnapshotStreamEvent (from stream_1_0.xml).
 const SBE_TEMPLATE_DEPTH_SNAPSHOT: u16 = 10002;
+
+/// SBE template ID for TradeStreamEvent (from stream_1_0.xml).
+const SBE_TEMPLATE_TRADE: u16 = 10003;
 
 /// Reconnection backoff: initial delay (ms).
 const BACKOFF_INITIAL_MS: u64 = 1_000;
@@ -73,25 +67,21 @@ const BACKOFF_MAX_MS: u64 = 30_000;
 /// Streams Binance spot SBE WebSocket feeds for BTC/USDT.
 ///
 /// Connects to the Binance SBE combined stream, decodes binary `@depth20` and
-/// `@bestBidAsk` frames, runs inline spike detection, and emits
-/// [`IngestorEvent::BinanceDepth`] and [`IngestorEvent::BinanceTick`] events to
-/// the Engine layer.
+/// `@bestBidAsk` frames, and emits [`IngestorEvent::BinanceDepth`] and
+/// [`IngestorEvent::BinanceTick`] events to the Engine layer.
 pub struct BinanceGateway {
     ws_url: String,
     ed25519_api_key: String,
-    spike_config: SpikeDetectionConfig,
 }
 
 impl BinanceGateway {
     pub fn new(
         ws_url: String,
         ed25519_api_key: String,
-        spike_config: SpikeDetectionConfig,
     ) -> Self {
         Self {
             ws_url,
             ed25519_api_key,
-            spike_config,
         }
     }
 
@@ -101,13 +91,12 @@ impl BinanceGateway {
     /// `now_ms - event.timestamp_ms > stale_threshold_ms`.
     pub async fn run(&self, tx: Sender<IngestorEvent>, stale_threshold_ms: u64) -> Result<()> {
         let mut backoff_ms = BACKOFF_INITIAL_MS;
-        let mut detector = SpikeDetector::new(&self.spike_config);
 
         loop {
             info!(url = %self.ws_url, "connecting to Binance SBE combined stream");
 
             match self
-                .connect_and_stream(&tx, &mut detector, stale_threshold_ms)
+                .connect_and_stream(&tx, stale_threshold_ms)
                 .await
             {
                 Ok(()) => {
@@ -137,7 +126,6 @@ impl BinanceGateway {
     async fn connect_and_stream(
         &self,
         tx: &Sender<IngestorEvent>,
-        detector: &mut SpikeDetector,
         stale_threshold_ms: u64,
     ) -> Result<()> {
         let mut ws = self.tls_connect().await?;
@@ -158,7 +146,7 @@ impl BinanceGateway {
                 OpCode::Binary => {
                     // SBE market data arrives as binary frames.
                     if let Err(e) =
-                        handle_sbe_message(&frame.payload, tx, detector, stale_threshold_ms)
+                        handle_sbe_message(&frame.payload, tx, stale_threshold_ms)
                     {
                         debug!(error = %e, "SBE message handling error (non-fatal)");
                     }
@@ -241,7 +229,6 @@ impl BinanceGateway {
 fn handle_sbe_message(
     payload: &[u8],
     tx: &Sender<IngestorEvent>,
-    detector: &mut SpikeDetector,
     stale_threshold_ms: u64,
 ) -> Result<()> {
     if payload.len() < SBE_HEADER_SIZE {
@@ -268,38 +255,7 @@ fn handle_sbe_message(
             if is_stale(depth.timestamp_ms, now_ms, stale_threshold_ms) {
                 let age = now_ms.saturating_sub(depth.timestamp_ms);
                 debug!(age_ms = age, "discarding stale SBE BinanceDepth");
-                detector.record_stale(now_ms);
                 return Ok(());
-            }
-
-            // ── Spike detection ───────────────────────────────────────
-            if let Some(mid) = depth.mid_price() {
-                let mid_f64 = mid.to_f64().unwrap_or(0.0);
-                match detector.update(mid_f64, depth.timestamp_ms, depth.obi()) {
-                    SpikeEvent::Confirmed(spike) => {
-                        debug!(
-                            direction = ?spike.direction,
-                            magnitude_pct = %(spike.magnitude.to_f64().unwrap_or(0.0) * 100.0),
-                            "Binance spike confirmed"
-                        );
-                        if tx.try_send(IngestorEvent::SpikeConfirmed(spike)).is_err() {
-                            warn!("ingestor channel full — SpikeConfirmed dropped");
-                        }
-                    }
-                    SpikeEvent::None => {}
-                }
-
-                // Emit spike diagnostics when the 60s gate fires.
-                if let Some(snap) = detector.take_diagnostic() {
-                    let _ = tx.try_send(IngestorEvent::SpikeDiagnostic {
-                        atr: snap.atr,
-                        threshold: snap.threshold,
-                        mid: snap.mid,
-                        rej_magnitude: snap.rej_magnitude,
-                        confirmed: snap.confirmed,
-                        stale: snap.stale,
-                    });
-                }
             }
 
             if tx.try_send(IngestorEvent::BinanceDepth(depth)).is_err() {
@@ -313,12 +269,21 @@ fn handle_sbe_message(
             if is_stale(tick.timestamp_ms, now_ms, stale_threshold_ms) {
                 let age = now_ms.saturating_sub(tick.timestamp_ms);
                 debug!(age_ms = age, "discarding stale SBE BinanceTick");
-                detector.record_stale(now_ms);
                 return Ok(());
             }
 
             if tx.try_send(IngestorEvent::BinanceTick(tick)).is_err() {
                 warn!("ingestor channel full — BinanceTick dropped");
+            }
+        }
+        SBE_TEMPLATE_TRADE => {
+            if let Ok(trade) = parse_sbe_trade(body, block_length) {
+                if !is_stale(trade.timestamp_ms, now_ms, stale_threshold_ms) {
+                    if tx.try_send(IngestorEvent::SpotTrade(trade)).is_err() {
+                        // High frequency — don't warn on every drop.
+                        debug!("ingestor channel full — SpotTrade dropped");
+                    }
+                }
             }
         }
         other => {
@@ -472,6 +437,45 @@ fn parse_sbe_best_bid_ask(body: &[u8], block_length: usize) -> Result<BinanceTic
         bid_qty: sbe_to_decimal(bid_qty, qty_exp),
         ask_price: sbe_to_decimal(ask_price, price_exp),
         ask_qty: sbe_to_decimal(ask_qty, qty_exp),
+        timestamp_ms,
+    })
+}
+
+/// Parse SBE `TradeStreamEvent` body (after 8-byte header) into [`SpotTrade`].
+///
+/// Root block layout (estimated from Binance SBE schema):
+///   - `[0..8]`   eventTime: i64 (microseconds)
+///   - `[8..16]`  tradeId: i64
+///   - `[16]`     priceExponent: i8
+///   - `[17]`     qtyExponent: i8
+///   - `[18..26]` price: i64 (mantissa)
+///   - `[26..34]` qty: i64 (mantissa)
+///   - `[34..42]` buyerOrderId: i64
+///   - `[42..50]` sellerOrderId: i64
+///   - `[50..58]` tradeTime: i64 (microseconds)
+///   - `[58]`     isBuyerMaker: u8 (1 = buyer is maker)
+fn parse_sbe_trade(body: &[u8], block_length: usize) -> Result<SpotTrade> {
+    if body.len() < block_length || block_length < 59 {
+        return Err(anyhow!(
+            "SBE trade body too short: {} bytes (block_length={})",
+            body.len(),
+            block_length
+        ));
+    }
+
+    let price_exp = body[16] as i8;
+    let qty_exp = body[17] as i8;
+    let price = read_i64(body, 18)?;
+    let qty = read_i64(body, 26)?;
+    let trade_time_us = read_i64(body, 50)?;
+    let is_buyer_maker = body[58] != 0;
+
+    let timestamp_ms = (trade_time_us / 1000) as u64;
+
+    Ok(SpotTrade {
+        price: sbe_to_decimal(price, price_exp),
+        quantity: sbe_to_decimal(qty, qty_exp),
+        is_buyer_maker,
         timestamp_ms,
     })
 }
@@ -635,8 +639,6 @@ mod tests {
     #[test]
     fn test_handle_sbe_message_depth() {
         let (tx, rx) = crossbeam_channel::bounded(64);
-        let spike_cfg = SpikeDetectionConfig::default();
-        let mut detector = SpikeDetector::new(&spike_cfg);
 
         // Build a full SBE message (header + body).
         let block_length: u16 = 18;
@@ -670,7 +672,7 @@ mod tests {
         payload.extend_from_slice(&9700200_i64.to_le_bytes());
         payload.extend_from_slice(&50000_i64.to_le_bytes());
 
-        handle_sbe_message(&payload, &tx, &mut detector, 5000).unwrap();
+        handle_sbe_message(&payload, &tx, 5000).unwrap();
 
         // Should emit a BinanceDepth event.
         let event = rx.try_recv().expect("expected BinanceDepth event");
@@ -687,8 +689,6 @@ mod tests {
     #[test]
     fn test_handle_sbe_message_best_bid_ask() {
         let (tx, rx) = crossbeam_channel::bounded(64);
-        let spike_cfg = SpikeDetectionConfig::default();
-        let mut detector = SpikeDetector::new(&spike_cfg);
 
         let block_length: u16 = 50;
         let template_id: u16 = SBE_TEMPLATE_BEST_BID_ASK;
@@ -711,7 +711,7 @@ mod tests {
         payload.extend_from_slice(&9700100_i64.to_le_bytes()); // askPrice
         payload.extend_from_slice(&200000_i64.to_le_bytes()); // askQty
 
-        handle_sbe_message(&payload, &tx, &mut detector, 5000).unwrap();
+        handle_sbe_message(&payload, &tx, 5000).unwrap();
 
         let event = rx.try_recv().expect("expected BinanceTick event");
         match event {
@@ -726,8 +726,6 @@ mod tests {
     #[test]
     fn test_handle_sbe_message_stale_dropped() {
         let (tx, rx) = crossbeam_channel::bounded(64);
-        let spike_cfg = SpikeDetectionConfig::default();
-        let mut detector = SpikeDetector::new(&spike_cfg);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&50_u16.to_le_bytes()); // blockLength
@@ -747,7 +745,7 @@ mod tests {
         payload.extend_from_slice(&200000_i64.to_le_bytes());
 
         // Stale threshold = 500ms, event is 2s old → should be dropped.
-        handle_sbe_message(&payload, &tx, &mut detector, 500).unwrap();
+        handle_sbe_message(&payload, &tx, 500).unwrap();
 
         assert!(rx.try_recv().is_err(), "stale event should be dropped");
     }

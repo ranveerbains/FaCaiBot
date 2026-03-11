@@ -28,6 +28,8 @@ pub enum ExitReason {
     Phase1Breach,
     /// Opposite spike detected after Leg 1 fill — immediate FOK hedge, no erosion.
     WhipsawReversal,
+    /// Composite score dropped below cancel threshold while Leg 2 in Phase 1.
+    FlowCollapse,
 }
 
 // ─── Side ────────────────────────────────────────────────────────────────────
@@ -52,8 +54,6 @@ pub enum OrderType {
     /// Fill-Or-Kill — must fill entirely or cancel. Crosses the spread (taker).
     /// Reserved for emergency hedges only.
     Fok,
-    /// Fill-And-Kill — fills as much as possible, cancels remainder.
-    Fak,
 }
 
 // ─── Profit Tier ─────────────────────────────────────────────────────────────
@@ -130,6 +130,7 @@ pub struct TradeSignal {
 
     // ── Binance reference ────────────────────────────────────────────────
     /// Binance mid-price at the moment the signal was generated.
+    #[allow(dead_code)] // will be used for analytics/logging in future phase
     pub reference_price: Decimal,
 
     // ── Repricing & allocation ──────────────────────────────────────────
@@ -152,7 +153,6 @@ pub struct TradeSignal {
     /// `false` = Leg 1 (directional entry), `true` = Leg 2 (hedge).
     pub is_leg2: bool,
     /// If this is a Leg 2 signal, the fill price of Leg 1. `None` for Leg 1 signals.
-    #[allow(dead_code)] // set on Leg 2 signals for QuestDB recording
     pub leg1_fill_price: Option<Decimal>,
 
     // ── Market context ───────────────────────────────────────────────────
@@ -169,9 +169,9 @@ pub struct TradeSignal {
     /// Whether a competitor depth wall was detected during signal generation.
     pub bot_contested: bool,
 
-    /// Taker fee per share at Leg 1 ask price.
-    /// Used by init_leg2() for buffer-aware hedge math.
-    pub leg1_taker_fee: Decimal,
+    /// Leg 1 fee per share. Negative = maker rebate (post-only Leg 1). Leg 1 is always maker.
+    /// Used by init_leg2() for breakeven computation.
+    pub leg1_fee: Decimal,
 
     // ── Book snapshot ────────────────────────────────────────────────────
     /// Best ask price on the hedge book at signal generation time.
@@ -182,13 +182,6 @@ pub struct TradeSignal {
     /// Used by the executor to simulate fills without a separate book feed.
     pub book_snapshot: Option<OrderBook>,
 
-    /// Simulation only: `true` when this signal is a confirmed fill from
-    /// `advance_simulation()`. Executor records it directly without re-checking.
-    pub sim_confirmed_fill: bool,
-
-    /// Simulation only: `true` when this emergency fill crossed the spread
-    /// (FOK fallback). `false` when it rested as a post-only maker fill.
-    pub sim_was_taker: bool,
 }
 
 // ─── Executor Command ────────────────────────────────────────────────────────
@@ -210,8 +203,10 @@ pub enum ExecutorCommand {
         /// Tick size for the new market.
         tick_size: Decimal,
         /// Condition ID of the outgoing market (None on first rotation after startup).
+        #[allow(dead_code)] // will be used by executor for position reconciliation (future phase)
         outgoing_condition_id: Option<String>,
         /// End timestamp of the outgoing market (epoch ms). 0 if no prior market.
+        #[allow(dead_code)] // will be used by executor for position reconciliation (future phase)
         outgoing_end_timestamp_ms: u64,
     },
     /// Post a Phase 2 order alongside the existing Phase 1 order (dual-order).
@@ -221,6 +216,10 @@ pub enum ExecutorCommand {
     CancelLeg2Order { order_id: String },
     /// Rebalance FOK: buy Leg 1 side after a double-fill race condition.
     RebalanceLeg1 { signal: TradeSignal },
+    /// Cancel unfilled Leg 1 maker order (flow-based sustain failure).
+    /// If `repost: true`, the engine will attempt to re-emit a fresh Leg 1 signal at the new best_ask
+    /// (after cancel confirmation). If `repost: false`, the state is fully reset.
+    CancelLeg1Order { order_id: String, repost: bool },
     /// Tick size changed mid-market — update SDK cache for both tokens.
     TickSizeChanged {
         yes_token_id: String,
@@ -274,19 +273,6 @@ impl OrderRequest {
         }
     }
 
-    /// Convenience constructor for a FAK (Fill-And-Kill) taker order.
-    #[allow(dead_code)] // used in upcoming FAK execution phase
-    pub fn fak(token_id: String, side: Side, price: Decimal, size: Decimal) -> Self {
-        Self {
-            token_id,
-            side,
-            price,
-            size,
-            order_type: OrderType::Fak,
-            post_only: false,
-            expiration: None,
-        }
-    }
 }
 
 // ─── Order Response ──────────────────────────────────────────────────────────
@@ -394,4 +380,222 @@ pub enum ExecutorFeedback {
     /// Executor halts further Leg 2 attempts until rotation. Engine sends
     /// a critical Telegram alert with position details.
     BalanceExhausted,
+}
+
+// ─── Fill Info (replaces SimFill) ────────────────────────────────────────────
+
+/// A single fill (either Leg 1 or Leg 2) for live trade reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillInfo {
+    /// Which side was traded (Buy YES or Buy NO).
+    pub side: Side,
+    /// Fill price.
+    pub price: Decimal,
+    /// Number of shares filled.
+    pub size: Decimal,
+    /// Epoch ms when the fill occurred.
+    pub timestamp_ms: u64,
+    /// Whether this was a partial fill (remaining size could not be matched).
+    pub was_partial: bool,
+    /// `true` if the fill crossed the spread (taker).
+    pub was_taker: bool,
+    /// Taker fee paid. `Decimal::ZERO` for maker fills.
+    pub taker_fee: Decimal,
+    /// Estimated maker rebate earned. `Decimal::ZERO` for taker fills.
+    pub maker_rebate: Decimal,
+}
+
+// ─── Live Trade Report (replaces SimTrade) ───────────────────────────────────
+
+/// A completed trade with full PnL accounting.
+/// Used for Telegram reporting, QuestDB recording, and market/session summaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTradeReport {
+    /// Polymarket condition ID.
+    pub market_id: String,
+    /// Spike direction (Up/Down → YES/NO entry).
+    pub direction: Direction,
+    /// Leg 1 fill details.
+    pub leg1: FillInfo,
+    /// Leg 2 fill details. `None` if unhedged at expiry.
+    pub leg2: Option<FillInfo>,
+
+    // ── Signal context ───────────────────────────────────────────────────
+    /// Expected repricing percentage that generated this trade.
+    pub expected_pct: Decimal,
+    /// Profit target tier (HIGH / MED / LOW).
+    pub profit_target_tier: ProfitTier,
+    /// USDC allocated to this trade.
+    pub alloc_amount: Decimal,
+
+    // ── PnL ──────────────────────────────────────────────────────────────
+    /// `leg1.price + leg2.price` per share (or just `leg1.price` if unhedged).
+    pub pair_cost: Decimal,
+    /// `(1.0 - pair_cost) * size` in USDC. Negative if pair cost > 1.0.
+    pub gross_profit: Decimal,
+    /// Taker fee paid on Leg 2 in USDC (0 in normal flow; non-zero only for emergency taker).
+    pub taker_fee: Decimal,
+    /// Estimated maker rebate earned on this trade (sum of both legs' maker rebates).
+    pub maker_rebate: Decimal,
+    /// `gross_profit - taker_fee + maker_rebate` in USDC.
+    pub net_profit: Decimal,
+    /// `net_profit / (pair_cost * size) * 100` — return on capital deployed.
+    pub profit_pct: Decimal,
+
+    // ── Execution metadata ───────────────────────────────────────────────
+    /// Hedge phase at trade close: 0=Phase1, 1=Phase2.
+    pub hedge_phase: u8,
+    /// Whether Leg 2 executed as an emergency taker (FOK).
+    pub leg2_was_taker: bool,
+    /// Whether a competitor depth wall was detected during this trade.
+    pub bot_contested: bool,
+    /// Whether Leg 2 filled as a favorable taker (ask < posted bid).
+    pub favorable_taker: bool,
+    /// Whether Leg 2 filled via the favorable maker try-first path (no taker fee + rebate).
+    pub favorable_maker: bool,
+    /// Whether Leg 2 was an emergency exit that filled as post-only maker (zero fee).
+    pub emergency_maker: bool,
+    /// Why the trade exited. `None` for normal erosion fills.
+    pub exit_reason: Option<ExitReason>,
+    /// Spike magnitude that triggered this trade (ratio, e.g., 0.005 = 0.5%).
+    pub spike_magnitude: Decimal,
+    /// Deprecated — always `false`. Kept for QuestDB backward compatibility.
+    pub leg1_cancel_race: bool,
+    /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
+    pub phase1_breach: bool,
+    /// Whether Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
+    pub phase1_dual_fill: bool,
+    /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
+    pub whipsaw_reversal: bool,
+
+    // ── Timestamps ───────────────────────────────────────────────────────
+    /// Epoch ms when the trade was opened (Leg 1 fill).
+    pub open_timestamp_ms: u64,
+    /// Epoch ms when the trade was closed (Leg 2 fill or market expiry).
+    pub close_timestamp_ms: u64,
+}
+
+// ─── Market Summary ──────────────────────────────────────────────────────────
+
+/// Aggregated stats for a single 5-minute market window.
+/// Used for Telegram reporting.
+#[derive(Debug, Clone)]
+pub struct MarketSummary {
+    /// Polymarket condition ID.
+    pub market_id: String,
+    /// UTC period string (e.g. "12:30 - 12:45 UTC").
+    pub period_label: String,
+    /// Resolution outcome: "YES", "NO", or "pending".
+    pub resolution: String,
+    /// Estimated time remaining in UMA challenge period (hours), None if resolved.
+    pub uma_hours_remaining: Option<u32>,
+    /// Total signals generated by the engine in this market.
+    pub signals_detected: u32,
+    /// Leg 1 fills in this market.
+    pub leg1_fills: u32,
+    /// Successfully hedged trades.
+    pub trades_hedged: u32,
+    /// Total trades (filled Leg 1, whether or not hedged).
+    #[allow(dead_code)] // set for Telegram reporting
+    pub total_trades: u32,
+    /// Smart outbidding events in this market.
+    pub walls_outbid: u32,
+    /// Emergency taker fills in this market.
+    pub emergency_taker_fills: u32,
+    /// Emergency post-only maker fills in this market (zero fee).
+    pub emergency_maker_fills: u32,
+    /// Favorable taker fills in this market (ask < posted bid).
+    pub favorable_taker_fills: u32,
+    /// Favorable maker fills in this market (try-maker-first succeeded).
+    pub favorable_maker_fills: u32,
+    /// All closed trades in this market (for detail lines).
+    pub trades: Vec<LiveTradeReport>,
+    /// Total USDC allocated this market.
+    pub allocation_used: Decimal,
+    /// FIXED_ALLOC cap for this session.
+    pub allocation_cap: Decimal,
+    /// Taker fees paid in this market.
+    pub taker_fees_paid: Decimal,
+    /// Estimated maker rebates earned in this market.
+    pub maker_rebates_earned: Decimal,
+    /// Gross PnL for this market (sum of gross_profit).
+    pub gross_market_pnl: Decimal,
+    /// Net PnL for this market (sum of net_profit).
+    pub net_market_pnl: Decimal,
+    /// Capital still locked in UMA resolution from this market.
+    pub capital_locked: Decimal,
+}
+
+// ─── Session Summary ─────────────────────────────────────────────────────────
+
+/// Aggregated stats for the entire session so far.
+/// Used for Telegram reporting (session shutdown / hourly).
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    /// Uptime in seconds since session_start.
+    pub uptime_secs: u64,
+    /// Number of 5-min markets observed.
+    pub markets_observed: u32,
+    /// Total signals generated.
+    pub signals_detected: u32,
+    /// Leg 1 fills (post-only filled).
+    pub leg1_fills: u32,
+    /// Trades where Leg 2 hedge filled.
+    pub trades_hedged: u32,
+    /// Total closed trades.
+    pub total_trades: u32,
+    /// Smart outbidding events.
+    pub walls_outbid: u32,
+    /// Emergency taker fills breakdown: price breach FOKs (BE, Phase2PriceBreach, Phase1Breach).
+    pub breach_fok: u32,
+    /// Emergency taker fills breakdown: timeout FOKs (Phase2Timeout, MarketExpiry).
+    pub timeout_fok: u32,
+    /// Total emergency taker fills.
+    pub emergency_taker_fills: u32,
+    /// Emergency post-only maker fills (zero fee).
+    pub emergency_maker_fills: u32,
+    /// Favorable taker fills (ask < posted bid).
+    pub favorable_taker_fills: u32,
+    /// Favorable maker fills (try-maker-first succeeded).
+    pub favorable_maker_fills: u32,
+
+    // ── Repricing tier breakdown ──────────────────────────────────────────
+    pub high_tier_trades: u32,
+    pub high_tier_avg_alloc: Decimal,
+    pub med_tier_trades: u32,
+    pub med_tier_avg_alloc: Decimal,
+    pub low_tier_trades: u32,
+    pub low_tier_avg_alloc: Decimal,
+    pub avg_expected_pct: Decimal,
+
+    // ── PnL ──────────────────────────────────────────────────────────────
+    pub gross_pnl: Decimal,
+    pub emergency_taker_fees: Decimal,
+    pub est_maker_rebates: Decimal,
+    pub net_pnl: Decimal,
+
+    // ── Win stats ─────────────────────────────────────────────────────────
+    /// Winning trades as a fraction (0-100).
+    pub win_rate_pct: Decimal,
+    /// Average net profit % per closed trade.
+    pub avg_net_profit_pct: Decimal,
+    /// Best net_profit trade description.
+    pub best_trade_pct: Decimal,
+    pub best_trade_market: String,
+    pub best_trade_reprice: Decimal,
+    /// Worst net_profit trade description.
+    pub worst_trade_pct: Decimal,
+    pub worst_trade_market: String,
+    pub worst_trade_reprice: Decimal,
+
+    // ── Unfilled signal breakdown ──────────────────────────────────────────
+    pub unfilled_signals: u32,
+    pub unfilled_post_only: u32,
+    pub unfilled_liquidity: u32,
+    pub unfilled_spread_wide: u32,
+
+    // ── Capital state ─────────────────────────────────────────────────────
+    pub capital_locked: Decimal,
+    pub virtual_balance: Decimal,
+    pub starting_balance: Decimal,
 }

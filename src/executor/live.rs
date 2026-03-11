@@ -1,7 +1,8 @@
 //! Live Executor — places real orders on the Polymarket CLOB.
 //!
 //! Handles the full trade lifecycle:
-//! - Leg 1: batch FAK taker orders at 3 price levels (ask-tick, ask, ask+tick)
+//! - Leg 1: maker post-only order at best ask (waits for fill via User WS)
+//! - Leg 1 cancel: flow-based sustain failure (composite dropped)
 //! - Leg 2 hedge: cancel previous resting order, repost at new price
 //! - Leg 2 emergency: cancel resting order, place FOK taker order
 //! - Market rotation: cancel all open orders, reset state
@@ -70,8 +71,6 @@ pub struct LiveExecutor {
     /// Timeout (ms) for favorable maker try before FOK fallback on crosses-book.
     favorable_maker_timeout_ms: u64,
 
-    /// Number of ticks above/below best ask for the FAK batch ladder.
-    fak_price_offset_ticks: u32,
 }
 
 impl LiveExecutor {
@@ -81,7 +80,6 @@ impl LiveExecutor {
         reporter: TelegramReporter,
         cold: Option<ColdStorage>,
         favorable_maker_timeout_ms: u64,
-        fak_price_offset_ticks: u32,
     ) -> Self {
         Self {
             poly,
@@ -93,7 +91,6 @@ impl LiveExecutor {
             active_leg2_phase2_id: None,
             balance_exhausted: false,
             favorable_maker_timeout_ms,
-            fak_price_offset_ticks,
         }
     }
 
@@ -152,6 +149,9 @@ impl LiveExecutor {
                 ExecutorCommand::RebalanceLeg1 { signal } => {
                     self.handle_rebalance_leg1(&signal).await;
                 }
+                ExecutorCommand::CancelLeg1Order { order_id, repost: _ } => {
+                    self.handle_cancel_leg1(&order_id).await;
+                }
             }
         }
 
@@ -187,155 +187,93 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 1: batch FAK taker entry ──────────────────────────────────
+    // ─── Leg 1: maker post-only entry ──────────────────────────────────
 
     async fn handle_leg1(&mut self, signal: &TradeSignal) {
         // New trade — clear any stale Leg 2 IDs from previous trade.
         self.active_leg2_phase1_id = None;
         self.active_leg2_phase2_id = None;
 
-        let tick = signal.tick_size;
-        let ask = signal.price; // evaluator sets price = best_ask
-        let offset = tick * Decimal::from(self.fak_price_offset_ticks);
-
-        // 3 FAK prices: ask-offset, ask, ask+offset
-        let prices = [
-            round_to_tick(ask - offset, tick),
-            ask,
-            round_to_tick(ask + offset, tick),
-        ];
+        let order = OrderRequest::post_only_gtc(
+            signal.token_id.clone(),
+            signal.side,
+            signal.price, // evaluator sets price = best_ask (maker posts at ask)
+            signal.size,
+        );
 
         info!(
             side = ?signal.side,
             token = %signal.token_id,
-            ask = %ask,
-            tick = %tick,
-            size_per_order = %signal.size,
+            price = %signal.price,
+            size = %signal.size,
             expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
-            "Leg 1: batch FAK at [{}, {}, {}]",
-            prices[0], prices[1], prices[2],
+            "Leg 1: maker post-only at {}",
+            signal.price,
         );
 
-        // Compute safe sizes for each price level.
-        let sizes: Vec<Decimal> = prices
-            .iter()
-            .map(|&p| clob_safe_fok_size(p, signal.size))
-            .collect();
-
-        // Build FAK orders for each price level with non-zero safe size.
-        let mut orders: Vec<(Decimal, Decimal, OrderRequest)> = Vec::with_capacity(3);
-        for (&price, &size) in prices.iter().zip(sizes.iter()) {
-            if size > Decimal::ZERO {
-                orders.push((
-                    price,
-                    size,
-                    OrderRequest::fak(signal.token_id.clone(), signal.side, price, size),
-                ));
+        match self.poly.place_order(&order).await {
+            Ok(resp) => {
+                if resp.status == OrderStatus::Rejected {
+                    // Post-only rejected — ask crossed our bid. Abort.
+                    warn!("Leg 1 maker REJECTED — aborting");
+                    let _ = self
+                        .feedback_tx
+                        .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
+                    self.log_signal_to_cold(signal, "rejected");
+                    return;
+                }
+                // Order resting on book — waiting for fill via User WS.
+                // If already filled synchronously (rare for post-only), handle it.
+                let already_filled = resp.status == OrderStatus::Filled;
+                info!(
+                    order_id = %resp.order_id,
+                    status = ?resp.status,
+                    %already_filled,
+                    "Leg 1: maker posted"
+                );
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                    is_leg2: false,
+                    order_id: resp.order_id,
+                    price: signal.price,
+                    size: signal.size,
+                    fill_method: None,
+                    already_filled,
+                    order_tag: None,
+                });
+                self.log_signal_to_cold(signal, "maker_posted");
+            }
+            Err(e) => {
+                error!("Leg 1 maker placement FAILED: {e}");
+                let _ = self
+                    .feedback_tx
+                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
+                self.log_signal_to_cold(signal, "failed");
             }
         }
+    }
 
-        if orders.is_empty() {
-            warn!("Leg 1: all FAK sizes are zero — aborting");
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
-            return;
-        }
+    // ─── Leg 1 cancel (flow-based sustain failure) ─────────────────────
 
-        // Step 1: Place FAK orders as a single batch request.
-        let order_requests: Vec<OrderRequest> = orders.iter().map(|(_, _, req)| req.clone()).collect();
-        let batch_results = self.poly.place_orders_batch(&order_requests).await;
-
-        // Collect successful order IDs for status query.
-        let mut order_ids: Vec<(usize, String)> = Vec::new();
-        for (i, result) in batch_results.into_iter().enumerate() {
-            let (price, size, _) = &orders[i];
-            match result {
-                Ok(resp) => {
-                    info!(
-                        order_id = %resp.order_id,
-                        status = ?resp.status,
-                        price = %price, size = %size,
-                        "FAK order {}/{} placed", i + 1, orders.len(),
-                    );
-                    order_ids.push((i, resp.order_id));
-                }
-                Err(e) => {
-                    warn!(error = %e, price = %price, size = %size,
-                        "FAK order {}/{} FAILED", i + 1, orders.len());
-                }
+    async fn handle_cancel_leg1(&mut self, order_id: &str) {
+        match self.poly.cancel_order(order_id).await {
+            Ok(was_cancelled) => {
+                info!(%order_id, %was_cancelled, "Leg 1 cancel result");
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                    order_id: order_id.to_string(),
+                    was_cancelled,
+                    is_leg2: false,
+                });
+            }
+            Err(e) => {
+                warn!(%order_id, error = %e, "Leg 1 cancel failed");
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                    order_id: order_id.to_string(),
+                    was_cancelled: false,
+                    is_leg2: false,
+                });
             }
         }
-
-        if order_ids.is_empty() {
-            error!("Leg 1: all FAK orders failed — no order IDs to query");
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
-            self.log_signal_to_cold(signal, "failed");
-            return;
-        }
-
-        // Step 2: Query fill status for each order (sequential — at most 3 × ~200ms).
-        let mut total_filled = Decimal::ZERO;
-        let mut weighted_price_sum = Decimal::ZERO;
-        let mut first_order_id: Option<String> = None;
-
-        for (j, (order_idx, oid)) in order_ids.iter().enumerate() {
-            match self.poly.get_order_status(oid).await {
-                Ok((status, size_matched, _original_size)) => {
-                    if size_matched > Decimal::ZERO {
-                        info!(
-                            order_id = %oid,
-                            ?status, %size_matched,
-                            "FAK fill: order {} matched", j + 1,
-                        );
-                        let fill_price = orders[*order_idx].0;
-                        weighted_price_sum += fill_price * size_matched;
-                        total_filled += size_matched;
-                        if first_order_id.is_none() {
-                            first_order_id = Some(oid.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(order_id = %oid, error = %e, "FAK status query failed");
-                }
-            }
-        }
-
-        if total_filled.is_zero() {
-            warn!("Leg 1: batch FAK — zero total fills");
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
-            self.log_signal_to_cold(signal, "failed");
-            return;
-        }
-
-        // VWAP = weighted_price_sum / total_filled, rounded to 2dp.
-        let vwap = (weighted_price_sum / total_filled).round_dp(2);
-        let total_filled = total_filled.round_dp(2);
-        let order_id = first_order_id.unwrap_or_default();
-
-        info!(
-            %order_id, %vwap, %total_filled,
-            orders_placed = order_ids.len(),
-            "Leg 1: batch FAK complete — sending fill"
-        );
-
-        let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-            is_leg2: false,
-            order_id,
-            price: vwap,
-            size: total_filled,
-            fill_method: None,
-            already_filled: true,
-            order_tag: None,
-        });
-
-        self.log_signal_to_cold(signal, "fak_batch");
     }
 
     // ─── Leg 2 hedge: cancel previous + repost at new price ────────────
@@ -712,7 +650,7 @@ impl LiveExecutor {
         self.active_leg2_phase1_id = None;
         self.active_leg2_phase2_id = None;
 
-        // All emergency signals use FOK taker (sim_was_taker is always true).
+        // All emergency signals use FOK taker.
         warn!(
             reason = ?exit_reason,
             price = %signal.price,
@@ -1107,6 +1045,7 @@ impl LiveExecutor {
                 signal.alloc_amount,
                 action,
                 signal.spike_info.timestamp_ms,
+                signal.expected_pct,
             ) {
                 warn!(error = %e, "failed to record signal to QuestDB");
             }

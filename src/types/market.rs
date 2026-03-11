@@ -14,6 +14,7 @@ pub enum Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataSource {
     Binance,
+    BinanceFutures,
     PolymarketMarket,
     PolymarketUser,
 }
@@ -52,11 +53,9 @@ pub enum OrderState {
     },
     /// Order has been fully or partially filled.
     Filled {
-        #[allow(dead_code)] // stored for QuestDB trade recording
         order_id: String,
         price: Decimal,
         size: Decimal,
-        #[allow(dead_code)] // stored for QuestDB trade recording
         fill_timestamp_ms: u64,
     },
 }
@@ -169,24 +168,110 @@ impl BinanceDepth {
     }
 }
 
+// ─── Futures / Spot Trade Types ──────────────────────────────────────────────
+
+/// Aggregated trade event from Binance Futures @aggTrade stream.
+#[derive(Debug, Clone)]
+pub struct FuturesAggTrade {
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub is_buyer_maker: bool, // false = taker buy (aggressor bought)
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub timestamp_ms: u64,
+}
+
+/// Best bid/ask from Binance Futures @bookTicker stream.
+#[derive(Debug, Clone)]
+pub struct FuturesBookTicker {
+    pub bid_price: Decimal,
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub bid_qty: Decimal,
+    pub ask_price: Decimal,
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub ask_qty: Decimal,
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub timestamp_ms: u64,
+}
+
+/// Forced liquidation event from Binance Futures @forceOrder stream.
+#[derive(Debug, Clone)]
+pub struct FuturesForceOrder {
+    pub side: String, // "SELL" (long liquidated) or "BUY" (short liquidated)
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub price: Decimal,
+    pub quantity: Decimal,
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub timestamp_ms: u64,
+}
+
+/// Individual trade from Binance Spot SBE @trade stream.
+#[derive(Debug, Clone)]
+pub struct SpotTrade {
+    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub is_buyer_maker: bool,
+    pub timestamp_ms: u64,
+}
+
+// ─── Buildup Info ───────────────────────────────────────────────────────────
+
+/// Buildup signal emitted by the BuildupDetector.
+/// Replaces SpikeInfo as the trigger for Leg 1 entry.
+#[derive(Debug, Clone)]
+pub struct BuildupInfo {
+    /// Composite buildup score [0.0, 1.0].
+    pub composite_score: Decimal,
+    /// Predicted direction of imminent spike.
+    pub direction: Direction,
+    /// Individual metric values (for diagnostics/logging).
+    #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
+    pub cvd_accel: Decimal,
+    #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
+    pub spot_flow: Decimal,
+    #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
+    pub obi_velocity: Decimal,
+    #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
+    pub basis_delta: Decimal,
+    #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
+    pub liq_pressure: Decimal,
+    pub atr_displacement: Decimal,
+    /// Spot mid-price at time of buildup detection (for Phase B refinement).
+    pub spot_mid_at_entry: Decimal,
+    /// Current EMA ATR (for Phase B observed displacement computation).
+    pub ema_atr: Decimal,
+    /// Raw ATR displacement ratio (abs_displacement / ema_atr) — same semantics as
+    /// SpikeInfo.atr_ratio. Used by the repricing model until Phase 7 reworks it.
+    pub signal_atr_ratio: Decimal,
+    /// Current Binance order book imbalance [-1, +1] at detection time.
+    /// Used by the OBI alignment gate in the evaluator.
+    pub obi: Decimal,
+    /// Epoch ms when buildup threshold was crossed.
+    pub timestamp_ms: u64,
+}
+
 // ─── Spike Info ──────────────────────────────────────────────────────────────
 
-/// Describes a detected Binance price spike that survived the sustain + momentum filters.
+/// Entry metadata container — synthesized from BuildupInfo for backward compatibility.
+/// Carried on TradeSignal, HedgeState, HedgeSnap for reporting and QuestDB recording.
 #[derive(Debug, Clone, Copy)]
 pub struct SpikeInfo {
-    /// Whether price spiked up or down.
+    /// Direction at entry time. Used for struct construction only.
+    #[allow(dead_code)]
     pub direction: Direction,
     /// Magnitude of the spike as a ratio (e.g., 0.0042 = 0.42%).
     pub magnitude: Decimal,
-    /// How long the spike has been sustained (ms).
+    /// Deprecated — always 0. Kept for struct compatibility.
+    #[allow(dead_code)]
     pub sustained_ms: u64,
     /// Epoch ms when the spike was first detected.
     pub timestamp_ms: u64,
-    /// Spike displacement in ATR multiples (abs_displacement / ema_atr).
-    /// Dimensionless — automatically adapts to volatility regime.
+    /// ATR ratio at entry. Synthesized from BuildupInfo.signal_atr_ratio.
+    #[allow(dead_code)]
     pub atr_ratio: Decimal,
-    /// Order Book Imbalance from Binance @depth20 at spike time.
-    /// Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish).
+    /// OBI at entry. Synthesized from BuildupInfo.obi.
+    #[allow(dead_code)]
     pub obi: Decimal,
 }
 
@@ -232,14 +317,26 @@ pub struct MarketState {
     pub leg1_state: OrderState,
     /// Current Leg 2 order lifecycle (populated after Leg 1 fill).
     pub leg2_state: OrderState,
+    /// Best ask at the time Leg 1 was posted (for adaptive repost detection).
+    /// Cleared on market rotation or when Leg 1 is fully reset.
+    pub leg1_posted_ask: Option<Decimal>,
 
-    // ── Spike / volatility ───────────────────────────────────────────────
+    // ── Volatility ────────────────────────────────────────────────────────
     /// Rolling EMA-ATR (1-minute window, alpha=0.1). `None` until enough data.
     pub atr: Option<Decimal>,
-    /// Whether a spike has been detected and survived sustain + momentum filters.
-    pub spike_detected: bool,
-    /// Details of the latest surviving spike (cleared on market rotation).
-    pub last_spike: Option<SpikeInfo>,
+
+    // ── Buildup detection (Phase 6+) ─────────────────────────────────────
+    /// Whether a buildup signal has been detected (replaces `spike_detected` as
+    /// the primary entry trigger). Set by BuildupDetector or ATR backstop.
+    pub buildup_detected: bool,
+    /// Details of the latest buildup signal (cleared on market rotation).
+    pub last_buildup: Option<BuildupInfo>,
+    /// Current composite buildup score (updated on every event for flow monitoring).
+    pub current_composite_score: Decimal,
+    /// Current composite direction (updated on every event for flow monitoring).
+    pub current_composite_direction: Option<Direction>,
+    /// Timestamp of the last composite update.
+    pub composite_update_ms: u64,
 
     // ── Capital tracking ─────────────────────────────────────────────────
     /// Total USDC allocated in the current market window.
@@ -266,9 +363,13 @@ impl MarketState {
             market_end_timestamp_ms: 0,
             leg1_state: OrderState::None,
             leg2_state: OrderState::None,
+            leg1_posted_ask: None,
             atr: None,
-            spike_detected: false,
-            last_spike: None,
+            buildup_detected: false,
+            last_buildup: None,
+            current_composite_score: Decimal::ZERO,
+            current_composite_direction: None,
+            composite_update_ms: 0,
             cumulative_used: Decimal::ZERO,
             available_capital: Decimal::ZERO,
             last_update_ms: 0,
@@ -361,18 +462,48 @@ pub enum IngestorEvent {
     /// Depth snapshot from SBE `@depth20` stream (50ms cadence).
     BinanceDepth(BinanceDepth),
 
-    /// Spike confirmed after sustain + momentum check passed.
-    /// Gates sim Leg 1 fills; live mode no-op (fills come from User WS).
-    SpikeConfirmed(SpikeInfo),
+    // ── Binance Futures ──────────────────────────────────────────────────
+    /// Futures aggregated trade (for CVD acceleration).
+    FuturesAggTrade(FuturesAggTrade),
 
-    /// Periodic spike detector diagnostics (every 60s).
-    SpikeDiagnostic {
-        atr: f64,
-        threshold: f64,
-        mid: f64,
-        rej_magnitude: u64,
-        confirmed: u64,
-        stale: u64,
+    /// Futures best bid/ask (for basis delta computation).
+    FuturesBookTicker(FuturesBookTicker),
+
+    /// Futures forced liquidation (for liquidation pressure).
+    FuturesForceOrder(FuturesForceOrder),
+
+    // ── Binance Spot @trade ─────────────────────────────────────────────
+    /// Spot individual trade from SBE @trade (for spot trade flow).
+    SpotTrade(SpotTrade),
+
+    // ── Buildup Detection ───────────────────────────────────────────────
+    /// Buildup signal: composite score crossed entry threshold.
+    /// Replaces SpikeConfirmed for Leg 1 entry decisions.
+    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
+    BuildupConfirmed(BuildupInfo),
+
+    /// Buildup score update (below entry threshold but non-zero).
+    /// Used by engine for flow monitoring after Leg 1 fill.
+    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
+    BuildupUpdate {
+        composite_score: Decimal,
+        direction: Direction,
+        timestamp_ms: u64,
+    },
+
+    /// Buildup detector diagnostics (every 60s).
+    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
+    BuildupDiagnostic {
+        composite_score: Decimal,
+        cvd_accel: f64,
+        spot_flow: f64,
+        obi_velocity: f64,
+        basis_delta: f64,
+        liq_pressure: f64,
+        atr_displacement: f64,
+        fresh_count: u32,
+        stale_count: u32,
+        signals_emitted: u64,
     },
 
     // ── Lifecycle ────────────────────────────────────────────────────────
