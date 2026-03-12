@@ -49,7 +49,7 @@ favorable_maker_timeout_ms = 2500
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.50
+entry_threshold = 0.40
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.30
 # Max wait (ms) for Leg 1 maker fill before cancelling
