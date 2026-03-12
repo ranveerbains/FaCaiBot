@@ -51,6 +51,11 @@ pub struct BuildupDetector {
     /// Tracks whether any feed method has been called since the last `tick()`.
     dirty: bool,
 
+    /// Set when composite crosses above `entry_threshold`; cleared when it drops below.
+    /// Prevents emitting a new BuildupInfo on every dirty tick while above threshold —
+    /// only the first crossing per episode fires (edge-triggered, not level-triggered).
+    above_threshold: bool,
+
     // Diagnostic counters
     diag_signals_emitted: u64,
     diag_direction_vetoes: u64,
@@ -246,6 +251,7 @@ impl BuildupDetector {
             current_spot_mid: 0.0,
             last_obi: 0.0,
             dirty: false,
+            above_threshold: false,
             diag_signals_emitted: 0,
             diag_direction_vetoes: 0,
             diag_causal_vetoes: 0,
@@ -307,10 +313,21 @@ impl BuildupDetector {
         let (score, direction) = self.evaluate(now_ms);
         let entry = match direction {
             Some(dir) if score >= self.entry_threshold => {
-                self.diag_signals_emitted += 1;
-                Some(self.build_info(score, dir, now_ms))
+                if !self.above_threshold {
+                    // First crossing above threshold — emit signal (edge-triggered).
+                    self.above_threshold = true;
+                    self.diag_signals_emitted += 1;
+                    Some(self.build_info(score, dir, now_ms))
+                } else {
+                    // Already above threshold — suppress until score drops and recovers.
+                    None
+                }
             }
-            _ => None,
+            _ => {
+                // Score dropped below threshold or no direction — reset for next episode.
+                self.above_threshold = false;
+                None
+            }
         };
         (score, direction, entry)
     }
