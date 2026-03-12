@@ -196,8 +196,8 @@ fn test_evaluate_generates_leg1_signal() {
     assert!(!s.is_leg2);
     assert_eq!(s.side, Side::Buy);
     assert_eq!(s.token_id, "yes"); // UP → YES
-    // FAK: signal price = ask price
-    assert_eq!(s.price, Decimal::new(505, 3));
+    // Maker post-only: signal price = bid price
+    assert_eq!(s.price, Decimal::new(495, 3));
 }
 
 #[test]

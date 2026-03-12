@@ -17,7 +17,9 @@ None ----------------> Posted -----------------> Filled
   +-------------------------------------------+
 ```
 
-Note: Sustain cancel and whipsaw cancel go through `CancelLeg1Order` -> fire-and-confirm. Cancel confirmed -> `None`. Cancel NOT confirmed -> stays `Posted` (may fill via User WS).
+Note: Sustain cancel and whipsaw cancel go through `CancelLeg1Order` → fire-and-confirm.
+- **Cancel confirmed (`was_cancelled=true`):** Full Leg 1 reset → `None`. Repost path re-arms `buildup_detected` if composite still alive; non-repost path clears all Leg 1 fields.
+- **Cancel NOT confirmed (`was_cancelled=false`):** Order filled before cancel reached CLOB. `leg1_state` stays `Posted`. `leg1_cancel_inflight` stays `true` (prevents sustain retry). User WS MATCHED transitions to `Filled`. `on_trade_complete()` clears `leg1_cancel_inflight`.
 
 **Triggers:**
 - `None -> Posted`: Engine emits signal on `BuildupConfirmed`, executor posts maker order
@@ -74,6 +76,7 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 2. evaluate() passes all guards -> Leg 1 signal emitted (maker post-only)
    buildup_detected = false, leg1_state = Posted
+   last_buildup preserved (init_leg2() needs it ~1s later when Leg 1 fills)
 
 3. [Sustain monitoring] On each event while Leg 1 is Posted:
    - Composite score < cancel_threshold -> CancelLeg1Order -> STOP (if confirmed)

@@ -36,7 +36,9 @@ Once `emergency_submitted = true`, the evaluator returns None on subsequent eval
 
 **Scenario:** CLOB fills the Leg 1 maker order at the same moment the engine dispatches a `CancelLeg1Order` (sustain failure or timeout).
 
-**Handle:** Cancel is fire-and-confirm. If `was_cancelled = true`, the order was cancelled before fill -- engine resets state. If `was_cancelled = false`, the order already filled -- engine keeps `leg1_state = Posted` and waits for User WS MATCHED event. When MATCHED arrives, it transitions to `Filled` and hedge begins normally.
+**Handle:** Cancel is fire-and-confirm. If `was_cancelled = true`, the order was cancelled before fill — engine resets state. If `was_cancelled = false`, the order already filled — engine keeps `leg1_state = Posted` and waits for User WS MATCHED event. When MATCHED arrives, it transitions to `Filled` and hedge begins normally.
+
+**Critical invariant:** `was_cancelled = false` MUST NOT clear `leg1_cancel_inflight`. If the flag is cleared, the sustain monitor fires again immediately, producing a cancel retry loop (repeated dispatches of a cancel for an order that no longer exists on the CLOB). `leg1_cancel_inflight` is only cleared when `was_cancelled = true` (in `on_cancel_result`) OR when `on_trade_complete()` runs (trade ended regardless of how cancel resolved).
 
 **Safety:** `pending_leg1_cancel.is_none()` guard prevents duplicate cancel dispatch.
 
@@ -47,6 +49,25 @@ Once `emergency_submitted = true`, the evaluator returns None on subsequent eval
 **Handle:** `is_provisional_order()` helper gates all 3 cancel dispatch points: if `order_id.starts_with("sim-leg1-")`, cancel commands are suppressed entirely. Once `on_order_posted()` arrives (~1.3s later), it replaces the provisional ID with the real CLOB hex hash and resets `timestamp_ms` to the confirmation time, activating all cancel checks against the real order. Additionally, `on_order_posted()` runs an immediate drift check: if the ask has moved ≥ `leg1_repost_tick_threshold` ticks since evaluation time, it cancels for repost right away rather than waiting for the next flow update.
 
 **Safety:** No futile cancel attempts against non-existent CLOB orders. The cancel window starts from CLOB confirmation, not signal emission. Stale orders (ask drifted during the round-trip) are caught immediately on confirmation.
+
+### Hedge not initialized after Leg 1 fill
+
+**Scenario:** Leg 1 fills (User WS MATCHED) but `init_leg2()` returns early because `self.state.last_buildup` is `None`, so `HedgeState` is never created. `evaluate_leg2()` returns `None` (requires `self.hedge.is_some()`). Leg 2 never starts — trade stalls indefinitely with Leg 1 Filled.
+
+**Root cause:** `evaluate()` previously cleared `self.state.last_buildup = None` when consuming the buildup to emit the Leg 1 signal (self-gating). `init_leg2()` is called from `on_order_filled()` which fires ~1s later (CLOB round-trip). By then, `last_buildup` was already gone.
+
+**Fix:** `evaluate()` only clears `buildup_detected = false` (self-gating). `last_buildup` is preserved through signal emission and is only cleared in:
+- `on_trade_complete()` (normal trade completion)
+- `MarketRotation` handler (market switch)
+- Non-repost cancel confirmed path (sustain fade / timeout cancel)
+
+**Safety:** `buildup_detected = false` still provides the one-evaluation-per-buildup guarantee. `last_buildup` is safe to read by `init_leg2()` because fills arrive ~1s after evaluation on the live path.
+
+### Non-repost cancel confirmed: full Leg 1 reset required
+
+**Scenario:** A sustain-fade or timeout cancel is confirmed (`was_cancelled = true`, `leg1_last_cancel_repost = false`). Previously only `leg1_posted_ask` was cleared — leaving `leg1_state = Posted`, `leg1_direction`, `pending_leg1_signal`, and `last_buildup` populated. Next event: `evaluate()` sees `leg1_state != None` and blocks (correctly), but `last_buildup` leaks into the next trade cycle.
+
+**Fix:** The non-repost cancel confirmed path now does a full Leg 1 reset: `leg1_state = None`, `leg1_posted_ask = None`, `leg1_direction = None`, `last_buildup = None`, `pending_leg1_signal = None`, `leg1_cancel_inflight = false`, `leg1_last_cancel_repost = false`. Matches the reset done in rotation and rejection paths.
 
 ### Emergency signal stacking (live)
 
@@ -201,7 +222,7 @@ Immediate FOK taker at `round_to_tick(0.51, tick)` = $0.51. Pair = $1.015, loss 
 |--------|-----------|------|
 | **Fill authority** | Engine (`advance_simulation()`) | CLOB (User WS primary, sync fill backup) |
 | **Leg 1 entry model** | Maker post-only: bid < ask AND near depth > 0 check | Maker post-only GTC via `place_order()` |
-| **Leg 1 fill model** | Book-based: ask <= fill_price AND near_ask_depth > 0 | Real CLOB matching engine, User WS notification |
+| **Leg 1 fill model** | Book-based: ask <= fill_price + 2×tick AND near_ask_depth > 0 | Real CLOB matching engine, User WS notification |
 | **Leg 1 cancel model** | Direct state reset (no real order to cancel) | `CancelLeg1Order` to executor, fire-and-confirm |
 | **Leg 2 fill model** | Book-based: ask <= posted -> fill | Real CLOB matching engine |
 | **Leg 2 hedge model** | 2-phase: Phase 1 at profit target, Phase 2 at ask-1tick | 2-phase: same logic, real CLOB matching |
@@ -222,7 +243,7 @@ Immediate FOK taker at `round_to_tick(0.51, tick)` = $0.51. Pair = $1.015, loss 
 
 ### Key simulation simplifications
 
-1. **Instant maker fills:** Sim fills whenever `ask <= fill_price` AND depth > 0 on the next event; live fills depend on real CLOB queue position and market activity
+1. **Instant maker fills:** Sim fills whenever `ask <= fill_price + 2×tick` AND depth > 0 on the next event (models the spread collapsing to our bid within 2 ticks); live fills depend on real CLOB queue position and market activity
 2. **No sustain cancel latency:** Sim sustain cancel is a direct state reset; live requires CLOB round-trip with cancel-not-confirmed race
 3. **Full depth available:** Assumes entire order fills at posted price; real CLOB may partially fill
 4. **No queue position:** Doesn't model time priority in the CLOB queue

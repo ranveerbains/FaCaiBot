@@ -1359,9 +1359,10 @@ impl StrategyEngine {
                 let price = signal.price;
                 let size = signal.size;
 
-                // Consume the buildup: clear both flags so detector won't re-fire same buildup.
+                // Consume the buildup: clear detected flag. last_buildup is preserved so
+                // init_leg2() can use it when Leg 1 fills. It will be cleared in
+                // on_trade_complete() and the MarketRotation handler.
                 self.state.buildup_detected = false;
-                self.state.last_buildup = None;
                 self.state.leg1_state = OrderState::Posted {
                     order_id: format!("sim-leg1-{}", now_ms),
                     price,
@@ -2029,8 +2030,8 @@ impl StrategyEngine {
             }
         } else {
             // Leg 1 cancel result
-            self.leg1_cancel_inflight = false;
             if was_cancelled {
+                self.leg1_cancel_inflight = false;
                 if self.leg1_last_cancel_repost {
                     // Repost path: partial reset, re-arm evaluation if composite still alive
                     self.state.leg1_state = OrderState::None;
@@ -2052,15 +2053,22 @@ impl StrategyEngine {
                         self.state.leg1_posted_ask = None;
                     }
                 } else {
-                    // Non-repost cancel (sustain fade, timeout): full reset already done
-                    debug!(%order_id, "Leg 1 cancel confirmed");
+                    // Non-repost cancel confirmed (sustain fade, timeout): full Leg 1 reset.
+                    debug!(%order_id, "Leg 1 cancel confirmed — resetting Leg 1 state");
+                    self.state.leg1_state = OrderState::None;
                     self.state.leg1_posted_ask = None;
+                    self.leg1_direction = None;
+                    self.state.last_buildup = None;
+                    self.pending_leg1_signal = None;
+                    self.leg1_cancel_inflight = false;
+                    self.leg1_last_cancel_repost = false;
                 }
             } else {
-                // NOT cancelled — order may have filled before cancel reached CLOB.
-                // Keep Posted state; User WS MATCHED will resolve it.
-                // leg1_cancel_inflight cleared above — will NOT retry (order is gone from CLOB).
-                debug!(%order_id, "Leg 1 cancel NOT confirmed — waiting for User WS resolution");
+                // NOT cancelled — order filled before cancel reached CLOB.
+                // Leave leg1_cancel_inflight=true so sustain monitor does NOT retry.
+                // User WS TradeStatusUpdate (MATCHED) will call on_order_filled() → on_trade_complete().
+                // on_trade_complete() clears leg1_cancel_inflight.
+                debug!(%order_id, "Leg 1 cancel NOT confirmed — order filled or gone, no retry");
                 self.leg1_last_cancel_repost = false;
             }
             let now_ms = now_epoch_ms();
@@ -2506,6 +2514,7 @@ impl StrategyEngine {
         self.prev_leg2_order = None;
         self.pending_fills.clear();
         self.state.leg1_posted_ask = None;
+        self.leg1_cancel_inflight = false;
         self.leg1_last_cancel_repost = false;
         // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
         self.leg2_phase1_order_id = None;
@@ -2628,8 +2637,8 @@ impl StrategyEngine {
             let tick = self.state.tick_size;
             let two_ticks = tick * Decimal::TWO;
 
-            // Leg 1 fill check: FAK taker — fills if ask depth exists at or below
-            // our limit price. No timing gate — instant fill.
+            // Leg 1 fill check: maker post-only — fills when ask is within two ticks of
+            // our bid price (ask has crossed or nearly crossed our level).
             let should_fill = match self.leg1_direction {
                 Some(Direction::Up) => {
                     let book_opt = self
@@ -2640,15 +2649,15 @@ impl StrategyEngine {
                     match book_opt {
                         Some(book) => {
                             let ask = book.best_ask().map(|a| a.price);
-                            // FAK: fills as taker when ask <= our limit price
-                            let taker_valid = ask.is_some_and(|a| a <= fill_price);
+                            // Maker: fills when ask drops to within two ticks of our bid
+                            let maker_valid = ask.is_some_and(|a| a <= fill_price + two_ticks);
                             let near_ask_depth: Decimal = book
                                 .asks
                                 .iter()
                                 .filter(|lvl| lvl.price <= fill_price + two_ticks)
                                 .map(|lvl| lvl.size)
                                 .sum();
-                            taker_valid && near_ask_depth > Decimal::ZERO
+                            maker_valid && near_ask_depth > Decimal::ZERO
                         }
                         None => false,
                     }
@@ -2656,15 +2665,15 @@ impl StrategyEngine {
                 Some(Direction::Down) => match self.state.poly_no_book.as_ref() {
                     Some(book) => {
                         let ask = book.best_ask().map(|a| a.price);
-                        // FAK: fills as taker when ask <= our limit price
-                        let taker_valid = ask.is_some_and(|a| a <= fill_price);
+                        // Maker: fills when ask drops to within two ticks of our bid
+                        let maker_valid = ask.is_some_and(|a| a <= fill_price + two_ticks);
                         let near_ask_depth: Decimal = book
                             .asks
                             .iter()
                             .filter(|lvl| lvl.price <= fill_price + two_ticks)
                             .map(|lvl| lvl.size)
                             .sum();
-                        taker_valid && near_ask_depth > Decimal::ZERO
+                        maker_valid && near_ask_depth > Decimal::ZERO
                     }
                     None => false,
                 },
