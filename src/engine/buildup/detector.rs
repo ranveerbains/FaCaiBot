@@ -39,7 +39,7 @@ pub struct BuildupDetector {
 
     // Thresholds
     entry_threshold: f64,
-    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    #[cfg_attr(not(test), allow(dead_code))]
     cancel_threshold: f64,
 
     // Spot reference for Phase B
@@ -47,6 +47,9 @@ pub struct BuildupDetector {
 
     /// Last raw OBI value from Binance depth (for BuildupInfo.obi).
     last_obi: f64,
+
+    /// Tracks whether any feed method has been called since the last `tick()`.
+    dirty: bool,
 
     // Diagnostic counters
     diag_signals_emitted: u64,
@@ -242,6 +245,7 @@ impl BuildupDetector {
             cancel_threshold: cfg.cancel_threshold,
             current_spot_mid: 0.0,
             last_obi: 0.0,
+            dirty: false,
             diag_signals_emitted: 0,
             diag_direction_vetoes: 0,
             diag_causal_vetoes: 0,
@@ -253,22 +257,26 @@ impl BuildupDetector {
     pub fn on_futures_agg_trade(&mut self, trade: &FuturesAggTrade, now_ms: u64) {
         let qty = trade.quantity.to_string().parse::<f64>().unwrap_or(0.0);
         self.cvd.update(qty, trade.is_buyer_maker, now_ms);
+        self.dirty = true;
     }
 
     pub fn on_futures_book_ticker(&mut self, ticker: &FuturesBookTicker, now_ms: u64) {
         let bid = ticker.bid_price.to_string().parse::<f64>().unwrap_or(0.0);
         let ask = ticker.ask_price.to_string().parse::<f64>().unwrap_or(0.0);
         self.basis_delta.update_futures_mid(bid, ask, now_ms);
+        self.dirty = true;
     }
 
     pub fn on_futures_force_order(&mut self, order: &FuturesForceOrder, now_ms: u64) {
         let qty = order.quantity.to_string().parse::<f64>().unwrap_or(0.0);
         self.liq_pressure.update(&order.side, qty, now_ms);
+        self.dirty = true;
     }
 
     pub fn on_spot_trade(&mut self, trade: &SpotTrade, now_ms: u64) {
         let qty = trade.quantity.to_string().parse::<f64>().unwrap_or(0.0);
         self.spot_flow.update(qty, trade.is_buyer_maker, now_ms);
+        self.dirty = true;
     }
 
     pub fn on_spot_depth(&mut self, mid: f64, obi: f64, now_ms: u64) {
@@ -277,13 +285,55 @@ impl BuildupDetector {
         self.current_spot_mid = mid;
         self.last_obi = obi;
         self.basis_delta.update_spot_mid(mid, now_ms);
+        self.dirty = true;
     }
 
     pub fn on_spot_bba(&mut self, mid: f64, _now_ms: u64) {
         self.current_spot_mid = mid;
+        self.dirty = true;
     }
 
     // ── Evaluation ───────────────────────────────────────────────────────
+
+    /// Whether any feed method has been called since the last `tick()`.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Evaluate after feeding. Returns (score, direction, optional entry signal).
+    /// Clears the dirty flag. Only call when `is_dirty()` to avoid redundant work.
+    pub fn tick(&mut self, now_ms: u64) -> (f64, Option<Direction>, Option<BuildupInfo>) {
+        self.dirty = false;
+        let (score, direction) = self.evaluate(now_ms);
+        let entry = match direction {
+            Some(dir) if score >= self.entry_threshold => {
+                self.diag_signals_emitted += 1;
+                Some(self.build_info(score, dir, now_ms))
+            }
+            _ => None,
+        };
+        (score, direction, entry)
+    }
+
+    /// Build a `BuildupInfo` from the current detector state.
+    fn build_info(&self, score: f64, direction: Direction, now_ms: u64) -> BuildupInfo {
+        let d = |v: f64| Decimal::try_from(v).unwrap_or(Decimal::ZERO);
+        BuildupInfo {
+            composite_score: d(score),
+            direction,
+            cvd_accel: d(self.cvd.raw()),
+            spot_flow: d(self.spot_flow.raw()),
+            obi_velocity: d(self.obi_velocity.raw()),
+            basis_delta: d(self.basis_delta.raw()),
+            liq_pressure: d(self.liq_pressure.raw()),
+            atr_displacement: d(self.atr_displacement.raw()),
+            spot_mid_at_entry: d(self.current_spot_mid),
+            ema_atr: d(self.atr_displacement.ema_atr()),
+            signal_atr_ratio: d(self.atr_displacement.raw()),
+            obi: d(self.last_obi),
+            timestamp_ms: now_ms,
+        }
+    }
 
     /// Compute composite score. Returns (score, direction) or (0, None) if vetoed.
     pub fn evaluate(&mut self, now_ms: u64) -> (f64, Option<Direction>) {
@@ -339,7 +389,8 @@ impl BuildupDetector {
         (composite, Some(dominant))
     }
 
-    /// Check if composite exceeds entry threshold.
+    /// Check if composite exceeds entry threshold (used by tests).
+    #[cfg(test)]
     pub fn check_entry(&mut self, now_ms: u64) -> Option<BuildupInfo> {
         let (score, direction) = self.evaluate(now_ms);
         let direction = direction?;
@@ -369,28 +420,20 @@ impl BuildupDetector {
         })
     }
 
-    /// Check if composite has dropped below cancel threshold.
-    #[allow(dead_code)] // API for strategy.rs integration (future phase)
+    /// Check if composite has dropped below cancel threshold (used by tests).
+    #[cfg(test)]
     pub fn below_cancel_threshold(&mut self, now_ms: u64) -> bool {
         let (score, _) = self.evaluate(now_ms);
         score < self.cancel_threshold
     }
 
-    /// Get current composite score (for flow monitoring after Leg 1 fill).
-    pub fn current_score(&mut self, now_ms: u64) -> (f64, Option<Direction>) {
-        self.evaluate(now_ms)
-    }
-
     /// Diagnostic counters.
-    #[allow(dead_code)] // API for strategy.rs integration (future phase)
     pub fn diag_signals_emitted(&self) -> u64 {
         self.diag_signals_emitted
     }
-    #[allow(dead_code)] // API for strategy.rs integration (future phase)
     pub fn diag_direction_vetoes(&self) -> u64 {
         self.diag_direction_vetoes
     }
-    #[allow(dead_code)] // API for strategy.rs integration (future phase)
     pub fn diag_causal_vetoes(&self) -> u64 {
         self.diag_causal_vetoes
     }

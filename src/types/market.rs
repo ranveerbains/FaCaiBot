@@ -173,11 +173,11 @@ impl BinanceDepth {
 /// Aggregated trade event from Binance Futures @aggTrade stream.
 #[derive(Debug, Clone)]
 pub struct FuturesAggTrade {
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub price: Decimal,
     pub quantity: Decimal,
     pub is_buyer_maker: bool, // false = taker buy (aggressor bought)
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub timestamp_ms: u64,
 }
 
@@ -185,12 +185,12 @@ pub struct FuturesAggTrade {
 #[derive(Debug, Clone)]
 pub struct FuturesBookTicker {
     pub bid_price: Decimal,
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub bid_qty: Decimal,
     pub ask_price: Decimal,
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub ask_qty: Decimal,
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub timestamp_ms: u64,
 }
 
@@ -198,17 +198,17 @@ pub struct FuturesBookTicker {
 #[derive(Debug, Clone)]
 pub struct FuturesForceOrder {
     pub side: String, // "SELL" (long liquidated) or "BUY" (short liquidated)
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub price: Decimal,
     pub quantity: Decimal,
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub timestamp_ms: u64,
 }
 
 /// Individual trade from Binance Spot SBE @trade stream.
 #[derive(Debug, Clone)]
 pub struct SpotTrade {
-    #[allow(dead_code)] // will be used for diagnostics/logging in future phase
+    #[allow(dead_code)] // constructed by gateway, used for logging/diagnostics
     pub price: Decimal,
     pub quantity: Decimal,
     pub is_buyer_maker: bool,
@@ -475,36 +475,6 @@ pub enum IngestorEvent {
     // ── Binance Spot @trade ─────────────────────────────────────────────
     /// Spot individual trade from SBE @trade (for spot trade flow).
     SpotTrade(SpotTrade),
-
-    // ── Buildup Detection ───────────────────────────────────────────────
-    /// Buildup signal: composite score crossed entry threshold.
-    /// Replaces SpikeConfirmed for Leg 1 entry decisions.
-    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
-    BuildupConfirmed(BuildupInfo),
-
-    /// Buildup score update (below entry threshold but non-zero).
-    /// Used by engine for flow monitoring after Leg 1 fill.
-    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
-    BuildupUpdate {
-        composite_score: Decimal,
-        direction: Direction,
-        timestamp_ms: u64,
-    },
-
-    /// Buildup detector diagnostics (every 60s).
-    #[allow(dead_code)] // will be emitted by futures gateway (future phase)
-    BuildupDiagnostic {
-        composite_score: Decimal,
-        cvd_accel: f64,
-        spot_flow: f64,
-        obi_velocity: f64,
-        basis_delta: f64,
-        liq_pressure: f64,
-        atr_displacement: f64,
-        fresh_count: u32,
-        stale_count: u32,
-        signals_emitted: u64,
-    },
 
     // ── Lifecycle ────────────────────────────────────────────────────────
     /// Emitted when the active 5-min market rotates (anticipatory loading complete).

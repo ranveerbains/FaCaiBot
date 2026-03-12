@@ -149,7 +149,7 @@ impl LiveExecutor {
                 ExecutorCommand::RebalanceLeg1 { signal } => {
                     self.handle_rebalance_leg1(&signal).await;
                 }
-                ExecutorCommand::CancelLeg1Order { order_id, repost: _ } => {
+                ExecutorCommand::CancelLeg1Order { order_id } => {
                     self.handle_cancel_leg1(&order_id).await;
                 }
             }

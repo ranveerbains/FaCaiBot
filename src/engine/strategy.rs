@@ -12,17 +12,18 @@
 //! - Latency target: <2ms from event pull to signal emit.
 //!
 //! # Buildup detection
-//! The BuildupDetector emits `BuildupConfirmed` when composite score crosses entry threshold.
+//! The internal BuildupDetector is fed raw Binance events and evaluated after each dirty tick.
 //! The engine posts a Leg 1 maker order on confirmed buildups only (no speculative posting).
 
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::engine::buildup::detector::{BuildupConfig, BuildupDetector};
 use crate::engine::confidence::round_to_tick;
 use crate::reporting::telegram::TelegramReporter;
 use crate::types::market::{
-    DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState,
+    BuildupInfo, DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState,
     PriceLevel, SpikeInfo, TradeStatus,
 };
 use crate::types::order::{
@@ -281,11 +282,15 @@ pub struct StrategyEngine {
     // ── Sub-evaluators ────────────────────────────────────────────────────
     leg1: Leg1Evaluator,
     leg2: Leg2Evaluator,
+
+    // ── BuildupDetector (internal — fed from raw Binance events) ─────────
+    detector: BuildupDetector,
 }
 
 impl StrategyEngine {
     pub fn new(config: &Config) -> Self {
         let state = MarketState::new();
+        let buildup_cfg = BuildupConfig::from_toml(&config.bot.buildup);
 
         Self {
             state,
@@ -393,6 +398,7 @@ impl StrategyEngine {
                 entry_threshold: Decimal::try_from(config.bot.buildup.entry_threshold).unwrap_or(Decimal::new(40, 2)),
                 cancel_threshold: Decimal::try_from(config.bot.buildup.cancel_threshold).unwrap_or(Decimal::new(25, 2)),
             },
+            detector: BuildupDetector::new(&buildup_cfg),
         }
     }
 
@@ -624,80 +630,29 @@ impl StrategyEngine {
 
             // ── Binance ticker update ─────────────────────────────────────
             IngestorEvent::BinanceTick(tick) => {
-                self.state.binance_price = Some(tick.mid_price());
+                let mid = tick.mid_price();
+                self.state.binance_price = Some(mid);
                 self.state.last_update_ms = tick.timestamp_ms;
+                // Feed BuildupDetector spot BBA
+                let mid_f64 = mid.to_string().parse::<f64>().unwrap_or(0.0);
+                self.detector.on_spot_bba(mid_f64, now_ms);
             }
 
             // ── Binance depth snapshot ────────────────────────────────────
             IngestorEvent::BinanceDepth(depth) => {
                 if let Some(mid) = depth.mid_price() {
                     self.state.binance_price = Some(mid);
+                    // Feed BuildupDetector with spot depth (OBI + ATR + basis spot side)
+                    let mid_f64 = mid.to_string().parse::<f64>().unwrap_or(0.0);
+                    let obi_f64 = depth.obi()
+                        .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+                        .unwrap_or(0.0);
+                    self.detector.on_spot_depth(mid_f64, obi_f64, now_ms);
                 }
                 self.state.last_update_ms = depth.timestamp_ms;
             }
 
-            // ── Buildup confirmed — predictive entry ─────────────────────
-            IngestorEvent::BuildupConfirmed(buildup) => {
-                self.diag_buildups_received += 1;
-                // Drop buildup if within post-rotation quiet period.
-                if self.in_quiet_period {
-                    self.diag_buildups_dropped_quiet += 1;
-                    debug!("buildup ignored — within rotation quiet period");
-                    return;
-                }
-                // Drop buildup if within entry_cutoff window — no new trades allowed.
-                if self.in_cutoff_window {
-                    self.diag_buildups_dropped_cutoff += 1;
-                    debug!("buildup ignored — within cutoff window");
-                    return;
-                }
-
-                self.state.buildup_detected = true;
-                self.state.last_buildup = Some(buildup.clone());
-
-                // ── Whipsaw guard: opposite buildup while Leg 1 is active ──
-                if let Some(leg1_dir) = self.leg1_direction {
-                    if buildup.direction != leg1_dir {
-                        match &self.state.leg1_state {
-                            OrderState::Posted { order_id, .. } => {
-                                self.diag_whipsaw_cancels += 1;
-                                warn!(
-                                    buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
-                                    "whipsaw — cancelling unfilled Leg 1 maker order"
-                                );
-                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                    order_id: order_id.clone(),
-                                    repost: false,
-                                });
-                                self.state.leg1_state = OrderState::None;
-                                self.pending_leg1_signal = None;
-                                self.leg1_direction = None;
-                                self.state.buildup_detected = false;
-                                self.state.last_buildup = None;
-                                self.state.leg1_posted_ask = None;
-                                self.leg1_last_cancel_repost = false;
-                                return; // Skip rest of BuildupConfirmed handling
-                            }
-                            OrderState::Filled { .. } => {
-                                warn!(
-                                    buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
-                                    "whipsaw — Leg 1 filled, triggering emergency exit"
-                                );
-                                self.whipsaw_fok_pending = true;
-                                self.diag_whipsaw_foks += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                info!(
-                    direction = ?buildup.direction,
-                    composite_score = %buildup.composite_score,
-                    buildup_detected_ms = buildup.timestamp_ms,
-                    "buildup CONFIRMED"
-                );
-            }
+            // BuildupConfirmed removed — detector is now internal; see handle_buildup_confirmed()
 
             // ── Market rotation ───────────────────────────────────────────
             IngestorEvent::MarketRotation {
@@ -1165,77 +1120,18 @@ impl StrategyEngine {
                 }
             },
 
-            // ── Futures / Spot / Buildup events ─────────────────────────
-            // These are consumed by the BuildupDetector (in main.rs) before
-            // reaching on_event(), or handled above (BuildupConfirmed).
-            // BuildupUpdate: update flow monitoring state for Leg 2 graduated response.
-            IngestorEvent::BuildupUpdate { composite_score, direction, timestamp_ms } => {
-                self.state.current_composite_score = composite_score;
-                self.state.current_composite_direction = Some(direction);
-                self.state.composite_update_ms = timestamp_ms;
-                // Update hedge flow monitoring if active.
-                if let Some(ref mut hedge) = self.hedge {
-                    hedge.last_flow_score = composite_score;
-                    hedge.last_flow_direction = Some(direction);
-                    hedge.last_flow_update_ms = timestamp_ms;
-                }
-
-                // ── Leg 1 sustain monitoring ──
-                // If Leg 1 is Posted and no cancel is already pending, check:
-                // 1. Ask-drift repost (composite still strong but ask moved)
-                // 2. Composite fade cancel
-                if self.pending_leg1_cancel.is_none() {
-                    if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-                        let order_id = order_id.clone();
-
-                        // 1. Ask-drift repost: ask moved ≥ threshold ticks while composite > cancel_threshold
-                        if self.leg1_repost_tick_threshold > 0
-                            && composite_score > self.leg2.cancel_threshold
-                        {
-                            if let Some(posted_ask) = self.state.leg1_posted_ask {
-                                let current_ask = self.get_current_best_ask();
-                                if let Some(current) = current_ask {
-                                    let drift = current - posted_ask;
-                                    let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
-                                    if drift >= threshold {
-                                        info!(
-                                            %posted_ask, current_ask = %current, %drift,
-                                            "Leg 1 ask drifted — cancelling for repost"
-                                        );
-                                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                            order_id: order_id.clone(),
-                                            repost: true,
-                                        });
-                                        self.leg1_last_cancel_repost = true;
-                                        self.diag_repost_attempts += 1;
-                                    }
-                                }
-                            }
-                        }
-
-                        // 2. Composite fade: composite fell below cancel_threshold → cancel (no repost)
-                        if self.pending_leg1_cancel.is_none() && composite_score < self.leg2.cancel_threshold {
-                            info!(
-                                %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
-                                "Leg 1 sustain — composite faded below cancel threshold"
-                            );
-                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                order_id,
-                                repost: false,
-                            });
-                            self.leg1_last_cancel_repost = false;
-                            self.diag_sustain_cancels += 1;
-                        }
-                    }
-                }
+            // ── Futures / Spot events → feed BuildupDetector ──────────────
+            IngestorEvent::FuturesAggTrade(ref trade) => {
+                self.detector.on_futures_agg_trade(trade, now_ms);
             }
-
-            IngestorEvent::FuturesAggTrade(_)
-            | IngestorEvent::FuturesBookTicker(_)
-            | IngestorEvent::FuturesForceOrder(_)
-            | IngestorEvent::SpotTrade(_)
-            | IngestorEvent::BuildupDiagnostic { .. } => {
-                // Consumed by BuildupDetector in main.rs — no action needed here.
+            IngestorEvent::FuturesBookTicker(ref ticker) => {
+                self.detector.on_futures_book_ticker(ticker, now_ms);
+            }
+            IngestorEvent::FuturesForceOrder(ref order) => {
+                self.detector.on_futures_force_order(order, now_ms);
+            }
+            IngestorEvent::SpotTrade(ref trade) => {
+                self.detector.on_spot_trade(trade, now_ms);
             }
 
             // Control events are handled in main.rs before on_event() is called.
@@ -1243,6 +1139,17 @@ impl StrategyEngine {
             | IngestorEvent::DrainAndRestart
             | IngestorEvent::PauseTrading
             | IngestorEvent::ResumeTrading => {}
+        }
+
+        // ── BuildupDetector: evaluate after feeding ───────────────────
+        if self.detector.is_dirty() {
+            let (score, dir, entry) = self.detector.tick(now_ms);
+            if let Some(buildup) = entry {
+                self.handle_buildup_confirmed(buildup, now_ms);
+            }
+            if let Some(d) = dir {
+                self.handle_flow_update(score, d, now_ms);
+            }
         }
 
         // ── Cutoff window detection (runs on every event) ──────────────
@@ -1294,10 +1201,147 @@ impl StrategyEngine {
                     info!(elapsed_ms = elapsed, "Leg 1 sustain — cancel_window_ms timeout");
                     self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
                         order_id: order_id.clone(),
-                        repost: false,
                     });
                     self.leg1_last_cancel_repost = false;
                     self.diag_sustain_timeouts += 1;
+                }
+            }
+        }
+    }
+
+    // ─── BuildupDetector integration ────────────────────────────────────
+
+    /// Handle a buildup entry signal from the internal BuildupDetector.
+    /// Extracted from the former `IngestorEvent::BuildupConfirmed` match arm.
+    fn handle_buildup_confirmed(&mut self, buildup: BuildupInfo, now_ms: u64) {
+        let _ = now_ms; // available for future use
+        self.diag_buildups_received += 1;
+        // Drop buildup if within post-rotation quiet period.
+        if self.in_quiet_period {
+            self.diag_buildups_dropped_quiet += 1;
+            debug!("buildup ignored — within rotation quiet period");
+            return;
+        }
+        // Drop buildup if within entry_cutoff window — no new trades allowed.
+        if self.in_cutoff_window {
+            self.diag_buildups_dropped_cutoff += 1;
+            debug!("buildup ignored — within cutoff window");
+            return;
+        }
+
+        // Gate: if buildup already active with same direction, skip repeated firing.
+        if self.state.buildup_detected {
+            if let Some(ref last) = self.state.last_buildup {
+                if last.direction == buildup.direction {
+                    return;
+                }
+            }
+        }
+
+        self.state.buildup_detected = true;
+        self.state.last_buildup = Some(buildup.clone());
+
+        // ── Whipsaw guard: opposite buildup while Leg 1 is active ──
+        if let Some(leg1_dir) = self.leg1_direction {
+            if buildup.direction != leg1_dir {
+                match &self.state.leg1_state {
+                    OrderState::Posted { order_id, .. } => {
+                        self.diag_whipsaw_cancels += 1;
+                        warn!(
+                            buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
+                            "whipsaw — cancelling unfilled Leg 1 maker order"
+                        );
+                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                            order_id: order_id.clone(),
+                        });
+                        self.state.leg1_state = OrderState::None;
+                        self.pending_leg1_signal = None;
+                        self.leg1_direction = None;
+                        self.state.buildup_detected = false;
+                        self.state.last_buildup = None;
+                        self.state.leg1_posted_ask = None;
+                        self.leg1_last_cancel_repost = false;
+                        return;
+                    }
+                    OrderState::Filled { .. } => {
+                        warn!(
+                            buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
+                            "whipsaw — Leg 1 filled, triggering emergency exit"
+                        );
+                        self.whipsaw_fok_pending = true;
+                        self.diag_whipsaw_foks += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        info!(
+            direction = ?buildup.direction,
+            composite_score = %buildup.composite_score,
+            buildup_detected_ms = buildup.timestamp_ms,
+            "buildup CONFIRMED"
+        );
+    }
+
+    /// Handle a flow update from the internal BuildupDetector (every dirty tick).
+    /// Updates composite score state and performs Leg 1 sustain monitoring.
+    /// Extracted from the former `IngestorEvent::BuildupUpdate` match arm.
+    fn handle_flow_update(&mut self, score: f64, direction: Direction, now_ms: u64) {
+        let composite_score = Decimal::try_from(score).unwrap_or(Decimal::ZERO);
+        self.state.current_composite_score = composite_score;
+        self.state.current_composite_direction = Some(direction);
+        self.state.composite_update_ms = now_ms;
+        // Update hedge flow monitoring if active.
+        if let Some(ref mut hedge) = self.hedge {
+            hedge.last_flow_score = composite_score;
+            hedge.last_flow_direction = Some(direction);
+            hedge.last_flow_update_ms = now_ms;
+        }
+
+        // ── Leg 1 sustain monitoring ──
+        // If Leg 1 is Posted and no cancel is already pending, check:
+        // 1. Ask-drift repost (composite still strong but ask moved)
+        // 2. Composite fade cancel
+        if self.pending_leg1_cancel.is_none() {
+            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
+                let order_id = order_id.clone();
+
+                // 1. Ask-drift repost: ask moved ≥ threshold ticks while composite > cancel_threshold
+                if self.leg1_repost_tick_threshold > 0
+                    && composite_score > self.leg2.cancel_threshold
+                {
+                    if let Some(posted_ask) = self.state.leg1_posted_ask {
+                        let current_ask = self.get_current_best_ask();
+                        if let Some(current) = current_ask {
+                            let drift = current - posted_ask;
+                            let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
+                            if drift >= threshold {
+                                info!(
+                                    %posted_ask, current_ask = %current, %drift,
+                                    "Leg 1 ask drifted — cancelling for repost"
+                                );
+                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                    order_id: order_id.clone(),
+                                });
+                                self.leg1_last_cancel_repost = true;
+                                self.diag_repost_attempts += 1;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Composite fade: composite fell below cancel_threshold → cancel (no repost)
+                if self.pending_leg1_cancel.is_none() && composite_score < self.leg2.cancel_threshold {
+                    info!(
+                        %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
+                        "Leg 1 sustain — composite faded below cancel threshold"
+                    );
+                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                        order_id,
+                    });
+                    self.leg1_last_cancel_repost = false;
+                    self.diag_sustain_cancels += 1;
                 }
             }
         }
@@ -1649,6 +1693,9 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             repost_attempts = self.diag_repost_attempts,
+            det_signals = self.detector.diag_signals_emitted(),
+            det_dir_veto = self.detector.diag_direction_vetoes(),
+            det_causal_veto = self.detector.diag_causal_vetoes(),
             "engine 60s"
         );
         self.last_diag_ms = now_ms;
@@ -1683,7 +1730,11 @@ impl StrategyEngine {
              Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
-             Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}",
+             Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}\n\
+             \n\
+             <b>BuildupDetector</b>\n\
+             Signals: {det_signals}  Dir vetoes: {det_dir_veto}  Causal vetoes: {det_causal_veto}\n\
+             Composite: {composite_score}",
             mkts = self.diag_markets_rotated,
             buildups = self.diag_buildups_received,
             buildup_fail = self.diag_buildup_failures,
@@ -1725,6 +1776,10 @@ impl StrategyEngine {
             rebal_success = self.diag_rebalance_successes,
             whip_cancel = self.diag_whipsaw_cancels,
             whip_fok = self.diag_whipsaw_foks,
+            det_signals = self.detector.diag_signals_emitted(),
+            det_dir_veto = self.detector.diag_direction_vetoes(),
+            det_causal_veto = self.detector.diag_causal_vetoes(),
+            composite_score = self.state.current_composite_score,
         ));
     }
 
@@ -2645,11 +2700,11 @@ impl StrategyEngine {
     }
 
     /// Advance simulation state: simulate Leg 1 and Leg 2 fills based on
-    /// current orderbook conditions. Called once per engine loop iteration
-    /// in simulation mode only.
+    /// current orderbook conditions. Test-only — not called in live mode.
     ///
     /// Returns confirmed fill signals for the
     /// executor to record directly. Usually 0 or 1 items per call.
+    #[cfg(test)]
     pub fn advance_simulation(&mut self) -> Vec<TradeSignal> {
         let now_ms = now_epoch_ms();
         let mut signals: Vec<TradeSignal> = Vec::new();

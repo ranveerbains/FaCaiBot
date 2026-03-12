@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::market::{BinanceTick, BuildupInfo, OrderBook, PriceLevel, SpikeInfo};
+use crate::types::market::{BinanceTick, BuildupInfo, OrderBook, PriceLevel};
 
 const TEST_FIXED_ALLOC: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
 fn make_engine_with_market(secs_remaining: u64) -> StrategyEngine {

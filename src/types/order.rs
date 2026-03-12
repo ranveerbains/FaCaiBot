@@ -216,10 +216,9 @@ pub enum ExecutorCommand {
     CancelLeg2Order { order_id: String },
     /// Rebalance FOK: buy Leg 1 side after a double-fill race condition.
     RebalanceLeg1 { signal: TradeSignal },
-    /// Cancel unfilled Leg 1 maker order (flow-based sustain failure).
-    /// If `repost: true`, the engine will attempt to re-emit a fresh Leg 1 signal at the new best_ask
-    /// (after cancel confirmation). If `repost: false`, the state is fully reset.
-    CancelLeg1Order { order_id: String, repost: bool },
+    /// Cancel unfilled Leg 1 maker order (flow-based sustain failure or whipsaw).
+    /// Engine tracks repost intent internally via `leg1_last_cancel_repost`.
+    CancelLeg1Order { order_id: String },
     /// Tick size changed mid-market — update SDK cache for both tokens.
     TickSizeChanged {
         yes_token_id: String,
