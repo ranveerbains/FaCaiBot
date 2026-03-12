@@ -97,7 +97,7 @@ const BOOK_DEPTH_ONE_MINUS: Decimal = Decimal::from_parts(9, 0, 0, false, 1);
 /// Implements the full three-stage arbitrage strategy:
 /// 1. **Leg 1**: Detect Binance spike → enter directional position (post-only maker)
 /// 2. **Leg 2**: After Leg 1 fills → hedge with opposite side (post-only maker)
-/// 3. **Emergency**: FOK taker fills when breach, timeout, or whipsaw is detected
+/// 3. **Emergency**: FOK taker fills when breach, timeout, or flow reversal is detected
 ///
 /// Signal evaluation logic (guard checks + signal building) lives in
 /// [`Leg1Evaluator`] and [`Leg2Evaluator`]. This struct owns shared mutable
@@ -132,10 +132,6 @@ pub struct StrategyEngine {
     /// Config: cooldown duration after trade completion.
     trade_cooldown_ms: u64,
 
-    /// `true` when opposite spike detected with Leg 1 filled — next evaluate_leg2()
-    /// emits immediate FOK at best ask, bypassing hedge.
-    whipsaw_fok_pending: bool,
-
     /// Stored Leg 1 signal for building confirmed fill signals in advance_simulation().
     pending_leg1_signal: Option<TradeSignal>,
 
@@ -157,7 +153,7 @@ pub struct StrategyEngine {
     /// Drained by main loop after on_event().
     pending_tick_size_cmd: Option<ExecutorCommand>,
 
-    /// Pending Leg 1 cancel command (flow-based sustain failure or whipsaw).
+    /// Pending Leg 1 cancel command (flow-based sustain failure or timeout).
     /// Drained by main loop via `take_leg1_cancel()`.
     pending_leg1_cancel: Option<ExecutorCommand>,
 
@@ -202,8 +198,6 @@ pub struct StrategyEngine {
     diag_buildups_dropped_quiet: u64,
     diag_buildups_dropped_cooldown: u64,
     diag_emg_phase1_breach: u64,
-    diag_whipsaw_cancels: u64,
-    diag_whipsaw_foks: u64,
     // Leg 1 rejection distribution — only incremented when buildup_detected = true
     diag_rej_busy: u64,    // ActiveTrade: trade already in flight
     diag_rej_no_book: u64,    // NoBook: Polymarket book missing
@@ -308,7 +302,6 @@ impl StrategyEngine {
             in_trade_cooldown: false,
             last_trade_complete_ms: 0,
             trade_cooldown_ms: config.bot.entry_guards.trade_cooldown_ms,
-            whipsaw_fok_pending: false,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
             leg1_repost_tick_threshold: config.bot.buildup.leg1_repost_tick_threshold,
@@ -334,8 +327,6 @@ impl StrategyEngine {
             diag_buildups_dropped_quiet: 0,
             diag_buildups_dropped_cooldown: 0,
             diag_emg_phase1_breach: 0,
-            diag_whipsaw_cancels: 0,
-            diag_whipsaw_foks: 0,
             diag_rej_busy: 0,
             diag_rej_no_book: 0,
             diag_rej_no_binance: 0,
@@ -776,7 +767,6 @@ impl StrategyEngine {
                 self.pending_tick_size_cmd = None;
                 self.pending_leg1_cancel = None;
                 self.leg1_cancel_inflight = false;
-                self.whipsaw_fok_pending = false;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
                 self.prev_leg2_order = None;
@@ -1201,15 +1191,17 @@ impl StrategyEngine {
         // ── Leg 1 sustain timeout (runs on every event) ─────────
         if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
             if let OrderState::Posted { ref order_id, timestamp_ms: post_ms, .. } = self.state.leg1_state {
-                let elapsed = now_ms.saturating_sub(post_ms);
-                if elapsed >= self.cancel_window_ms {
-                    info!(elapsed_ms = elapsed, "Leg 1 sustain — cancel_window_ms timeout");
-                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                        order_id: order_id.clone(),
-                    });
-                    self.leg1_last_cancel_repost = false;
-                    self.leg1_cancel_inflight = true;
-                    self.diag_sustain_timeouts += 1;
+                if !Self::is_provisional_order(order_id) {
+                    let elapsed = now_ms.saturating_sub(post_ms);
+                    if elapsed >= self.cancel_window_ms {
+                        info!(elapsed_ms = elapsed, "Leg 1 sustain — cancel_window_ms timeout");
+                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                            order_id: order_id.clone(),
+                        });
+                        self.leg1_last_cancel_repost = false;
+                        self.leg1_cancel_inflight = true;
+                        self.diag_sustain_timeouts += 1;
+                    }
                 }
             }
         }
@@ -1254,41 +1246,6 @@ impl StrategyEngine {
         self.state.buildup_detected = true;
         self.state.last_buildup = Some(buildup.clone());
 
-        // ── Whipsaw guard: opposite buildup while Leg 1 is active ──
-        if let Some(leg1_dir) = self.leg1_direction {
-            if buildup.direction != leg1_dir {
-                match &self.state.leg1_state {
-                    OrderState::Posted { order_id, .. } => {
-                        self.diag_whipsaw_cancels += 1;
-                        warn!(
-                            buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
-                            "whipsaw — cancelling unfilled Leg 1 maker order"
-                        );
-                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                            order_id: order_id.clone(),
-                        });
-                        self.state.leg1_state = OrderState::None;
-                        self.pending_leg1_signal = None;
-                        self.leg1_direction = None;
-                        self.state.buildup_detected = false;
-                        self.state.last_buildup = None;
-                        self.state.leg1_posted_ask = None;
-                        self.leg1_last_cancel_repost = false;
-                        return;
-                    }
-                    OrderState::Filled { .. } => {
-                        warn!(
-                            buildup_dir = ?buildup.direction, leg1_dir = ?leg1_dir,
-                            "whipsaw — Leg 1 filled, triggering emergency exit"
-                        );
-                        self.whipsaw_fok_pending = true;
-                        self.diag_whipsaw_foks += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
         info!(
             direction = ?buildup.direction,
             composite_score = %buildup.composite_score,
@@ -1316,47 +1273,50 @@ impl StrategyEngine {
         // If Leg 1 is Posted and no cancel is already pending, check:
         // 1. Ask-drift repost (composite still strong but ask moved)
         // 2. Composite fade cancel
+        // Skip if order ID is provisional (real CLOB ID not yet received).
         if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
             if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-                let order_id = order_id.clone();
+                if !Self::is_provisional_order(order_id) {
+                    let order_id = order_id.clone();
 
-                // 1. Ask-drift repost: ask moved ≥ threshold ticks while composite > cancel_threshold
-                if self.leg1_repost_tick_threshold > 0
-                    && composite_score > self.leg2.cancel_threshold
-                {
-                    if let Some(posted_ask) = self.state.leg1_posted_ask {
-                        let current_ask = self.get_current_best_ask();
-                        if let Some(current) = current_ask {
-                            let drift = current - posted_ask;
-                            let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
-                            if drift >= threshold {
-                                info!(
-                                    %posted_ask, current_ask = %current, %drift,
-                                    "Leg 1 ask drifted — cancelling for repost"
-                                );
-                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                    order_id: order_id.clone(),
-                                });
-                                self.leg1_last_cancel_repost = true;
-                                self.leg1_cancel_inflight = true;
-                                self.diag_repost_attempts += 1;
+                    // 1. Ask-drift repost: ask moved ≥ threshold ticks while composite > cancel_threshold
+                    if self.leg1_repost_tick_threshold > 0
+                        && composite_score > self.leg2.cancel_threshold
+                    {
+                        if let Some(posted_ask) = self.state.leg1_posted_ask {
+                            let current_ask = self.get_current_best_ask();
+                            if let Some(current) = current_ask {
+                                let drift = current - posted_ask;
+                                let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
+                                if drift >= threshold {
+                                    info!(
+                                        %posted_ask, current_ask = %current, %drift,
+                                        "Leg 1 ask drifted — cancelling for repost"
+                                    );
+                                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                        order_id: order_id.clone(),
+                                    });
+                                    self.leg1_last_cancel_repost = true;
+                                    self.leg1_cancel_inflight = true;
+                                    self.diag_repost_attempts += 1;
+                                }
                             }
                         }
                     }
-                }
 
-                // 2. Composite fade: composite fell below cancel_threshold → cancel (no repost)
-                if self.pending_leg1_cancel.is_none() && composite_score < self.leg2.cancel_threshold {
-                    info!(
-                        %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
-                        "Leg 1 sustain — composite faded below cancel threshold"
-                    );
-                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                        order_id,
-                    });
-                    self.leg1_last_cancel_repost = false;
-                    self.leg1_cancel_inflight = true;
-                    self.diag_sustain_cancels += 1;
+                    // 2. Composite fade: composite fell below cancel_threshold → cancel (no repost)
+                    if self.pending_leg1_cancel.is_none() && composite_score < self.leg2.cancel_threshold {
+                        info!(
+                            %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
+                            "Leg 1 sustain — composite faded below cancel threshold"
+                        );
+                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                            order_id,
+                        });
+                        self.leg1_last_cancel_repost = false;
+                        self.leg1_cancel_inflight = true;
+                        self.diag_sustain_cancels += 1;
+                    }
                 }
             }
         }
@@ -1454,11 +1414,6 @@ impl StrategyEngine {
         if self.leg2_command_pending {
             return None;
         }
-        // Whipsaw FOK: opposite spike after Leg 1 fill → immediate taker, bypasses hedge.
-        if self.whipsaw_fok_pending {
-            self.whipsaw_fok_pending = false;
-            return self.emit_whipsaw_fok();
-        }
         let now_ms = now_epoch_ms();
 
         // Build borrow-free snapshot of hedge state to pass to evaluator.
@@ -1524,7 +1479,7 @@ impl StrategyEngine {
                 Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
                 Some(ExitReason::FavorableTaker) => self.diag_favorable_exits += 1,
                 Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
-                Some(ExitReason::WhipsawReversal) => {} // counted in buildup handler (diag_whipsaw_foks)
+                Some(ExitReason::WhipsawReversal) => {} // flow reversal FOK — counted via flow monitoring
                 Some(ExitReason::FlowCollapse) => {} // composite flow collapse — counted via flow monitoring
                 None => {}
             }
@@ -1676,8 +1631,6 @@ impl StrategyEngine {
             buildups_quiet = self.diag_buildups_dropped_quiet,
             buildups_cooldown = self.diag_buildups_dropped_cooldown,
             emg_phase1_breach = self.diag_emg_phase1_breach,
-            whipsaw_cancel = self.diag_whipsaw_cancels,
-            whipsaw_fok = self.diag_whipsaw_foks,
             rej_paused = self.diag_rej_paused,
             rej_busy = self.diag_rej_busy,
             rej_no_book = self.diag_rej_no_book,
@@ -1749,7 +1702,6 @@ impl StrategyEngine {
              Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
-             Whipsaw — cancels: {whip_cancel}  FOKs: {whip_fok}\n\
              \n\
              <b>BuildupDetector</b>\n\
              Signals: {det_signals}  Dir vetoes: {det_dir_veto}  Causal vetoes: {det_causal_veto}\n\
@@ -1793,8 +1745,6 @@ impl StrategyEngine {
             double_fills = self.diag_double_fills,
             rebal_attempts = self.diag_rebalance_attempts,
             rebal_success = self.diag_rebalance_successes,
-            whip_cancel = self.diag_whipsaw_cancels,
-            whip_fok = self.diag_whipsaw_foks,
             det_signals = self.detector.diag_signals_emitted(),
             det_dir_veto = self.detector.diag_direction_vetoes(),
             det_causal_veto = self.detector.diag_causal_vetoes(),
@@ -1815,6 +1765,11 @@ impl StrategyEngine {
     }
 
     /// Get the current best ask from the direction-appropriate order book.
+    /// Returns `true` if the order ID is a provisional placeholder (real CLOB ID pending).
+    fn is_provisional_order(order_id: &str) -> bool {
+        order_id.starts_with("sim-leg1-")
+    }
+
     fn get_current_best_ask(&self) -> Option<Decimal> {
         let book = match self.leg1_direction {
             Some(Direction::Up) => self.state.poly_yes_book.as_ref().or(self.state.poly_book.as_ref()),
@@ -1945,6 +1900,9 @@ impl StrategyEngine {
             return;
         }
 
+        // Clone order_id before moving into state (needed for Leg 1 drift check).
+        let order_id_for_drift = if !is_leg2 { Some(order_id.clone()) } else { None };
+
         let leg = if is_leg2 {
             &mut self.state.leg2_state
         } else {
@@ -1956,6 +1914,30 @@ impl StrategyEngine {
             size,
             timestamp_ms: now_ms,
         };
+
+        // Leg 1: immediate drift check — ask may have moved during SDK round-trip (~1.3s).
+        if let Some(oid) = order_id_for_drift {
+            self.state.leg1_posted_ask = Some(price);
+            if self.pending_leg1_cancel.is_none()
+                && !self.leg1_cancel_inflight
+                && self.leg1_repost_tick_threshold > 0
+                && self.state.current_composite_score > self.leg2.cancel_threshold
+            {
+                if let Some(current_ask) = self.get_current_best_ask() {
+                    let drift = current_ask - price;
+                    let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
+                    if drift >= threshold {
+                        info!(%price, %current_ask, %drift,
+                            "Leg 1 posted — immediate drift detected, cancelling for repost");
+                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
+                        self.leg1_last_cancel_repost = true;
+                        self.leg1_cancel_inflight = true;
+                        self.diag_repost_attempts += 1;
+                    }
+                }
+            }
+        }
+
         self.replay_pending_fills(now_ms);
     }
 
@@ -2070,7 +2052,7 @@ impl StrategyEngine {
                         self.state.leg1_posted_ask = None;
                     }
                 } else {
-                    // Non-repost cancel (whipsaw, sustain fade, timeout): full reset already done
+                    // Non-repost cancel (sustain fade, timeout): full reset already done
                     debug!(%order_id, "Leg 1 cancel confirmed");
                     self.state.leg1_posted_ask = None;
                 }
@@ -2519,7 +2501,6 @@ impl StrategyEngine {
         self.pending_leg1_signal = None;
         self.pending_tick_size_cmd = None;
         self.pending_leg1_cancel = None;
-        self.whipsaw_fok_pending = false;
         self.emergency_signal_in_flight = false;
         self.leg2_command_pending = false;
         self.prev_leg2_order = None;
@@ -2621,103 +2602,6 @@ impl StrategyEngine {
         } else {
             warn!("Leg 1 filled but no buildup info — hedge not initialised");
         }
-    }
-
-    /// Emit an immediate FOK signal at best ask to hedge a whipsaw reversal.
-    /// Called from `evaluate_leg2()` when `whipsaw_fok_pending` is set.
-    /// Bypasses hedge entirely — the opposite spike invalidated the thesis.
-    fn emit_whipsaw_fok(&mut self) -> Option<TradeSignal> {
-        let now_ms = now_epoch_ms();
-        let hedge = self.hedge.as_ref()?;
-        let direction = hedge.direction;
-
-        let hedge_book = match direction {
-            Direction::Up => self
-                .state
-                .poly_no_book
-                .as_ref()
-                .or(self.state.poly_book.as_ref()),
-            Direction::Down => self
-                .state
-                .poly_yes_book
-                .as_ref()
-                .or(self.state.poly_book.as_ref()),
-        }?;
-        let best_ask = hedge_book.best_ask()?.price;
-        let tick = self.state.tick_size;
-        let fok_price = round_to_tick(best_ask, tick);
-
-        let leg1_size = match &self.state.leg1_state {
-            OrderState::Filled { size, .. } => *size,
-            _ => return None,
-        };
-
-        let hedge_token_id = match direction {
-            Direction::Up => self.state.active_no_token_id.as_ref()?.clone(),
-            Direction::Down => self.state.active_yes_token_id.as_ref()?.clone(),
-        };
-
-        let signal = make_leg2_signal(
-            &hedge_token_id,
-            self.state.active_condition_id.as_deref().unwrap_or(""),
-            fok_price,
-            leg1_size,
-            self.state.binance_price.unwrap_or(Decimal::ZERO),
-            hedge.expected_pct,
-            hedge.tier,
-            Decimal::ZERO,
-            direction,
-            hedge.spike_info,
-            hedge.leg1_fill_price,
-            now_ms,
-            self.state.market_end_timestamp_ms,
-            tick,
-            self.state.atr.unwrap_or(Decimal::ZERO),
-            false,
-            Some(best_ask),
-            Some(hedge_book.clone()),
-            Some(ExitReason::WhipsawReversal),
-        );
-        // Set up emergency dispatch state (mirrors evaluate_leg2 dispatch)
-        self.live_trade_meta = LiveTradeMeta {
-            leg2_was_taker: true,
-            exit_reason: Some(ExitReason::WhipsawReversal),
-            emergency_maker: false,
-            favorable_taker: false,
-            favorable_maker: false,
-            phase1_breach: false,
-            phase1_dual_fill: false,
-        };
-        if let Some(e) = self.hedge.as_mut() {
-            e.emergency_submitted = true;
-            e.fok_emitted = true;
-            e.exit_reason = Some(ExitReason::WhipsawReversal);
-        }
-        self.emergency_signal_in_flight = true;
-        if self.reporter.is_some() {
-            self.leg2_command_pending = true;
-        }
-        // Save prev leg2 order for cancel-confirm tracking
-        if let OrderState::Posted {
-            ref order_id,
-            price: p,
-            size: s,
-            ..
-        } = self.state.leg2_state
-        {
-            if !order_id.starts_with("sim-") {
-                self.prev_leg2_order = Some((order_id.clone(), p, s));
-            }
-        }
-        self.state.leg2_state = OrderState::Posted {
-            order_id: format!("sim-leg2-emergency-{}", now_ms),
-            price: fok_price,
-            size: leg1_size,
-            timestamp_ms: now_ms,
-        };
-
-        warn!(%fok_price, %leg1_size, "whipsaw FOK emitted — bypassing hedge");
-        Some(signal)
     }
 
     /// Advance simulation state: simulate Leg 1 and Leg 2 fills based on

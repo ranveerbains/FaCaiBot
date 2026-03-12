@@ -97,10 +97,10 @@ This change would align the system fully with academic literature on order flow 
 #### Evaluation pipeline
 
 1. **Normalize**: Compute [0,1] value for each metric (0 if stale beyond freshness window)
-2. **Direction consensus**: Count fresh metrics voting Up vs Down. If >1 metric disagrees with the dominant direction, the signal is **vetoed** (score = 0)
+2. **Direction consensus**: All 4 directional metrics (basis delta, CVD, OBI velocity, spot flow) must agree unanimously. If `minority > 0` (any directional metric disagrees), the signal is **vetoed** (score = 0). ATR displacement and liquidation pressure are not directional metrics and do not participate in the vote
 3. **Causal ordering**: At least 1 **leading** metric (basis delta or CVD) AND 1 **confirming** metric (spot flow or OBI velocity) must be fresh and non-zero. Vetoed otherwise
 4. **Weighted sum**: `composite = sum(weight_i * normalized_i)`
-5. **Entry check**: If `composite >= entry_threshold` (default 0.40), emit `BuildupInfo` with full metric breakdown
+5. **Entry check**: If `composite >= entry_threshold` (default 0.40), emit `BuildupInfo` with full metric breakdown. The `above_threshold` flag is set on the first crossing and cleared when the score drops below threshold. **Direction flips while above threshold also reset `above_threshold`**, allowing a new signal to fire immediately on direction change without requiring the score to dip below threshold first. `last_direction: Option<Direction>` tracks the previous composite direction for this comparison
 
 #### Expected behavior changes with new weights (2026-03-11c)
 
@@ -281,9 +281,11 @@ Both triggers dispatch `CancelLeg1Order { order_id }` to the executor. The cance
 
 Guards:
 - `pending_leg1_cancel.is_none()` -- prevents duplicate cancel dispatch while waiting for CLOB response
-- **Provisional ID guard**: Sustain checks (both timeout and flow fade) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The cancel window and flow fade only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip. The same guard applies to whipsaw cancels of Posted Leg 1 orders.
+- **Provisional ID guard**: Sustain checks (timeout, flow fade, and ask-drift repost) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The cancel window and flow fade only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip.
 
 Diagnostic counters: `diag_sustain_cancels` (flow fade), `diag_sustain_timeouts` (timeout).
+
+**Immediate drift check on order confirmation**: `on_order_posted()` installs the real CLOB order ID and immediately runs a drift check. If the ask has moved ≥ `leg1_repost_tick_threshold` ticks since evaluation time, the order is cancelled for repost right away — without waiting for the next flow update. This catches the case where the ask drifted significantly during the ~1.3s SDK round-trip and the sustain checks were suppressed (provisional ID guard) throughout that window.
 
 ### 5a. Adaptive Leg 1 Repost
 

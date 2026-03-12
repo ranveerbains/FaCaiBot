@@ -2,7 +2,7 @@
 //!
 //! Evaluation pipeline:
 //! 1. Compute normalized [0,1] value for each metric (0 if stale)
-//! 2. Direction consensus: dominant direction from fresh metrics; veto if >1 disagrees
+//! 2. Direction consensus: dominant direction from fresh metrics; veto if any disagrees
 //! 3. Causal ordering: at least 1 leading (CVD, basis) AND 1 confirming (spot flow, OBI)
 //! 4. Weighted sum: composite = sum(weight_i × normalized_i)
 //! 5. Return (composite, direction) or (0, None) if vetoed
@@ -51,10 +51,15 @@ pub struct BuildupDetector {
     /// Tracks whether any feed method has been called since the last `tick()`.
     dirty: bool,
 
-    /// Set when composite crosses above `entry_threshold`; cleared when it drops below.
+    /// Set when composite crosses above `entry_threshold`; cleared when it drops below
+    /// OR when the direction flips while above threshold (new opportunity).
     /// Prevents emitting a new BuildupInfo on every dirty tick while above threshold —
     /// only the first crossing per episode fires (edge-triggered, not level-triggered).
     above_threshold: bool,
+
+    /// Tracks the last confirmed direction for direction-flip detection.
+    /// Reset to `None` when direction is vetoed.
+    last_direction: Option<Direction>,
 
     // Diagnostic counters
     diag_signals_emitted: u64,
@@ -252,6 +257,7 @@ impl BuildupDetector {
             last_obi: 0.0,
             dirty: false,
             above_threshold: false,
+            last_direction: None,
             diag_signals_emitted: 0,
             diag_direction_vetoes: 0,
             diag_causal_vetoes: 0,
@@ -311,6 +317,20 @@ impl BuildupDetector {
     pub fn tick(&mut self, now_ms: u64) -> (f64, Option<Direction>, Option<BuildupInfo>) {
         self.dirty = false;
         let (score, direction) = self.evaluate(now_ms);
+
+        // Direction flip → reset edge-trigger so a new signal can fire immediately.
+        if let Some(dir) = direction {
+            if let Some(last) = self.last_direction
+                && dir != last
+                && self.above_threshold
+            {
+                self.above_threshold = false;
+            }
+            self.last_direction = Some(dir);
+        } else {
+            self.last_direction = None;
+        }
+
         let entry = match direction {
             Some(dir) if score >= self.entry_threshold => {
                 if !self.above_threshold {
@@ -385,8 +405,8 @@ impl BuildupDetector {
             (Direction::Down, up_count)
         };
 
-        // Allow up to 1 directional metric to disagree (majority vote wins).
-        if minority > 1 {
+        // Require all 4 directional metrics to agree (unanimous consensus).
+        if minority > 0 {
             self.diag_direction_vetoes += 1;
             return (0.0, None);
         }

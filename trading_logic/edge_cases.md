@@ -42,11 +42,11 @@ Once `emergency_submitted = true`, the evaluator returns None on subsequent eval
 
 ### Provisional order ID race (live)
 
-**Scenario:** `evaluate()` sets `leg1_state = Posted { order_id: "sim-leg1-{ts}" }` immediately (self-gating). The real CLOB ID arrives later via `ExecutorFeedback::OrderPosted` (~1.3s round-trip). During this window, sustain timeout/flow fade or whipsaw could try to cancel using the provisional ID.
+**Scenario:** `evaluate()` sets `leg1_state = Posted { order_id: "sim-leg1-{ts}" }` immediately (self-gating). The real CLOB ID arrives later via `ExecutorFeedback::OrderPosted` (~1.3s round-trip). During this window, all three sustain cancel triggers (sustain timeout, flow/composite fade, ask-drift repost) could fire and send the placeholder ID to the CLOB cancel endpoint, causing "Invalid orderID" 400 errors — there is no CLOB order under that ID yet.
 
-**Handle:** Sustain checks (timeout, flow fade) and whipsaw cancel are gated by `!order_id.starts_with("sim-leg1-")`. While the order ID is provisional, no cancel commands are dispatched — there is no CLOB order to cancel yet. Once `on_order_posted()` replaces the provisional ID with the real CLOB hex hash and resets `timestamp_ms` to the confirmation time, the cancel window and flow fade checks activate against the real order.
+**Handle:** `is_provisional_order()` helper gates all 3 cancel dispatch points: if `order_id.starts_with("sim-leg1-")`, cancel commands are suppressed entirely. Once `on_order_posted()` arrives (~1.3s later), it replaces the provisional ID with the real CLOB hex hash and resets `timestamp_ms` to the confirmation time, activating all cancel checks against the real order. Additionally, `on_order_posted()` runs an immediate drift check: if the ask has moved ≥ `leg1_repost_tick_threshold` ticks since evaluation time, it cancels for repost right away rather than waiting for the next flow update.
 
-**Safety:** No futile cancel attempts against non-existent CLOB orders. The cancel window starts from when the CLOB confirms the order is resting, not from signal emission time.
+**Safety:** No futile cancel attempts against non-existent CLOB orders. The cancel window starts from CLOB confirmation, not signal emission. Stale orders (ask drifted during the round-trip) are caught immediately on confirmation.
 
 ### Emergency signal stacking (live)
 
@@ -92,6 +92,16 @@ The `ActiveTrade` guard rejects the buildup signal, incrementing `rej_busy`. The
 **Scenario:** Post-only order is rejected because the price would cross the book (e.g., our bid is at or above the current ask).
 
 **Handle:** Executor detects `OrderStatus::Rejected`, sends `OrderFailed`. Engine resets `leg1_state = None` via `on_order_failed()`. The signal is consumed -- next buildup can enter fresh.
+
+### Whipsaw guard removal (dead code)
+
+**Background:** `handle_buildup_confirmed()` previously contained a whipsaw guard block (approx. lines 1257-1290) that was intended to cancel a Posted Leg 1 order and emit a FOK taker in the opposite direction when a new opposite-direction buildup fired during a live order.
+
+**Why it was unreachable:** The early-return guard at the top of `handle_buildup_confirmed()` — `if !matches!(self.state.leg1_state, OrderState::None) { return; }` — exits immediately for any non-None `leg1_state`, including `Posted`. The whipsaw block could never be reached because the function had already returned.
+
+**Removed:** `whipsaw_fok_pending` field, `emit_whipsaw_fok()` function, `diag_whipsaw_cancels` and `diag_whipsaw_foks` diagnostic counters.
+
+**Kept:** `ExitReason::WhipsawReversal` (still used by the evaluator's flow reversal path in `evaluate_leg2()`), `whipsaw_reversal` field on `LiveTradeReport` (used for Telegram and QuestDB tagging of flow-reversal emergency exits).
 
 ### Flow data stale during hedge
 
@@ -269,4 +279,4 @@ The whole value of flow reversal detection is that it exits **before Polymarket 
 
 **Conclusion:** The phase-based multi-phase hedge (Phase 1 profit target, Phase 2 break-even) is the price-based backstop for false reversals. Phase 1 breach and Phase 2 price breach FOK provide a secondary safeguard if the market truly moves against us. Flow reversal is optimized for capturing Binance's lead, and flash crash exits are an acceptable cost of that optimization.
 
-**Diagnostic:** Count flash crash (true) reversals vs false reversals in `diag_whipsaw_foks` and session summaries (cross-reference with later UP trades). Sustained negative sessions suggest the reversal sustain window should be reconsidered.
+**Diagnostic:** Count flash crash (true) reversals vs false reversals in session summaries and `whipsaw_reversal` field on `LiveTradeReport` (cross-reference with later UP trades). Sustained negative sessions suggest the reversal sustain window should be reconsidered.
