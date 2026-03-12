@@ -1384,7 +1384,9 @@ impl StrategyEngine {
                 let price = signal.price;
                 let size = signal.size;
 
+                // Consume the buildup: clear both flags so detector won't re-fire same buildup.
                 self.state.buildup_detected = false;
+                self.state.last_buildup = None;
                 self.state.leg1_state = OrderState::Posted {
                     order_id: format!("sim-leg1-{}", now_ms),
                     price,
@@ -1401,8 +1403,9 @@ impl StrategyEngine {
                 Some(signal)
             }
             Leg1Outcome::Rejected(reason) => {
-                // Spike consumed — record why it was blocked.
+                // Buildup consumed (rejected) — clear both flags.
                 self.state.buildup_detected = false;
+                self.state.last_buildup = None;
                 match reason {
                     Leg1RejectReason::ActiveTrade => self.diag_rej_busy += 1,
                     Leg1RejectReason::NoBook => self.diag_rej_no_book += 1,

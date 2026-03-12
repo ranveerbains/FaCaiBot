@@ -194,22 +194,25 @@ impl LiveExecutor {
         self.active_leg2_phase1_id = None;
         self.active_leg2_phase2_id = None;
 
+        // Round price to tick size (SDK requirement: price decimals <= tick decimals).
+        let rounded_price = crate::engine::confidence::round_to_tick(signal.price, signal.tick_size);
+
         let order = OrderRequest::post_only_gtc(
             signal.token_id.clone(),
             signal.side,
-            signal.price, // evaluator sets price = best_ask (maker posts at ask)
+            rounded_price,
             signal.size,
         );
 
         info!(
             side = ?signal.side,
             token = %signal.token_id,
-            price = %signal.price,
+            price = %rounded_price,
             size = %signal.size,
             expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
             "Leg 1: maker post-only at {}",
-            signal.price,
+            rounded_price,
         );
 
         match self.poly.place_order(&order).await {
