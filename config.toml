@@ -17,7 +17,7 @@ trade_cooldown_ms = 3000
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 9
+max_alloc_per_trade = 10
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
@@ -39,19 +39,19 @@ max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 4000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
-phase2_timeout_ms = 2500
+phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
-favorable_maker_timeout_ms = 2500
+favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.40
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.20
+cancel_threshold = 0.15
 # Max wait (ms) for Leg 1 maker fill before cancelling
 cancel_window_ms = 1500
 # Repost Leg 1 maker if ask moves this many ticks while composite > cancel_threshold (0 = disabled)
