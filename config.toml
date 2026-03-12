@@ -49,9 +49,9 @@ favorable_maker_timeout_ms = 2500
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.40
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.25
+cancel_threshold = 0.20
 # Max wait (ms) for Leg 1 maker fill before cancelling
 cancel_window_ms = 1500
 # Repost Leg 1 maker if ask moves this many ticks while composite > cancel_threshold (0 = disabled)
@@ -80,14 +80,16 @@ freshness_liq_ms = 3000
 freshness_atr_ms = 100
 
 # Normalization: [min_threshold, saturation] for each metric
+# Calibrated for Polymarket 5-min BTC markets where $15-20 directional moves are significant.
+# CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
 cvd_min = 0.0
-cvd_saturation = 1.0
+cvd_saturation = 0.05
 spot_flow_min = 0.0
-spot_flow_saturation = 1.0
+spot_flow_saturation = 0.05
 obi_min = 0.0
-obi_saturation = 0.5
+obi_saturation = 0.2
 basis_min = 0.0
-basis_saturation = 2.0
+basis_saturation = 0.5
 liq_min = 0.0
 liq_saturation = 10.0
 atr_min = 0.0
