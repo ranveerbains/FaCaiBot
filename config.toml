@@ -99,6 +99,6 @@ atr_saturation = 15.0
 # Time-based: consistent smoothing regardless of data arrival rate
 cvd_fast_halflife_ms = 200
 cvd_slow_halflife_ms = 800
-spot_flow_halflife_ms = 350
-obi_velocity_halflife_ms = 350
+spot_flow_halflife_ms = 500
+obi_velocity_halflife_ms = 400
 basis_halflife_ms = 400

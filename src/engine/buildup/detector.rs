@@ -399,14 +399,15 @@ impl BuildupDetector {
             }
         }
 
-        let (dominant, minority) = if up_count >= down_count {
-            (Direction::Up, down_count)
+        // Majority consensus: require at least 3 of 4 directional metrics to agree.
+        // Allow 1 dissenter (3–1), but veto ties (2–2) and weak majorities (< 3 votes).
+        let (dominant, minority, majority) = if up_count >= down_count {
+            (Direction::Up, down_count, up_count)
         } else {
-            (Direction::Down, up_count)
+            (Direction::Down, up_count, down_count)
         };
 
-        // Require all 4 directional metrics to agree (unanimous consensus).
-        if minority > 0 {
+        if majority < 3 || up_count == down_count {
             self.diag_direction_vetoes += 1;
             return (0.0, None);
         }
