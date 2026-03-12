@@ -1699,6 +1699,7 @@ impl StrategyEngine {
             det_signals = self.detector.diag_signals_emitted(),
             det_dir_veto = self.detector.diag_direction_vetoes(),
             det_causal_veto = self.detector.diag_causal_vetoes(),
+            det_composite = %self.state.current_composite_score,
             "engine 60s"
         );
         self.last_diag_ms = now_ms;
