@@ -125,7 +125,7 @@ This change would align the system fully with academic literature on order flow 
 | `entry_threshold` | 0.40 | Composite score must exceed this to trigger Leg 1 entry |
 | `cancel_threshold` | 0.25 | Composite below this cancels unfilled Leg 1 maker (sustain failure) or triggers emergency FOK during hedge |
 
-Config: `[buildup]` section with all weights, thresholds, per-metric alpha/freshness/min/saturation values.
+Config: `[buildup]` section with all weights, thresholds, per-metric halflife/freshness/min/saturation values.
 
 ### 2b. Signal delivery
 

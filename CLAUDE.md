@@ -22,7 +22,7 @@ FaCaiBot is a Polymarket arbitrage bot targeting BTC 5-minute prediction markets
 cargo build                  # Debug build
 cargo build --release        # Release (LTO, single codegen unit)
 cargo run                    # Run the bot
-cargo test                   # All tests (153)
+cargo test                   # All tests (160)
 cargo clippy                 # Lint
 cargo fmt                    # Format
 docker-compose up -d         # Start QuestDB (analytics only)
@@ -66,22 +66,27 @@ src/
 │   ├── evaluator.rs               # Leg1Evaluator + Leg2Evaluator (pure, no state mutation)
 │   ├── confidence.rs              # Repricing model (compute_expected_repricing), round_to_tick()
 │   ├── erosion.rs                 # HedgeState/HedgeSnap/HedgePhase: Leg 2 hedge FSM
+│   ├── tests/                     # Extracted test modules (strategy, evaluator, confidence, erosion)
 │   └── buildup/
 │       ├── detector.rs            # BuildupDetector: composite 6-metric score, direction consensus
-│       └── metrics.rs             # 6 metric trackers (CVD, spot flow, OBI, basis, liq, ATR)
+│       ├── metrics.rs             # 6 metric trackers (CVD, spot flow, OBI, basis, liq, ATR)
+│       └── tests/                 # Extracted test modules (detector, metrics)
 ├── executor/
 │   ├── live.rs                    # LiveExecutor: CLOB order placement, cancel, FOK emergency
-│   └── fill_engine.rs             # Utility: compute_taker_fee, compute_maker_rebate, round_to_tick
+│   ├── fill_engine.rs             # Utility: compute_taker_fee, compute_maker_rebate, round_to_tick
+│   └── tests/                     # Extracted test modules (fill_engine)
 ├── gateway/
 │   ├── binance/
 │   │   ├── ws.rs                  # Spot SBE WS: depth20 + bestBidAsk + @trade
-│   │   └── futures_ws.rs          # Futures JSON WS: @aggTrade, @bookTicker, @forceOrder
+│   │   ├── futures_ws.rs          # Futures JSON WS: @aggTrade, @bookTicker, @forceOrder
+│   │   └── tests/                 # Extracted test modules (ws, futures_ws)
 │   └── polymarket/
 │       ├── rest.rs                # CLOB REST: order placement, cancellation, book query
 │       ├── market_ws.rs           # Public Market WS: book, price, tick events
 │       ├── user_ws.rs             # Authenticated User WS: fill detection (order events)
 │       ├── heartbeat.rs           # POST /heartbeat every 5s (live only)
-│       └── rotation.rs            # Gamma API market discovery + rotation timer
+│       ├── rotation.rs            # Gamma API market discovery + rotation timer
+│       └── tests/                 # Extracted test modules (rest, market_ws, user_ws, rotation)
 ├── reporting/
 │   └── telegram.rs                # Telegram Bot API (fire-and-forget, rate-limited)
 ├── storage/
@@ -90,7 +95,8 @@ src/
 │   ├── listener.rs                # Telegram command listener (getUpdates polling)
 │   ├── handlers.rs                # Command handlers (pure logic)
 │   ├── config_editor.rs           # TOML read/write, param allowlist with ranges
-│   └── wallet.rs                  # /balance, /polybalance, /redeem (Polygon RPC + CTF)
+│   ├── wallet.rs                  # /balance, /polybalance, /redeem (Polygon RPC + CTF)
+│   └── tests/                     # Extracted test modules (config_editor, wallet)
 ├── types/
 │   ├── market.rs                  # IngestorEvent, MarketState, OrderBook, BuildupInfo
 │   ├── order.rs                   # TradeSignal, ExecutorCommand, ExecutorFeedback, OrderRequest
@@ -98,7 +104,8 @@ src/
 └── utils/
     ├── signing.rs                 # build_signer() (hex key → PrivateKeySigner)
     ├── time.rs                    # epoch_ms() — single timestamp source
-    └── tls.rs                     # Shared TLS config + SpawnExecutor
+    ├── tls.rs                     # Shared TLS config + SpawnExecutor
+    └── tests/                     # Extracted test modules (signing)
 ```
 
 ## How to Work
@@ -133,7 +140,7 @@ Before modifying any function or struct, **trace its callers and consumers**:
 After implementing, verify in this order:
 
 1. **`cargo build`** — Catch type errors, missing imports, signature mismatches. Fix all errors before proceeding.
-2. **`cargo test`** — Run the full test suite (153 tests). If tests fail, fix them before touching docs. Tests cover evaluator guards, repricing math, fill engine utilities, buildup normalization, and more.
+2. **`cargo test`** — Run the full test suite (160 tests). If tests fail, fix them before touching docs. Tests cover evaluator guards, repricing math, fill engine utilities, buildup normalization, and more.
 3. **`cargo clippy`** — Fix warnings. Common ones: collapsible if-statements, derivable impls, too many function arguments.
 4. **Manual trace** — For behavioral changes, mentally walk through a complete trade lifecycle (buildup → Leg 1 → hedge → completion) to verify no state leaks or missed transitions. Use `trading_logic/state_machines.md` as reference.
 

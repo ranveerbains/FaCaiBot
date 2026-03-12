@@ -663,9 +663,9 @@ freshness_basis_ms, freshness_liq_ms, freshness_atr_ms
 cvd_min, cvd_saturation, spot_flow_min, spot_flow_saturation,
 obi_min, obi_saturation, basis_min, basis_saturation,
 liq_min, liq_saturation, atr_min, atr_saturation
-# EMA alphas:
-cvd_fast_alpha, cvd_slow_alpha, spot_flow_alpha,
-obi_velocity_alpha, basis_alpha
+# EMA half-lives (ms) — time-based decay, consistent regardless of data cadence:
+cvd_fast_halflife_ms, cvd_slow_halflife_ms, spot_flow_halflife_ms,
+obi_velocity_halflife_ms, basis_halflife_ms
 ```
 
 All have `#[serde(default)]` with production defaults. `Config::test_defaults()` uses `BotConfig::default()` (same defaults as config.toml).
