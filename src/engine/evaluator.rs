@@ -285,8 +285,10 @@ impl Leg1Evaluator {
             },
         };
 
-        // Leg 1 ask price — maker post-only order posted at the ask.
-        let ask_price = best_ask_price;
+        // Leg 1 maker price — one tick below the best ask.
+        // Posting AT the ask crosses the book when resting sells exist there (post-only rejected).
+        // Posting at ask-1-tick places us inside the spread as a resting bid: valid maker order.
+        let ask_price = (best_ask_price - tick).max(tick);
 
         debug!(
             spike_direction = ?direction,
