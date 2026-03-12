@@ -149,6 +149,9 @@ pub struct StrategyEngine {
     cancel_window_ms: u64,
     /// Tracks whether the last Leg 1 cancel was a repost request.
     leg1_last_cancel_repost: bool,
+    /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
+    /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
+    leg1_cancel_inflight: bool,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -311,6 +314,7 @@ impl StrategyEngine {
             leg1_repost_tick_threshold: config.bot.buildup.leg1_repost_tick_threshold,
             cancel_window_ms: config.bot.buildup.cancel_window_ms,
             leg1_last_cancel_repost: false,
+            leg1_cancel_inflight: false,
             pending_tick_size_cmd: None,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
@@ -771,6 +775,7 @@ impl StrategyEngine {
                 self.pending_leg1_signal = None;
                 self.pending_tick_size_cmd = None;
                 self.pending_leg1_cancel = None;
+                self.leg1_cancel_inflight = false;
                 self.whipsaw_fok_pending = false;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
@@ -1194,7 +1199,7 @@ impl StrategyEngine {
         }
 
         // ── Leg 1 sustain timeout (runs on every event) ─────────
-        if self.pending_leg1_cancel.is_none() {
+        if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
             if let OrderState::Posted { ref order_id, timestamp_ms: post_ms, .. } = self.state.leg1_state {
                 let elapsed = now_ms.saturating_sub(post_ms);
                 if elapsed >= self.cancel_window_ms {
@@ -1203,6 +1208,7 @@ impl StrategyEngine {
                         order_id: order_id.clone(),
                     });
                     self.leg1_last_cancel_repost = false;
+                    self.leg1_cancel_inflight = true;
                     self.diag_sustain_timeouts += 1;
                 }
             }
@@ -1226,6 +1232,13 @@ impl StrategyEngine {
         if self.in_cutoff_window {
             self.diag_buildups_dropped_cutoff += 1;
             debug!("buildup ignored — within cutoff window");
+            return;
+        }
+
+        // Don't process new buildups if an order is already active. Without this guard,
+        // evaluate() clears buildup_detected on ActiveTrade rejection, causing the next
+        // feed event to re-trigger this function in an infinite loop.
+        if !matches!(self.state.leg1_state, OrderState::None) {
             return;
         }
 
@@ -1303,7 +1316,7 @@ impl StrategyEngine {
         // If Leg 1 is Posted and no cancel is already pending, check:
         // 1. Ask-drift repost (composite still strong but ask moved)
         // 2. Composite fade cancel
-        if self.pending_leg1_cancel.is_none() {
+        if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
             if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
                 let order_id = order_id.clone();
 
@@ -1325,6 +1338,7 @@ impl StrategyEngine {
                                     order_id: order_id.clone(),
                                 });
                                 self.leg1_last_cancel_repost = true;
+                                self.leg1_cancel_inflight = true;
                                 self.diag_repost_attempts += 1;
                             }
                         }
@@ -1341,6 +1355,7 @@ impl StrategyEngine {
                         order_id,
                     });
                     self.leg1_last_cancel_repost = false;
+                    self.leg1_cancel_inflight = true;
                     self.diag_sustain_cancels += 1;
                 }
             }
@@ -2032,6 +2047,7 @@ impl StrategyEngine {
             }
         } else {
             // Leg 1 cancel result
+            self.leg1_cancel_inflight = false;
             if was_cancelled {
                 if self.leg1_last_cancel_repost {
                     // Repost path: partial reset, re-arm evaluation if composite still alive
@@ -2061,6 +2077,7 @@ impl StrategyEngine {
             } else {
                 // NOT cancelled — order may have filled before cancel reached CLOB.
                 // Keep Posted state; User WS MATCHED will resolve it.
+                // leg1_cancel_inflight cleared above — will NOT retry (order is gone from CLOB).
                 debug!(%order_id, "Leg 1 cancel NOT confirmed — waiting for User WS resolution");
                 self.leg1_last_cancel_repost = false;
             }
@@ -3388,6 +3405,7 @@ impl StrategyEngine {
         self.state.last_buildup = None;
         self.state.leg1_posted_ask = None;
         self.leg1_last_cancel_repost = false;
+        self.leg1_cancel_inflight = false;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).
