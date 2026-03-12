@@ -347,10 +347,12 @@ impl BuildupDetector {
             (self.w_atr, self.atr_displacement.normalized(now_ms), self.atr_displacement.direction()),
         ];
 
-        // 2. Direction consensus.
+        // 2. Direction consensus from directional metrics only (indices 0-3: CVD, spot_flow, OBI, basis).
+        // Liq and ATR are non-directional — they confirm activity, not direction.
         let mut up_count = 0u32;
         let mut down_count = 0u32;
-        for &(_, norm, dir) in &metrics {
+        for i in 0..4 {
+            let (_, norm, dir) = metrics[i];
             if norm > 0.0 {
                 match dir {
                     Some(Direction::Up) => up_count += 1,
@@ -366,7 +368,7 @@ impl BuildupDetector {
             (Direction::Down, up_count)
         };
 
-        // If >1 metric disagrees with dominant → veto.
+        // Allow up to 1 directional metric to disagree (majority vote wins).
         if minority > 1 {
             self.diag_direction_vetoes += 1;
             return (0.0, None);
@@ -383,7 +385,7 @@ impl BuildupDetector {
             return (0.0, None);
         }
 
-        // 4. Weighted sum.
+        // 4. Weighted sum (entry_threshold check happens downstream).
         let composite: f64 = metrics.iter().map(|(w, n, _)| w * n).sum();
 
         (composite, Some(dominant))

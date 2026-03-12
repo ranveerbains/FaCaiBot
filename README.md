@@ -20,7 +20,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [trading_logic
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-54-76-238-203.eu-west-1.compute.amazonaws.com
+ec2-user@ec2-176-34-67-27.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
  ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-54-76-238-203.eu-west-1.compute.amazonaws.com
