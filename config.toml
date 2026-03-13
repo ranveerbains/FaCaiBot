@@ -23,7 +23,7 @@ max_alloc_per_trade = 15
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
 reprice_scale = 0.055
 # Minimum model output to enter a trade (0.02 = 2.0%)
-min_reprice_pct = 0.018
+min_reprice_pct = 0.02
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
 phase1_target_dampen = 1
 # Minimum OBI alignment (0.2 = reject if Binance book contradicts spike direction)
@@ -49,7 +49,7 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.25
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
@@ -91,7 +91,7 @@ freshness_atr_ms = 120
 cvd_min = 0.0
 cvd_saturation = 0.6
 spot_flow_min = 0.0
-spot_flow_saturation = 0.3
+spot_flow_saturation = 5
 obi_min = 0.0
 obi_saturation = 0.2
 basis_min = 0.0

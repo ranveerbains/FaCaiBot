@@ -103,17 +103,16 @@ Each metric is independently normalized to [0, 1] using per-metric `(min_thresho
 | **Basis delta** | 0.0 bps | 0.05 bps/update | Binance futures ticks rapidly; 50ms update cadence. First-order micro-price movement. |
 | **CVD acceleration** | 0.0 | 0.60 BTC/update | EMA of aggressive volume differential. Calibrated empirically to achieve ~38% avg normalized contribution across quiet+active markets. |
 | **OBI velocity** | 0.0 | 0.2 OBI-delta/update | Rate of change of order book imbalance. Typical depth shifts 0.1-0.2 per update at entry latency. |
-| **Spot trade flow** | 0.0 | **0.3 BTC/update** | EMA of net aggressive buy/sell volume. **Recalibrated 2026-03-13** from 0.05 → 0.3 (6× increase): SpotFlow parser bug fixed, old saturation was under-calibrated, causing 97% ceiling hits and spurious entries in quiet markets. Target avg_norm ~0.16 vs CVD ~0.38. |
+| **Spot trade flow** | 0.0 | **0.6 BTC/update** | EMA of net aggressive buy/sell volume. **Recalibrated 2026-03-13**: SpotFlow parser bug fixed. Initial 0.05 → 0.3 attempt insufficient (avg_norm 0.942, 94% ceiling hits). Raised to 0.6 (matching CVD's saturation) after live test. Expected avg_norm ~0.47 post-adjustment. |
 | **Liquidation pressure** | 0.0 | 10.0 BTC | Exponentially-decaying forced liquidation volume. Rare signal; 10.0 BTC threshold is conservative (typical spike ~1-5 BTC). |
 | **ATR displacement** | 0.0 | 15.0 std-devs | Volatility gauge only; ATR predicts magnitude, not direction. High threshold (15x ATR) prevents false entries from volatility alone. |
 
 **Normalization formula:** `normalized = min(raw_value / saturation, 1.0)`
 
-The 0.05 → 0.3 SpotFlow adjustment was motivated by:
-1. SpotFlow's order-of-magnitude matches CVD (both BTC-denominated EMAs of trade flow)
-2. CVD's calibration achieved 0.381 avg normalized via saturation=0.6
-3. 0.3 ≈ saturation / 2 (CVD's value), providing a gentler saturation curve for SpotFlow
-4. Expected composite avg post-adjustment: ~0.29 (was 0.41), filtering quiet-market noise while preserving real buildups
+Live calibration process (2026-03-13):
+1. **Initial attempt (0.05 → 0.3)**: Empirical estimate of raw SpotFlow (~0.048 BTC) was ~6× too low. Live test showed avg_norm=0.942 (94% ceiling hits), revealing raw values ~0.283 BTC/update.
+2. **Second adjustment (0.3 → 0.6)**: Doubled saturation to match CVD's proven calibration (CVD saturation=0.6 → avg_norm=0.421). Expected post-adjustment: avg_norm ~0.47, reducing ceiling hits to ~15-20%.
+3. **Rationale**: SpotFlow and CVD are both BTC-denominated EMAs of trade flow. CVD's saturation calibration is well-validated. Matching saturation values aligns them to similar normalized scales.
 
 #### Evaluation pipeline
 
