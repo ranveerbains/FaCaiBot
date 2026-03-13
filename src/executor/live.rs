@@ -29,11 +29,12 @@ use crate::types::order::{
 use super::fill_engine::round_to_tick;
 
 /// Adjusts `size` so that `price * size` has at most 2 decimal places
-/// and `price * size >= $1.00` (CLOB minimum notional for FOK orders).
+/// (CLOB maker amount constraint) and `price * size >= $1.00` (minimum notional).
 ///
-/// If the original size produces a notional below $1.00, the size is
-/// increased to meet the minimum. An overshoot of 1-2 extra shares is
-/// acceptable for emergency hedges.
+/// The CLOB rejects any FOK/FAK order where `price × size` has more than 2dp.
+/// This function searches DOWNWARD from the input size to find the largest valid
+/// size, minimising under-hedging. Falls back to an upward search from the
+/// minimum notional size if no valid size exists at or below the input.
 fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
     let tick = Decimal::new(1, 2); // 0.01
 
@@ -41,20 +42,36 @@ fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
         return Decimal::ZERO;
     }
 
+    // Floor input to 2dp (CLOB taker amount max 4dp; we use 2dp for cleanliness).
     let truncated = (size / tick).floor() * tick;
 
-    // If notional is already >= $1, the CLOB accepts the exact truncated size.
-    // The price×size ≤2dp search is only needed for tiny notionals.
-    if price * truncated >= Decimal::ONE {
+    // Fast path: if truncated already satisfies both constraints, return it.
+    let n = price * truncated;
+    if n == n.round_dp(2) && n >= Decimal::ONE {
         return truncated;
     }
 
-    // Small notional: search upward from minimum size for $1.00 notional.
+    // Downward search: find the largest s ≤ truncated where price×s has ≤2dp
+    // and price×s ≥ $1.00. Prefer under-hedging over over-hedging.
+    let mut s = if truncated >= tick { truncated - tick } else { Decimal::ZERO };
+    while s > Decimal::ZERO {
+        let n = price * s;
+        if n < Decimal::ONE {
+            break; // further down only reduces notional
+        }
+        if n == n.round_dp(2) {
+            return s;
+        }
+        s -= tick;
+    }
+
+    // Upward fallback: smallest s ≥ min_size where price×s has ≤2dp.
     let min_size = (Decimal::ONE / price).ceil();
     let mut s = min_size;
     let cap = min_size + Decimal::new(100, 0);
     while s <= cap {
-        if price * s == (price * s).round_dp(2) {
+        let n = price * s;
+        if n == n.round_dp(2) {
             return s;
         }
         s += tick;
@@ -766,6 +783,8 @@ impl LiveExecutor {
                     let err_msg = e.to_string();
 
                     if err_msg.contains("decimal places")
+                        || err_msg.contains("decimals")
+                        || err_msg.contains("invalid amounts")
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
                         || err_msg.contains("allowance")
@@ -980,6 +999,8 @@ impl LiveExecutor {
                 Err(e) => {
                     let err_msg = e.to_string();
                     if err_msg.contains("decimal places")
+                        || err_msg.contains("decimals")
+                        || err_msg.contains("invalid amounts")
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
                         || err_msg.contains("allowance")

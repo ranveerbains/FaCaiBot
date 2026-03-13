@@ -249,3 +249,48 @@ fn test_handle_sbe_message_stale_dropped() {
 
     assert!(rx.try_recv().is_err(), "stale event should be dropped");
 }
+
+// ── SBE trade parsing ───────────────────────────────────────
+
+#[test]
+fn test_parse_sbe_trade_happy_path() {
+    // Build a 59-byte SBE root block:
+    // [0..8]   eventTime (ignored)
+    // [8..16]  tradeId (ignored)
+    // [16]     priceExponent = -2
+    // [17]     qtyExponent = -4
+    // [18..26] price mantissa = 9_000_000 → $90,000.00
+    // [26..34] qty mantissa = 5_000 → 0.5 BTC
+    // [34..42] buyerOrderId (ignored)
+    // [42..50] sellerOrderId (ignored)
+    // [50..58] tradeTime = 1_700_000_000_000_000 µs → timestamp_ms = 1_700_000_000_000
+    // [58]     isBuyerMaker = 1
+
+    let mut body = [0u8; 59];
+    body[16] = (-2_i8) as u8;
+    body[17] = (-4_i8) as u8;
+    body[18..26].copy_from_slice(&9_000_000_i64.to_le_bytes());
+    body[26..34].copy_from_slice(&5_000_i64.to_le_bytes());
+    body[50..58].copy_from_slice(&1_700_000_000_000_000_i64.to_le_bytes());
+    body[58] = 1;
+
+    let trade = parse_sbe_trade(&body, 59).expect("should parse valid 59-byte frame");
+    assert_eq!(trade.timestamp_ms, 1_700_000_000_000);
+    assert!(trade.is_buyer_maker);
+    // Price: 9_000_000 × 10^-2 = 90_000.00
+    assert_eq!(trade.price, Decimal::new(9_000_000, 2));
+    // Qty: 5_000 × 10^-4 = 0.5
+    assert_eq!(trade.quantity, Decimal::new(5_000, 4));
+}
+
+#[test]
+fn test_parse_sbe_trade_block_length_too_short() {
+    let body = [0u8; 59];
+    assert!(parse_sbe_trade(&body, 58).is_err()); // block_length < 59
+}
+
+#[test]
+fn test_parse_sbe_trade_body_shorter_than_block_length() {
+    let body = [0u8; 30]; // body shorter than declared block_length
+    assert!(parse_sbe_trade(&body, 59).is_err());
+}

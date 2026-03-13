@@ -376,9 +376,9 @@ SELECT
     round(avg(cvd_norm), 3) AS avg_val,
     sum(CASE WHEN cvd_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN cvd_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN cvd_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN cvd_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN cvd_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN cvd_norm >= 0.0 AND cvd_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN cvd_norm >= 0.3 AND cvd_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN cvd_norm >= 0.7 AND cvd_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -390,9 +390,9 @@ SELECT
     round(avg(basis_norm), 3) AS avg_val,
     sum(CASE WHEN basis_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN basis_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN basis_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN basis_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN basis_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN basis_norm >= 0.0 AND basis_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN basis_norm >= 0.3 AND basis_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN basis_norm >= 0.7 AND basis_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -404,9 +404,9 @@ SELECT
     round(avg(spot_flow_norm), 3) AS avg_val,
     sum(CASE WHEN spot_flow_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN spot_flow_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN spot_flow_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN spot_flow_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN spot_flow_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN spot_flow_norm >= 0.0 AND spot_flow_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN spot_flow_norm >= 0.3 AND spot_flow_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN spot_flow_norm >= 0.7 AND spot_flow_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -418,9 +418,9 @@ SELECT
     round(avg(obi_norm), 3) AS avg_val,
     sum(CASE WHEN obi_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN obi_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN obi_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN obi_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN obi_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN obi_norm >= 0.0 AND obi_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN obi_norm >= 0.3 AND obi_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN obi_norm >= 0.7 AND obi_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -432,9 +432,9 @@ SELECT
     round(avg(liq_norm), 3) AS avg_val,
     sum(CASE WHEN liq_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN liq_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN liq_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN liq_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN liq_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN liq_norm >= 0.0 AND liq_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN liq_norm >= 0.3 AND liq_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN liq_norm >= 0.7 AND liq_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -446,9 +446,9 @@ SELECT
     round(avg(atr_norm), 3) AS avg_val,
     sum(CASE WHEN atr_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN atr_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN atr_norm BETWEEN 0.0 AND 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN atr_norm BETWEEN 0.3 AND 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN atr_norm BETWEEN 0.7 AND 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN atr_norm >= 0.0 AND atr_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN atr_norm >= 0.3 AND atr_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN atr_norm >= 0.7 AND atr_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now());
 

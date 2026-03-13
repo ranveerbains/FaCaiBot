@@ -277,12 +277,17 @@ fn handle_sbe_message(
             }
         }
         SBE_TEMPLATE_TRADE => {
-            if let Ok(trade) = parse_sbe_trade(body, block_length) {
-                if !is_stale(trade.timestamp_ms, now_ms, stale_threshold_ms) {
-                    if tx.try_send(IngestorEvent::SpotTrade(trade)).is_err() {
-                        // High frequency — don't warn on every drop.
-                        debug!("ingestor channel full — SpotTrade dropped");
+            match parse_sbe_trade(body, block_length) {
+                Ok(trade) => {
+                    if !is_stale(trade.timestamp_ms, now_ms, stale_threshold_ms) {
+                        if tx.try_send(IngestorEvent::SpotTrade(trade)).is_err() {
+                            // High frequency — don't warn on every drop.
+                            debug!("ingestor channel full — SpotTrade dropped");
+                        }
                     }
+                }
+                Err(e) => {
+                    warn!(error = %e, block_length, "SBE trade parse failed — SpotFlow dead");
                 }
             }
         }

@@ -49,7 +49,7 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.35
+entry_threshold = 0.25
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
@@ -89,13 +89,13 @@ freshness_atr_ms = 120
 # Higher min_thresholds filter out noise—metrics must show REAL precursor magnitude to count.
 # CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
 cvd_min = 0.0
-cvd_saturation = 0.05
+cvd_saturation = 0.25
 spot_flow_min = 0.0
 spot_flow_saturation = 0.05
 obi_min = 0.0
 obi_saturation = 0.2
 basis_min = 0.0
-basis_saturation = 0.5
+basis_saturation = 0.05
 liq_min = 0.0
 liq_saturation = 10.0
 atr_min = 0.0
