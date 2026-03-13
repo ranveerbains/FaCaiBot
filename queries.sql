@@ -364,9 +364,10 @@ ORDER BY spike_bucket;
 -- to tune config.toml saturation and freshness gates.
 
 -- ============================================================
--- 21. Metric normalization distribution (recent signals)
+-- 21. Metric normalization distribution (past 30 min)
 -- Shows if metrics are saturating at 1.0 or stuck at 0.0
 -- Tune: saturation (if all 1.0) or min_threshold (if all 0.0)
+-- Ranges: 0.0-0.25 (weak), 0.25-0.5 (medium), 0.5-0.75 (strong), 0.75-1.0 (peak)
 -- ============================================================
 SELECT
     'CVD' AS metric,
@@ -376,9 +377,10 @@ SELECT
     round(avg(cvd_norm), 3) AS avg_val,
     sum(CASE WHEN cvd_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN cvd_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN cvd_norm >= 0.0 AND cvd_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN cvd_norm >= 0.3 AND cvd_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN cvd_norm >= 0.7 AND cvd_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN cvd_norm > 0.0 AND cvd_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN cvd_norm >= 0.25 AND cvd_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN cvd_norm >= 0.5 AND cvd_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN cvd_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -390,9 +392,10 @@ SELECT
     round(avg(basis_norm), 3) AS avg_val,
     sum(CASE WHEN basis_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN basis_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN basis_norm >= 0.0 AND basis_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN basis_norm >= 0.3 AND basis_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN basis_norm >= 0.7 AND basis_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN basis_norm > 0.0 AND basis_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN basis_norm >= 0.25 AND basis_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN basis_norm >= 0.5 AND basis_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN basis_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -404,9 +407,10 @@ SELECT
     round(avg(spot_flow_norm), 3) AS avg_val,
     sum(CASE WHEN spot_flow_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN spot_flow_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN spot_flow_norm >= 0.0 AND spot_flow_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN spot_flow_norm >= 0.3 AND spot_flow_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN spot_flow_norm >= 0.7 AND spot_flow_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN spot_flow_norm > 0.0 AND spot_flow_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN spot_flow_norm >= 0.25 AND spot_flow_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN spot_flow_norm >= 0.5 AND spot_flow_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN spot_flow_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -418,9 +422,10 @@ SELECT
     round(avg(obi_norm), 3) AS avg_val,
     sum(CASE WHEN obi_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN obi_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN obi_norm >= 0.0 AND obi_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN obi_norm >= 0.3 AND obi_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN obi_norm >= 0.7 AND obi_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN obi_norm > 0.0 AND obi_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN obi_norm >= 0.25 AND obi_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN obi_norm >= 0.5 AND obi_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN obi_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -432,9 +437,10 @@ SELECT
     round(avg(liq_norm), 3) AS avg_val,
     sum(CASE WHEN liq_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN liq_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN liq_norm >= 0.0 AND liq_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN liq_norm >= 0.3 AND liq_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN liq_norm >= 0.7 AND liq_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN liq_norm > 0.0 AND liq_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN liq_norm >= 0.25 AND liq_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN liq_norm >= 0.5 AND liq_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN liq_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now())
 UNION ALL
@@ -446,23 +452,25 @@ SELECT
     round(avg(atr_norm), 3) AS avg_val,
     sum(CASE WHEN atr_norm = 0.0 THEN 1 ELSE 0 END) AS count_zero,
     sum(CASE WHEN atr_norm = 1.0 THEN 1 ELSE 0 END) AS count_max,
-    sum(CASE WHEN atr_norm >= 0.0 AND atr_norm <= 0.3 THEN 1 ELSE 0 END) AS count_weak,
-    sum(CASE WHEN atr_norm >= 0.3 AND atr_norm <= 0.7 THEN 1 ELSE 0 END) AS count_medium,
-    sum(CASE WHEN atr_norm >= 0.7 AND atr_norm <= 1.0 THEN 1 ELSE 0 END) AS count_strong
+    sum(CASE WHEN atr_norm > 0.0 AND atr_norm < 0.25 THEN 1 ELSE 0 END) AS count_weak,
+    sum(CASE WHEN atr_norm >= 0.25 AND atr_norm < 0.5 THEN 1 ELSE 0 END) AS count_medium,
+    sum(CASE WHEN atr_norm >= 0.5 AND atr_norm < 0.75 THEN 1 ELSE 0 END) AS count_strong,
+    sum(CASE WHEN atr_norm >= 0.75 THEN 1 ELSE 0 END) AS count_peak
 FROM trade_signals
 WHERE timestamp > dateadd('m', -30, now());
 
 -- ============================================================
--- 22. Metric freshness distribution (recent signals)
+-- 22. Metric freshness distribution (past 30 min)
 -- Shows age of metrics at signal time (ms since last update)
 -- If age > freshness_X_ms, metric was stale — increase gate
+-- Excludes never-initialized outliers (age > 100s) from min/max/avg
 -- ============================================================
 SELECT
     'CVD' AS metric,
     count(*) AS total_signals,
-    round(min(cvd_age_ms), 0) AS min_age_ms,
-    round(max(cvd_age_ms), 0) AS max_age_ms,
-    round(avg(cvd_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN cvd_age_ms < 100000 THEN cvd_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN cvd_age_ms < 100000 THEN cvd_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN cvd_age_ms < 100000 THEN cvd_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN cvd_age_ms > 150 THEN 1 ELSE 0 END) AS stale_count,
     '150' AS freshness_gate_ms
 FROM trade_signals
@@ -471,9 +479,9 @@ UNION ALL
 SELECT
     'Basis' AS metric,
     count(*) AS total_signals,
-    round(min(basis_age_ms), 0) AS min_age_ms,
-    round(max(basis_age_ms), 0) AS max_age_ms,
-    round(avg(basis_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN basis_age_ms < 100000 THEN basis_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN basis_age_ms < 100000 THEN basis_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN basis_age_ms < 100000 THEN basis_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN basis_age_ms > 150 THEN 1 ELSE 0 END) AS stale_count,
     '150' AS freshness_gate_ms
 FROM trade_signals
@@ -482,9 +490,9 @@ UNION ALL
 SELECT
     'SpotFlow' AS metric,
     count(*) AS total_signals,
-    round(min(spot_flow_age_ms), 0) AS min_age_ms,
-    round(max(spot_flow_age_ms), 0) AS max_age_ms,
-    round(avg(spot_flow_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN spot_flow_age_ms < 100000 THEN spot_flow_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN spot_flow_age_ms < 100000 THEN spot_flow_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN spot_flow_age_ms < 100000 THEN spot_flow_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN spot_flow_age_ms > 150 THEN 1 ELSE 0 END) AS stale_count,
     '150' AS freshness_gate_ms
 FROM trade_signals
@@ -493,9 +501,9 @@ UNION ALL
 SELECT
     'OBI' AS metric,
     count(*) AS total_signals,
-    round(min(obi_age_ms), 0) AS min_age_ms,
-    round(max(obi_age_ms), 0) AS max_age_ms,
-    round(avg(obi_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN obi_age_ms < 100000 THEN obi_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN obi_age_ms < 100000 THEN obi_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN obi_age_ms < 100000 THEN obi_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN obi_age_ms > 120 THEN 1 ELSE 0 END) AS stale_count,
     '120' AS freshness_gate_ms
 FROM trade_signals
@@ -504,9 +512,9 @@ UNION ALL
 SELECT
     'Liq' AS metric,
     count(*) AS total_signals,
-    round(min(liq_age_ms), 0) AS min_age_ms,
-    round(max(liq_age_ms), 0) AS max_age_ms,
-    round(avg(liq_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN liq_age_ms < 100000 THEN liq_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN liq_age_ms < 100000 THEN liq_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN liq_age_ms < 100000 THEN liq_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN liq_age_ms > 2500 THEN 1 ELSE 0 END) AS stale_count,
     '2500' AS freshness_gate_ms
 FROM trade_signals
@@ -515,9 +523,9 @@ UNION ALL
 SELECT
     'ATR' AS metric,
     count(*) AS total_signals,
-    round(min(atr_age_ms), 0) AS min_age_ms,
-    round(max(atr_age_ms), 0) AS max_age_ms,
-    round(avg(atr_age_ms), 0) AS avg_age_ms,
+    round(min(CASE WHEN atr_age_ms < 100000 THEN atr_age_ms ELSE NULL END), 0) AS min_age_ms,
+    round(max(CASE WHEN atr_age_ms < 100000 THEN atr_age_ms ELSE NULL END), 0) AS max_age_ms,
+    round(avg(CASE WHEN atr_age_ms < 100000 THEN atr_age_ms ELSE NULL END), 0) AS avg_age_ms,
     sum(CASE WHEN atr_age_ms > 120 THEN 1 ELSE 0 END) AS stale_count,
     '120' AS freshness_gate_ms
 FROM trade_signals
