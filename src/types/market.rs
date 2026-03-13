@@ -245,6 +245,20 @@ pub struct BuildupInfo {
     pub obi: Decimal,
     /// Epoch ms when buildup threshold was crossed.
     pub timestamp_ms: u64,
+    /// Normalized metric values [0.0, 1.0] at detection time (for tuning diagnostics).
+    pub cvd_norm: f64,
+    pub basis_norm: f64,
+    pub spot_flow_norm: f64,
+    pub obi_norm: f64,
+    pub liq_norm: f64,
+    pub atr_norm: f64,
+    /// Metric freshness: age in ms since last update at detection time (for freshness gate tuning).
+    pub cvd_age_ms: u64,
+    pub basis_age_ms: u64,
+    pub spot_flow_age_ms: u64,
+    pub obi_age_ms: u64,
+    pub liq_age_ms: u64,
+    pub atr_age_ms: u64,
 }
 
 // ─── Spike Info ──────────────────────────────────────────────────────────────

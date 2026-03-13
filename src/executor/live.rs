@@ -36,22 +36,25 @@ use super::fill_engine::round_to_tick;
 /// acceptable for emergency hedges.
 fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
     let tick = Decimal::new(1, 2); // 0.01
-    let one_dollar = Decimal::ONE;
 
-    // Start from max(truncated size, minimum size for $1.00 notional).
-    let truncated = (size / tick).floor() * tick;
-    let min_size = if price.is_zero() {
+    if price.is_zero() {
         return Decimal::ZERO;
-    } else {
-        (one_dollar / price).ceil()
-    };
-    let mut s = truncated.max(min_size);
+    }
 
-    // Search upward for a size where price * s has ≤2dp.
-    let cap = s + Decimal::new(100, 0); // safety cap: don't search forever
+    let truncated = (size / tick).floor() * tick;
+
+    // If notional is already >= $1, the CLOB accepts the exact truncated size.
+    // The price×size ≤2dp search is only needed for tiny notionals.
+    if price * truncated >= Decimal::ONE {
+        return truncated;
+    }
+
+    // Small notional: search upward from minimum size for $1.00 notional.
+    let min_size = (Decimal::ONE / price).ceil();
+    let mut s = min_size;
+    let cap = min_size + Decimal::new(100, 0);
     while s <= cap {
-        let maker = price * s;
-        if maker == maker.round_dp(2) {
+        if price * s == (price * s).round_dp(2) {
             return s;
         }
         s += tick;
@@ -614,11 +617,13 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
+                    // Use actual fill from REST response; fall back to posted size if zero.
+                    let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: signal.price,
-                        size: safe_size,
+                        size: fill_size,
                         fill_method: Some(FillMethod::FavorableTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                         order_tag: None,
@@ -744,11 +749,13 @@ impl LiveExecutor {
                         self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
 
+                    // Use actual fill from REST response; fall back to posted size if zero.
+                    let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: current_price,
-                        size: safe_size,
+                        size: fill_size,
                         fill_method: Some(FillMethod::EmergencyTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                         order_tag: None,
@@ -936,16 +943,18 @@ impl LiveExecutor {
             match self.poly.place_order(&order).await {
                 Ok(resp) => {
                     if resp.status == OrderStatus::Filled {
+                        // Use actual fill from REST response; fall back to posted size if zero.
+                        let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
                         info!(
                             order_id = %resp.order_id,
                             price = %current_price,
-                            size = %safe_size,
+                            size = %fill_size,
                             "rebalance FOK FILLED"
                         );
                         let _ = self.feedback_tx.try_send(ExecutorFeedback::RebalanceResult {
                             success: true,
                             price: current_price,
-                            size: safe_size,
+                            size: fill_size,
                             order_id: Some(resp.order_id),
                         });
                         return;
@@ -1075,6 +1084,17 @@ impl LiveExecutor {
             / 1000;
 
         if let Some(ref mut c) = self.cold {
+            // Extract normalized metrics and freshness from buildup_info if available
+            let (cvd_norm, basis_norm, spot_flow_norm, obi_norm, liq_norm, atr_norm) =
+                signal.buildup_info.as_ref()
+                    .map(|bi| (bi.cvd_norm, bi.basis_norm, bi.spot_flow_norm, bi.obi_norm, bi.liq_norm, bi.atr_norm))
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+
+            let (cvd_age_ms, basis_age_ms, spot_flow_age_ms, obi_age_ms, liq_age_ms, atr_age_ms) =
+                signal.buildup_info.as_ref()
+                    .map(|bi| (bi.cvd_age_ms, bi.basis_age_ms, bi.spot_flow_age_ms, bi.obi_age_ms, bi.liq_age_ms, bi.atr_age_ms))
+                    .unwrap_or((0, 0, 0, 0, 0, 0));
+
             if let Err(e) = c.record_signal(
                 &signal.token_id,
                 direction_str,
@@ -1091,6 +1111,18 @@ impl LiveExecutor {
                 action,
                 signal.spike_info.timestamp_ms,
                 signal.expected_pct,
+                cvd_norm,
+                basis_norm,
+                spot_flow_norm,
+                obi_norm,
+                liq_norm,
+                atr_norm,
+                cvd_age_ms,
+                basis_age_ms,
+                spot_flow_age_ms,
+                obi_age_ms,
+                liq_age_ms,
+                atr_age_ms,
             ) {
                 warn!(error = %e, "failed to record signal to QuestDB");
             }

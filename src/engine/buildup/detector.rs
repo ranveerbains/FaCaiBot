@@ -374,6 +374,18 @@ impl BuildupDetector {
             signal_atr_ratio: d(self.atr_displacement.raw()),
             obi: d(self.last_obi),
             timestamp_ms: now_ms,
+            cvd_norm: self.cvd.normalized(now_ms),
+            basis_norm: self.basis_delta.normalized(now_ms),
+            spot_flow_norm: self.spot_flow.normalized(now_ms),
+            obi_norm: self.obi_velocity.normalized(now_ms),
+            liq_norm: self.liq_pressure.normalized(now_ms),
+            atr_norm: self.atr_displacement.normalized(now_ms),
+            cvd_age_ms: self.cvd.age_ms(now_ms),
+            basis_age_ms: self.basis_delta.age_ms(now_ms),
+            spot_flow_age_ms: self.spot_flow.age_ms(now_ms),
+            obi_age_ms: self.obi_velocity.age_ms(now_ms),
+            liq_age_ms: self.liq_pressure.age_ms(now_ms),
+            atr_age_ms: self.atr_displacement.age_ms(now_ms),
         }
     }
 
@@ -462,6 +474,18 @@ impl BuildupDetector {
             signal_atr_ratio: d(self.atr_displacement.raw()),
             obi: d(self.last_obi),
             timestamp_ms: now_ms,
+            cvd_norm: self.cvd.normalized(now_ms),
+            basis_norm: self.basis_delta.normalized(now_ms),
+            spot_flow_norm: self.spot_flow.normalized(now_ms),
+            obi_norm: self.obi_velocity.normalized(now_ms),
+            liq_norm: self.liq_pressure.normalized(now_ms),
+            atr_norm: self.atr_displacement.normalized(now_ms),
+            cvd_age_ms: self.cvd.age_ms(now_ms),
+            basis_age_ms: self.basis_delta.age_ms(now_ms),
+            spot_flow_age_ms: self.spot_flow.age_ms(now_ms),
+            obi_age_ms: self.obi_velocity.age_ms(now_ms),
+            liq_age_ms: self.liq_pressure.age_ms(now_ms),
+            atr_age_ms: self.atr_displacement.age_ms(now_ms),
         })
     }
 

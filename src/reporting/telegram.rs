@@ -628,9 +628,6 @@ mod formatter {
         } else {
             trade.leg1.size
         };
-        let total_cost_usdc = trade.leg1.price * trade.leg1.size
-            + trade.leg2.as_ref().map_or(Decimal::ZERO, |l2| l2.price * l2.size);
-
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
             let phase_note = if trade.phase1_dual_fill {
                 " (PHASE-1-DUAL)"
@@ -744,7 +741,7 @@ mod formatter {
             Leg 1: Buy {l1_side}  <code>${l1_price:.2}</code> \u{00d7} {l1_size:.2}sh = <code>${l1_total:.2}</code>{l1_tag}\n\
             {leg2}\n\
             \n\
-            Pair: <code>${pair:.3}</code>/sh \u{00d7} {paired:.2}sh = <code>${total_cost:.2}</code>{unhedged}\n\
+            Pair: <code>${pair:.3}</code>/sh \u{00d7} {paired:.2}sh = <code>${matched_cost:.2}</code>{unhedged}\n\
             {profit}",
             market = market_short,
             l1_side = l1_label,
@@ -755,7 +752,7 @@ mod formatter {
             leg2 = leg2_str,
             pair = trade.pair_cost,
             paired = paired_size,
-            total_cost = total_cost_usdc,
+            matched_cost = trade.pair_cost * paired_size,
             unhedged = unhedged_note,
             profit = profit_line,
         )
@@ -814,16 +811,24 @@ mod formatter {
             .iter()
             .enumerate()
             .map(|(i, t)| {
+                use crate::types::market::Direction;
+                let (l1_label, l2_label) = match t.direction {
+                    Direction::Up => ("YES", "NO"),
+                    Direction::Down => ("NO", "YES"),
+                };
                 let leg2_info = if let Some(ref l2) = t.leg2 {
                     let fee_tag = if l2.was_taker { "taker" } else { "maker" };
                     let net_sign = if t.net_profit >= Decimal::ZERO { "+" } else { "" };
+                    let paired_size = t.leg1.size.min(l2.size);
                     // pair_cost is per-share; net_profit is USDC
                     format!(
-                        "YES@{l1:.3} + NO@{l2:.3} = ${pair:.3}/sh × {sz:.2}sh → maker+{fee} → net {sign}${net:.4} USDC ({pct:.2}%)",
+                        "{ll1}@{l1:.3} + {ll2}@{l2:.3} = ${pair:.3}/sh × {sz:.2}sh → maker+{fee} → net {sign}${net:.4} USDC ({pct:.2}%)",
+                        ll1 = l1_label,
+                        ll2 = l2_label,
                         l1 = t.leg1.price,
                         l2 = l2.price,
                         pair = t.pair_cost,
-                        sz = t.leg1.size,
+                        sz = paired_size,
                         fee = fee_tag,
                         sign = net_sign,
                         net = t.net_profit,
@@ -831,7 +836,8 @@ mod formatter {
                     )
                 } else {
                     format!(
-                        "YES@{l1:.3} × {sz:.2}sh — unhedged → awaiting resolution",
+                        "{ll1}@{l1:.3} × {sz:.2}sh — unhedged → awaiting resolution",
+                        ll1 = l1_label,
                         l1 = t.leg1.price,
                         sz = t.leg1.size,
                     )

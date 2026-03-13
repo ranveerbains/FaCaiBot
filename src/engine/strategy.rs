@@ -2302,6 +2302,7 @@ impl StrategyEngine {
             leg1_fee: Decimal::ZERO,
             best_ask: None,
             book_snapshot: book,
+            buildup_info: None,
         };
 
         Some(ExecutorCommand::RebalanceLeg1 { signal })

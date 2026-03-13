@@ -311,6 +311,18 @@ fn test_buildup_info(direction: Direction, now_ms: u64) -> BuildupInfo {
         signal_atr_ratio: Decimal::new(60, 0),  // 60x — matches old spike tests
         obi: Decimal::new(3, 1),                 // 0.3 — bid-heavy
         timestamp_ms: now_ms.saturating_sub(200),
+        cvd_norm: 0.0,
+        basis_norm: 0.0,
+        spot_flow_norm: 0.0,
+        obi_norm: 0.0,
+        liq_norm: 0.0,
+        atr_norm: 0.0,
+        cvd_age_ms: 0,
+        basis_age_ms: 0,
+        spot_flow_age_ms: 0,
+        obi_age_ms: 0,
+        liq_age_ms: 0,
+        atr_age_ms: 0,
     }
 }
 

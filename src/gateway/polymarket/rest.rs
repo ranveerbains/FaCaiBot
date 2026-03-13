@@ -240,6 +240,7 @@ impl PolymarketGateway {
             order_id: resp.order_id,
             status,
             timestamp_ms: now_ms(),
+            size_matched: resp.taking_amount.max(resp.making_amount),
         })
     }
 

@@ -44,6 +44,18 @@ fn inject_buildup(engine: &mut StrategyEngine, direction: Direction) {
         signal_atr_ratio: Decimal::new(50, 0),
         obi: Decimal::ZERO,
         timestamp_ms: now_epoch_ms() - 200,
+        cvd_norm: 0.0,
+        basis_norm: 0.0,
+        spot_flow_norm: 0.0,
+        obi_norm: 0.0,
+        liq_norm: 0.0,
+        atr_norm: 0.0,
+        cvd_age_ms: 0,
+        basis_age_ms: 0,
+        spot_flow_age_ms: 0,
+        obi_age_ms: 0,
+        liq_age_ms: 0,
+        atr_age_ms: 0,
     });
     engine.state.atr = Some(Decimal::new(2, 3));
     engine.state.binance_price = Some(Decimal::new(50_000, 0));
@@ -272,6 +284,18 @@ fn test_leg1_fill_initialises_hedge() {
         signal_atr_ratio: Decimal::ZERO,
         obi: Decimal::ZERO,
         timestamp_ms: now_ms - 300,
+        cvd_norm: 0.0,
+        basis_norm: 0.0,
+        spot_flow_norm: 0.0,
+        obi_norm: 0.0,
+        liq_norm: 0.0,
+        atr_norm: 0.0,
+        cvd_age_ms: 0,
+        basis_age_ms: 0,
+        spot_flow_age_ms: 0,
+        obi_age_ms: 0,
+        liq_age_ms: 0,
+        atr_age_ms: 0,
     });
     engine.state.atr = Some(Decimal::new(2, 3));
 

@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::market::{Direction, OrderBook, SpikeInfo};
+use super::market::{BuildupInfo, Direction, OrderBook, SpikeInfo};
 
 // ─── Exit Reason ─────────────────────────────────────────────────────────────
 
@@ -182,6 +182,10 @@ pub struct TradeSignal {
     /// Used by the executor to simulate fills without a separate book feed.
     pub book_snapshot: Option<OrderBook>,
 
+    /// Buildup detector snapshot at signal generation time (normalized metrics + ages).
+    /// Used by the executor for QuestDB analytics recording.
+    pub buildup_info: Option<BuildupInfo>,
+
 }
 
 // ─── Executor Command ────────────────────────────────────────────────────────
@@ -283,6 +287,9 @@ pub struct OrderResponse {
     pub status: OrderStatus,
     /// Epoch ms when the CLOB accepted the order.
     pub timestamp_ms: u64,
+    /// Shares actually filled, from SDK `taking_amount` (taker) or `making_amount` (maker).
+    /// Zero if the order went on the book without immediate fill.
+    pub size_matched: Decimal,
 }
 
 // ─── Order Status ────────────────────────────────────────────────────────────

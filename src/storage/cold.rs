@@ -206,6 +206,20 @@ impl ColdStorage {
         action: &str,
         spike_detected_ms: u64,
         composite_score: Decimal,
+        // Metric normalized values [0.0, 1.0]
+        cvd_norm: f64,
+        basis_norm: f64,
+        spot_flow_norm: f64,
+        obi_norm: f64,
+        liq_norm: f64,
+        atr_norm: f64,
+        // Metric freshness (ms since last update)
+        cvd_age_ms: u64,
+        basis_age_ms: u64,
+        spot_flow_age_ms: u64,
+        obi_age_ms: u64,
+        liq_age_ms: u64,
+        atr_age_ms: u64,
     ) -> Result<()> {
         self.buffer
             .table("trade_signals")?
@@ -220,6 +234,20 @@ impl ColdStorage {
             .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
             .column_i64("spike_detected_ms", spike_detected_ms as i64)?
             .column_f64("composite_score", composite_score.try_into().unwrap_or(0.0))?
+            // Metric normalized values (0.0-1.0)
+            .column_f64("cvd_norm", cvd_norm)?
+            .column_f64("basis_norm", basis_norm)?
+            .column_f64("spot_flow_norm", spot_flow_norm)?
+            .column_f64("obi_norm", obi_norm)?
+            .column_f64("liq_norm", liq_norm)?
+            .column_f64("atr_norm", atr_norm)?
+            // Metric freshness (ms since last update)
+            .column_i64("cvd_age_ms", cvd_age_ms as i64)?
+            .column_i64("basis_age_ms", basis_age_ms as i64)?
+            .column_i64("spot_flow_age_ms", spot_flow_age_ms as i64)?
+            .column_i64("obi_age_ms", obi_age_ms as i64)?
+            .column_i64("liq_age_ms", liq_age_ms as i64)?
+            .column_i64("atr_age_ms", atr_age_ms as i64)?
             .at_now()?;
 
         // Flush immediately — signals are rare, we want them durable right away.

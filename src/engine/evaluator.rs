@@ -362,6 +362,7 @@ impl Leg1Evaluator {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
                 Direction::Down => state.poly_no_book.clone().or(state.poly_book.clone()),
             },
+            buildup_info: Some(buildup.clone()),
         })
     }
 }
@@ -919,6 +920,7 @@ pub(crate) fn make_leg2_signal(
         leg1_fee: Decimal::ZERO,
         best_ask,
         book_snapshot,
+        buildup_info: None,
     }
 }
 
