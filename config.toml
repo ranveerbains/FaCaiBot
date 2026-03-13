@@ -103,8 +103,8 @@ atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight
 # Time-based: consistent smoothing regardless of data arrival rate
-cvd_fast_halflife_ms = 100
-cvd_slow_halflife_ms = 300
-spot_flow_halflife_ms = 150
-obi_velocity_halflife_ms = 150
-basis_halflife_ms = 150
+cvd_fast_halflife_ms = 200
+cvd_slow_halflife_ms = 500
+spot_flow_halflife_ms = 250
+obi_velocity_halflife_ms = 250
+basis_halflife_ms = 250
