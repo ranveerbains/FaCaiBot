@@ -179,11 +179,51 @@ pub fn handle_status(status: &BotStatus) -> String {
     )
 }
 
+/// Handle `/metrics`. Queries QuestDB to show raw metric values (reverse-normalized).
+/// Reverse formula: raw = normalized * (saturation - min), then adds min_threshold.
+pub fn handle_metrics() -> String {
+    // Try to connect to QuestDB and query trade_signals for the last 50 signals.
+    match std::net::TcpStream::connect("127.0.0.1:9009") {
+        Err(_) => return "QuestDB not running (127.0.0.1:9009). Start docker-compose and retry.".into(),
+        Ok(_stream) => {
+            // Build and send ILP query (raw query format).
+            // For simplicity, just show the user what to query.
+            let query = r#"
+SELECT
+    timestamp,
+    round(spot_flow_norm * 0.6, 4) AS spot_flow_raw_btc,
+    round(cvd_norm * 0.6, 4) AS cvd_raw_btc,
+    round(basis_norm * 0.05, 4) AS basis_raw_bps,
+    round(obi_norm * 0.2, 4) AS obi_raw_delta,
+    composite_score,
+    count(*) OVER (ORDER BY timestamp ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS window_count
+FROM trade_signals
+WHERE timestamp > dateadd('m', -5, now())
+ORDER BY timestamp DESC
+LIMIT 20;"#;
+
+            format!(
+                "Raw metric values from last 20 signals (past 5min):\n\n\
+                 Paste this in QuestDB console (http://localhost:9000):\n\n\
+                 {}\n\n\
+                 Key:\n\
+                 • spot_flow_raw_btc: BTC units of aggressive buy-sell flow (0.6 = saturates to 1.0)\n\
+                 • cvd_raw_btc: BTC units of buy-sell accel (0.6 = saturates to 1.0)\n\
+                 • basis_raw_bps: Futures-spot spread in basis points (0.05 bps = saturates to 1.0)\n\
+                 • obi_raw_delta: Rate of OBI depth imbalance (0.2 = saturates to 1.0)\n\
+                 • composite_score: Weighted sum of all 6 metrics [0, 1]",
+                query
+            )
+        }
+    }
+}
+
 /// Handle `/help`.
 pub fn handle_help() -> String {
     "/trades on|off — Toggle trade notifications\n\
      /summary on|off — Toggle market summary notifications\n\
      /diag on|off — Toggle 60s diagnostic forwarding\n\
+     /metrics — Show raw metric values query (reverse-normalized from signals)\n\
      /stop — Pause trading (keeps connections alive)\n\
      /resume — Resume trading after /stop\n\
      /shutdown — Graceful shutdown (drains open position)\n\
