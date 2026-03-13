@@ -54,7 +54,7 @@ const SBE_TEMPLATE_BEST_BID_ASK: u16 = 10001;
 const SBE_TEMPLATE_DEPTH_SNAPSHOT: u16 = 10002;
 
 /// SBE template ID for TradeStreamEvent (from stream_1_0.xml).
-const SBE_TEMPLATE_TRADE: u16 = 10003;
+const SBE_TEMPLATE_TRADE: u16 = 10000;
 
 /// Reconnection backoff: initial delay (ms).
 const BACKOFF_INITIAL_MS: u64 = 1_000;
@@ -278,11 +278,16 @@ fn handle_sbe_message(
         }
         SBE_TEMPLATE_TRADE => {
             match parse_sbe_trade(body, block_length) {
-                Ok(trade) => {
-                    if !is_stale(trade.timestamp_ms, now_ms, stale_threshold_ms) {
-                        if tx.try_send(IngestorEvent::SpotTrade(trade)).is_err() {
-                            // High frequency — don't warn on every drop.
-                            debug!("ingestor channel full — SpotTrade dropped");
+                Ok(trades) => {
+                    for trade in trades {
+                        if !is_stale(trade.timestamp_ms, now_ms, stale_threshold_ms) {
+                            if tx.try_send(IngestorEvent::SpotTrade(trade)).is_err() {
+                                // High frequency — don't warn on every drop.
+                                debug!("ingestor channel full — SpotTrade dropped");
+                            }
+                        } else {
+                            let age = now_ms.saturating_sub(trade.timestamp_ms);
+                            debug!(age_ms = age, "discarding stale SBE SpotTrade");
                         }
                     }
                 }
@@ -446,43 +451,88 @@ fn parse_sbe_best_bid_ask(body: &[u8], block_length: usize) -> Result<BinanceTic
     })
 }
 
-/// Parse SBE `TradeStreamEvent` body (after 8-byte header) into [`SpotTrade`].
+/// Parse SBE `TradesStreamEvent` (template 10000) with repeating group of trades into vec of [`SpotTrade`].
 ///
-/// Root block layout (estimated from Binance SBE schema):
-///   - `[0..8]`   eventTime: i64 (microseconds)
-///   - `[8..16]`  tradeId: i64
+/// Root block layout (18 bytes):
+///   - `[0..8]`   eventTime: i64 (utcTimestampUs)
+///   - `[8..16]`  transactTime: i64 (utcTimestampUs)
 ///   - `[16]`     priceExponent: i8
 ///   - `[17]`     qtyExponent: i8
-///   - `[18..26]` price: i64 (mantissa)
-///   - `[26..34]` qty: i64 (mantissa)
-///   - `[34..42]` buyerOrderId: i64
-///   - `[42..50]` sellerOrderId: i64
-///   - `[50..58]` tradeTime: i64 (microseconds)
-///   - `[58]`     isBuyerMaker: u8 (1 = buyer is maker)
-fn parse_sbe_trade(body: &[u8], block_length: usize) -> Result<SpotTrade> {
-    if body.len() < block_length || block_length < 59 {
+/// Group header (4 bytes):
+///   - `[18..20]` blockLength: u16 (size per trade entry, little-endian)
+///   - `[20..22]` numInGroup: u16 (number of trades, little-endian)
+/// Trade entries (repeating, blockLength bytes each, typically 26 bytes):
+///   - `[0..8]`   id: i64 (tradeId)
+///   - `[8..16]`  price: i64 (mantissa64)
+///   - `[16..24]` qty: i64 (mantissa64)
+///   - `[24]`     isBuyerMaker: u8 (boolean)
+///   - `[25]`     isBestMatch: u8 (boolean, unused)
+/// Variable data:
+///   - symbol: varString8 (skipped)
+fn parse_sbe_trade(body: &[u8], _block_length: usize) -> Result<Vec<SpotTrade>> {
+    // Root block: 18 bytes
+    if body.len() < 18 {
         return Err(anyhow!(
-            "SBE trade body too short: {} bytes (block_length={})",
-            body.len(),
-            block_length
+            "SBE trade root block too short: {} bytes (need 18)",
+            body.len()
         ));
     }
 
+    let event_time_us = read_i64(body, 0)?;
     let price_exp = body[16] as i8;
     let qty_exp = body[17] as i8;
-    let price = read_i64(body, 18)?;
-    let qty = read_i64(body, 26)?;
-    let trade_time_us = read_i64(body, 50)?;
-    let is_buyer_maker = body[58] != 0;
+    let timestamp_ms = (event_time_us / 1000) as u64;
 
-    let timestamp_ms = (trade_time_us / 1000) as u64;
+    // Group header: 4 bytes at [18..22]
+    if body.len() < 22 {
+        return Err(anyhow!(
+            "SBE trade group header too short: {} bytes (need 22)",
+            body.len()
+        ));
+    }
 
-    Ok(SpotTrade {
-        price: sbe_to_decimal(price, price_exp),
-        quantity: sbe_to_decimal(qty, qty_exp),
-        is_buyer_maker,
-        timestamp_ms,
-    })
+    let trade_block_length = u16::from_le_bytes([body[18], body[19]]) as usize;
+    let num_trades = u16::from_le_bytes([body[20], body[21]]) as usize;
+
+    // Verify we have enough data for all trades
+    let expected_len = 22 + (num_trades * trade_block_length);
+    if body.len() < expected_len {
+        return Err(anyhow!(
+            "SBE trade body too short: {} bytes (expected {} for {} trades with block_length={})",
+            body.len(),
+            expected_len,
+            num_trades,
+            trade_block_length
+        ));
+    }
+
+    let mut trades = Vec::with_capacity(num_trades);
+
+    // Parse each trade entry in the repeating group
+    for i in 0..num_trades {
+        let offset = 22 + (i * trade_block_length);
+
+        if body.len() < offset + 26 {
+            return Err(anyhow!(
+                "SBE trade entry {} too short at offset {}",
+                i,
+                offset
+            ));
+        }
+
+        let price = read_i64(body, offset + 8)?;
+        let qty = read_i64(body, offset + 16)?;
+        let is_buyer_maker = body[offset + 24] != 0;
+
+        trades.push(SpotTrade {
+            price: sbe_to_decimal(price, price_exp),
+            quantity: sbe_to_decimal(qty, qty_exp),
+            is_buyer_maker,
+            timestamp_ms,
+        });
+    }
+
+    Ok(trades)
 }
 
 use crate::utils::tls::build_tls_config;

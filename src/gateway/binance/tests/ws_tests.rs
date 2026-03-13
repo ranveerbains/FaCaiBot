@@ -254,27 +254,38 @@ fn test_handle_sbe_message_stale_dropped() {
 
 #[test]
 fn test_parse_sbe_trade_happy_path() {
-    // Build a 59-byte SBE root block:
-    // [0..8]   eventTime (ignored)
-    // [8..16]  tradeId (ignored)
-    // [16]     priceExponent = -2
-    // [17]     qtyExponent = -4
-    // [18..26] price mantissa = 9_000_000 → $90,000.00
-    // [26..34] qty mantissa = 5_000 → 0.5 BTC
-    // [34..42] buyerOrderId (ignored)
-    // [42..50] sellerOrderId (ignored)
-    // [50..58] tradeTime = 1_700_000_000_000_000 µs → timestamp_ms = 1_700_000_000_000
-    // [58]     isBuyerMaker = 1
+    // Build a TradesStreamEvent with 1 trade:
+    // Root block (18 bytes):
+    //   [0..8]   eventTime = 1_700_000_000_000_000 µs → timestamp_ms = 1_700_000_000_000
+    //   [8..16]  transactTime (unused)
+    //   [16]     priceExponent = -2
+    //   [17]     qtyExponent = -4
+    // Group header (4 bytes):
+    //   [18..20] blockLength = 26 (trade entry size)
+    //   [20..22] numInGroup = 1
+    // Trade entry (26 bytes):
+    //   [0..8]   id (unused)
+    //   [8..16]  price = 9_000_000 → $90,000.00
+    //   [16..24] qty = 5_000 → 0.5 BTC
+    //   [24]     isBuyerMaker = 1
+    //   [25]     isBestMatch = 0
 
-    let mut body = [0u8; 59];
+    let mut body = vec![0u8; 48]; // 18 + 4 + 26
+    // Root block
+    body[0..8].copy_from_slice(&1_700_000_000_000_000_i64.to_le_bytes());
     body[16] = (-2_i8) as u8;
     body[17] = (-4_i8) as u8;
-    body[18..26].copy_from_slice(&9_000_000_i64.to_le_bytes());
-    body[26..34].copy_from_slice(&5_000_i64.to_le_bytes());
-    body[50..58].copy_from_slice(&1_700_000_000_000_000_i64.to_le_bytes());
-    body[58] = 1;
+    // Group header
+    body[18..20].copy_from_slice(&26_u16.to_le_bytes());
+    body[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    // Trade entry
+    body[30..38].copy_from_slice(&9_000_000_i64.to_le_bytes());
+    body[38..46].copy_from_slice(&5_000_i64.to_le_bytes());
+    body[46] = 1; // isBuyerMaker
 
-    let trade = parse_sbe_trade(&body, 59).expect("should parse valid 59-byte frame");
+    let trades = parse_sbe_trade(&body, 18).expect("should parse valid frame");
+    assert_eq!(trades.len(), 1);
+    let trade = &trades[0];
     assert_eq!(trade.timestamp_ms, 1_700_000_000_000);
     assert!(trade.is_buyer_maker);
     // Price: 9_000_000 × 10^-2 = 90_000.00
@@ -284,13 +295,13 @@ fn test_parse_sbe_trade_happy_path() {
 }
 
 #[test]
-fn test_parse_sbe_trade_block_length_too_short() {
-    let body = [0u8; 59];
-    assert!(parse_sbe_trade(&body, 58).is_err()); // block_length < 59
+fn test_parse_sbe_trade_root_block_too_short() {
+    let body = [0u8; 17]; // Need at least 18 bytes for root block
+    assert!(parse_sbe_trade(&body, 18).is_err());
 }
 
 #[test]
-fn test_parse_sbe_trade_body_shorter_than_block_length() {
-    let body = [0u8; 30]; // body shorter than declared block_length
-    assert!(parse_sbe_trade(&body, 59).is_err());
+fn test_parse_sbe_trade_group_header_too_short() {
+    let body = [0u8; 21]; // Need at least 22 bytes for root block + group header
+    assert!(parse_sbe_trade(&body, 18).is_err());
 }
