@@ -955,8 +955,9 @@ fn test_repost_capped_at_max() {
     let now = now_epoch_ms();
     engine.handle_flow_update(0.5, Direction::Up, now);
 
-    // Repost should be BLOCKED (count >= max).
-    assert!(engine.pending_leg1_cancel.is_none(), "repost should be blocked after max_repost_count");
+    // Repost capped → should issue a NON-repost cancel (kills the stale order).
+    assert!(engine.pending_leg1_cancel.is_some(), "stale order should be cancelled when repost capped");
+    assert!(!engine.leg1_last_cancel_repost, "cancel should NOT be a repost");
     assert_eq!(engine.diag_repost_capped, 1, "diag_repost_capped should increment");
     assert_eq!(engine.diag_repost_attempts, 0, "diag_repost_attempts should NOT increment");
 }
@@ -969,8 +970,9 @@ fn test_chase_distance_blocks_repost() {
     let now = now_epoch_ms();
     engine.handle_flow_update(0.5, Direction::Up, now);
 
-    // Repost should be BLOCKED (chase distance exceeds limit).
-    assert!(engine.pending_leg1_cancel.is_none(), "repost should be blocked by chase distance");
+    // Chase distance exceeded → should issue a NON-repost cancel.
+    assert!(engine.pending_leg1_cancel.is_some(), "stale order should be cancelled when chase exceeded");
+    assert!(!engine.leg1_last_cancel_repost, "cancel should NOT be a repost");
     assert_eq!(engine.diag_repost_capped, 1);
 }
 

@@ -291,13 +291,13 @@ if leg1_state == Posted AND composite_score > cancel_threshold:
         if repost_allowed AND chase_allowed:
             cancel(repost: true)
         else:
-            log "repost CAPPED, order stays resting"
+            cancel(repost: false)  // kill stale order — fill at this price would lose on hedge
 ```
 
 **Repost flow:**
 1. Engine detects ask drift ≥ threshold while composite live
 2. Checks two guards: `repost_count < max_repost_count` AND `chase_distance ≤ max_chase_ticks`
-3. If either guard fails: logs "repost CAPPED", increments `diag_repost_capped`, order stays resting
+3. If either guard fails: issues a **non-repost cancel** (kills the stale order), increments `diag_repost_capped`. A fill at the stranded price would produce a losing hedge
 4. If both pass: dispatches `CancelLeg1Order` to executor, increments `diag_repost_attempts`
 5. Executor cancels the order on CLOB
 6. Engine receives cancel confirmation with `was_cancelled = true`
@@ -320,8 +320,8 @@ Repost is only triggered when composite **remains live** (`> cancel_threshold`).
 
 **Scenario examples:**
 - **Ask drifts 1 tick (within cap):** Composite = 0.45 (still live), ask moves 1 tick up, repost_count=0 → cancel + repost. Entry at original+1tick.
-- **Ask drifts 5 ticks (chase cap hit):** Composite = 0.60 (very hot), ask moves 5 ticks from original, max_chase_ticks=4 → repost CAPPED. Order stays resting at current price.
-- **3rd repost attempt (count cap hit):** After 2 successful reposts, ask drifts again, max_repost_count=2 → repost CAPPED. No further chasing.
+- **Ask drifts 5 ticks (chase cap hit):** Composite = 0.60 (very hot), ask moves 5 ticks from original, max_chase_ticks=4 → stale order cancelled (no repost). Prevents fill at stranded price.
+- **3rd repost attempt (count cap hit):** After 2 successful reposts, ask drifts again, max_repost_count=2 → stale order cancelled (no repost). No further chasing.
 - **Ask drifts + buildup fades:** Composite drops below cancel_threshold → cancel with `repost: false` → full reset including repost counters.
 
 Diagnostic counters: `diag_repost_attempts` (reposts issued), `diag_repost_capped` (reposts blocked by limits). Both logged every 60s.

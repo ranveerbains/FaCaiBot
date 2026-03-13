@@ -157,6 +157,9 @@ pub struct StrategyEngine {
     leg1_original_signal_price: Option<Decimal>,
     /// Maximum chase distance in ticks from original signal price (0 = unlimited). From config.
     max_chase_ticks: u32,
+    /// Set `true` after first "repost CAPPED" log per episode. Prevents log spam
+    /// from the sustain monitor firing on every Binance event while capped.
+    leg1_repost_cap_logged: bool,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -322,6 +325,7 @@ impl StrategyEngine {
             max_repost_count: config.bot.buildup.max_repost_count,
             leg1_original_signal_price: None,
             max_chase_ticks: config.bot.buildup.max_chase_ticks,
+            leg1_repost_cap_logged: false,
             pending_tick_size_cmd: None,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
@@ -1339,15 +1343,25 @@ impl StrategyEngine {
                                         self.leg1_last_cancel_repost = true;
                                         self.leg1_cancel_inflight = true;
                                         self.diag_repost_attempts += 1;
-                                    } else {
+                                    } else if !self.leg1_repost_cap_logged {
+                                        // Repost capped: cancel the stale order entirely
+                                        // (no repost). A fill at this stale price would
+                                        // produce a losing hedge.
                                         info!(
                                             %posted_ask, current_ask = %current, %drift,
                                             repost_count = self.leg1_repost_count,
                                             max_repost = self.max_repost_count,
                                             max_chase = self.max_chase_ticks,
-                                            "repost CAPPED, order stays resting"
+                                            "repost CAPPED — cancelling stale order"
                                         );
+                                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                            order_id: order_id.clone(),
+                                        });
+                                        self.leg1_last_cancel_repost = false;
+                                        self.leg1_cancel_inflight = true;
+                                        self.leg1_repost_cap_logged = true;
                                         self.diag_repost_capped += 1;
+                                        self.diag_sustain_cancels += 1;
                                     }
                                 }
                             }
@@ -1997,17 +2011,22 @@ impl StrategyEngine {
                             info!(%price, %current_ask, %drift,
                                 repost_count = self.leg1_repost_count,
                                 "Leg 1 posted — immediate drift detected, cancelling for repost");
-                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
+                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid.clone() });
                             self.leg1_last_cancel_repost = true;
                             self.leg1_cancel_inflight = true;
                             self.diag_repost_attempts += 1;
                         } else {
+                            // Repost capped on first post: cancel stale order entirely.
                             info!(%price, %current_ask, %drift,
                                 repost_count = self.leg1_repost_count,
                                 max_repost = self.max_repost_count,
                                 max_chase = self.max_chase_ticks,
-                                "repost CAPPED on order posted, order stays resting");
+                                "repost CAPPED on order posted — cancelling stale order");
+                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
+                            self.leg1_last_cancel_repost = false;
+                            self.leg1_cancel_inflight = true;
                             self.diag_repost_capped += 1;
+                            self.diag_sustain_cancels += 1;
                         }
                     }
                 }
@@ -2606,6 +2625,7 @@ impl StrategyEngine {
         self.leg1_last_cancel_repost = false;
         self.leg1_repost_count = 0;
         self.leg1_original_signal_price = None;
+        self.leg1_repost_cap_logged = false;
         // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
@@ -3375,6 +3395,7 @@ impl StrategyEngine {
         self.leg1_cancel_inflight = false;
         self.leg1_repost_count = 0;
         self.leg1_original_signal_price = None;
+        self.leg1_repost_cap_logged = false;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).
