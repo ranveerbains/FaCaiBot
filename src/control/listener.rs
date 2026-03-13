@@ -255,7 +255,6 @@ async fn handle_message(
         "trades" => handlers::handle_trades(args, notify_flags),
         "summary" => handlers::handle_summary(args, notify_flags),
         "diag" => handlers::handle_diag(args, notify_flags),
-        "metrics" => handlers::handle_metrics(),
         "stop" => handlers::handle_stop(ingestor_tx),
         "resume" => handlers::handle_resume(ingestor_tx),
         "shutdown" => handlers::handle_shutdown(ingestor_tx),
