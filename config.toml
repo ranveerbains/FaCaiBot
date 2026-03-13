@@ -49,13 +49,19 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.40
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
-cancel_window_ms = 2500
+cancel_window_ms = 3000
 # Repost Leg 1 maker if ask moves this many ticks while composite > cancel_threshold (0 = disabled)
 leg1_repost_tick_threshold = 1
+# Maximum reposts per buildup episode (0 = unlimited)
+max_repost_count = 3
+# Maximum chase distance in ticks from original signal price (0 = unlimited)
+max_chase_ticks = 4
+# Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
+max_dissenters = 1
 
 # Metric weights (must sum to 1.0)
 # Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
@@ -72,27 +78,27 @@ w_liq = 0.05
 w_atr = 0.05
 
 # Freshness gates (ms) — metric treated as stale after this. Tightened to only include recent data.
-freshness_basis_ms = 100
-freshness_cvd_ms = 100
-freshness_spot_flow_ms = 100
-freshness_obi_ms = 80
-freshness_liq_ms = 2000
-freshness_atr_ms = 80
+freshness_basis_ms = 150
+freshness_cvd_ms = 150
+freshness_spot_flow_ms = 150
+freshness_obi_ms = 120
+freshness_liq_ms = 2500
+freshness_atr_ms = 120
 
 # Normalization: [min_threshold, saturation] for each metric
 # Higher min_thresholds filter out noise—metrics must show REAL precursor magnitude to count.
 # CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
-cvd_min = 0.005
+cvd_min = 0.0
 cvd_saturation = 0.05
-spot_flow_min = 0.005
+spot_flow_min = 0.0
 spot_flow_saturation = 0.05
-obi_min = 0.05
+obi_min = 0.0
 obi_saturation = 0.2
-basis_min = 0.1
+basis_min = 0.0
 basis_saturation = 0.5
-liq_min = 0.5
+liq_min = 0.0
 liq_saturation = 10.0
-atr_min = 0.5
+atr_min = 0.0
 atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight

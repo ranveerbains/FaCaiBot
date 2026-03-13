@@ -21,6 +21,8 @@ use super::metrics::{
 // ─── BuildupDetector ─────────────────────────────────────────────────────────
 
 pub struct BuildupDetector {
+    /// Maximum dissenting directional metrics allowed in consensus vote.
+    max_dissenters: u32,
     // Individual metrics
     pub(crate) cvd: CvdAccelTracker,
     pub(crate) spot_flow: SpotFlowTracker,
@@ -69,6 +71,8 @@ pub struct BuildupDetector {
 
 /// Configuration for the BuildupDetector.
 pub struct BuildupConfig {
+    /// Maximum dissenting directional metrics allowed in consensus vote.
+    pub max_dissenters: u32,
     // Weights
     pub w_cvd: f64,
     pub w_spot_flow: f64,
@@ -124,6 +128,7 @@ impl BuildupConfig {
     /// Create from the TOML config section.
     pub fn from_toml(cfg: &crate::config::BuildupTomlConfig) -> Self {
         Self {
+            max_dissenters: cfg.max_dissenters,
             w_cvd: cfg.w_cvd,
             w_spot_flow: cfg.w_spot_flow,
             w_obi: cfg.w_obi,
@@ -166,6 +171,7 @@ impl BuildupConfig {
 impl Default for BuildupConfig {
     fn default() -> Self {
         Self {
+            max_dissenters: 1,
             w_cvd: 0.30,
             w_spot_flow: 0.15,
             w_obi: 0.20,
@@ -207,6 +213,7 @@ impl Default for BuildupConfig {
 impl BuildupDetector {
     pub fn new(cfg: &BuildupConfig) -> Self {
         Self {
+            max_dissenters: cfg.max_dissenters,
             cvd: CvdAccelTracker::new(
                 cfg.cvd_fast_halflife_ms,
                 cfg.cvd_slow_halflife_ms,
@@ -398,8 +405,8 @@ impl BuildupDetector {
         }
 
         // Majority consensus: require at least 3 directional metrics to agree AND
-        // allow at most 1 dissenter. Veto ties (2–2), weak majorities (< 3 votes),
-        // and cases where minority > 1 (e.g. 3–2 has 2 dissenters — too noisy).
+        // allow at most `max_dissenters` dissenters. Veto ties, weak majorities (< 3 votes),
+        // and cases where minority exceeds the configured limit.
         let minority = std::cmp::min(up_count, down_count);
         let (dominant, majority) = if up_count >= down_count {
             (Direction::Up, up_count)
@@ -407,7 +414,7 @@ impl BuildupDetector {
             (Direction::Down, down_count)
         };
 
-        if majority < 3 || minority > 1 {
+        if majority < 3 || minority > self.max_dissenters {
             self.diag_direction_vetoes += 1;
             return (0.0, None);
         }

@@ -109,3 +109,29 @@ fn test_below_cancel_threshold_when_stale() {
     // No data → all metrics stale → score=0 < cancel_threshold.
     assert!(det.below_cancel_threshold(0));
 }
+
+#[test]
+fn test_max_dissenters_zero() {
+    // With max_dissenters=0, a 4-1 vote (1 dissenter) should be vetoed.
+    let mut cfg = BuildupConfig::default();
+    cfg.max_dissenters = 0;
+    let mut det = BuildupDetector::new(&cfg);
+
+    // Push 4 metrics bullish, 1 bearish → minority=1 > max_dissenters=0 → veto.
+    for i in 0..50u64 {
+        let t = i * 10;
+        // Bullish: CVD, spot_flow, OBI, basis (4 metrics).
+        det.cvd.update((i + 1) as f64 * 2.0, false, t);
+        det.spot_flow.update(2.0, false, t);
+        det.obi_velocity.update(0.01 * i as f64, t);
+        det.basis_delta.update_spot_mid(50000.0, t);
+        det.basis_delta.update_futures_mid(50001.0 + i as f64 * 0.1, 50002.0 + i as f64 * 0.1, t);
+        // Bearish: liq (long liquidations = bearish).
+        det.liq_pressure.update("SELL", 1.0, t);
+    }
+    let (score, dir) = det.evaluate(500);
+    // 4 up, 1 down → minority=1 > max_dissenters=0 → vetoed.
+    assert_eq!(score, 0.0, "should be vetoed with max_dissenters=0 and 1 dissenter");
+    assert!(dir.is_none());
+    assert!(det.diag_direction_vetoes > 0);
+}

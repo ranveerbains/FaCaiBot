@@ -97,7 +97,7 @@ This change would align the system fully with academic literature on order flow 
 #### Evaluation pipeline
 
 1. **Normalize**: Compute [0,1] value for each metric (0 if stale beyond freshness window)
-2. **Direction consensus**: All 4 directional metrics (basis delta, CVD, OBI velocity, spot flow) must agree unanimously. If `minority > 0` (any directional metric disagrees), the signal is **vetoed** (score = 0). ATR displacement and liquidation pressure are not directional metrics and do not participate in the vote
+2. **Direction consensus**: At least 3 of the 5 directional metrics (basis delta, CVD, OBI velocity, spot flow, liquidation pressure) must agree, with at most `max_dissenters` (default: 1) disagreeing. If `minority > max_dissenters`, the signal is **vetoed** (score = 0). ATR displacement is not a directional metric and does not participate in the vote. Set `max_dissenters = 0` for unanimous agreement among all active directional metrics
 3. **Causal ordering**: At least 1 **leading** metric (basis delta or CVD) AND 1 **confirming** metric (spot flow or OBI velocity) must be fresh and non-zero. Vetoed otherwise
 4. **Weighted sum**: `composite = sum(weight_i * normalized_i)`
 5. **Entry check**: If `composite >= entry_threshold` (default 0.40), emit `BuildupInfo` with full metric breakdown. The `above_threshold` flag is set on the first crossing and cleared when the score drops below threshold. **Direction flips while above threshold also reset `above_threshold`**, allowing a new signal to fire immediately on direction change without requiring the score to dip below threshold first. `last_direction: Option<Direction>` tracks the previous composite direction for this comparison
@@ -280,37 +280,51 @@ Diagnostic counters: `diag_sustain_cancels` (flow fade), `diag_sustain_timeouts`
 
 ### 5a. Adaptive Leg 1 Repost
 
-After Leg 1 is posted at `best_ask`, the market maker's ask price may drift upward while the buildup composite score remains strong (`> cancel_threshold`). If the ask moves ≥ `leg1_repost_tick_threshold` ticks away, the order sits stranded below the market. A single repost at the new ask recovers this case without chasing the market or creating directional bias.
+After Leg 1 is posted at `best_ask`, the market maker's ask price may drift upward while the buildup composite score remains strong (`> cancel_threshold`). If the ask moves ≥ `leg1_repost_tick_threshold` ticks away, the order sits stranded below the market. A repost at the new ask recovers this case — but is bounded by two hard limits to prevent the chase loop that destroys entry advantage.
 
-**Repost trigger logic** (runs on every event in sustain block):
+**Repost trigger logic** (runs on every event in sustain block + on_order_posted):
 ```
 if leg1_state == Posted AND composite_score > cancel_threshold:
     if current_ask - posted_ask >= leg1_repost_tick_threshold * tick_size:
-        cancel(repost: true)
+        repost_allowed = (max_repost_count == 0) OR (repost_count < max_repost_count)
+        chase_allowed  = (max_chase_ticks == 0)  OR (current_ask - original_signal_price <= max_chase_ticks * tick_size)
+        if repost_allowed AND chase_allowed:
+            cancel(repost: true)
+        else:
+            log "repost CAPPED, order stays resting"
 ```
 
 **Repost flow:**
 1. Engine detects ask drift ≥ threshold while composite live
-2. Dispatches `CancelLeg1Order { order_id, repost: true }` to executor
-3. Executor cancels the order on CLOB
-4. Engine receives cancel confirmation with `was_cancelled = true`
-5. **Repost path**: If the cancel was a repost (`repost: true`), engine re-arms `buildup_detected = true`, keeping `last_buildup` and `current_composite_score` live
-6. Main loop calls `evaluate()` on the next event
-7. `evaluate()` re-runs all entry guards (book, Binance price, skew, repricing) and emits a fresh Leg 1 signal at the new best ask
-8. If any guard rejects the repost (e.g., buildup faded between cancel dispatch and confirm), full state reset as normal
+2. Checks two guards: `repost_count < max_repost_count` AND `chase_distance ≤ max_chase_ticks`
+3. If either guard fails: logs "repost CAPPED", increments `diag_repost_capped`, order stays resting
+4. If both pass: dispatches `CancelLeg1Order` to executor, increments `diag_repost_attempts`
+5. Executor cancels the order on CLOB
+6. Engine receives cancel confirmation with `was_cancelled = true`
+7. **Repost path**: increments `leg1_repost_count`, re-arms `buildup_detected = true`, keeping `last_buildup`, `current_composite_score`, and `leg1_original_signal_price` live
+8. Main loop calls `evaluate()` on the next event
+9. `evaluate()` re-runs all entry guards (book, Binance price, skew, repricing) and emits a fresh Leg 1 signal at the new best ask
+10. If any guard rejects the repost (e.g., buildup faded between cancel dispatch and confirm), full state reset as normal
+
+**Chase anchor**: `leg1_original_signal_price` is captured on the first Leg 1 post (in `evaluate()` and `on_order_posted()`). All subsequent reposts measure chase distance from this anchor, not from the most recent posted price. This prevents incremental drift from bypassing the cap.
 
 **Config:**
 - `leg1_repost_tick_threshold` (default: 1) — minimum ask drift in ticks to trigger repost. Set to 0 to disable
+- `max_repost_count` (default: 2) — maximum reposts per buildup episode. Set to 0 for unlimited
+- `max_chase_ticks` (default: 4) — maximum chase distance in ticks from original signal price. Set to 0 for unlimited
+
+**State resets**: `leg1_repost_count` and `leg1_original_signal_price` are cleared in: `on_trade_complete()`, MarketRotation handler, `reset_leg1_state()`, and the "composite faded" / non-repost branches of `on_cancel_result()`.
 
 **Why no sustain window on reversal?**
 Repost is only triggered when composite **remains live** (`> cancel_threshold`). It does NOT require a sustain window for composite decay — if the composite fades, the cancel defaults to `repost: false` and state is fully reset. This allows rapid adaptive reposting as long as the buildup signal is hot, but immediately stops when the signal dies.
 
 **Scenario examples:**
-- **Ask drifts (genuine MM repricing):** Composite = 0.45 (still live), ask moves 2 ticks up → cancel + repost at new ask. Order catches the next seller at better pricing.
-- **Ask drifts + buildup fades:** Composite = 0.40 → drops to 0.20 between events → cancel has `repost: false` → full reset. Next buildup triggers fresh entry.
-- **Ask drifts + spike still hot:** Composite = 0.60 (very hot), ask moves 3 ticks up → cancel + repost. New order placed immediately at new ask, likely fills faster from buying pressure.
+- **Ask drifts 1 tick (within cap):** Composite = 0.45 (still live), ask moves 1 tick up, repost_count=0 → cancel + repost. Entry at original+1tick.
+- **Ask drifts 5 ticks (chase cap hit):** Composite = 0.60 (very hot), ask moves 5 ticks from original, max_chase_ticks=4 → repost CAPPED. Order stays resting at current price.
+- **3rd repost attempt (count cap hit):** After 2 successful reposts, ask drifts again, max_repost_count=2 → repost CAPPED. No further chasing.
+- **Ask drifts + buildup fades:** Composite drops below cancel_threshold → cancel with `repost: false` → full reset including repost counters.
 
-Diagnostic counter: `diag_repost_attempts` (logged every 60s).
+Diagnostic counters: `diag_repost_attempts` (reposts issued), `diag_repost_capped` (reposts blocked by limits). Both logged every 60s.
 
 ### Fill models
 

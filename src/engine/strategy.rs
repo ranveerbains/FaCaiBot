@@ -149,6 +149,15 @@ pub struct StrategyEngine {
     /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
     leg1_cancel_inflight: bool,
 
+    /// Number of reposts completed in the current buildup episode.
+    leg1_repost_count: u32,
+    /// Maximum reposts per buildup episode (0 = unlimited). From config.
+    max_repost_count: u32,
+    /// Ask price at time of first Leg 1 post (chase distance anchor).
+    leg1_original_signal_price: Option<Decimal>,
+    /// Maximum chase distance in ticks from original signal price (0 = unlimited). From config.
+    max_chase_ticks: u32,
+
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
     pending_tick_size_cmd: Option<ExecutorCommand>,
@@ -232,6 +241,7 @@ pub struct StrategyEngine {
     diag_sustain_cancels: u64,    // Leg 1 cancelled: composite < cancel_threshold
     diag_sustain_timeouts: u64,   // Leg 1 cancelled: cancel_window_ms timeout
     diag_repost_attempts: u64,    // Leg 1 cancelled + reposted: ask drifted, composite still strong
+    diag_repost_capped: u64,      // Repost blocked by max_repost_count or max_chase_ticks
     last_diag_ms: u64,
 
     // ── Dual-order tracking (Phase 1 + Phase 2) ────────────────────────
@@ -308,6 +318,10 @@ impl StrategyEngine {
             cancel_window_ms: config.bot.buildup.cancel_window_ms,
             leg1_last_cancel_repost: false,
             leg1_cancel_inflight: false,
+            leg1_repost_count: 0,
+            max_repost_count: config.bot.buildup.max_repost_count,
+            leg1_original_signal_price: None,
+            max_chase_ticks: config.bot.buildup.max_chase_ticks,
             pending_tick_size_cmd: None,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
@@ -360,6 +374,7 @@ impl StrategyEngine {
             diag_sustain_cancels: 0,
             diag_sustain_timeouts: 0,
             diag_repost_attempts: 0,
+            diag_repost_capped: 0,
             last_diag_ms: 0,
             leg2_phase1_order_id: None,
             leg2_phase2_order_id: None,
@@ -774,6 +789,8 @@ impl StrategyEngine {
                 self.pending_partial_fills.clear();
                 self.state.leg1_posted_ask = None;
                 self.leg1_last_cancel_repost = false;
+                self.leg1_repost_count = 0;
+                self.leg1_original_signal_price = None;
                 // Dual-order: clear ALL state on rotation (new market).
                 self.leg2_phase1_order_id = None;
                 self.leg2_phase2_order_id = None;
@@ -1301,16 +1318,37 @@ impl StrategyEngine {
                                 let drift = current - posted_ask;
                                 let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
                                 if drift >= threshold {
-                                    info!(
-                                        %posted_ask, current_ask = %current, %drift,
-                                        "Leg 1 ask drifted — cancelling for repost"
-                                    );
-                                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                        order_id: order_id.clone(),
-                                    });
-                                    self.leg1_last_cancel_repost = true;
-                                    self.leg1_cancel_inflight = true;
-                                    self.diag_repost_attempts += 1;
+                                    // Check repost cap and chase distance before cancelling.
+                                    let repost_allowed = self.max_repost_count == 0
+                                        || self.leg1_repost_count < self.max_repost_count;
+                                    let chase_allowed = self.max_chase_ticks == 0
+                                        || self.leg1_original_signal_price.map_or(true, |orig| {
+                                            let chase = current - orig;
+                                            chase <= self.state.tick_size * Decimal::from(self.max_chase_ticks)
+                                        });
+
+                                    if repost_allowed && chase_allowed {
+                                        info!(
+                                            %posted_ask, current_ask = %current, %drift,
+                                            repost_count = self.leg1_repost_count,
+                                            "Leg 1 ask drifted — cancelling for repost"
+                                        );
+                                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                            order_id: order_id.clone(),
+                                        });
+                                        self.leg1_last_cancel_repost = true;
+                                        self.leg1_cancel_inflight = true;
+                                        self.diag_repost_attempts += 1;
+                                    } else {
+                                        info!(
+                                            %posted_ask, current_ask = %current, %drift,
+                                            repost_count = self.leg1_repost_count,
+                                            max_repost = self.max_repost_count,
+                                            max_chase = self.max_chase_ticks,
+                                            "repost CAPPED, order stays resting"
+                                        );
+                                        self.diag_repost_capped += 1;
+                                    }
                                 }
                             }
                         }
@@ -1383,6 +1421,10 @@ impl StrategyEngine {
                 };
                 // Record best_ask at time of post for adaptive repost drift detection.
                 self.state.leg1_posted_ask = Some(price);
+                // Capture original signal price on first post (chase distance anchor).
+                if self.leg1_original_signal_price.is_none() {
+                    self.leg1_original_signal_price = Some(price);
+                }
                 self.state.cumulative_used += alloc;
                 self.leg1_direction = Some(direction);
                 self.pending_leg1_signal = Some(signal.clone());
@@ -1673,6 +1715,7 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             repost_attempts = self.diag_repost_attempts,
+            repost_capped = self.diag_repost_capped,
             det_signals = self.detector.diag_signals_emitted(),
             det_dir_veto = self.detector.diag_direction_vetoes(),
             det_causal_veto = self.detector.diag_causal_vetoes(),
@@ -1703,7 +1746,7 @@ impl StrategyEngine {
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  reposts: {sustain_reposts}\n\
+             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  reposts: {sustain_reposts}  capped: {repost_capped}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
@@ -1736,6 +1779,7 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             sustain_reposts = self.diag_repost_attempts,
+            repost_capped = self.diag_repost_capped,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -1927,6 +1971,10 @@ impl StrategyEngine {
         // Leg 1: immediate drift check — ask may have moved during SDK round-trip (~1.3s).
         if let Some(oid) = order_id_for_drift {
             self.state.leg1_posted_ask = Some(price);
+            // Capture original signal price on first post (chase distance anchor).
+            if self.leg1_original_signal_price.is_none() {
+                self.leg1_original_signal_price = Some(price);
+            }
             if self.pending_leg1_cancel.is_none()
                 && !self.leg1_cancel_inflight
                 && self.leg1_repost_tick_threshold > 0
@@ -1936,12 +1984,31 @@ impl StrategyEngine {
                     let drift = current_ask - price;
                     let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
                     if drift >= threshold {
-                        info!(%price, %current_ask, %drift,
-                            "Leg 1 posted — immediate drift detected, cancelling for repost");
-                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
-                        self.leg1_last_cancel_repost = true;
-                        self.leg1_cancel_inflight = true;
-                        self.diag_repost_attempts += 1;
+                        // Check repost cap and chase distance before cancelling.
+                        let repost_allowed = self.max_repost_count == 0
+                            || self.leg1_repost_count < self.max_repost_count;
+                        let chase_allowed = self.max_chase_ticks == 0
+                            || self.leg1_original_signal_price.map_or(true, |orig| {
+                                let chase = current_ask - orig;
+                                chase <= self.state.tick_size * Decimal::from(self.max_chase_ticks)
+                            });
+
+                        if repost_allowed && chase_allowed {
+                            info!(%price, %current_ask, %drift,
+                                repost_count = self.leg1_repost_count,
+                                "Leg 1 posted — immediate drift detected, cancelling for repost");
+                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
+                            self.leg1_last_cancel_repost = true;
+                            self.leg1_cancel_inflight = true;
+                            self.diag_repost_attempts += 1;
+                        } else {
+                            info!(%price, %current_ask, %drift,
+                                repost_count = self.leg1_repost_count,
+                                max_repost = self.max_repost_count,
+                                max_chase = self.max_chase_ticks,
+                                "repost CAPPED on order posted, order stays resting");
+                            self.diag_repost_capped += 1;
+                        }
                     }
                 }
             }
@@ -2044,14 +2111,16 @@ impl StrategyEngine {
                     // Repost path: partial reset, re-arm evaluation if composite still alive
                     self.state.leg1_state = OrderState::None;
                     self.leg1_last_cancel_repost = false;
+                    self.leg1_repost_count += 1;
 
                     let composite_alive = self.state.current_composite_score > self.leg2.cancel_threshold
                         && self.state.last_buildup.is_some();
 
                     if composite_alive {
-                        info!(%order_id, "Leg 1 cancel confirmed — re-arming for repost");
+                        info!(%order_id, repost_count = self.leg1_repost_count,
+                            "Leg 1 cancel confirmed — re-arming for repost");
                         self.state.buildup_detected = true; // re-arm evaluate()
-                        // Keep: leg1_direction, last_buildup, pending_leg1_signal
+                        // Keep: leg1_direction, last_buildup, pending_leg1_signal, leg1_original_signal_price
                     } else {
                         info!(%order_id, "Leg 1 cancel confirmed — composite faded, full reset");
                         self.leg1_direction = None;
@@ -2059,6 +2128,8 @@ impl StrategyEngine {
                         self.state.buildup_detected = false;
                         self.state.last_buildup = None;
                         self.state.leg1_posted_ask = None;
+                        self.leg1_repost_count = 0;
+                        self.leg1_original_signal_price = None;
                     }
                 } else {
                     // Non-repost cancel confirmed (sustain fade, timeout): full Leg 1 reset.
@@ -2070,6 +2141,8 @@ impl StrategyEngine {
                     self.pending_leg1_signal = None;
                     self.leg1_cancel_inflight = false;
                     self.leg1_last_cancel_repost = false;
+                    self.leg1_repost_count = 0;
+                    self.leg1_original_signal_price = None;
                 }
             } else {
                 // NOT cancelled — order filled before cancel reached CLOB.
@@ -2531,6 +2604,8 @@ impl StrategyEngine {
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
         self.leg1_last_cancel_repost = false;
+        self.leg1_repost_count = 0;
+        self.leg1_original_signal_price = None;
         // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
@@ -3298,6 +3373,8 @@ impl StrategyEngine {
         self.state.leg1_posted_ask = None;
         self.leg1_last_cancel_repost = false;
         self.leg1_cancel_inflight = false;
+        self.leg1_repost_count = 0;
+        self.leg1_original_signal_price = None;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).

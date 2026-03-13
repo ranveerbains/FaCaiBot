@@ -136,6 +136,12 @@ pub struct BuildupTomlConfig {
     /// Repost threshold — if ask moves ≥ this many ticks while composite > cancel_threshold,
     /// cancel and repost at new best_ask (0 = disabled).
     pub leg1_repost_tick_threshold: u32,
+    /// Maximum number of reposts per buildup episode (0 = unlimited).
+    pub max_repost_count: u32,
+    /// Maximum chase distance in ticks from original signal price (0 = unlimited).
+    pub max_chase_ticks: u32,
+    /// Maximum dissenting directional metrics allowed in consensus vote (default 1).
+    pub max_dissenters: u32,
     // Metric weights (must sum to 1.0)
     pub w_cvd: f64,
     pub w_spot_flow: f64,
@@ -178,6 +184,9 @@ impl Default for BuildupTomlConfig {
             cancel_threshold: 0.25,
             cancel_window_ms: 500,
             leg1_repost_tick_threshold: 1,
+            max_repost_count: 2,
+            max_chase_ticks: 4,
+            max_dissenters: 1,
             w_cvd: 0.30,
             w_spot_flow: 0.15,
             w_obi: 0.20,

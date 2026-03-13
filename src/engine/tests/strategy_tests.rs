@@ -921,3 +921,75 @@ fn test_on_event_ignores_control_variants() {
     engine.on_event(IngestorEvent::DrainAndRestart);
     assert!(engine.has_no_open_position());
 }
+
+// ── Repost cap tests ─────────────────────────────────────────────────
+
+/// Helper: set up engine with Leg 1 Posted and configure repost params.
+fn setup_repost_scenario(max_repost_count: u32, max_chase_ticks: u32) -> StrategyEngine {
+    let mut engine = make_engine_with_market(600);
+    engine.max_repost_count = max_repost_count;
+    engine.max_chase_ticks = max_chase_ticks;
+    engine.leg1_repost_tick_threshold = 1;
+    // Set Leg 1 as Posted at ask=0.50 with a real order ID.
+    engine.state.leg1_state = OrderState::Posted {
+        order_id: "clob-leg1-001".to_string(),
+        price: Decimal::new(50, 2),
+        size: Decimal::new(100, 0),
+        timestamp_ms: now_epoch_ms(),
+    };
+    engine.state.leg1_posted_ask = Some(Decimal::new(50, 2));
+    engine.leg1_original_signal_price = Some(Decimal::new(50, 2));
+    engine.leg1_direction = Some(Direction::Up);
+    // Set book with ask at 0.52 (2 ticks of drift).
+    set_book(&mut engine, "0.49", "0.52");
+    engine
+}
+
+#[test]
+fn test_repost_capped_at_max() {
+    let mut engine = setup_repost_scenario(2, 0); // max 2 reposts, unlimited chase
+    // Simulate 2 reposts already completed.
+    engine.leg1_repost_count = 2;
+
+    // Trigger flow update with strong composite (0.5 > cancel_threshold 0.25).
+    let now = now_epoch_ms();
+    engine.handle_flow_update(0.5, Direction::Up, now);
+
+    // Repost should be BLOCKED (count >= max).
+    assert!(engine.pending_leg1_cancel.is_none(), "repost should be blocked after max_repost_count");
+    assert_eq!(engine.diag_repost_capped, 1, "diag_repost_capped should increment");
+    assert_eq!(engine.diag_repost_attempts, 0, "diag_repost_attempts should NOT increment");
+}
+
+#[test]
+fn test_chase_distance_blocks_repost() {
+    let mut engine = setup_repost_scenario(0, 1); // unlimited reposts, max 1 tick chase
+    // Original signal at 0.50, current ask at 0.52 → chase = 2 ticks > max_chase_ticks=1.
+
+    let now = now_epoch_ms();
+    engine.handle_flow_update(0.5, Direction::Up, now);
+
+    // Repost should be BLOCKED (chase distance exceeds limit).
+    assert!(engine.pending_leg1_cancel.is_none(), "repost should be blocked by chase distance");
+    assert_eq!(engine.diag_repost_capped, 1);
+}
+
+#[test]
+fn test_repost_counter_resets_on_trade_complete() {
+    let mut engine = setup_repost_scenario(2, 4);
+    engine.leg1_repost_count = 2;
+    engine.leg1_original_signal_price = Some(Decimal::new(50, 2));
+
+    // Simulate trade completion.
+    // First set to Filled state so on_trade_complete works.
+    engine.state.leg1_state = OrderState::Filled {
+        order_id: "clob-leg1-001".to_string(),
+        price: Decimal::new(50, 2),
+        size: Decimal::new(100, 0),
+        fill_timestamp_ms: now_epoch_ms(),
+    };
+    engine.on_trade_complete();
+
+    assert_eq!(engine.leg1_repost_count, 0, "repost count should reset on trade complete");
+    assert!(engine.leg1_original_signal_price.is_none(), "original signal price should clear on trade complete");
+}
