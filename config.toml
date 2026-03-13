@@ -61,7 +61,7 @@ max_repost_count = 3
 # Maximum chase distance in ticks from original signal price (0 = unlimited)
 max_chase_ticks = 3
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
-max_dissenters = 0
+max_dissenters = 1
 
 # Metric weights (must sum to 1.0)
 # Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
@@ -88,17 +88,17 @@ freshness_atr_ms = 120
 # Normalization: [min_threshold, saturation] for each metric
 # Higher min_thresholds filter out noise—metrics must show REAL precursor magnitude to count.
 # CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
-cvd_min = 0.005
+cvd_min = 0.0
 cvd_saturation = 0.05
-spot_flow_min = 0.005
+spot_flow_min = 0.0
 spot_flow_saturation = 0.05
-obi_min = 0.001
+obi_min = 0.0
 obi_saturation = 0.2
-basis_min = 0.05
+basis_min = 0.0
 basis_saturation = 0.5
-liq_min = 0.1
+liq_min = 0.0
 liq_saturation = 10.0
-atr_min = 0.1
+atr_min = 0.0
 atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight
