@@ -302,14 +302,20 @@ impl Leg1Evaluator {
         let bot_contested = false;
 
         // Entry size — rounded to 2dp (Polymarket share precision).
+        // Clamped to CLOB minimums: ≥5 shares (maker) and ≥ ceil($1/price) (FOK notional).
         let entry_size = if !ask_price.is_zero() {
-            (alloc / ask_price).round_dp(2)
+            let raw = (alloc / ask_price).round_dp(2);
+            let min_notional_size = (Decimal::ONE / ask_price).ceil();
+            raw.max(Decimal::new(5, 0)).max(min_notional_size)
         } else {
             return Leg1Outcome::Rejected(Leg1RejectReason::Other);
         };
         if entry_size <= Decimal::ZERO {
             return Leg1Outcome::Rejected(Leg1RejectReason::Other);
         }
+
+        // Recalculate alloc to match clamped size (in case clamp fired).
+        let alloc = (entry_size * ask_price).round_dp(2);
 
         info!(
             direction = ?buildup.direction, %expected_pct, %target_pct, tier = tier.label(),

@@ -108,6 +108,25 @@ The `ActiveTrade` guard rejects the buildup signal, incrementing `rej_busy`. The
 
 **Handle:** The CLOB does not allow partial cancel of maker orders -- if the order was partially filled before the cancel reached the CLOB, `was_cancelled = false`. The engine keeps Posted state and waits for User WS events. If the remaining size fills, User WS sends MATCHED events that the engine processes normally. The paired size PnL logic (`min(l1_size, l2_size)`) handles size mismatches naturally.
 
+### User WS CANCELED race with cancel inflight (live)
+
+**Scenario:** A drift-repost or sustain cancel is dispatched (`leg1_cancel_inflight = true`). Before the cancel result arrives, the CLOB sends a `TradeStatus::Canceled` event via the User WS (e.g., CLOB self-cancels due to post-only constraint violation or TTL). The engine's old handler unconditionally reset `leg1_state = None`. If the order then filled (CLOB processed fill before cancel), the `TradeStatus::Matched` event arrives after the state reset — `is_leg1` is `false`, fill is buffered/missed, and the open position is orphaned.
+
+**Handle:** The `TradeStatus::Canceled` handler checks `leg1_cancel_inflight`:
+- **`leg1_cancel_inflight = true`** — Our cancel is in flight; the cancel result is the authoritative cleanup path. State is NOT reset here. If the order filled, the later `Matched` event finds `leg1_state = Posted` and processes the fill normally, starting Leg 2.
+- **`leg1_cancel_inflight = false`** — Unexpected CLOB cancellation (e.g., TTL expiry, post-only rejection) with no cancel from our side. Full reset: `leg1_state = None`, `leg1_posted_ask = None`, `last_buildup = None`, `leg1_direction = None`, `pending_leg1_signal = None`.
+
+The same conditional logic applies to the `replay_pending_fills` buffer handler.
+
+**Manual trace (orphan prevention):**
+1. Drift repost cancel dispatched → `leg1_cancel_inflight = true`
+2. CLOB sends `Canceled` via User WS → handler defers (no state change)
+3. CLOB sends `Matched` (order filled before cancel) → `is_leg1 = true` (state still Posted) → fill processed → Leg 2 starts normally
+4. Cancel result arrives: `was_cancelled = false` → `leg1_cancel_inflight` stays `true`, `leg1_last_cancel_repost = false`
+5. `on_trade_complete()` clears `leg1_cancel_inflight = false`
+
+**Safety:** No orphaned positions. Cancel result is always the authoritative Leg 1 cancel path when `leg1_cancel_inflight = true`.
+
 ### Maker rejected (live)
 
 **Scenario:** Post-only order is rejected because the price would cross the book (e.g., our bid is at or above the current ask).
@@ -301,3 +320,29 @@ The whole value of flow reversal detection is that it exits **before Polymarket 
 **Conclusion:** The phase-based multi-phase hedge (Phase 1 profit target, Phase 2 break-even) is the price-based backstop for false reversals. Phase 1 breach and Phase 2 price breach FOK provide a secondary safeguard if the market truly moves against us. Flow reversal is optimized for capturing Binance's lead, and flash crash exits are an acceptable cost of that optimization.
 
 **Diagnostic:** Count flash crash (true) reversals vs false reversals in session summaries and `whipsaw_reversal` field on `LiveTradeReport` (cross-reference with later UP trades). Sustained negative sessions suggest the reversal sustain window should be reconsidered.
+
+---
+
+## 17. Session Fixes — 2026-03-12
+
+The following changes were made to address real-money edge cases discovered in live operation.
+
+### 17a. Skew Guard Tightened (hard_skew_cap 0.93 → 0.90)
+
+`hard_skew_cap` was reduced from 0.93 to 0.90. Markets priced above $0.90 or below $0.10 (YES mid) have insufficient repricing capacity for a profitable trade. The tighter cap reduces false entries in near-binary markets.
+
+### 17b. FOK $1.00 Minimum Notional Fix
+
+The `emergency_fok_fallback()` loop now enforces a $1.00 minimum notional via `clob_safe_fok_size()`. Previously, price escalation could reduce the computed size to a sub-dollar notional that the CLOB rejects. The fix increases size to meet the floor before each FOK submission. See Section 8b for full loop constraints.
+
+### 17c. Entry Size Clamping (5 Shares / $1.00 Notional)
+
+Leg 1 entry size is clamped to `max(raw_size, 5, ceil($1/price))` instead of being rejected. The 5-share floor satisfies the CLOB maker minimum; the `ceil($1/price)` floor satisfies the FOK $1.00 notional minimum. Since Leg 2 inherits Leg 1's filled size, it always meets these minimums. See Section 8a.
+
+### 17d. FOK Escalation Loop: "Too Old" Abort
+
+A `"too old"` error response from the CLOB during the FOK escalation loop now causes an immediate non-retryable abort. This error indicates the market has expired or the order timestamp is stale; retrying at a higher price cannot resolve it and burns attempts unnecessarily. The loop fires an orphaned-position Telegram alert and exits.
+
+### 17e. FOK Attempt Cap (10)
+
+The `emergency_fok_fallback()` price-escalation loop is now capped at a maximum of 10 attempts. Previously the loop could run indefinitely if the book was thin or the price kept moving. After 10 failed attempts, the loop exits and fires a Telegram orphaned-position alert for manual intervention.

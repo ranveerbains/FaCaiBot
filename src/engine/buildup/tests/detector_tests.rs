@@ -14,11 +14,13 @@ fn test_empty_returns_zero() {
 
 #[test]
 fn test_causal_veto_spot_only() {
-    // Only spot metrics → no leading metric → veto.
+    // 3 bullish non-leading metrics (OBI + spot_flow + liq): direction check passes
+    // (majority=3, minority=0), but causal check fails (no CVD or basis_delta) → causal veto.
     let mut det = default_detector();
     for i in 0..50u64 {
         det.obi_velocity.update(0.01 * i as f64, i * 50);
         det.spot_flow.update(1.0, false, i * 50);
+        det.liq_pressure.update("BUY", 1.0, i * 50); // short liquidations = bullish
     }
     let (score, _) = det.evaluate(2500);
     // Should be 0 due to causal veto (no leading).

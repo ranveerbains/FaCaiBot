@@ -199,3 +199,18 @@ Guards: `clob_safe_fok_size()` zero-size check and `price x size >= $1` notional
 **Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]`.
 
 **Tracking:** `diag_favorable_exits` counter (total), `diag_favorable_maker_fills` (maker try succeeded), `diag_favorable_maker_timeouts` (fell back to FOK). Telegram tags: `[FAVORABLE MAKER]` (maker try succeeded), `[FAVORABLE FOK FALLBACK]` (FOK fallback), `[FAVORABLE POST-ONLY]` (emergency maker fill).
+
+### 8a. Entry Size Clamping
+
+Leg 1 entry size is clamped to `max(raw_size, 5, ceil($1/price))` in the evaluator. This ensures all trades meet both the CLOB 5-share maker minimum and the $1.00 FOK notional floor. Since Leg 2 inherits Leg 1's filled size, it always satisfies these minimums too.
+
+### 8b. FOK Emergency Loop Constraints
+
+The `emergency_fok_fallback()` price-escalation loop enforces several safety constraints:
+
+- **$1.00 minimum notional floor:** `clob_safe_fok_size()` increases the FOK size if `price × size < $1.00`. Sizes are rounded up to meet the CLOB notional minimum — the executor never sends a sub-dollar FOK.
+- **Maximum 10 attempts:** The loop is capped at 10 price-escalation attempts. If the position is still unhedged after 10 FOK attempts, the loop exits and fires a Telegram orphaned-position alert ("ORPHANED POSITION — FOK loop exhausted without fill") for manual intervention.
+- **Non-retryable errors (immediate abort):** Two error classes cause the loop to abort immediately rather than retrying at a higher price:
+  - `"too old"` — the market has expired or the order timestamp is stale. Retrying at a higher price cannot resolve this; further attempts are futile.
+  - `"min size"` — the computed FOK size is below the exchange minimum even after the $1.00 notional adjustment. Escalating price would only reduce the computed size further, so the loop aborts.
+- **Other non-transient errors** (e.g., `"balance"`, `"allowance"`, `"decimal places"`, `"Validation"`) also abort the loop immediately (existing behavior).

@@ -28,17 +28,33 @@ use crate::types::order::{
 
 use super::fill_engine::round_to_tick;
 
-/// Adjusts `size` so that `price * size` has at most 2 decimal places,
-/// as required by the Polymarket CLOB for Buy FOK orders (maker_amount).
+/// Adjusts `size` so that `price * size` has at most 2 decimal places
+/// and `price * size >= $1.00` (CLOB minimum notional for FOK orders).
+///
+/// If the original size produces a notional below $1.00, the size is
+/// increased to meet the minimum. An overshoot of 1-2 extra shares is
+/// acceptable for emergency hedges.
 fn clob_safe_fok_size(price: Decimal, size: Decimal) -> Decimal {
     let tick = Decimal::new(1, 2); // 0.01
-    let mut s = (size / tick).floor() * tick; // truncate size to 2dp
-    while s > Decimal::ZERO {
+    let one_dollar = Decimal::ONE;
+
+    // Start from max(truncated size, minimum size for $1.00 notional).
+    let truncated = (size / tick).floor() * tick;
+    let min_size = if price.is_zero() {
+        return Decimal::ZERO;
+    } else {
+        (one_dollar / price).ceil()
+    };
+    let mut s = truncated.max(min_size);
+
+    // Search upward for a size where price * s has ≤2dp.
+    let cap = s + Decimal::new(100, 0); // safety cap: don't search forever
+    while s <= cap {
         let maker = price * s;
         if maker == maker.round_dp(2) {
             return s;
         }
-        s -= tick;
+        s += tick;
     }
     Decimal::ZERO
 }
@@ -673,12 +689,16 @@ impl LiveExecutor {
         // Price-escalating FOK: walk up the book +1 tick per attempt until
         // filled or $1.00 cap reached. After Leg 1 fills we hold a directional
         // position — Leg 2 *must* fill. The ~1.2s HTTP round-trip per attempt
-        // is the natural rate limiter. The $1.00 price cap (~23 ticks max from
-        // any starting price) prevents infinite loops.
+        // is the natural rate limiter.
+        const MAX_FOK_ATTEMPTS: u32 = 10;
         let mut current_price = signal.price;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            if attempt > MAX_FOK_ATTEMPTS {
+                error!(attempts = MAX_FOK_ATTEMPTS, reason = ?exit_reason, "FOK max attempts reached — aborting");
+                break;
+            }
             let safe_size = clob_safe_fok_size(current_price, signal.size);
             if safe_size.is_zero() {
                 error!(price = %current_price, size = %signal.size, "FOK size zero — aborting");
@@ -742,6 +762,8 @@ impl LiveExecutor {
                         || err_msg.contains("Validation")
                         || err_msg.contains("balance")
                         || err_msg.contains("allowance")
+                        || err_msg.contains("too old")
+                        || err_msg.contains("min size")
                     {
                         error!(error = %e, "FOK non-transient error — aborting retries");
                         break;
@@ -756,6 +778,26 @@ impl LiveExecutor {
                 }
             }
         }
+        // FOK loop exhausted without fill — orphaned Leg 1 position.
+        error!(
+            token_id = %signal.token_id,
+            size = %signal.size,
+            reason = ?exit_reason,
+            attempts = attempt,
+            "ORPHANED POSITION: Leg 2 FOK loop failed — Leg 1 unhedged"
+        );
+        self.reporter.fire_critical(format!(
+            "<b>ORPHANED POSITION</b>\n\n\
+            Leg 2 FOK loop failed after {} attempts.\n\
+            Token: <code>{}</code>\n\
+            Size: {} shares\n\
+            Reason: {:?}\n\n\
+            Manual intervention required.",
+            attempt.saturating_sub(1),
+            signal.token_id,
+            signal.size,
+            exit_reason,
+        ));
         self.active_leg2_phase1_id = None;
         self.active_leg2_phase2_id = None;
         let _ = self

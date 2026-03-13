@@ -13,11 +13,11 @@ stale_book_ms = 850
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 0
 # Cooldown (ms) after trade completion before allowing new entries
-trade_cooldown_ms = 3000
+trade_cooldown_ms = 0
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 10
+max_alloc_per_trade = 15
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
@@ -31,7 +31,7 @@ min_obi_alignment = 0.3
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
 min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model
-hard_skew_cap = 0.93
+hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
@@ -39,9 +39,9 @@ max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 4000
+phase1_timeout_ms = 2500
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.02
+phase1_breach_threshold = 1.01
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -49,11 +49,11 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.325
+entry_threshold = 0.3
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.15
+cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
-cancel_window_ms = 1500
+cancel_window_ms = 2500
 # Repost Leg 1 maker if ask moves this many ticks while composite > cancel_threshold (0 = disabled)
 leg1_repost_tick_threshold = 1
 
@@ -72,9 +72,9 @@ w_liq = 0.05
 w_atr = 0.05
 
 # Freshness gates (ms) — metric treated as stale after this
-freshness_basis_ms = 200
-freshness_cvd_ms = 200
-freshness_spot_flow_ms = 200
+freshness_basis_ms = 150
+freshness_cvd_ms = 150
+freshness_spot_flow_ms = 150
 freshness_obi_ms = 100
 freshness_liq_ms = 3000
 freshness_atr_ms = 100
@@ -97,8 +97,8 @@ atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight
 # Time-based: consistent smoothing regardless of data arrival rate
-cvd_fast_halflife_ms = 200
-cvd_slow_halflife_ms = 800
-spot_flow_halflife_ms = 500
-obi_velocity_halflife_ms = 400
-basis_halflife_ms = 400
+cvd_fast_halflife_ms = 100
+cvd_slow_halflife_ms = 300
+spot_flow_halflife_ms = 150
+obi_velocity_halflife_ms = 150
+basis_halflife_ms = 150

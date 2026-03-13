@@ -196,6 +196,7 @@ async fn async_main() -> Result<()> {
         config.telegram_chat_id.clone(),
     )
     .with_notify_flags(Arc::clone(&notify_flags));
+    live_reporter_for_engine.spawn_cleanup_task();
 
     let redeem_notify_engine = Arc::clone(&redeem_notify);
     let engine_handle = tokio::task::spawn_blocking(move || {
@@ -604,6 +605,7 @@ async fn async_main() -> Result<()> {
             executor_config.telegram_chat_id.clone(),
         )
         .with_notify_flags(Arc::clone(&executor_notify_flags));
+        reporter.spawn_cleanup_task();
 
         let live_executor = LiveExecutor::new(
             poly,

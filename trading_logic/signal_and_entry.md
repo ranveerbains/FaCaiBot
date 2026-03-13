@@ -161,6 +161,7 @@ When `buildup_detected = true`, the evaluator checks every guard in sequence. **
 | 8 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
 | 9 | **Repricing model** | `expected_pct < min_reprice_pct` (2.0%) | `InsufficientRepricing` | Model output too low to justify entry |
 | 10 | **OBI alignment** | Binance book imbalance contradicts buildup direction | `ObiMismatch` | Signal quality confirmation from order flow |
+| 11 | **Min size clamp** | Entry size clamped to `max(5, ceil($1/price))` | n/a (clamped, not rejected) | CLOB minimum: 5 shares for maker, $1.00 notional for FOK |
 
 ### Direction-aware book selection
 
@@ -233,7 +234,7 @@ Default `time_exponent = 0.5` (sqrt). Set to 0 to disable. `max_time_factor` (de
 
 `alloc = max(round(max_alloc_per_trade x alloc_fraction, 2dp), $0.01)`. Dynamic -- better signals get more capital.
 
-Entry size: `round_dp(alloc / ask_price, 2)`. If entry_size rounds to 0, the signal is rejected.
+Entry size: `round_dp(alloc / ask_price, 2)`, then clamped to `max(raw, 5, ceil($1/price))`. The 5-share floor satisfies the CLOB maker minimum; the `ceil($1/price)` floor satisfies the FOK $1.00 notional minimum. If entry_size rounds to 0 before clamping, the signal is rejected.
 
 ### ProfitTier (display-only label)
 

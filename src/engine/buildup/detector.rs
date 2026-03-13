@@ -384,11 +384,11 @@ impl BuildupDetector {
             (self.w_atr, self.atr_displacement.normalized(now_ms), self.atr_displacement.direction()),
         ];
 
-        // 2. Direction consensus from directional metrics only (indices 0-3: CVD, spot_flow, OBI, basis).
-        // Liq and ATR are non-directional — they confirm activity, not direction.
+        // 2. Direction consensus from directional metrics (indices 0-4: CVD, spot_flow, OBI, basis, liq).
+        // ATR (index 5) is excluded — it measures volatility magnitude only, not direction.
         let mut up_count = 0u32;
         let mut down_count = 0u32;
-        for i in 0..4 {
+        for i in 0..5 {
             let (_, norm, dir) = metrics[i];
             if norm > 0.0 {
                 match dir {
@@ -399,15 +399,17 @@ impl BuildupDetector {
             }
         }
 
-        // Majority consensus: require at least 3 of 4 directional metrics to agree.
-        // Allow 1 dissenter (3–1), but veto ties (2–2) and weak majorities (< 3 votes).
-        let (dominant, minority, majority) = if up_count >= down_count {
-            (Direction::Up, down_count, up_count)
+        // Majority consensus: require at least 3 directional metrics to agree AND
+        // allow at most 1 dissenter. Veto ties (2–2), weak majorities (< 3 votes),
+        // and cases where minority > 1 (e.g. 3–2 has 2 dissenters — too noisy).
+        let minority = std::cmp::min(up_count, down_count);
+        let (dominant, majority) = if up_count >= down_count {
+            (Direction::Up, up_count)
         } else {
-            (Direction::Down, up_count, down_count)
+            (Direction::Down, down_count)
         };
 
-        if majority < 3 || up_count == down_count {
+        if majority < 3 || minority > 1 {
             self.diag_direction_vetoes += 1;
             return (0.0, None);
         }

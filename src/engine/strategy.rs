@@ -858,9 +858,21 @@ impl StrategyEngine {
                             self.state.leg1_state = OrderState::None;
                         }
                         TradeStatus::Canceled => {
-                            warn!(%order_id, "Leg 1 CANCELED by CLOB — resetting");
-                            self.state.leg1_state = OrderState::None;
-                            self.pending_leg1_signal = None;
+                            if self.leg1_cancel_inflight {
+                                // Our cancel is in flight — cancel result will handle cleanup.
+                                // Don't reset leg1_state here: if the order actually filled,
+                                // the MATCHED event arriving after this still needs to find
+                                // leg1_state=Posted to recognise it as a Leg 1 fill.
+                                debug!(%order_id, "Leg 1 CANCELED by CLOB (cancel in flight) — deferring to cancel result");
+                            } else {
+                                // Unexpected CLOB cancellation with no cancel in flight from our side.
+                                warn!(%order_id, "Leg 1 CANCELED by CLOB unexpectedly — full reset");
+                                self.state.leg1_state = OrderState::None;
+                                self.state.leg1_posted_ask = None;
+                                self.state.last_buildup = None;
+                                self.leg1_direction = None;
+                                self.pending_leg1_signal = None;
+                            }
                         }
                         TradeStatus::Retrying => {
                             debug!(%order_id, "Leg 1 RETRYING");
@@ -2278,7 +2290,14 @@ impl StrategyEngine {
                         self.state.leg1_state = OrderState::None;
                     }
                     TradeStatus::Canceled => {
-                        self.state.leg1_state = OrderState::None;
+                        if self.leg1_cancel_inflight {
+                            // Cancel in flight — defer cleanup to cancel result handler.
+                            debug!(%order_id, "replayed Leg 1 CANCELED (cancel in flight) — deferring to cancel result");
+                        } else {
+                            warn!(%order_id, "replayed Leg 1 CANCELED unexpectedly — resetting");
+                            self.state.leg1_state = OrderState::None;
+                            self.pending_leg1_signal = None;
+                        }
                     }
                     TradeStatus::Retrying => {}
                 }

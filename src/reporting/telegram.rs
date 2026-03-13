@@ -12,6 +12,7 @@
 // Message format: HTML parse_mode (bold via <b>, code via <code>).
 // Number conventions: prices 3 dp, percentages 1 dp, USDC amounts 2 dp.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,8 +24,9 @@ use hyper_util::rt::TokioIo;
 use rust_decimal::Decimal;
 use serde_json::json;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::control::types::NotifyFlags;
 use crate::types::market::OrderBook;
@@ -50,6 +52,8 @@ struct ReporterInner {
     last_send_ms: AtomicU64,
     /// Optional notification flags (shared with command listener).
     notify_flags: Option<Arc<NotifyFlags>>,
+    /// Tracked sent message IDs for periodic cleanup (bounded to last 200).
+    sent_messages: Mutex<VecDeque<i64>>,
 }
 
 impl TelegramReporter {
@@ -70,6 +74,7 @@ impl TelegramReporter {
                 tls_connector,
                 last_send_ms: AtomicU64::new(0),
                 notify_flags: None,
+                sent_messages: Mutex::new(VecDeque::new()),
             }),
         }
     }
@@ -86,6 +91,7 @@ impl TelegramReporter {
                     tls_connector: old.tls_connector,
                     last_send_ms: old.last_send_ms,
                     notify_flags: Some(flags),
+                    sent_messages: old.sent_messages,
                 }),
             },
             Err(arc) => {
@@ -98,6 +104,7 @@ impl TelegramReporter {
                         tls_connector: arc.tls_connector.clone(),
                         last_send_ms: AtomicU64::new(arc.last_send_ms.load(Ordering::Relaxed)),
                         notify_flags: Some(flags),
+                        sent_messages: Mutex::new(VecDeque::new()),
                     }),
                 }
             }
@@ -221,7 +228,7 @@ impl TelegramReporter {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             for chunk in split_message(&text) {
-                if let Err(e) = post_telegram_message(
+                match post_telegram_message(
                     &inner.tls_connector,
                     &inner.bot_token,
                     &inner.chat_id,
@@ -229,7 +236,13 @@ impl TelegramReporter {
                 )
                 .await
                 {
-                    error!(error = %e, "Telegram send failed");
+                    Ok(Some(msg_id)) => {
+                        track_message_id(&inner.sent_messages, msg_id).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!(error = %e, "Telegram send failed");
+                    }
                 }
             }
         });
@@ -252,7 +265,7 @@ impl TelegramReporter {
                 tokio::time::sleep(std::time::Duration::from_millis(1_500 - gap_ms)).await;
             }
             for chunk in split_message(&text) {
-                if let Err(e) = post_telegram_message(
+                match post_telegram_message(
                     &inner.tls_connector,
                     &inner.bot_token,
                     &inner.chat_id,
@@ -260,7 +273,41 @@ impl TelegramReporter {
                 )
                 .await
                 {
-                    error!(error = %e, "Telegram critical send failed");
+                    Ok(Some(msg_id)) => {
+                        track_message_id(&inner.sent_messages, msg_id).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!(error = %e, "Telegram critical send failed");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawn a background task that deletes tracked messages every 5 minutes.
+    /// Call once after reporter construction. Silently ignores deletion failures.
+    pub fn spawn_cleanup_task(&self) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let ids: Vec<i64> = {
+                    let mut lock = inner.sent_messages.lock().await;
+                    lock.drain(..).collect()
+                };
+                if ids.is_empty() {
+                    continue;
+                }
+                info!(count = ids.len(), "cleaning up Telegram messages");
+                for msg_id in ids {
+                    let _ = delete_telegram_message(
+                        &inner.tls_connector,
+                        &inner.bot_token,
+                        &inner.chat_id,
+                        msg_id,
+                    )
+                    .await;
                 }
             }
         });
@@ -338,7 +385,7 @@ pub(crate) async fn post_telegram_message(
     bot_token: &str,
     chat_id: &str,
     text: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<i64>> {
     // ── Build JSON body ───────────────────────────────────────────────────────
     let body_json = json!({
         "chat_id": chat_id,
@@ -381,15 +428,75 @@ pub(crate) async fn post_telegram_message(
     let resp = sender.send_request(req).await?;
     let status = resp.status();
 
+    let body = resp.into_body().collect().await?.to_bytes();
     if !status.is_success() {
-        let body = resp.into_body().collect().await?.to_bytes();
         let body_text = String::from_utf8_lossy(&body);
         warn!(
             status = %status,
             body = %body_text,
             "Telegram API returned non-2xx response"
         );
-        // Non-fatal — reporting is best-effort.
+        return Ok(None);
+    }
+
+    // Extract message_id from response for cleanup tracking.
+    let message_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("result")?.get("message_id")?.as_i64());
+
+    Ok(message_id)
+}
+
+/// Track a sent message ID for later cleanup (bounded to 200).
+async fn track_message_id(sent_messages: &Mutex<VecDeque<i64>>, msg_id: i64) {
+    let mut lock = sent_messages.lock().await;
+    lock.push_back(msg_id);
+    while lock.len() > 200 {
+        lock.pop_front();
+    }
+}
+
+/// Delete a single Telegram message. Silently ignores failures.
+async fn delete_telegram_message(
+    tls_connector: &TlsConnector,
+    bot_token: &str,
+    chat_id: &str,
+    message_id: i64,
+) -> anyhow::Result<()> {
+    let body_json = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    let body_str = serde_json::to_string(&body_json)?;
+    let body_bytes = Bytes::from(body_str);
+    let content_len = body_bytes.len();
+
+    let tcp = TcpStream::connect((TELEGRAM_HOST, TELEGRAM_PORT)).await?;
+    let server_name = rustls::pki_types::ServerName::try_from(TELEGRAM_HOST)
+        .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?
+        .to_owned();
+    let tls_stream = tls_connector.connect(server_name, tcp).await?;
+    let io = TokioIo::new(tls_stream);
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            warn!(error = %e, "Telegram deleteMessage connection error");
+        }
+    });
+
+    let path = format!("/bot{}/deleteMessage", bot_token);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(&path)
+        .header(HOST, TELEGRAM_HOST)
+        .header(CONTENT_TYPE, "application/json")
+        .header("Content-Length", content_len.to_string())
+        .body(Full::new(body_bytes))?;
+
+    let resp = sender.send_request(req).await?;
+    if !resp.status().is_success() {
+        debug!(message_id, "deleteMessage failed (may already be deleted)");
     }
 
     Ok(())

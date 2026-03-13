@@ -135,11 +135,11 @@ impl TelegramCommandListener {
         }
 
         loop {
-            // Wrap the long-poll in a timeout. The Telegram long-poll is 30s,
-            // so we allow 45s total (30s poll + 15s for TLS handshake/network).
+            // Wrap the long-poll in a timeout. The Telegram long-poll is 10s,
+            // so we allow 15s total (10s poll + 5s for TLS handshake/network).
             // Without this, a silently dropped connection hangs the listener forever.
             let poll_result = tokio::time::timeout(
-                std::time::Duration::from_secs(45),
+                std::time::Duration::from_secs(15),
                 poll_updates(&tls_connector, &bot_token, &mut last_update_id),
             )
             .await;
@@ -175,7 +175,9 @@ impl TelegramCommandListener {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Err(_) => {
-                    warn!("getUpdates timed out (>45s) — connection likely dropped, retrying");
+                    warn!("getUpdates timed out (>15s) — connection likely dropped, retrying");
+                    // Brief pause to avoid tight-loop on persistent network issues.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
@@ -283,7 +285,7 @@ async fn poll_updates(
     last_update_id: &mut i64,
 ) -> anyhow::Result<Vec<TelegramMessage>> {
     let path = format!(
-        "/bot{}/getUpdates?offset={}&timeout=30&allowed_updates=%5B%22message%22%5D",
+        "/bot{}/getUpdates?offset={}&timeout=10&allowed_updates=%5B%22message%22%5D",
         bot_token,
         *last_update_id + 1
     );
