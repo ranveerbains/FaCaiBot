@@ -94,6 +94,27 @@ Where buy/sell volume is the 1-min or 30-sec rolling sum of aggressive trade vol
 
 This change would align the system fully with academic literature on order flow toxicity.
 
+#### Metric Normalization & Saturation Calibration
+
+Each metric is independently normalized to [0, 1] using per-metric `(min_threshold, saturation)` bounds configured in `config.toml` `[buildup]` section:
+
+| Metric | min_threshold | saturation | Rationale |
+|--------|---|---|---|
+| **Basis delta** | 0.0 bps | 0.05 bps/update | Binance futures ticks rapidly; 50ms update cadence. First-order micro-price movement. |
+| **CVD acceleration** | 0.0 | 0.60 BTC/update | EMA of aggressive volume differential. Calibrated empirically to achieve ~38% avg normalized contribution across quiet+active markets. |
+| **OBI velocity** | 0.0 | 0.2 OBI-delta/update | Rate of change of order book imbalance. Typical depth shifts 0.1-0.2 per update at entry latency. |
+| **Spot trade flow** | 0.0 | **0.3 BTC/update** | EMA of net aggressive buy/sell volume. **Recalibrated 2026-03-13** from 0.05 → 0.3 (6× increase): SpotFlow parser bug fixed, old saturation was under-calibrated, causing 97% ceiling hits and spurious entries in quiet markets. Target avg_norm ~0.16 vs CVD ~0.38. |
+| **Liquidation pressure** | 0.0 | 10.0 BTC | Exponentially-decaying forced liquidation volume. Rare signal; 10.0 BTC threshold is conservative (typical spike ~1-5 BTC). |
+| **ATR displacement** | 0.0 | 15.0 std-devs | Volatility gauge only; ATR predicts magnitude, not direction. High threshold (15x ATR) prevents false entries from volatility alone. |
+
+**Normalization formula:** `normalized = min(raw_value / saturation, 1.0)`
+
+The 0.05 → 0.3 SpotFlow adjustment was motivated by:
+1. SpotFlow's order-of-magnitude matches CVD (both BTC-denominated EMAs of trade flow)
+2. CVD's calibration achieved 0.381 avg normalized via saturation=0.6
+3. 0.3 ≈ saturation / 2 (CVD's value), providing a gentler saturation curve for SpotFlow
+4. Expected composite avg post-adjustment: ~0.29 (was 0.41), filtering quiet-market noise while preserving real buildups
+
 #### Evaluation pipeline
 
 1. **Normalize**: Compute [0,1] value for each metric (0 if stale beyond freshness window)

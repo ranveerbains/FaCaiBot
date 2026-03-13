@@ -1,0 +1,289 @@
+[13/3/26 9:18 PM] facaibot: FaCaiBot live started
+
+Connected to Binance SBE + Polymarket CLOB. Real orders will be placed.
+[13/3/26 9:19 PM] r b: /balance
+[13/3/26 9:19 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $307.037218
+POL: 161.0637
+[13/3/26 9:20 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #62fc0
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:15 - 13:20 UTC
+
+Signals detected: 0
+Leg 1 fills: 0 (0% fill rate)
+Hedged: 0/0 (0%)
+Walls outbid: 0
+Emergency taker fills: 0 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+
+
+Allocation used: $0.00 / $15.00 (0%)
+Taker fees paid: $0.00 (both legs maker)
+Gross market PnL: +$0.0000
+Net market PnL: $0.0000 (zero fees in normal flow)
+Capital locked in resolution: $0.00
+[13/3/26 9:20 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 1.95%
+Target: 1.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.63 × 11.90sh = $7.49
+Top of book | Depth: $52685
+
+Leg 2 target
+Buy YES  $0.36 | Break-even: $0.37
+Est. profit: 1.00% (~$0.1190) | FOK fee: $0.0132/sh
+
+Status: Watching for hedge...
+[13/3/26 9:20 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.63 × 11.90sh = $7.49 [MAKER]
+Leg 2: Buy YES  $0.36 × 11.90sh (PHASE-1)
+
+Pair: $0.990/sh × 11.90sh = $11.78
+Profit: +$0.1829 (+$0.0639 est. rebate) (1.55%)
+[13/3/26 9:20 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 2.16%
+Target: 2.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.68 × 11.03sh = $7.50
+Top of book | Depth: $55257
+
+Leg 2 target
+Buy YES  $0.30 | Break-even: $0.32
+Est. profit: 2.00% (~$0.2206) | FOK fee: $0.0110/sh
+
+Status: Watching for hedge...
+[13/3/26 9:20 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.68 × 11.03sh = $7.50 [MAKER]
+Leg 2: Buy YES  $0.35 × 12.03sh [PHASE-1 BREACH FOK FALLBACK] (PHASE-1)
+
+Pair: $1.030/sh × 11.03sh = $11.36
+Unhedged: 1.00sh YES at $0.35 (pending resolution)
+Gross: $-0.3309 | Fee: -$0.1556 | Rebate: +$0.0261 | Net: $-0.4604 (-3.93%)
+[13/3/26 9:20 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 2.23%
+Target: 2.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.74 × 10.14sh = $7.50
+Top of book | Depth: $49968
+
+Leg 2 target
+Buy YES  $0.24 | Break-even: $0.26
+Est. profit: 2.00% (~$0.2028) | FOK fee: $0.0083/sh
+
+Status: Watching for hedge...
+[13/3/26 9:20 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.74 × 10.14sh = $7.50 [MAKER]
+Leg 2: Buy YES  $0.30 × 10.10sh [PHASE-1 BREACH FOK FALLBACK] (PHASE-1)
+
+Pair: $1.040/sh × 10.10sh = $10.50
+Unhedged: 0.04sh NO at $0.74 (pending resolution)
+Gross: $-0.4040 | Fee: -$0.1113 | Rebate: +$0.0187 | Net: $-0.4965 (-4.71%)
+[13/3/26 9:20 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 3.92%
+Target: 3.00% (MED) | Capital: $10.71
+
+Leg 1 [MAKER]
+Buy NO  $0.71 × 15.08sh = $10.70
+Top of book | Depth: $48090
+
+Leg 2 target
+Buy YES  $0.26 | Break-even: $0.29
+Est. profit: 3.00% (~$0.4524) | FOK fee: $0.0092/sh
+
+Status: Watching for hedge...
+[13/3/26 9:20 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.71 × 15.08sh = $10.70 [MAKER]
+Leg 2: Buy YES  $0.26 × 15.08sh (PHASE-1)
+
+Pair: $0.970/sh × 15.08sh = $14.62
+Profit: +$0.5122 (+$0.0598 est. rebate) (3.50%)
+[13/3/26 9:21 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 3.70%
+Target: 3.00% (MED) | Capital: $10.11
+
+Leg 1 [MAKER]
+Buy NO  $0.77 × 13.13sh = $10.11
+Top of book | Depth: $44866
+
+Leg 2 target
+Buy YES  $0.20 | Break-even: $0.23
+Est. profit: 3.00% (~$0.3939) | FOK fee: $0.0064/sh
+
+Status: Watching for hedge...
+[13/3/26 9:21 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.77 × 13.13sh = $10.11 [MAKER]
+Leg 2: Buy YES  $0.23 × 13.59sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.000/sh × 13.13sh = $13.13
+Unhedged: 0.46sh YES at $0.23 (pending resolution)
+Gross: +$0.0000 | Fee: -$0.1065 | Rebate: +$0.0205 | Net: $-0.0859 (-0.64%)
+[13/3/26 9:21 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 2.28%
+Target: 2.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.81 × 9.26sh = $7.50
+Top of book | Depth: $40964
+
+Leg 2 target
+Buy YES  $0.17 | Break-even: $0.19
+Est. profit: 2.00% (~$0.1852) | FOK fee: $0.0049/sh
+
+Status: Watching for hedge...
+[13/3/26 9:21 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.81 × 9.25sh = $7.49 [MAKER]
+Leg 2: Buy YES  $0.20 × 9.25sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.010/sh × 9.25sh = $9.34
+Gross: $-0.0925 | Fee: -$0.0592 | Rebate: +$0.0109 | Net: $-0.1407 (-1.50%)
+[13/3/26 9:23 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 2.35%
+Target: 2.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.81 × 9.26sh = $7.50
+Top of book | Depth: $28282
+
+Leg 2 target
+Buy YES  $0.17 | Break-even: $0.19
+Est. profit: 2.00% (~$0.1852) | FOK fee: $0.0049/sh
+
+Status: Watching for hedge...
+[13/3/26 9:23 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.81 × 4.97sh = $4.02 [MAKER]
+Leg 2: Buy YES  $0.21 × 5.00sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.020/sh × 4.97sh = $5.06
+Unhedged: 0.03sh YES at $0.21 (pending resolution)
+Gross: $-0.0994 | Fee: -$0.0344 | Rebate: +$0.0058 | Net: $-0.1279 (-2.52%)
+[13/3/26 9:24 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e422e
+Buildup: DOWN | Reprice: 3.23%
+Target: 3.00% (MED) | Capital: $8.83
+
+Leg 1 [MAKER]
+Buy NO  $0.84 × 10.51sh = $8.82
+Top of book | Depth: $27552
+
+Leg 2 target
+Buy YES  $0.13 | Break-even: $0.16
+Est. profit: 3.00% (~$0.3153) | FOK fee: $0.0031/sh
+
+Status: Watching for hedge...
+[13/3/26 9:24 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e422e
+
+Leg 1: Buy NO  $0.84 × 10.51sh = $8.82 [MAKER]
+Leg 2: Buy YES  $0.13 × 10.51sh (PHASE-1)
+
+Pair: $0.970/sh × 10.51sh = $10.19
+Profit: +$0.3315 (+$0.0162 est. rebate) (3.25%)
+[13/3/26 9:24 PM] r b: /polybalance
+[13/3/26 9:24 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $99.08
+[13/3/26 9:24 PM] r b: /balance
+[13/3/26 9:24 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $200.289249
+POL: 161.0637
+[13/3/26 9:25 PM] facaibot: --- MARKET SUMMARY ---
+
+Market: #e422e
+Resolution: pending (UMA challenge period: ~2h remaining)
+Period: 13:20 - 13:25 UTC
+
+Signals detected: 8
+Leg 1 fills: 8 (100% fill rate)
+Hedged: 8/8 (100%)
+Walls outbid: 0
+Emergency taker fills: 5 (post-only: 0)
+Favorable exits: 0 taker / 0 maker
+
+Trade 1: reprice=1.95% target=LOW alloc=$7 → NO@0.630 + YES@0.360 = $0.990/sh × 11.90sh → maker+maker → net +$0.1829 USDC (1.55%)
+Trade 2: reprice=2.16% target=LOW alloc=$7 → NO@0.680 + YES@0.350 = $1.030/sh × 11.03sh → maker+taker → net $-0.4604 USDC (-3.93%)
+Trade 3: reprice=2.23% target=LOW alloc=$7 → NO@0.740 + YES@0.300 = $1.040/sh × 10.10sh → maker+taker → net $-0.4965 USDC (-4.71%)
+Trade 4: reprice=3.92% target=MED alloc=$10 → NO@0.710 + YES@0.260 = $0.970/sh × 15.08sh → maker+maker → net +$0.5122 USDC (3.50%)
+Trade 5: reprice=3.70% target=MED alloc=$10 → NO@0.770 + YES@0.230 = $1.000/sh × 13.13sh → maker+taker → net $-0.0859 USDC (-0.64%)
+Trade 6: reprice=2.28% target=LOW alloc=$7 → NO@0.810 + YES@0.200 = $1.010/sh × 9.25sh → maker+taker → net $-0.1407 USDC (-1.50%)
+Trade 7: reprice=2.35% target=LOW alloc=$7 → NO@0.810 + YES@0.210 = $1.020/sh × 4.97sh → maker+taker → net $-0.1279 USDC (-2.52%)
+Trade 8: reprice=3.23% target=MED alloc=$8 → NO@0.840 + YES@0.130 = $0.970/sh × 10.51sh → maker+maker → net +$0.3315 USDC (3.25%)
+
+Allocation used: $67.15 / $15.00 (448%)
+Taker fees paid: $0.4671
+Est. maker rebates: $0.2223
+Gross market PnL: $-0.0401
+Net market PnL: $-0.2849
+Capital locked in resolution: $86.05
+[13/3/26 9:25 PM] r b: /stop
+[13/3/26 9:25 PM] facaibot: Trading paused. Use /resume to restart.
+[13/3/26 9:25 PM] r b: /resume
+[13/3/26 9:25 PM] facaibot: Trading resumed.
+[13/3/26 9:25 PM] facaibot: --- OPPORTUNITY DETECTED ---
+
+Market: #e8e2e
+Buildup: DOWN | Reprice: 2.29%
+Target: 2.00% (LOW) | Capital: $7.50
+
+Leg 1 [MAKER]
+Buy NO  $0.74 × 10.14sh = $7.50
+Top of book | Depth: $51315
+
+Leg 2 target
+Buy YES  $0.24 | Break-even: $0.26
+Est. profit: 2.00% (~$0.2028) | FOK fee: $0.0083/sh
+
+Status: Watching for hedge...
+[13/3/26 9:25 PM] facaibot: --- TRADE COMPLETED ---
+
+Market: #e8e2e
+
+Leg 1: Buy NO  $0.74 × 10.14sh = $7.50 [MAKER]
+Leg 2: Buy YES  $0.26 × 10.00sh [FOK FALLBACK] (PHASE-2)
+
+Pair: $1.000/sh × 10.00sh = $10.00
+Unhedged: 0.14sh NO at $0.74 (pending resolution)
+Gross: +$0.0000 | Fee: -$0.0925 | Rebate: +$0.0187 | Net: $-0.0737 (-0.73%)
+[13/3/26 9:25 PM] r b: /redeem
