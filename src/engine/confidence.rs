@@ -22,8 +22,6 @@ use crate::types::market::Direction;
 ///
 /// # Signal strength semantics
 /// - Phase A (entry): composite buildup score [0,1]
-/// - Phase B (hedge targeting): max(observed_norm, composite) [0,1]
-/// - ATR backstop: normalized spike ATR ratio [0,1]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_expected_repricing(
     signal_strength: Decimal,

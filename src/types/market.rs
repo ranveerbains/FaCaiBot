@@ -237,10 +237,6 @@ pub struct BuildupInfo {
     #[allow(dead_code)] // diagnostic field, will be logged/reported in future phase
     pub liq_pressure: Decimal,
     pub atr_displacement: Decimal,
-    /// Spot mid-price at time of buildup detection (for Phase B refinement).
-    pub spot_mid_at_entry: Decimal,
-    /// Current EMA ATR (for Phase B observed displacement computation).
-    pub ema_atr: Decimal,
     /// Raw ATR displacement ratio (abs_displacement / ema_atr) — same semantics as
     /// SpikeInfo.atr_ratio. Used by the repricing model until Phase 7 reworks it.
     pub signal_atr_ratio: Decimal,

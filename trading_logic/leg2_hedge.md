@@ -28,7 +28,7 @@ The hedge system uses two phases with a single cancel/repost at the transition -
 
 ### Phase 1 target price computation
 
-`target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)` where `initial_profit_target = round_to_tick(best_expected_pct x phase1_target_dampen, tick)` -- the dampened target from the repricing model. `best_expected_pct = max(Phase A, Phase B)` from the two-phase repricing model (default dampening 80% of raw expected_pct).
+`target_price = round_to_tick(1.0 - initial_profit_target - leg1_price, tick)` where `initial_profit_target = round_to_tick(expected_pct x phase1_target_dampen, tick)` -- the dampened target from the repricing model. `expected_pct` is the composite-score-based entry repricing estimate (default dampening 80% of raw expected_pct).
 
 The raw target is sent to the executor as-is (no don't-cross-ask clamping, no smart outbid). If the price would cross the book, the CLOB rejects the post-only order or returns "crosses book", and the executor routes to `attempt_favorable_maker_then_fok()` -- which is the correct path for that scenario.
 

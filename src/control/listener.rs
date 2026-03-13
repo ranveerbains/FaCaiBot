@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::control::handlers;
 use crate::control::types::{BotStatus, DrainStatus, NotifyFlags};
 use crate::control::wallet;
-use crate::reporting::telegram::{TELEGRAM_HOST, post_telegram_message};
+use crate::reporting::telegram::{TELEGRAM_HOST, TelegramReporter, post_telegram_message};
 use crate::types::market::IngestorEvent;
 
 const TELEGRAM_PORT: u16 = 443;
@@ -33,6 +33,7 @@ pub struct TelegramCommandListener {
     ingestor_tx: Sender<IngestorEvent>,
     status_rx: watch::Receiver<BotStatus>,
     drain_status_rx: watch::Receiver<DrainStatus>,
+    reporter: TelegramReporter,
 }
 
 impl TelegramCommandListener {
@@ -46,6 +47,7 @@ impl TelegramCommandListener {
         ingestor_tx: Sender<IngestorEvent>,
         status_rx: watch::Receiver<BotStatus>,
         drain_status_rx: watch::Receiver<DrainStatus>,
+        reporter: TelegramReporter,
     ) -> Self {
         Self {
             bot_token,
@@ -56,6 +58,7 @@ impl TelegramCommandListener {
             ingestor_tx,
             status_rx,
             drain_status_rx,
+            reporter,
         }
     }
 
@@ -73,11 +76,13 @@ impl TelegramCommandListener {
         let ingestor_tx = self.ingestor_tx;
         let status_rx = self.status_rx;
         let mut drain_status_rx = self.drain_status_rx;
+        let reporter = self.reporter;
 
         // Clone for the drain watcher task.
         let drain_tls = tls_connector.clone();
         let drain_bot_token = bot_token.clone();
         let drain_chat_id = chat_id.clone();
+        let drain_reporter = reporter.clone();
 
         // Task 1: Watch drain status → send Telegram progress updates.
         let _drain_watcher = tokio::spawn(async move {
@@ -94,22 +99,28 @@ impl TelegramCommandListener {
                     } => {
                         let msg =
                             format!("Drain mode activated ({reason}) — {position_info}");
-                        let _ = post_telegram_message(
+                        if let Ok(Some(id)) = post_telegram_message(
                             &drain_tls,
                             &drain_bot_token,
                             &drain_chat_id,
                             &msg,
                         )
-                        .await;
+                        .await
+                        {
+                            drain_reporter.track_msg_id(id).await;
+                        }
                     }
                     DrainStatus::Complete { exit_code, summary } => {
-                        let _ = post_telegram_message(
+                        if let Ok(Some(id)) = post_telegram_message(
                             &drain_tls,
                             &drain_bot_token,
                             &drain_chat_id,
                             &summary,
                         )
-                        .await;
+                        .await
+                        {
+                            drain_reporter.track_msg_id(id).await;
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         info!(exit_code, "drain complete — exiting");
                         std::process::exit(exit_code);
@@ -157,16 +168,20 @@ impl TelegramCommandListener {
                             &status_rx,
                             &tls_connector,
                             &bot_token,
+                            &reporter,
                         )
                         .await;
                         if let Some(reply_text) = reply {
-                            let _ = post_telegram_message(
+                            if let Ok(Some(id)) = post_telegram_message(
                                 &tls_connector,
                                 &bot_token,
                                 &chat_id,
                                 &reply_text,
                             )
-                            .await;
+                            .await
+                            {
+                                reporter.track_msg_id(id).await;
+                            }
                         }
                     }
                 }
@@ -202,6 +217,7 @@ async fn handle_message(
     status_rx: &watch::Receiver<BotStatus>,
     tls_connector: &TlsConnector,
     bot_token: &str,
+    reporter: &TelegramReporter,
 ) -> Option<String> {
     let from_id = msg.from.as_ref().map(|f| f.id).unwrap_or(0);
     let msg_chat_id = msg.chat.id.to_string();
@@ -254,6 +270,7 @@ async fn handle_message(
             let chat = chat_id.to_string();
             let cmd_owned = cmd.to_string();
             let args_owned = args.trim().to_string();
+            let wallet_reporter = reporter.clone();
             tokio::spawn(async move {
                 let reply = match cmd_owned.as_str() {
                     "balance" => wallet::handle_balance().await,
@@ -267,7 +284,9 @@ async fn handle_message(
                     }
                     _ => return,
                 };
-                let _ = post_telegram_message(&tls, &token, &chat, &reply).await;
+                if let Ok(Some(id)) = post_telegram_message(&tls, &token, &chat, &reply).await {
+                    wallet_reporter.track_msg_id(id).await;
+                }
             });
             return None;
         }

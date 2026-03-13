@@ -285,13 +285,19 @@ impl TelegramReporter {
         });
     }
 
-    /// Spawn a background task that deletes tracked messages every 5 minutes.
+    /// Track an externally sent message ID for cleanup (e.g. from direct
+    /// `post_telegram_message` calls outside the reporter's send methods).
+    pub async fn track_msg_id(&self, msg_id: i64) {
+        track_message_id(&self.inner.sent_messages, msg_id).await;
+    }
+
+    /// Spawn a background task that deletes tracked messages every hour.
     /// Call once after reporter construction. Silently ignores deletion failures.
     pub fn spawn_cleanup_task(&self) {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
                 let ids: Vec<i64> = {
                     let mut lock = inner.sent_messages.lock().await;
                     lock.drain(..).collect()

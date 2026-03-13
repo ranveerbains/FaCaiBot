@@ -85,11 +85,11 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
    - Whipsaw (opposite direction signal) -> CancelLeg1Order -> STOP (if confirmed)
 
 4a. [SIM] advance_simulation() fill check passes -> leg1_state = Filled
-    init_leg2() (Phase B repricing), emit confirmed fill signal
+    init_leg2() (stores entry expected_pct, initializes HedgeState), emit confirmed fill signal
 
 4b. [LIVE] Executor posts maker post-only GTC
     OrderPosted feedback -> engine stores order_id
-    User WS fill (MATCHED event) -> leg1_state = Filled, init_leg2() (Phase B repricing)
+    User WS fill (MATCHED event) -> leg1_state = Filled, init_leg2() (stores entry expected_pct)
 
 5. evaluate_leg2() runs on each event:
    - Phase 1: post at profit target, hold until fill or timeout

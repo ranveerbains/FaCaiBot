@@ -185,7 +185,7 @@ Score 0.504 >= entry_threshold 0.40 -> `BuildupConfirmed`.
 
 Guards pass: no active trade, Binance price present, YES book bid=0.495/ask=0.505, book age 50ms, YES mid=0.50 (no skew).
 
-Phase A repricing model: composite_score 0.508 (already [0,1]) x `4P(1-P)` x alignment x time_factor x reprice_scale -> expected_pct. Used as Phase 1 profit target (dampened by phase1_target_dampen).
+Repricing model: composite_score 0.508 (already [0,1]) x `4P(1-P)` x alignment x time_factor x reprice_scale -> expected_pct. Used as Phase 1 profit target (dampened by phase1_target_dampen).
 
 Allocation = round(max_alloc x alloc_fraction) based on dynamic sizing. Ask = best_ask = $0.505. Size = round_dp(alloc / ask_price).
 
@@ -199,7 +199,7 @@ Maker order rests on book. Engine monitors composite score on every event. Score
 
 CLOB market maker sells into our resting bid at $0.505. User WS sends MATCHED event.
 
-Result: `leg1_state = Filled`, Phase B repricing computed: observed spot displacement $200/$12.50 ATR = 16.0 ratio, normalized to 0.60. `max(0.60, 0.508) = 0.60`. Hedge initialized (`init_leg2()`). `initial_profit_target` = dampened Phase B target.
+Result: `leg1_state = Filled`. Hedge initialized (`init_leg2()`). `initial_profit_target` = dampened entry expected_pct (0.508 composite score → dampened by phase1_target_dampen).
 
 ### Step 5: Phase 1 Post (T+500ms, immediately after fill)
 

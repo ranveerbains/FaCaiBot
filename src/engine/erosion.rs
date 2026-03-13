@@ -46,14 +46,6 @@ pub(crate) struct HedgeState {
     pub phase2_posted_price: Option<Decimal>,
     /// Epoch ms when Phase 2 started (for Phase 2 timeout).
     pub phase2_start_ms: Option<u64>,
-    /// Phase A repricing estimate (composite-based, at entry).
-    pub phase_a_pct: Decimal,
-    /// Phase B repricing estimate (refined after fill, max of observed and composite).
-    pub phase_b_pct: Decimal,
-    /// Spot mid price when buildup triggered (for Phase B displacement calc).
-    pub spot_mid_at_entry: Decimal,
-    /// EMA ATR at entry (for Phase B displacement normalization).
-    pub entry_ema_atr: Decimal,
     /// `true` while composite flow data is fresh and usable for graduated response.
     pub flow_monitoring_active: bool,
     /// Latest composite score snapshot (updated by engine on each event).
@@ -75,10 +67,6 @@ impl HedgeState {
         spike_info: SpikeInfo,
         expected_pct: Decimal,
         phase1_target_price: Decimal,
-        phase_a_pct: Decimal,
-        phase_b_pct: Decimal,
-        spot_mid_at_entry: Decimal,
-        entry_ema_atr: Decimal,
     ) -> Self {
         Self {
             leg1_fill_ms,
@@ -96,10 +84,6 @@ impl HedgeState {
             phase1_target_price,
             phase2_posted_price: None,
             phase2_start_ms: None,
-            phase_a_pct,
-            phase_b_pct,
-            spot_mid_at_entry,
-            entry_ema_atr,
             flow_monitoring_active: false,
             last_flow_score: Decimal::ZERO,
             last_flow_direction: None,
@@ -147,18 +131,6 @@ pub(crate) struct HedgeSnap {
     pub phase2_start_ms: Option<u64>,
     /// The price at which Phase 2 order was posted (for Phase 2 breach guard).
     pub phase2_posted_price: Option<Decimal>,
-    /// Phase A repricing estimate (composite-based, at entry).
-    #[allow(dead_code)]
-    pub phase_a_pct: Decimal,
-    /// Phase B repricing estimate (refined after fill).
-    #[allow(dead_code)]
-    pub phase_b_pct: Decimal,
-    /// Spot mid price when buildup triggered.
-    #[allow(dead_code)]
-    pub spot_mid_at_entry: Decimal,
-    /// EMA ATR at entry.
-    #[allow(dead_code)]
-    pub entry_ema_atr: Decimal,
     /// Whether composite flow data is fresh and usable.
     pub flow_monitoring_active: bool,
     /// Latest composite score snapshot.

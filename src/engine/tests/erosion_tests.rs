@@ -18,10 +18,6 @@ fn make_hedge() -> HedgeState {
         },
         Decimal::new(7, 1),      // expected_pct = 0.7
         Decimal::new(475, 3),    // phase1_target_price = 0.475
-        Decimal::ZERO,           // phase_a_pct
-        Decimal::ZERO,           // phase_b_pct
-        Decimal::ZERO,           // spot_mid_at_entry
-        Decimal::ZERO,           // entry_ema_atr
     )
 }
 

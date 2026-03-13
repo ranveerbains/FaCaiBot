@@ -176,12 +176,11 @@ When `buildup_detected = true`, the evaluator checks every guard in sequence. **
 
 ## 4. Repricing Model & Allocation
 
-### Two-phase repricing
+### Repricing model
 
-The repricing model runs twice during a trade lifecycle:
+The repricing model runs once per trade lifecycle at signal time:
 
-- **Phase A (entry)**: Computed in `Leg1Evaluator::evaluate()` at signal time. Uses the composite score as signal strength. Drives the entry gate and initial allocation
-- **Phase B (hedge targeting)**: Computed in `init_leg2()` after Leg 1 fills. Refines using observed spot displacement since entry (current spot vs `spot_mid_at_entry`). Takes the `max(Phase A, Phase B)` for hedge targeting -- if the observed move exceeded the prediction, the target improves
+- **Entry repricing**: Computed in `Leg1Evaluator::evaluate()` using the composite buildup score as signal strength. The result (`expected_pct`) drives the entry gate, allocation, and becomes the Phase 1 profit target. `init_leg2()` stores this value directly in `HedgeState.expected_pct`.
 
 ### Expected repricing formula
 
@@ -197,15 +196,6 @@ The composite score is already [0,1]-normalized by the buildup detector, so no r
 ```
 norm_signal = clamp((composite_score - 0) / (1 - 0), 0, 1) = composite_score
 ```
-
-**Phase B refinement**: After Leg 1 fills, `init_leg2()` computes observed spot displacement:
-```
-displacement = |current_spot - spot_mid_at_entry|
-observed_ratio = displacement / ema_atr_at_entry
-observed_norm = clamp((observed_ratio - min) / range, 0, 1)
-refined_strength = max(observed_norm, composite_score)
-```
-The better of Phase A and Phase B is used for hedge targeting.
 
 **Component 2: `adjusted_sensitivity`** -- binary option delta proxy:
 ```

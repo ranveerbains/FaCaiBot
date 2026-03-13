@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use tokio_rustls::TlsConnector;
 use tracing::warn;
 
-use crate::reporting::telegram::post_telegram_message;
+use crate::reporting::telegram::{TelegramReporter, post_telegram_message};
 use crate::utils::signing::build_signer;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -492,6 +492,7 @@ pub async fn auto_redeem_loop(
     bot_token: String,
     chat_id: String,
     rotation_notify: Arc<tokio::sync::Notify>,
+    reporter: TelegramReporter,
 ) {
     loop {
         rotation_notify.notified().await;
@@ -509,8 +510,10 @@ pub async fn auto_redeem_loop(
         }
 
         let msg = format!("Auto-redeem: {result}");
-        if let Err(e) = post_telegram_message(&tls_connector, &bot_token, &chat_id, &msg).await {
-            warn!(error = %e, "failed to send auto-redeem notification");
+        match post_telegram_message(&tls_connector, &bot_token, &chat_id, &msg).await {
+            Ok(Some(id)) => reporter.track_msg_id(id).await,
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "failed to send auto-redeem notification"),
         }
     }
 }

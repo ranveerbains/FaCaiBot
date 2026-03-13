@@ -41,7 +41,7 @@ max_time_factor = 2.25
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 2500
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.01
+phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -49,7 +49,7 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.3
+entry_threshold = 0.40
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
@@ -71,28 +71,28 @@ w_liq = 0.05
 # Spot displacement from EMA normalized by ATR — VOLATILITY only, no direction prediction
 w_atr = 0.05
 
-# Freshness gates (ms) — metric treated as stale after this
-freshness_basis_ms = 150
-freshness_cvd_ms = 150
-freshness_spot_flow_ms = 150
-freshness_obi_ms = 100
-freshness_liq_ms = 3000
-freshness_atr_ms = 100
+# Freshness gates (ms) — metric treated as stale after this. Tightened to only include recent data.
+freshness_basis_ms = 100
+freshness_cvd_ms = 100
+freshness_spot_flow_ms = 100
+freshness_obi_ms = 80
+freshness_liq_ms = 2000
+freshness_atr_ms = 80
 
 # Normalization: [min_threshold, saturation] for each metric
-# Calibrated for Polymarket 5-min BTC markets where $15-20 directional moves are significant.
+# Higher min_thresholds filter out noise—metrics must show REAL precursor magnitude to count.
 # CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
-cvd_min = 0.0
+cvd_min = 0.005
 cvd_saturation = 0.05
-spot_flow_min = 0.0
+spot_flow_min = 0.005
 spot_flow_saturation = 0.05
-obi_min = 0.0
+obi_min = 0.05
 obi_saturation = 0.2
-basis_min = 0.0
+basis_min = 0.1
 basis_saturation = 0.5
-liq_min = 0.0
+liq_min = 0.5
 liq_saturation = 10.0
-atr_min = 0.0
+atr_min = 0.5
 atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight

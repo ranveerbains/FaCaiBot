@@ -515,10 +515,6 @@ impl AtrDisplacementTracker {
         self.displacement_ratio
     }
 
-    /// Current EMA ATR value (for Phase B observed displacement normalization).
-    pub fn ema_atr(&self) -> f64 {
-        self.ema_atr
-    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

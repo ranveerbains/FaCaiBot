@@ -122,10 +122,6 @@ fn make_leg2_test_setup(
         phase1_target_price: Decimal::new(475, 3),
         phase2_start_ms: None,
         phase2_posted_price: None,
-        phase_a_pct: Decimal::ZERO,
-        phase_b_pct: Decimal::ZERO,
-        spot_mid_at_entry: Decimal::ZERO,
-        entry_ema_atr: Decimal::ZERO,
         flow_monitoring_active: false,
         last_flow_score: Decimal::ZERO,
         last_flow_direction: None,
@@ -312,8 +308,6 @@ fn test_buildup_info(direction: Direction, now_ms: u64) -> BuildupInfo {
         basis_delta: Decimal::ZERO,
         liq_pressure: Decimal::ZERO,
         atr_displacement: Decimal::new(5, 3),
-        spot_mid_at_entry: Decimal::new(50_000, 0),
-        ema_atr: Decimal::new(2, 3),
         signal_atr_ratio: Decimal::new(60, 0),  // 60x — matches old spike tests
         obi: Decimal::new(3, 1),                 // 0.3 — bid-heavy
         timestamp_ms: now_ms.saturating_sub(200),

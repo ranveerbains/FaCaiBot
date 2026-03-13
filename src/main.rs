@@ -198,6 +198,12 @@ async fn async_main() -> Result<()> {
     .with_notify_flags(Arc::clone(&notify_flags));
     live_reporter_for_engine.spawn_cleanup_task();
 
+    // Shared clones for listener, wallet, and diagnostic sends — all share
+    // the same sent_messages tracker and cleanup task via Arc<ReporterInner>.
+    let listener_reporter = live_reporter_for_engine.clone();
+    let wallet_reporter = live_reporter_for_engine.clone();
+    let diag_reporter = live_reporter_for_engine.clone();
+
     let redeem_notify_engine = Arc::clone(&redeem_notify);
     let engine_handle = tokio::task::spawn_blocking(move || {
         let mut engine = StrategyEngine::new(&engine_config);
@@ -560,11 +566,15 @@ async fn async_main() -> Result<()> {
                 let tls = diag_tls.clone();
                 let token = diag_bot_token.clone();
                 let chat = diag_chat_id.clone();
+                let rep = diag_reporter.clone();
                 tokio::spawn(async move {
-                    let _ = crate::reporting::telegram::post_telegram_message(
+                    if let Ok(Some(id)) = crate::reporting::telegram::post_telegram_message(
                         &tls, &token, &chat, &diag_msg,
                     )
-                    .await;
+                    .await
+                    {
+                        rep.track_msg_id(id).await;
+                    }
                 });
             }
 
@@ -633,6 +643,7 @@ async fn async_main() -> Result<()> {
             ingestor_tx_control,
             status_rx,
             drain_status_rx,
+            listener_reporter,
         );
         tokio::spawn(listener.run());
         info!(user_id, "command listener spawned");
@@ -648,6 +659,7 @@ async fn async_main() -> Result<()> {
             redeem_bot_token,
             redeem_chat_id,
             redeem_notify,
+            wallet_reporter,
         ));
     }
 

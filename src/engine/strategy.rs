@@ -1446,10 +1446,6 @@ impl StrategyEngine {
                 phase1_target_price: e.phase1_target_price,
                 phase2_start_ms: e.phase2_start_ms,
                 phase2_posted_price: e.phase2_posted_price,
-                phase_a_pct: e.phase_a_pct,
-                phase_b_pct: e.phase_b_pct,
-                spot_mid_at_entry: e.spot_mid_at_entry,
-                entry_ema_atr: e.entry_ema_atr,
                 flow_monitoring_active: e.flow_monitoring_active,
                 last_flow_score: e.last_flow_score,
                 last_flow_direction: e.last_flow_direction,
@@ -2568,7 +2564,7 @@ impl StrategyEngine {
                     })
                     .unwrap_or(Decimal::new(5, 1));
                 let c = compute_expected_repricing(
-                    buildup.signal_atr_ratio,
+                    buildup.composite_score,
                     Decimal::ZERO,  // min_strength (not used meaningfully with composite)
                     Decimal::ONE,   // strong_strength
                     yes_mid,
@@ -2592,18 +2588,6 @@ impl StrategyEngine {
             let leg1_fee = self.pending_leg1_signal.as_ref()
                 .map(|s| s.leg1_fee)
                 .unwrap_or(Decimal::ZERO);
-            // Phase A: composite-based repricing at entry
-            let phase_a_pct = conf;
-            // Phase B: refined after fill (spot displacement vs entry)
-            let spot_mid_at_entry = buildup.spot_mid_at_entry;
-            let entry_ema_atr = buildup.ema_atr;
-            let current_spot = self.state.binance_price.unwrap_or(spot_mid_at_entry);
-            let displacement = (current_spot - spot_mid_at_entry).abs();
-            let phase_b_pct = if entry_ema_atr > Decimal::ZERO {
-                displacement / entry_ema_atr * self.leg1.reprice_scale
-            } else {
-                conf
-            };
             self.hedge = Some(HedgeState::new(
                 now_ms,
                 fill_price,
@@ -2621,10 +2605,6 @@ impl StrategyEngine {
                 },
                 conf,
                 phase1_target_price,
-                phase_a_pct,
-                phase_b_pct,
-                spot_mid_at_entry,
-                entry_ema_atr,
             ));
             info!(tier = tier.label(), %fill_price, %fill_size, %phase1_target_price, "leg2 hedge initialised");
         } else {
