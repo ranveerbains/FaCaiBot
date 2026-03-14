@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeInfo};
-use crate::executor::fill_engine::compute_taker_fee;
+use crate::executor::fill_engine::compute_maker_rebate;
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::{compute_expected_repricing, round_to_tick};
@@ -275,9 +275,10 @@ impl Leg1Evaluator {
             },
         };
 
-        // FOK taker: take at the best ask price directly.
-        // (Maker era: was ask-1-tick to avoid crossing as post-only.)
-        let ask_price = best_ask_price;
+        // Leg 1 maker price — one tick below the best ask.
+        // Posting AT the ask crosses the book when resting sells exist there (post-only rejected).
+        // Posting at ask-1-tick places us inside the spread as a resting bid: valid maker order.
+        let ask_price = (best_ask_price - tick).max(tick);
 
         debug!(
             spike_direction = ?direction,
@@ -345,7 +346,7 @@ impl Leg1Evaluator {
             tick_size: tick,
             atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
-            leg1_fee: compute_taker_fee(ask_price, entry_size),
+            leg1_fee: -compute_maker_rebate(ask_price, entry_size),
             best_ask: Some(best_ask_price),
             book_snapshot: match direction {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
