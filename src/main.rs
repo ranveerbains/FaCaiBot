@@ -246,7 +246,6 @@ async fn async_main() -> Result<()> {
                         if is_leg2 && already_filled
                             && matches!(engine.state().leg1_state, OrderState::Filled { .. })
                             && matches!(engine.state().leg2_state, OrderState::Filled { .. })
-                            && !engine.has_resize_remainder_pending()
                         {
                             if let Some(ref mut c) = cold
                                 && let Err(e) = engine.record_live_trade(c)
@@ -254,10 +253,6 @@ async fn async_main() -> Result<()> {
                                 warn!(error = %e, "failed to record live trade to QuestDB (FOK already_filled)");
                             }
                             engine.on_trade_complete();
-                            // After trade complete, check for orphan cancel.
-                            if let Some(orphan_cmd) = engine.take_orphan_cancel() {
-                                let _ = executor_tx.send(orphan_cmd);
-                            }
                         }
                     }
                     ExecutorFeedback::OrderFailed { is_leg2 } => {
@@ -267,33 +262,12 @@ async fn async_main() -> Result<()> {
                         order_id,
                         was_cancelled,
                         is_leg2,
+                        size_matched,
                     } => {
-                        engine.on_cancel_result(order_id, was_cancelled, is_leg2);
-                    }
-                    ExecutorFeedback::Leg2OrderCancelResult {
-                        order_id,
-                        was_cancelled,
-                    } => {
-                        engine.on_leg2_order_cancel_result(order_id, was_cancelled);
+                        engine.on_cancel_result(order_id, was_cancelled, is_leg2, size_matched);
                     }
                     ExecutorFeedback::BalanceExhausted => {
                         engine.on_balance_exhausted();
-                    }
-                    ExecutorFeedback::RebalanceResult {
-                        success,
-                        price,
-                        size,
-                        order_id,
-                    } => {
-                        engine.on_rebalance_result(success, price, size, order_id);
-                    }
-                    ExecutorFeedback::ResizeRemainderResult {
-                        success,
-                        price,
-                        size,
-                        order_id,
-                    } => {
-                        engine.on_resize_remainder_result(success, price, size, order_id);
                     }
                 }
             }
@@ -510,13 +484,6 @@ async fn async_main() -> Result<()> {
                 error!(error = %e, "failed to send heartbeat cancel to executor");
             }
 
-            // Drain Leg 2 resize cancels (additional Leg 1 fill → hedge resize).
-            for cmd in engine.take_leg2_resize_cancels() {
-                if let Err(e) = executor_tx.send(cmd) {
-                    error!(error = %e, "failed to send Leg 2 resize cancel to executor");
-                }
-            }
-
             // Evaluate Leg 1 signals.
             if let Some(signal) = engine.evaluate() {
                 if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
@@ -527,7 +494,7 @@ async fn async_main() -> Result<()> {
 
             // Evaluate Leg 2 signals (erosion cascade, emergency hedge).
             if let Some(signal) = engine.evaluate_leg2() {
-                // Phase2Alongside: send as PostLeg2Phase2 (don't cancel Phase 1).
+                // Phase2Alongside: send as PostLeg2Phase2 (cancel Phase 1, then post Phase 2).
                 let cmd = if engine.take_phase2_alongside_flag() {
                     ExecutorCommand::PostLeg2Phase2 { signal }
                 } else {
@@ -539,22 +506,9 @@ async fn async_main() -> Result<()> {
                 }
             }
 
-            // Check for orphan cancel and rebalance after trade status updates.
-            if engine.has_orphan_cancel() {
-                if let Some(orphan_cmd) = engine.take_orphan_cancel() {
-                    let _ = executor_tx.send(orphan_cmd);
-                }
-            }
-            if engine.rebalance_in_progress() {
-                if let Some(rebal_cmd) = engine.take_rebalance_signal() {
-                    let _ = executor_tx.send(rebal_cmd);
-                }
-            }
-
             // Detect trade completion (both legs filled via User WS).
             if matches!(engine.state().leg1_state, OrderState::Filled { .. })
                 && matches!(engine.state().leg2_state, OrderState::Filled { .. })
-                && !engine.has_resize_remainder_pending()
             {
                 // Record to QuestDB before state reset.
                 if let Some(ref mut c) = cold
@@ -563,20 +517,6 @@ async fn async_main() -> Result<()> {
                     warn!(error = %e, "failed to record live trade to QuestDB");
                 }
                 engine.on_trade_complete();
-                // After trade complete, check for orphan cancel.
-                if let Some(orphan_cmd) = engine.take_orphan_cancel() {
-                    let _ = executor_tx.send(orphan_cmd);
-                }
-            }
-
-            // Emit resize remainder FOK when both legs filled but remainder pending.
-            if matches!(engine.state().leg1_state, OrderState::Filled { .. })
-                && matches!(engine.state().leg2_state, OrderState::Filled { .. })
-                && engine.has_resize_remainder_pending()
-                && let Some(cmd) = engine.take_resize_remainder()
-                && let Err(e) = executor_tx.send(cmd)
-            {
-                error!(error = %e, "failed to send resize remainder FOK to executor");
             }
 
             // Check drain completion: position fully closed after drain was activated.

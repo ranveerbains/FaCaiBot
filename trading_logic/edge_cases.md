@@ -377,12 +377,24 @@ The `emergency_fok_fallback()` price-escalation loop is now capped at a maximum 
 
 **Root cause:** A race condition where `OrderPosted` feedback and `CANCELED` TradeStatusUpdate are processed in the same main-loop iteration. This clears both `leg2_command_pending` and `leg2_state` simultaneously, causing `evaluate_leg2()` to emit another Phase1Post while the executor still has `active_leg2_phase1_id` set — triggering a cancel-and-replace cycle that burns API calls in a ~30ms loop.
 
-**Fix:** `handle_leg2_hedge()` in `executor/live.rs` now rejects duplicate Phase 1 signals with an early return when `active_leg2_phase1_id` is already set. Instead of cancelling the existing order and replacing, it logs a warning and sends `OrderFailed { is_leg2: true }` feedback. This is scoped to Phase 1 hedge only — does not affect Phase 2, rebalance, or resize paths.
+**Fix:** `handle_leg2_hedge()` in `executor/live.rs` now rejects duplicate Phase 1 signals with an early return when `active_leg2_phase1_id` is already set. Instead of cancelling the existing order and replacing, it logs a warning and sends `OrderFailed { is_leg2: true }` feedback. This is scoped to Phase 1 hedge only — does not affect Phase 2.
 
-### 17g. Minimum Size Gates on Rebalance and Resize Remainder
+### 17g. Leg 1 cancel race condition (cancel vs fill)
 
-**Problem:** Rebalance and resize remainder FOK paths lacked CLOB minimum checks (5 shares, $1 notional). Undersized orders were submitted and always rejected.
+**Problem:** A sustain-timeout cancel returned `was_cancelled=true`, but the CLOB had already filled the order. The engine treated `was_cancelled=true` as "nothing was filled" and reset all state, losing track of the filled position.
 
-**Fix — Rebalance:** `take_rebalance_signal()` in `strategy.rs` checks `orphan.size < 5` or `size × breakeven_price < $1` before building the FOK. If gated, logs info, sends Telegram alert ("REBALANCE SKIPPED"), and clears `rebalance_in_progress`.
+**Root cause:** Polymarket docs state "Partial fills cannot be cancelled — only the unfilled portion can be cancelled." So `was_cancelled=true` means the *unfilled remainder* was cancelled — shares may still have been filled.
 
-**Fix — Resize remainder:** The resize cancel-failed path in `on_leg2_cancel_result()` checks `remainder < 5` or `remainder × hedge_price < $1` before setting `resize_remainder_pending`. If gated, logs info and sends Telegram alert ("RESIZE REMAINDER SKIPPED").
+**Fix:** After every Leg 1 cancel, the executor queries `get_order_status()` to get the authoritative `size_matched`. The `CancelResult` feedback now includes `size_matched: Option<Decimal>`. The engine's `on_cancel_result()` uses this to detect fills:
+- `filled > 0` + `leg1_state == Posted` → transition to Filled, init_leg2, send opportunity alert
+- `filled > 0` + `leg1_state == Filled` → update size if larger (User WS MATCHED arrived first)
+- `filled == 0` + (`was_cancelled` or query succeeded) → full reset (old behavior)
+- Query failed + `was_cancelled == false` → keep state as-is, wait for User WS (defensive fallback)
+
+**Dead code removed:** The entire "additional Leg 1 fill → resize Leg 2" machinery was removed because `get_order_status()` after cancel provides the authoritative fill size. No additional fills can arrive on a cancelled order, so `handle_leg1_additional_fill()`, `initiate_leg2_resize()`, `reset_leg2_for_resize()`, `build_resize_remainder_fok()`, `ResizeRemainderFok`, `ResizeRemainderResult`, and all associated fields were deleted (~250 lines).
+
+### 17h. Leg 2 fill size from CLOB (not state-derived)
+
+**Problem:** Fill size in `TradeStatusUpdate` handler was derived from `leg2_state.size` (which may be reset by resize) or `leg1_state.size` (which may differ after additional fills). Production reports showed 17.30sh hedged when only 13.25sh were actually filled on the CLOB.
+
+**Fix:** After computing state-derived `fill_size`, prefer actual CLOB `size_matched` when available and non-zero: `let fill_size = match size_matched { Some(matched) if matched > 0 => matched.round_dp(2), _ => fill_size };`

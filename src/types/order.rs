@@ -216,12 +216,6 @@ pub enum ExecutorCommand {
     /// Post a Phase 2 order alongside the existing Phase 1 order (dual-order).
     /// Does NOT cancel Phase 1.
     PostLeg2Phase2 { signal: TradeSignal },
-    /// Cancel a specific Leg 2 order by ID (used when one of two dual orders fills).
-    CancelLeg2Order { order_id: String },
-    /// Rebalance FOK: buy Leg 1 side after a double-fill race condition.
-    RebalanceLeg1 { signal: TradeSignal },
-    /// FOK taker to cover unhedged Leg 1 shares after resize cancel failed.
-    ResizeRemainderFok { signal: TradeSignal },
     /// Cancel unfilled Leg 1 maker order (flow-based sustain failure or timeout).
     /// Engine tracks repost intent internally via `leg1_last_cancel_repost`.
     CancelLeg1Order { order_id: String },
@@ -371,25 +365,9 @@ pub enum ExecutorFeedback {
         order_id: String,
         was_cancelled: bool,
         is_leg2: bool,
-    },
-    /// Result of cancelling a specific Leg 2 order (from dual-order system).
-    Leg2OrderCancelResult {
-        order_id: String,
-        was_cancelled: bool,
-    },
-    /// Result of a rebalance FOK after double-fill race condition.
-    RebalanceResult {
-        success: bool,
-        price: Decimal,
-        size: Decimal,
-        order_id: Option<String>,
-    },
-    /// Result of a resize remainder FOK (additional Leg 1 fill recovery).
-    ResizeRemainderResult {
-        success: bool,
-        price: Decimal,
-        size: Decimal,
-        order_id: Option<String>,
+        /// Authoritative fill size from `get_order_status()` after Leg 1 cancel.
+        /// `None` for Leg 2 cancels or if the query failed.
+        size_matched: Option<Decimal>,
     },
     /// Leg 2 placement failed due to insufficient balance/allowance.
     /// Executor halts further Leg 2 attempts until rotation. Engine sends
@@ -478,8 +456,6 @@ pub struct LiveTradeReport {
     pub leg1_cancel_race: bool,
     /// Whether Leg 2 was triggered by Phase 1 breach (pair cost exceeded threshold).
     pub phase1_breach: bool,
-    /// Whether Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
-    pub phase1_dual_fill: bool,
     /// Whether Leg 2 was triggered by whipsaw reversal (opposite spike → immediate FOK).
     pub whipsaw_reversal: bool,
 

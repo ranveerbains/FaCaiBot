@@ -524,7 +524,7 @@ impl Leg2Evaluator {
                     }
                 }
 
-                // Flow weakening → tighten (Phase 2 alongside Phase 1).
+                // Flow weakening → tighten (cancel Phase 1, post Phase 2).
                 if score < self.entry_threshold {
                     if let Some(ask_price) = best_ask_price {
                         let phase2_price = round_to_tick(ask_price - tick, tick);
@@ -548,7 +548,7 @@ impl Leg2Evaluator {
                             }
                         } else {
                             info!(%score, threshold = %self.entry_threshold, %phase2_price,
-                                "flow weakening — posting Phase 2 alongside");
+                                "flow weakening — cancelling Phase 1, posting Phase 2");
                             let signal = make_leg2_signal(
                                 &hedge_token_id,
                                 state.active_condition_id.as_deref().unwrap_or(""),
@@ -621,7 +621,7 @@ impl Leg2Evaluator {
                             size: fok_size,
                         });
                     }
-                    info!(elapsed_ms = elapsed, %phase2_price, "phase 1 timeout — posting phase 2 alongside");
+                    info!(elapsed_ms = elapsed, %phase2_price, "phase 1 timeout — cancelling Phase 1, posting Phase 2");
                     let signal = make_leg2_signal(
                         &hedge_token_id,
                         state.active_condition_id.as_deref().unwrap_or(""),
@@ -784,6 +784,50 @@ impl Leg2Evaluator {
             }
         }
 
+        // Phase 2 initial post: Phase 1 was cancelled, Phase 2 not yet posted (or post failed).
+        // Re-post maker at ask-1tick. Reuses Phase1Post decision — engine/executor path is
+        // identical; the fact that we're in Phase 2 is tracked by hedge.phase.
+        if matches!(state.leg2_state, OrderState::None)
+            && let Some(ask_price) = best_ask_price
+        {
+            let phase2_price = round_to_tick(ask_price - tick, tick);
+            let breakeven_hedge_price = Decimal::ONE - leg1_price;
+            if phase2_price > breakeven_hedge_price {
+                // Phase 2 price above breakeven — FOK immediately.
+                let fok_price = round_to_tick(ask_price, tick);
+                let fok_size = leg1_size.round_dp(2);
+                if fok_size > Decimal::ZERO {
+                    warn!(
+                        %phase2_price, %breakeven_hedge_price,
+                        "Phase 2 initial post breach — immediate FOK"
+                    );
+                    let signal = make_leg2_signal(
+                        &hedge_token_id,
+                        state.active_condition_id.as_deref().unwrap_or(""),
+                        fok_price, fok_size, reference_price,
+                        snap.expected_pct, snap.tier, Decimal::ZERO,
+                        snap.direction, snap.spike_info, leg1_price,
+                        now_ms, market_end_ms, tick, atr, false,
+                        best_ask_price, Some(hedge_book.clone()),
+                        Some(ExitReason::BreakEvenBreach),
+                    );
+                    return Some(Leg2Decision::Emergency { signal, price: fok_price, size: fok_size });
+                }
+            }
+            info!(%phase2_price, "Phase 2 initial post at ask-1tick");
+            let signal = make_leg2_signal(
+                &hedge_token_id,
+                state.active_condition_id.as_deref().unwrap_or(""),
+                phase2_price, leg1_size, reference_price,
+                snap.expected_pct, snap.tier, Decimal::ZERO,
+                snap.direction, snap.spike_info, leg1_price,
+                now_ms, market_end_ms, tick, atr, false,
+                best_ask_price, Some(hedge_book.clone()),
+                None,
+            );
+            return Some(Leg2Decision::Phase1Post { signal, price: phase2_price, size: leg1_size });
+        }
+
         // Hold position — preserve FIFO queue priority.
         None
     }
@@ -803,8 +847,8 @@ pub(crate) enum Leg2Decision {
         price: Decimal,
         size: Decimal,
     },
-    /// Post Phase 2 alongside Phase 1 (dual-order): post at ask-1tick WITHOUT
-    /// cancelling Phase 1. Both maker orders rest simultaneously.
+    /// Transition to Phase 2: cancel Phase 1, then post at ask-1tick.
+    /// Sequential — only one maker order rests at a time.
     Phase2Alongside {
         signal: TradeSignal,
         price: Decimal,

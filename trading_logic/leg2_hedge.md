@@ -18,13 +18,13 @@ The hedge system uses two phases with a single cancel/repost at the transition -
 - If filled during Phase 1 -> trade completes at the profit target (best outcome)
 - If `phase1_timeout_ms` elapses without fill -> transition to Phase 2
 
-**Phase 2 -- Break-even pursuit / Dual-order** (`phase2_timeout_ms`, default 2000ms):
-- Post Phase 2 order at `best_ask - 1 tick` **without cancelling Phase 1** -- two maker orders rest simultaneously (dual-order)
-- **No reposts** on either order -- preserve FIFO queue priority
-- Whichever order fills first -> cancel the other -> trade complete
+**Phase 2 -- Break-even pursuit / Sequential** (`phase2_timeout_ms`, default 2000ms):
+- Executor **cancels Phase 1** first, then posts Phase 2 at `best_ask - 1 tick` (sequential, one order at a time)
+- **No reposts** -- preserve FIFO queue priority
 - Phase 2 timeout (`phase2_timeout_ms` elapsed) -> immediate FOK taker at best ask
 - If `ask > phase2_posted_price` -> Phase 2 breach -> immediate FOK taker at best ask (Section 7)
 - **Phase 2 entry guard**: If `ask - 1tick > breakeven_hedge_price` (`$1.00 - leg1_price`), even the best maker fill would give pair cost > $1.00 -> skip posting Phase 2, FOK immediately
+- If Phase 2 post fails (`OrderFailed`), evaluator re-emits a `Phase1Post` signal (reused decision type) to retry posting at `ask - 1tick`
 
 ### Phase 1 target price computation
 
@@ -36,13 +36,9 @@ The raw target is sent to the executor as-is (no don't-cross-ask clamping, no sm
 
 Phase 1 posts once at the profit target, then holds. The evaluator returns `None` if `leg2_state` is already `Posted` or `Filled`. If `OrderFailed` feedback resets `leg2_state` to `None`, the evaluator will re-emit a Phase 1 post signal on the next cycle (retry on failure). No reposts, no outbidding, no price adjustments during Phase 1.
 
-### Phase 2 behavior (dual-order)
+### Phase 2 behavior (sequential)
 
-Phase 2 posts at `best_ask - 1 tick` **without cancelling the Phase 1 order** -- two maker orders rest simultaneously (dual-order). No reposts on either order, preserving FIFO queue priority on both. Whichever fills first wins; the engine cancels the other and completes the trade. Three exit triggers: (1) `phase2_timeout_ms` elapsed -> FOK taker; (2) Phase 2 breach (`ask > phase2_posted_price`) -> immediate FOK taker; (3) Phase 2 entry breach (ask - tick > breakeven) -> skip posting, immediate FOK. `HedgeState.phase2_start_ms` tracks when Phase 2 began for timeout calculation. `HedgeState.phase2_posted_price` records the Phase 2 order price for breach detection.
-
-### Double-fill rebalance
-
-Rare race condition: both Phase 1 and Phase 2 orders fill before the cancel reaches the CLOB (~3ms window). Result: N shares Leg 1 + 2N shares Leg 2 (excess). Fix: FOK taker buy N shares on Leg 1 side (same direction as original entry) to form a second pair. Uses the standard `emergency_fok_fallback` price-escalation loop, capped at $1.00. FOK is atomic -> no recursive overfill risk. If FOK fails -> critical Telegram alert (naked directional exposure, manual intervention needed). Tracked via `post_trade_orphan` on `StrategyEngine` -- persists across `on_trade_complete()` so the orphan fill can be detected after the trade resets.
+Executor cancels Phase 1 order, then posts Phase 2 at `best_ask - 1 tick`. Only one maker order rests at a time. On Phase 2 OrderPosted, engine clears `leg2_phase1_order_id` to prevent stale CANCELED events from resetting state. Three exit triggers: (1) `phase2_timeout_ms` elapsed -> FOK taker; (2) Phase 2 breach (`ask > phase2_posted_price`) -> immediate FOK taker; (3) Phase 2 entry breach (ask - tick > breakeven) -> skip posting, immediate FOK. If Phase 2 post fails, evaluator detects `leg2_state == None` in Phase 2 and re-emits a `Phase1Post` signal to retry at `ask - 1tick`. `HedgeState.phase2_start_ms` tracks when Phase 2 began for timeout calculation. `HedgeState.phase2_posted_price` records the Phase 2 order price for breach detection.
 
 ### Flow-based graduated hedge response
 
@@ -50,7 +46,7 @@ During Phase 1, the composite flow score from the buildup detector drives a grad
 
 1. **Flow reversal** (`flow_direction != hedge_direction AND score > cancel_threshold`): The buildup has reversed direction -- immediate emergency FOK at ask. `ExitReason::WhipsawReversal`
 2. **Flow collapse** (`score < cancel_threshold`): The buildup has dissipated below the cancel threshold -- immediate emergency FOK at ask. `ExitReason::FlowCollapse`. Exits before the book reprices against us
-3. **Flow weakening** (`score < entry_threshold`): The buildup has weakened below the entry threshold but hasn't collapsed -- transition to Phase 2 alongside Phase 1 (dual-order at `ask - 1tick`). `TransitionReason::FlowWeakening`. Tightens the hedge without abandoning the profit target. If `ask - tick > breakeven` at transition time, entry guard fires and FOK immediately instead
+3. **Flow weakening** (`score < entry_threshold`): The buildup has weakened below the entry threshold but hasn't collapsed -- cancel Phase 1 and post Phase 2 at `ask - 1tick` (sequential). `TransitionReason::FlowWeakening`. Tightens the hedge. If `ask - tick > breakeven` at transition time, entry guard fires and FOK immediately instead
 
 These flow-based triggers only fire when `flow_monitoring_active = true` (composite score > 0, meaning the detector has fresh data). When flow data goes stale (all metrics beyond freshness window), the system falls back to time-based Phase 1 timeout and breach checks.
 
@@ -64,14 +60,15 @@ On every engine event, if hedge exists and `leg1_state == Filled`:
    - Check Phase 1 breach (pair cost > `phase1_breach_threshold`) -> immediate FOK taker at ask
    - Check flow reversal -> immediate FOK (Section 7f)
    - Check flow collapse -> immediate FOK (Section 7f)
-   - Check flow weakening -> transition to Phase 2 alongside
-   - Check Phase 1 timeout (`elapsed >= phase1_timeout_ms`) -> transition to Phase 2
+   - Check flow weakening -> cancel Phase 1, post Phase 2
+   - Check Phase 1 timeout (`elapsed >= phase1_timeout_ms`) -> cancel Phase 1, post Phase 2
    - If already posted or filled -> hold (post-once-and-wait)
    - Emit Phase 1 post signal (only when `leg2_state == None`)
 4. **Phase 2 path** (if `phase == Phase2`):
    - Check Phase 2 timeout (`elapsed >= phase2_timeout_ms`) -> FOK taker at best ask
    - Check Phase 2 breach (`ask > phase2_posted_price`) -> immediate FOK taker at ask
-   - No breach/timeout -> hold (preserve queue priority, no reposts on either order)
+   - If `leg2_state == None` (Phase 2 post failed or cancelled) -> re-post at `ask - 1tick`
+   - Already posted -> hold (preserve queue priority, no reposts)
 
 ---
 
@@ -203,13 +200,6 @@ Guards: `clob_safe_fok_size()` zero-size check and `price x size >= $1` notional
 ### 8a. Entry Size Clamping
 
 Leg 1 entry size is clamped to `max(raw_size, 5, ceil($1/price))` in the evaluator. This ensures all trades meet both the CLOB 5-share maker minimum and the $1.00 FOK notional floor. Since Leg 2 inherits Leg 1's filled size, it always satisfies these minimums too.
-
-### 8a-1. Minimum Size Gates on Rebalance and Resize Remainder
-
-Two secondary FOK paths bypass the Leg 1 size clamping and can produce undersized orders:
-
-- **Rebalance** (`take_rebalance_signal()`): Double-fill recovery orphan may be small. Gated at `5 shares / $1 notional` — if below, rebalance is skipped with a Telegram alert and `rebalance_in_progress` is cleared.
-- **Resize remainder** (resize cancel-failed path in `on_leg2_cancel_result()`): The `leg1_size - old_leg2_size` remainder may be small. Gated at `5 shares / $1 notional` — if below, `resize_remainder_pending` is not set, Telegram alert fired, and the trade completes with a partial hedge.
 
 ### 8b. FOK Emergency Loop Constraints
 

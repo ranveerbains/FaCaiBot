@@ -63,24 +63,7 @@ struct LiveTradeMeta {
     /// `true` if Leg 2 filled via the favorable maker try-first path (no taker fee).
     favorable_maker: bool,
     phase1_breach: bool,
-    /// `true` if Leg 2 filled from the Phase 1 order while Phase 2 was also active (dual-order).
-    phase1_dual_fill: bool,
     exit_reason: Option<ExitReason>,
-}
-
-// ─── Orphan state for dual-order double-fill recovery ───────────────────────
-
-/// State for the "other" order after one of the dual Phase 1/Phase 2 orders fills.
-/// Persists across `on_trade_complete()` — the orphan may fill after the trade resets.
-/// Cleared on: confirmed cancel, rebalance complete, or market rotation.
-#[derive(Debug, Clone)]
-struct OrphanState {
-    order_id: String,
-    size: Decimal,
-    leg1_direction: Direction,
-    leg1_price: Decimal,
-    condition_id: String,
-    tick_size: Decimal,
 }
 
 // ─── Precomputed Decimal constants ───────────────────────────────────────────
@@ -144,20 +127,6 @@ pub struct StrategyEngine {
     /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
     /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
     leg1_cancel_inflight: bool,
-
-    /// True when Leg 2 orders are being cancelled for resize (additional Leg 1 fills).
-    /// Gates evaluate_leg2() to prevent posting while cancels are in flight.
-    leg2_resize_pending: bool,
-    /// Pending Leg 2 cancel commands for resize. Drained by main loop.
-    pending_leg2_resize_cancels: Vec<ExecutorCommand>,
-
-    /// True when waiting for a resize remainder FOK to fill.
-    /// Gates on_trade_complete() — prevents premature completion with mismatched sizes.
-    resize_remainder_pending: bool,
-    /// Pre-built resize remainder FOK command. Built when resize cancel fails
-    /// (while we still have leg1_direction, hedge state, etc.). Drained by main
-    /// loop when both legs are Filled but resize_remainder_pending is true.
-    pending_resize_remainder: Option<ExecutorCommand>,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -238,16 +207,12 @@ pub struct StrategyEngine {
     diag_emg_taker: u64,  // emergency exits filled as FOK taker
     diag_favorable_maker_fills: u64,
     diag_favorable_maker_timeouts: u64,
-    diag_double_fills: u64,
-    diag_rebalance_attempts: u64,
-    diag_rebalance_successes: u64,
     diag_phase2_entry_breach: u64,
     diag_buildup_failures: u64,
     diag_order_failures: u64,
     diag_sustain_cancels: u64,    // Leg 1 cancelled: composite < cancel_threshold
     diag_sustain_timeouts: u64,   // Leg 1 cancelled: cancel_window_ms timeout
     diag_opposite_dir_cancels: u64, // Leg 1 cancelled: opposite-direction buildup confirmed
-    diag_leg1_additional_fills: u64, // Leg 1 additional fills after partial
     diag_rej_heartbeat: u64,       // Leg 1 rejected: heartbeat down
     diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
     last_diag_ms: u64,
@@ -257,15 +222,6 @@ pub struct StrategyEngine {
     leg2_phase1_order_id: Option<String>,
     /// Phase 2 Leg 2 order ID (posted alongside Phase 1 at ask-1tick).
     leg2_phase2_order_id: Option<String>,
-    /// Orphan state: survives `on_trade_complete()` — tracks the "other" order
-    /// after one of the dual orders fills. Cleared on confirmed cancel, rebalance
-    /// complete, or market rotation.
-    post_trade_orphan: Option<OrphanState>,
-    /// `true` after `take_orphan_cancel()` dispatches a cancel — prevents re-dispatch
-    /// on every main-loop iteration while waiting for the CLOB response.
-    orphan_cancel_sent: bool,
-    /// `true` when a rebalance FOK is in progress (double-fill recovery).
-    rebalance_in_progress: bool,
     /// Set `true` when the last `evaluate_leg2()` returned a Phase2Alongside signal.
     /// Main loop checks this to send `PostLeg2Phase2` instead of `Signal`.
     /// Cleared after being consumed.
@@ -324,10 +280,6 @@ impl StrategyEngine {
             rotation_emergency_buffer: Vec::new(),
             cancel_window_ms: config.bot.buildup.cancel_window_ms,
             leg1_cancel_inflight: false,
-            leg2_resize_pending: false,
-            pending_leg2_resize_cancels: Vec::new(),
-            resize_remainder_pending: false,
-            pending_resize_remainder: None,
             pending_tick_size_cmd: None,
             pending_heartbeat_cancel: None,
             heartbeat_dead_threshold: config.bot.entry_guards.heartbeat_dead_threshold,
@@ -372,24 +324,17 @@ impl StrategyEngine {
             diag_emg_taker: 0,
             diag_favorable_maker_fills: 0,
             diag_favorable_maker_timeouts: 0,
-            diag_double_fills: 0,
-            diag_rebalance_attempts: 0,
-            diag_rebalance_successes: 0,
             diag_phase2_entry_breach: 0,
             diag_buildup_failures: 0,
             diag_order_failures: 0,
             diag_sustain_cancels: 0,
             diag_sustain_timeouts: 0,
             diag_opposite_dir_cancels: 0,
-            diag_leg1_additional_fills: 0,
             diag_rej_heartbeat: 0,
             diag_heartbeat_resets: 0,
             last_diag_ms: 0,
             leg2_phase1_order_id: None,
             leg2_phase2_order_id: None,
-            post_trade_orphan: None,
-            orphan_cancel_sent: false,
-            rebalance_in_progress: false,
             last_leg2_was_phase2_alongside: false,
             draining: false,
             paused: false,
@@ -799,13 +744,6 @@ impl StrategyEngine {
                 // Dual-order: clear ALL state on rotation (new market).
                 self.leg2_phase1_order_id = None;
                 self.leg2_phase2_order_id = None;
-                self.post_trade_orphan = None;
-                self.orphan_cancel_sent = false;
-                self.rebalance_in_progress = false;
-                self.leg2_resize_pending = false;
-                self.pending_leg2_resize_cancels.clear();
-                self.resize_remainder_pending = false;
-                self.pending_resize_remainder = None;
                 self.in_cutoff_window = false;
                 self.in_quiet_period = true;
                 self.in_trade_cooldown = false;
@@ -966,6 +904,13 @@ impl StrategyEngine {
                         (Decimal::ZERO, Decimal::ZERO)
                     };
 
+                    // Prefer actual CLOB fill size over state-derived value.
+                    // State-derived size may be stale after resize resets leg2_state.
+                    let fill_size = match size_matched {
+                        Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
+                        _ => fill_size,
+                    };
+
                     match status {
                         TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
                             info!(%order_id, %fill_price, %fill_size, status = ?status, "Leg 2 fill — pair complete");
@@ -985,47 +930,6 @@ impl StrategyEngine {
                                 fill_timestamp_ms: now_ms,
                             };
 
-                            // Dual-order: identify the "other" order and store as orphan.
-                            let phase1_filled = is_leg2_phase1 || (!is_leg2_phase2 && is_leg2);
-                            let other_id = if phase1_filled {
-                                // Phase 1 filled (or single-order leg2) — orphan is Phase 2.
-                                self.leg2_phase2_order_id.take()
-                            } else {
-                                // Phase 2 filled — orphan is Phase 1.
-                                self.leg2_phase1_order_id.take()
-                            };
-                            // Mark phase1_dual_fill if Phase 1 order filled while Phase 2 was also active.
-                            if phase1_filled && self.hedge.as_ref().is_some_and(|e| matches!(e.phase, HedgePhase::Phase2)) {
-                                self.live_trade_meta.phase1_dual_fill = true;
-                            }
-                            if let Some(orphan_id) = other_id {
-                                if let (Some(hedge), Some(dir), Some(l1_price)) = (
-                                    &self.hedge,
-                                    self.leg1_direction,
-                                    match &self.state.leg1_state {
-                                        OrderState::Filled { price, .. } => Some(*price),
-                                        _ => None,
-                                    },
-                                ) {
-                                    let orphan_price = if is_leg2_phase2 || (!is_leg2_phase1 && !is_leg2) {
-                                        // The filled one was Phase 2, orphan is Phase 1.
-                                        hedge.phase1_target_price
-                                    } else {
-                                        // The filled one was Phase 1, orphan is Phase 2.
-                                        hedge.phase2_posted_price.unwrap_or(Decimal::ZERO)
-                                    };
-                                    self.post_trade_orphan = Some(OrphanState {
-                                        order_id: orphan_id.clone(),
-                                        size: fill_size,
-                                        leg1_direction: dir,
-                                        leg1_price: l1_price,
-                                        condition_id: self.state.active_condition_id.clone().unwrap_or_default(),
-                                        tick_size: self.state.tick_size,
-                                    });
-                                    self.orphan_cancel_sent = false;
-                                    info!(%orphan_id, %orphan_price, "dual-order: storing orphan, emitting cancel");
-                                }
-                            }
                             // hedge cleared by on_trade_complete() after Telegram + recording
                         }
                         TradeStatus::Failed => {
@@ -1043,39 +947,11 @@ impl StrategyEngine {
                     }
                 }
 
-                // Check orphan fill (dual-order double-fill recovery).
-                let is_orphan = self.post_trade_orphan.as_ref().is_some_and(|o| o.order_id == order_id);
-                if is_orphan && !is_any_leg2 && !is_leg1 {
-                    match status {
-                        TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
-                            warn!(%order_id, ?status, "DOUBLE-FILL: orphan order filled — triggering rebalance");
-                            // The orphan filled after the trade completed. Need rebalance.
-                            self.diag_double_fills += 1;
-                            self.rebalance_in_progress = true;
-                            // Rebalance signal built in take_rebalance_signal().
-                        }
-                        TradeStatus::Canceled => {
-                            info!(%order_id, "orphan order cancelled — clearing orphan state");
-                            self.post_trade_orphan = None;
-                            self.orphan_cancel_sent = false;
-                        }
-                        _ => {}
-                    }
-                }
-
                 // Buffer unmatched TradeStatusUpdate events (may arrive before
                 // OrderPosted feedback or after a cancel cleared state).
-                if !is_leg1 && !is_any_leg2 && !is_orphan {
-                    // Check if this is an additional fill on the current Leg 1 order.
-                    let is_leg1_additional_fill = matches!(
-                        &self.state.leg1_state,
-                        OrderState::Filled { order_id: oid, .. } if *oid == order_id
-                    );
-
-                    if is_leg1_additional_fill {
-                        if matches!(status, TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed) {
-                            self.handle_leg1_additional_fill(&order_id, size_matched, original_size, now_ms);
-                        }
+                if !is_leg1 && !is_any_leg2 {
+                    if matches!(&self.state.leg1_state, OrderState::Filled { order_id: oid, .. } if *oid == order_id) {
+                        debug!(%order_id, "late TradeStatusUpdate for filled Leg 1 — ignored");
                     } else if let Some(mut pending) = self.pending_partial_fills.remove(&order_id) {
                         match status {
                             TradeStatus::Matched => {
@@ -1407,12 +1283,6 @@ impl StrategyEngine {
             return None;
         }
 
-        // Rebalance / orphan pending: block new Leg 1 entries until double-fill recovery completes.
-        if self.rebalance_in_progress || self.post_trade_orphan.is_some() {
-            self.state.buildup_detected = false;
-            return None;
-        }
-
         // Post-trade cooldown: block new Leg 1 entries.
         if self.in_trade_cooldown {
             if self.state.buildup_detected {
@@ -1486,9 +1356,6 @@ impl StrategyEngine {
             return None;
         }
         if self.leg2_command_pending {
-            return None;
-        }
-        if self.leg2_resize_pending {
             return None;
         }
         let now_ms = now_epoch_ms();
@@ -1570,7 +1437,6 @@ impl StrategyEngine {
                 favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
                 favorable_maker: false,
                 phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
-                phase1_dual_fill: false,
             };
             if let Some(e) = self.hedge.as_mut() {
                 e.emergency_submitted = true;
@@ -1610,7 +1476,7 @@ impl StrategyEngine {
                     };
                 }
                 Leg2Decision::Phase2Alongside { .. } => {
-                    // Dual-order: keep Phase 1 alive, post Phase 2 alongside.
+                    // Sequential: executor cancels Phase 1, then posts Phase 2.
                     if let Some(e) = self.hedge.as_mut() {
                         e.phase = HedgePhase::Phase2;
                         e.phase2_posted_price = Some(price);
@@ -1621,10 +1487,10 @@ impl StrategyEngine {
                     if self.reporter.is_some() {
                         self.leg2_command_pending = true;
                     }
-                    // In live mode, Phase 1 order stays alive — we track Phase 2
-                    // separately via leg2_phase2_order_id.
+                    // In live mode, executor cancels Phase 1 and posts Phase 2.
+                    // We track Phase 2 via leg2_phase2_order_id.
                     // For sim mode, update leg2_state to Phase 2 price (sim only
-                    // tracks one order; advance_simulation handles dual-order).
+                    // tracks one order).
                     self.leg2_phase2_order_id = Some(format!("sim-leg2-p2-{}", now_ms));
                     if self.reporter.is_none() {
                         // Sim mode: overwrite leg2_state (Phase 1 order doesn't
@@ -1652,16 +1518,6 @@ impl StrategyEngine {
         let v = self.last_leg2_was_phase2_alongside;
         self.last_leg2_was_phase2_alongside = false;
         v
-    }
-
-    /// Returns `true` if a rebalance FOK is in progress.
-    pub fn rebalance_in_progress(&self) -> bool {
-        self.rebalance_in_progress
-    }
-
-    /// Returns `true` if there's a pending orphan cancel to send.
-    pub fn has_orphan_cancel(&self) -> bool {
-        self.post_trade_orphan.is_some() && !self.orphan_cancel_sent
     }
 
     /// Take the pending tick size change command (if any).
@@ -1784,16 +1640,12 @@ impl StrategyEngine {
             fav_maker_timeout = self.diag_favorable_maker_timeouts,
             emg_maker = self.diag_emg_maker,
             emg_taker = self.diag_emg_taker,
-            double_fills = self.diag_double_fills,
-            rebal_attempts = self.diag_rebalance_attempts,
-            rebal_success = self.diag_rebalance_successes,
             p2_entry_breach = self.diag_phase2_entry_breach,
             buildup_fail = self.diag_buildup_failures,
             order_fail = self.diag_order_failures,
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
-            leg1_addl_fills = self.diag_leg1_additional_fills,
             hb_rej = self.diag_rej_heartbeat,
             hb_resets = self.diag_heartbeat_resets,
             hb_failures = self.connectivity.consecutive_heartbeat_failures,
@@ -1827,14 +1679,13 @@ impl StrategyEngine {
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}  addl-fills: {leg1_addl_fills}\n\
+             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
              Favorable: exits={fav_exits}  maker={fav_maker}  maker-timeout={fav_maker_timeout}\n\
              Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
-             Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
              \n\
              <b>Heartbeat</b>\n\
              {hb_status}  Failures: {hb_failures}  Latency: {hb_latency}ms  Rej: {hb_rej}  Resets: {hb_resets}\n\
@@ -1862,7 +1713,6 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
-            leg1_addl_fills = self.diag_leg1_additional_fills,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -1878,9 +1728,6 @@ impl StrategyEngine {
             emg_p1b = self.diag_emg_phase1_breach,
             emg_mkr = self.diag_emg_maker,
             emg_tkr = self.diag_emg_taker,
-            double_fills = self.diag_double_fills,
-            rebal_attempts = self.diag_rebalance_attempts,
-            rebal_success = self.diag_rebalance_successes,
             hb_status = if self.connectivity.heartbeat_healthy { "OK" } else { "DOWN" },
             hb_failures = self.connectivity.consecutive_heartbeat_failures,
             hb_latency = self.connectivity.last_heartbeat_latency_ms,
@@ -1966,6 +1813,7 @@ impl StrategyEngine {
                 }
                 Some(OrderTag::Leg2Phase2) => {
                     self.leg2_phase2_order_id = Some(order_id.clone());
+                    self.leg2_phase1_order_id = None; // Phase 1 was cancelled for Phase 2 transition
                 }
                 None => {
                     // Backward compat: no tag → treat as Phase 1 (initial Leg 2 post).
@@ -2097,9 +1945,11 @@ impl StrategyEngine {
     }
 
     /// Called when a `CancelResult` feedback arrives from the executor.
-    /// If the cancel was confirmed, clears saved info. If NOT confirmed (order
-    /// may have filled), restores the Posted state so User WS events can match.
-    pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool) {
+    ///
+    /// For Leg 1: uses authoritative `size_matched` from `get_order_status()` to detect
+    /// fills that the cancel response alone can't reveal (race condition fix).
+    /// For Leg 2: `size_matched` is always `None`.
+    pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool, size_matched: Option<Decimal>) {
         if is_leg2 {
             self.emergency_signal_in_flight = false;
             self.leg2_command_pending = false;
@@ -2139,15 +1989,79 @@ impl StrategyEngine {
                 self.replay_pending_fills(now_ms);
             }
         } else {
-            // Leg 1 cancel result
-            if was_cancelled {
-                self.leg1_cancel_inflight = false;
+            // Leg 1 cancel result — use authoritative size_matched from get_order_status().
+            self.leg1_cancel_inflight = false;
+            let filled = size_matched.unwrap_or(Decimal::ZERO);
+
+            if filled > Decimal::ZERO {
+                // Shares were filled before/during cancel — handle based on current state.
+                let now_ms = now_epoch_ms();
+                match &self.state.leg1_state {
+                    OrderState::Posted { price, .. } => {
+                        // Cancel-race: CLOB filled the order but cancel returned true.
+                        // Transition Posted → Filled and init hedge.
+                        let fill_price = *price;
+                        let fill_size = filled.round_dp(2);
+                        info!(%order_id, %fill_price, %fill_size,
+                            "Leg 1 cancel-race: order was filled — transitioning to Filled");
+                        self.state.leg1_state = OrderState::Filled {
+                            order_id: order_id.clone(),
+                            price: fill_price,
+                            size: fill_size,
+                            fill_timestamp_ms: now_ms,
+                        };
+                        self.init_leg2(fill_price, fill_size, now_ms);
+                        self.diag_leg1_fills += 1;
+
+                        // Reset live trade meta for the new trade.
+                        self.live_trade_meta = LiveTradeMeta::default();
+
+                        // Send opportunity alert via Telegram in live mode.
+                        if let (Some(reporter), Some(signal)) = (
+                            self.reporter.clone(),
+                            self.pending_leg1_signal.clone(),
+                        ) {
+                            let book = signal
+                                .book_snapshot
+                                .clone()
+                                .or_else(|| self.state.poly_book.clone())
+                                .unwrap_or_else(|| OrderBook {
+                                    asset_id: signal.token_id.clone(),
+                                    bids: vec![],
+                                    asks: vec![],
+                                    timestamp_ms: now_ms,
+                                });
+                            reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
+                            self.live_market_signals += 1;
+                            if signal.bot_contested {
+                                self.live_market_walls += 1;
+                            }
+                        }
+                    }
+                    OrderState::Filled { size: current_size, .. } => {
+                        // Already Filled (User WS MATCHED arrived first). Update size if larger.
+                        if filled.round_dp(2) > *current_size {
+                            let new_size = filled.round_dp(2);
+                            info!(%order_id, old_size = %current_size, %new_size,
+                                "Leg 1 cancel result: size_matched > current — updating");
+                            if let OrderState::Filled { ref mut size, .. } = self.state.leg1_state {
+                                *size = new_size;
+                            }
+                            // evaluate_leg2() reads size from leg1_state — will naturally repost at correct size.
+                        }
+                    }
+                    OrderState::None => {
+                        warn!(%order_id, %filled, "Leg 1 cancel result: size_matched > 0 but leg1_state=None — ignoring");
+                    }
+                }
+            } else if was_cancelled || size_matched.is_some() {
+                // filled == 0 and either cancel confirmed or query succeeded → nothing filled.
                 if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-                    // Partial-fill cleanup — trade is actively hedging, don't reset.
+                    // Partial-fill remainder cancelled — trade continues with hedge.
                     debug!(%order_id, "Leg 1 partial-fill remainder cancelled — trade continues");
                 } else {
                     // Normal sustain-fade cancel — full reset.
-                    debug!(%order_id, "Leg 1 cancel confirmed — resetting Leg 1 state");
+                    debug!(%order_id, "Leg 1 cancel confirmed (0 filled) — resetting Leg 1 state");
                     self.state.leg1_state = OrderState::None;
                     self.state.leg1_posted_ask = None;
                     self.leg1_direction = None;
@@ -2156,469 +2070,13 @@ impl StrategyEngine {
                     self.pending_leg1_signal = None;
                 }
             } else {
-                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-                    // Partial-fill cancel failed — remaining shares may have also filled unhedged.
-                    self.leg1_cancel_inflight = false;
-                    warn!(%order_id, "partial-fill remainder cancel failed — additional fills may be unhedged");
-                } else {
-                    // Normal sustain cancel not confirmed — order likely filled.
-                    // Leave leg1_cancel_inflight=true so sustain monitor does NOT retry.
-                    debug!(%order_id, "Leg 1 cancel NOT confirmed — order filled or gone, no retry");
-                }
+                // Query failed AND was_cancelled=false → defensive fallback.
+                // Keep state as-is, wait for User WS.
+                debug!(%order_id, "Leg 1 cancel: query failed, not cancelled — waiting for User WS");
             }
             let now_ms = now_epoch_ms();
             self.replay_pending_fills(now_ms);
         }
-    }
-
-    /// Called when the executor confirms a specific Leg 2 order cancel (dual-order).
-    pub fn on_leg2_order_cancel_result(&mut self, order_id: String, was_cancelled: bool) {
-        if let Some(ref orphan) = self.post_trade_orphan {
-            if orphan.order_id == order_id {
-                if was_cancelled {
-                    info!(%order_id, "orphan cancel confirmed — clearing orphan state");
-                    self.post_trade_orphan = None;
-                    self.orphan_cancel_sent = false;
-                } else {
-                    warn!(%order_id, "orphan cancel NOT confirmed — watching for fill via User WS");
-                    // Keep orphan state — may fill via User WS TradeStatusUpdate.
-                }
-                return;
-            }
-        }
-        // Resize cancel (additional Leg 1 fill).
-        if self.leg2_resize_pending {
-            if was_cancelled {
-                info!(%order_id, "Leg 2 resize cancel confirmed");
-                // Clear matching phase ID
-                if self.leg2_phase1_order_id.as_deref() == Some(&order_id) {
-                    self.leg2_phase1_order_id = None;
-                }
-                if self.leg2_phase2_order_id.as_deref() == Some(&order_id) {
-                    self.leg2_phase2_order_id = None;
-                }
-                // All cancels done → reset leg2_state for re-evaluation
-                if self.leg2_phase1_order_id.is_none() && self.leg2_phase2_order_id.is_none() {
-                    self.leg2_resize_pending = false;
-                    self.reset_leg2_for_resize();
-                    info!("Leg 2 resize complete — evaluate_leg2() will repost with updated size");
-                }
-            } else {
-                // Cancel FAILED — order likely filled for old_size.
-                // Abort resize. Pre-build remainder FOK now (state still available).
-                // Gate on_trade_complete until FOK fills.
-                let old_leg2_size = match &self.state.leg2_state {
-                    OrderState::Posted { size, .. } => *size,
-                    _ => Decimal::ZERO,
-                };
-                let leg1_size = match &self.state.leg1_state {
-                    OrderState::Filled { size, .. } => *size,
-                    _ => Decimal::ZERO,
-                };
-                let remainder = leg1_size - old_leg2_size;
-
-                warn!(%order_id, %old_leg2_size, %leg1_size, %remainder,
-                    "Leg 2 resize cancel FAILED — will FOK remainder after old Leg 2 fills");
-
-                self.leg2_resize_pending = false;
-                self.pending_leg2_resize_cancels.clear();
-
-                if remainder > Decimal::ZERO {
-                    // CLOB rejects orders below 5 shares or $1 notional — skip if too small.
-                    let leg1_price = match &self.state.leg1_state {
-                        OrderState::Filled { price, .. } => *price,
-                        _ => Decimal::ZERO,
-                    };
-                    let hedge_price = Decimal::ONE - leg1_price;
-                    let notional = remainder * hedge_price;
-                    if remainder < Decimal::new(5, 0) || notional < Decimal::ONE {
-                        info!(
-                            %remainder, %notional,
-                            "Resize remainder skipped — below CLOB minimum"
-                        );
-                        if let Some(ref reporter) = self.reporter {
-                            reporter.fire_critical(format!(
-                                "RESIZE REMAINDER SKIPPED\nAdditional Leg 1 fill too small to hedge\n\
-                                 Remainder: {} shares, Notional: ${:.2}\nMin: 5 shares / $1.00\n\
-                                 Completing trade with partial hedge",
-                                remainder, notional,
-                            ));
-                        }
-                    } else {
-                        self.resize_remainder_pending = true;
-                        self.pending_resize_remainder = Some(self.build_resize_remainder_fok(remainder));
-                    }
-                }
-
-                if let Some(reporter) = self.reporter.as_ref() {
-                    reporter.fire_critical(format!(
-                        "RESIZE: Leg 2 cancel failed (filled)\n\
-                         Leg 1: {leg1_size} | Old Leg 2: {old_leg2_size}\n\
-                         Will FOK {remainder} remainder after old fill completes",
-                    ));
-                }
-            }
-            return;
-        }
-
-        // Not an orphan or resize cancel — treat as standard Leg 2 cancel result.
-        self.on_cancel_result(order_id, was_cancelled, true);
-    }
-
-    /// Called when the executor completes a rebalance FOK (double-fill recovery).
-    pub fn on_rebalance_result(
-        &mut self,
-        success: bool,
-        price: Decimal,
-        size: Decimal,
-        _order_id: Option<String>,
-    ) {
-        self.rebalance_in_progress = false;
-        self.post_trade_orphan = None;
-        self.orphan_cancel_sent = false;
-        self.diag_rebalance_attempts += 1;
-
-        if success {
-            self.diag_rebalance_successes += 1;
-            info!(%price, %size, "rebalance FOK succeeded — double-fill recovered");
-            if let Some(ref reporter) = self.reporter {
-                reporter.fire_critical(format!(
-                    "REBALANCE COMPLETED\nDouble-fill recovery: bought {} @ {}\nPair cost (rebalance): {}",
-                    size, price, Decimal::ONE - price,
-                ));
-            }
-        } else {
-            warn!(%price, %size, "REBALANCE FOK FAILED — naked directional exposure");
-            if let Some(ref reporter) = self.reporter {
-                reporter.fire_critical(format!(
-                    "REBALANCE FAILED\nDouble-fill detected\nRebalance FOK FAILED — naked directional exposure\nManual intervention required",
-                ));
-            }
-        }
-    }
-
-    // ─── Additional Leg 1 fill → Leg 2 resize ────────────────────────────
-
-    /// Handle an additional fill on the current Leg 1 order (cancel-failed partial fill).
-    /// Updates `leg1_state.size` and triggers Leg 2 resize if hedge orders are resting.
-    fn handle_leg1_additional_fill(
-        &mut self,
-        order_id: &str,
-        size_matched: Option<Decimal>,
-        _original_size: Option<Decimal>,
-        now_ms: u64,
-    ) {
-        let new_total = match size_matched {
-            Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
-            _ => {
-                warn!(%order_id, "additional Leg 1 fill but no size_matched — cannot resize");
-                return;
-            }
-        };
-
-        let current_size = match &self.state.leg1_state {
-            OrderState::Filled { size, .. } => *size,
-            _ => return,
-        };
-
-        if new_total <= current_size {
-            return; // duplicate or stale event
-        }
-
-        warn!(%order_id, old_size = %current_size, new_size = %new_total,
-            "ADDITIONAL LEG 1 FILL — resizing hedge");
-        self.diag_leg1_additional_fills += 1;
-
-        // Update leg1_state.size
-        if let OrderState::Filled { ref mut size, .. } = self.state.leg1_state {
-            *size = new_total;
-        }
-
-        // Handle based on current leg2_state
-        match &self.state.leg2_state {
-            OrderState::Posted { .. } => {
-                // Cancel existing Leg 2 orders, let evaluate_leg2() repost with new size.
-                self.initiate_leg2_resize(now_ms);
-            }
-            OrderState::None => {
-                // Not yet posted — size update is sufficient.
-                info!(%order_id, "Leg 2 not yet posted — size update sufficient");
-            }
-            OrderState::Filled { .. } => {
-                // Leg 2 already filled — trade will complete for partial amount.
-                // Can't start a second trade. Alert operator.
-                warn!(%order_id, %new_total, %current_size,
-                    "additional Leg 1 fill but Leg 2 ALREADY FILLED — unhedged exposure");
-                if let Some(reporter) = self.reporter.as_ref() {
-                    reporter.fire_critical(format!(
-                        "UNHEDGED: Leg 1 additional fill\n\
-                         Size: {} → {} (+{})\n\
-                         Leg 2 already filled — {} shares unhedged",
-                        current_size, new_total, new_total - current_size, new_total - current_size,
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Queue Leg 2 cancel commands to resize hedge after additional Leg 1 fills.
-    fn initiate_leg2_resize(&mut self, _now_ms: u64) {
-        self.leg2_resize_pending = true;
-
-        if let Some(ref p1_id) = self.leg2_phase1_order_id {
-            self.pending_leg2_resize_cancels.push(ExecutorCommand::CancelLeg2Order {
-                order_id: p1_id.clone(),
-            });
-        }
-        if let Some(ref p2_id) = self.leg2_phase2_order_id {
-            self.pending_leg2_resize_cancels.push(ExecutorCommand::CancelLeg2Order {
-                order_id: p2_id.clone(),
-            });
-        }
-
-        // No real CLOB orders to cancel — reset directly.
-        if self.pending_leg2_resize_cancels.is_empty() {
-            self.leg2_resize_pending = false;
-            self.reset_leg2_for_resize();
-            info!("Leg 2 resize: no CLOB orders — leg2_state reset directly");
-        } else {
-            info!(count = self.pending_leg2_resize_cancels.len(), "Leg 2 resize: cancels queued");
-        }
-    }
-
-    /// Reset Leg 2 state for re-evaluation after resize.
-    fn reset_leg2_for_resize(&mut self) {
-        self.state.leg2_state = OrderState::None;
-        self.leg2_phase1_order_id = None;
-        self.leg2_phase2_order_id = None;
-        self.prev_leg2_order = None;
-        self.emergency_signal_in_flight = false;
-        self.leg2_command_pending = false;
-        if let Some(ref mut hedge) = self.hedge {
-            hedge.phase = HedgePhase::Phase1;
-            hedge.phase2_posted_price = None;
-            hedge.phase2_start_ms = None;
-            hedge.emergency_submitted = false;
-            hedge.fok_emitted = false;
-        }
-    }
-
-    /// Drain pending Leg 2 resize cancel commands (additional Leg 1 fill → hedge resize).
-    /// Called by the main loop after `on_event()`.
-    pub fn take_leg2_resize_cancels(&mut self) -> Vec<ExecutorCommand> {
-        std::mem::take(&mut self.pending_leg2_resize_cancels)
-    }
-
-    /// Build a resize remainder FOK command while state is still intact.
-    /// Called when resize cancel fails (order filled for old size) — we need
-    /// to FOK the remainder (new_leg1_size - old_leg2_size) on the Leg 2 side.
-    fn build_resize_remainder_fok(&self, remainder: Decimal) -> ExecutorCommand {
-        let direction = self.leg1_direction.unwrap_or(Direction::Up);
-        // Leg 2 is opposite side to Leg 1
-        let (token_id, book) = match direction {
-            Direction::Up => (
-                self.state.active_no_token_id.clone().unwrap_or_default(),
-                self.state.poly_no_book.clone().or_else(|| self.state.poly_book.clone()),
-            ),
-            Direction::Down => (
-                self.state.active_yes_token_id.clone().unwrap_or_default(),
-                self.state.poly_yes_book.clone().or_else(|| self.state.poly_book.clone()),
-            ),
-        };
-        let leg1_price = match &self.state.leg1_state {
-            OrderState::Filled { price, .. } => *price,
-            _ => Decimal::ZERO,
-        };
-        let breakeven_price = Decimal::ONE - leg1_price;
-        let condition_id = self.state.active_condition_id.clone().unwrap_or_default();
-
-        let signal = TradeSignal {
-            side: Side::Buy,
-            token_id,
-            condition_id,
-            price: breakeven_price,
-            size: remainder,
-            reference_price: Decimal::ZERO,
-            expected_pct: Decimal::ZERO,
-            profit_target_tier: ProfitTier::Low,
-            profit_target_pct: Decimal::ZERO,
-            alloc_amount: Decimal::ZERO,
-            direction,
-            spike_info: self.state.last_buildup.as_ref().map(|b| SpikeInfo {
-                direction: b.direction,
-                magnitude: b.composite_score,
-                sustained_ms: 0,
-                timestamp_ms: b.timestamp_ms,
-                atr_ratio: b.signal_atr_ratio,
-                obi: b.obi,
-            }).unwrap_or(SpikeInfo {
-                direction,
-                magnitude: Decimal::ZERO,
-                sustained_ms: 0,
-                timestamp_ms: 0,
-                atr_ratio: Decimal::ZERO,
-                obi: Decimal::ZERO,
-            }),
-            is_leg2: true,
-            leg1_fill_price: Some(leg1_price),
-            entry_timestamp_ms: now_epoch_ms(),
-            market_end_timestamp_ms: self.state.market_end_timestamp_ms,
-            tick_size: self.state.tick_size,
-            exit_reason: None,
-            atr: Decimal::ZERO,
-            bot_contested: false,
-            leg1_fee: Decimal::ZERO,
-            best_ask: None,
-            book_snapshot: book,
-            buildup_info: None,
-        };
-
-        ExecutorCommand::ResizeRemainderFok { signal }
-    }
-
-    /// True when a resize remainder FOK is pending.
-    /// Gates on_trade_complete() in main.rs.
-    pub fn has_resize_remainder_pending(&self) -> bool {
-        self.resize_remainder_pending
-    }
-
-    /// Drain pre-built resize remainder FOK command.
-    pub fn take_resize_remainder(&mut self) -> Option<ExecutorCommand> {
-        self.pending_resize_remainder.take()
-    }
-
-    /// Handle result of resize remainder FOK — update leg2_state with combined fill.
-    pub fn on_resize_remainder_result(
-        &mut self,
-        success: bool,
-        fok_price: Decimal,
-        fok_size: Decimal,
-        _order_id: Option<String>,
-    ) {
-        self.resize_remainder_pending = false;
-
-        if success {
-            // Update leg2_state with combined fill (weighted avg price).
-            if let OrderState::Filled { ref mut price, ref mut size, .. } = self.state.leg2_state {
-                let old_size = *size;
-                let old_price = *price;
-                let new_total = old_size + fok_size;
-                if new_total > Decimal::ZERO {
-                    *price = ((old_price * old_size) + (fok_price * fok_size)) / new_total;
-                }
-                *size = new_total;
-            }
-            info!(%fok_price, %fok_size, "resize remainder FOK filled — trade will complete with full size");
-        } else {
-            // FOK failed — complete trade with partial hedge. Alert operator.
-            warn!(%fok_price, %fok_size, "RESIZE REMAINDER FOK FAILED — completing with partial hedge");
-            if let Some(ref reporter) = self.reporter {
-                reporter.fire_critical(format!(
-                    "RESIZE REMAINDER FOK FAILED\nUnhedged shares remain\nManual intervention may be needed",
-                ));
-            }
-        }
-    }
-
-    /// Take the pending orphan cancel command (if any).
-    /// Called by the main loop after `on_trade_complete()` when `post_trade_orphan` is set.
-    pub fn take_orphan_cancel(&mut self) -> Option<ExecutorCommand> {
-        let orphan = self.post_trade_orphan.as_ref()?;
-        self.orphan_cancel_sent = true;
-        Some(ExecutorCommand::CancelLeg2Order {
-            order_id: orphan.order_id.clone(),
-        })
-    }
-
-    /// Take the pending rebalance signal (if any).
-    /// Called by the main loop when `rebalance_in_progress` is set.
-    pub fn take_rebalance_signal(&mut self) -> Option<ExecutorCommand> {
-        if !self.rebalance_in_progress {
-            return None;
-        }
-        let orphan = self.post_trade_orphan.as_ref()?;
-
-        // CLOB rejects orders below 5 shares or $1 notional — skip if too small.
-        let breakeven = Decimal::ONE - orphan.leg1_price;
-        let notional = orphan.size * breakeven;
-        if orphan.size < Decimal::new(5, 0) || notional < Decimal::ONE {
-            info!(
-                size = %orphan.size, notional = %notional,
-                "Rebalance skipped — below CLOB minimum (5 shares / $1 notional)"
-            );
-            if let Some(ref reporter) = self.reporter {
-                reporter.fire_critical(format!(
-                    "REBALANCE SKIPPED\nDouble-fill detected but orphan too small for CLOB\n\
-                     Size: {} shares, Notional: ${:.2}\nMin: 5 shares / $1.00\n\
-                     Accepting imbalance — no action needed",
-                    orphan.size, notional,
-                ));
-            }
-            self.rebalance_in_progress = false;
-            return None;
-        }
-
-        // Build a rebalance signal: buy Leg 1 side (same direction as original entry).
-        let (token_id, book) = match orphan.leg1_direction {
-            Direction::Up => (
-                self.state.active_yes_token_id.clone().unwrap_or_default(),
-                self.state
-                    .poly_yes_book
-                    .clone()
-                    .or_else(|| self.state.poly_book.clone()),
-            ),
-            Direction::Down => (
-                self.state.active_no_token_id.clone().unwrap_or_default(),
-                self.state
-                    .poly_no_book
-                    .clone()
-                    .or_else(|| self.state.poly_book.clone()),
-            ),
-        };
-
-        let breakeven_price = Decimal::ONE - orphan.leg1_price;
-        let signal = TradeSignal {
-            side: Side::Buy,
-            token_id,
-            condition_id: orphan.condition_id.clone(),
-            price: breakeven_price,
-            size: orphan.size,
-            reference_price: Decimal::ZERO,
-            expected_pct: Decimal::ZERO,
-            profit_target_tier: ProfitTier::Low,
-            profit_target_pct: Decimal::ZERO,
-            alloc_amount: Decimal::ZERO,
-            direction: orphan.leg1_direction,
-            spike_info: self.state.last_buildup.as_ref().map(|b| SpikeInfo {
-                direction: b.direction,
-                magnitude: b.composite_score,
-                sustained_ms: 0,
-                timestamp_ms: b.timestamp_ms,
-                atr_ratio: b.signal_atr_ratio,
-                obi: b.obi,
-            }).unwrap_or(SpikeInfo {
-                direction: orphan.leg1_direction,
-                magnitude: Decimal::ZERO,
-                sustained_ms: 0,
-                timestamp_ms: 0,
-                atr_ratio: Decimal::ZERO,
-                obi: Decimal::ZERO,
-            }),
-            is_leg2: true,
-            leg1_fill_price: Some(orphan.leg1_price),
-            entry_timestamp_ms: now_epoch_ms(),
-            market_end_timestamp_ms: self.state.market_end_timestamp_ms,
-            tick_size: orphan.tick_size,
-            exit_reason: None,
-            atr: Decimal::ZERO,
-            bot_contested: false,
-            leg1_fee: Decimal::ZERO,
-            best_ask: None,
-            book_snapshot: book,
-            buildup_info: None,
-        };
-
-        Some(ExecutorCommand::RebalanceLeg1 { signal })
     }
 
     /// Replay buffered TradeStatusUpdate events that didn't match any leg when
@@ -2937,15 +2395,10 @@ impl StrategyEngine {
         self.pending_fills.clear();
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
-        self.leg2_resize_pending = false;
-        self.pending_leg2_resize_cancels.clear();
-        self.resize_remainder_pending = false;
-        self.pending_resize_remainder = None;
-        // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
+        // Dual-order tracking: clear IDs on trade reset.
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
         self.last_leg2_was_phase2_alongside = false;
-        // post_trade_orphan deliberately NOT cleared — survives trade reset.
         // cumulative_used is NOT reset — capital stays allocated within this market.
     }
 
@@ -3673,7 +3126,6 @@ impl StrategyEngine {
             spike_magnitude: hedge.spike_info.magnitude,
             leg1_cancel_race: false,
             phase1_breach: self.live_trade_meta.phase1_breach,
-            phase1_dual_fill: self.live_trade_meta.phase1_dual_fill,
             whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
             open_timestamp_ms: l1_ts,
             close_timestamp_ms: now_ms,

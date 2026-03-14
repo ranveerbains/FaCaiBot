@@ -17,9 +17,11 @@ None ----------------> Posted -----------------> Filled
   +-------------------------------------------+
 ```
 
-Note: Sustain cancel and whipsaw cancel go through `CancelLeg1Order` → fire-and-confirm.
-- **Cancel confirmed (`was_cancelled=true`):** Full Leg 1 reset → `None`. Repost path re-arms `buildup_detected` if composite still alive; non-repost path clears all Leg 1 fields.
-- **Cancel NOT confirmed (`was_cancelled=false`):** Order filled before cancel reached CLOB. `leg1_state` stays `Posted`. `leg1_cancel_inflight` stays `true` (prevents sustain retry). User WS MATCHED transitions to `Filled`. `on_trade_complete()` clears `leg1_cancel_inflight`.
+Note: Sustain cancel and whipsaw cancel go through `CancelLeg1Order` → executor calls `cancel_order()` then `get_order_status()` to get authoritative `size_matched`.
+- **`size_matched > 0` + `leg1_state == Posted`:** Cancel-race detected — CLOB filled the order before/during cancel. Transition `Posted → Filled`, call `init_leg2()`, send opportunity alert. No additional fills can arrive on a cancelled order.
+- **`size_matched > 0` + `leg1_state == Filled`:** User WS MATCHED arrived first. Update size if `size_matched > current_size` (evaluate_leg2 will repost at correct size).
+- **`size_matched == 0` (confirmed or query succeeded):** Nothing filled. Full Leg 1 reset → `None`.
+- **Query failed + `was_cancelled == false`:** Defensive fallback — keep state as-is, wait for User WS MATCHED.
 
 **Triggers:**
 - `None -> Posted`: Engine emits signal on `BuildupConfirmed`, executor posts maker order

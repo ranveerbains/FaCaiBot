@@ -629,9 +629,7 @@ mod formatter {
             trade.leg1.size
         };
         let leg2_str = if let Some(ref leg2) = trade.leg2 {
-            let phase_note = if trade.phase1_dual_fill {
-                " (PHASE-1-DUAL)"
-            } else if trade.hedge_phase > 0 {
+            let phase_note = if trade.hedge_phase > 0 {
                 " (PHASE-2)"
             } else {
                 " (PHASE-1)"
