@@ -246,6 +246,7 @@ async fn async_main() -> Result<()> {
                         if is_leg2 && already_filled
                             && matches!(engine.state().leg1_state, OrderState::Filled { .. })
                             && matches!(engine.state().leg2_state, OrderState::Filled { .. })
+                            && !engine.has_resize_remainder_pending()
                         {
                             if let Some(ref mut c) = cold
                                 && let Err(e) = engine.record_live_trade(c)
@@ -285,6 +286,14 @@ async fn async_main() -> Result<()> {
                         order_id,
                     } => {
                         engine.on_rebalance_result(success, price, size, order_id);
+                    }
+                    ExecutorFeedback::ResizeRemainderResult {
+                        success,
+                        price,
+                        size,
+                        order_id,
+                    } => {
+                        engine.on_resize_remainder_result(success, price, size, order_id);
                     }
                 }
             }
@@ -501,6 +510,13 @@ async fn async_main() -> Result<()> {
                 error!(error = %e, "failed to send heartbeat cancel to executor");
             }
 
+            // Drain Leg 2 resize cancels (additional Leg 1 fill → hedge resize).
+            for cmd in engine.take_leg2_resize_cancels() {
+                if let Err(e) = executor_tx.send(cmd) {
+                    error!(error = %e, "failed to send Leg 2 resize cancel to executor");
+                }
+            }
+
             // Evaluate Leg 1 signals.
             if let Some(signal) = engine.evaluate() {
                 if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
@@ -538,6 +554,7 @@ async fn async_main() -> Result<()> {
             // Detect trade completion (both legs filled via User WS).
             if matches!(engine.state().leg1_state, OrderState::Filled { .. })
                 && matches!(engine.state().leg2_state, OrderState::Filled { .. })
+                && !engine.has_resize_remainder_pending()
             {
                 // Record to QuestDB before state reset.
                 if let Some(ref mut c) = cold
@@ -550,6 +567,16 @@ async fn async_main() -> Result<()> {
                 if let Some(orphan_cmd) = engine.take_orphan_cancel() {
                     let _ = executor_tx.send(orphan_cmd);
                 }
+            }
+
+            // Emit resize remainder FOK when both legs filled but remainder pending.
+            if matches!(engine.state().leg1_state, OrderState::Filled { .. })
+                && matches!(engine.state().leg2_state, OrderState::Filled { .. })
+                && engine.has_resize_remainder_pending()
+                && let Some(cmd) = engine.take_resize_remainder()
+                && let Err(e) = executor_tx.send(cmd)
+            {
+                error!(error = %e, "failed to send resize remainder FOK to executor");
             }
 
             // Check drain completion: position fully closed after drain was activated.

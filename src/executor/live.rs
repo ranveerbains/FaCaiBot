@@ -185,6 +185,9 @@ impl LiveExecutor {
                 ExecutorCommand::RebalanceLeg1 { signal } => {
                     self.handle_rebalance_leg1(&signal).await;
                 }
+                ExecutorCommand::ResizeRemainderFok { signal } => {
+                    self.handle_resize_remainder(&signal).await;
+                }
                 ExecutorCommand::CancelLeg1Order { order_id } => {
                     self.handle_cancel_leg1(&order_id).await;
                 }
@@ -1020,6 +1023,106 @@ impl LiveExecutor {
         }
         // All attempts failed.
         let _ = self.feedback_tx.try_send(ExecutorFeedback::RebalanceResult {
+            success: false,
+            price: current_price,
+            size: signal.size,
+            order_id: None,
+        });
+    }
+
+    // ─── Resize remainder FOK ─────────────────────────────────────────────
+
+    /// FOK taker to cover unhedged Leg 1 shares after resize cancel failed.
+    /// Same price-escalation loop as `handle_rebalance_leg1()`.
+    async fn handle_resize_remainder(&mut self, signal: &TradeSignal) {
+        warn!(
+            price = %signal.price,
+            size = %signal.size,
+            "RESIZE REMAINDER: FOK buy Leg 2 side to cover additional Leg 1 fill"
+        );
+        let mut current_price = signal.price;
+        let dollar = Decimal::ONE;
+
+        loop {
+            let safe_size = clob_safe_fok_size(current_price, signal.size);
+            if safe_size.is_zero() {
+                error!("resize remainder FOK size zero at price {} — aborting", current_price);
+                break;
+            }
+            if current_price * safe_size < Decimal::ONE {
+                warn!("resize remainder FOK below $1 minimum at price {} — escalating", current_price);
+                current_price += signal.tick_size;
+                if current_price > dollar {
+                    error!("resize remainder FOK exceeded $1.00 cap — aborting");
+                    break;
+                }
+                continue;
+            }
+            let order = OrderRequest::emergency_fok(
+                signal.token_id.clone(),
+                signal.side,
+                current_price,
+                safe_size,
+            );
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Filled {
+                        let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
+                        info!(
+                            order_id = %resp.order_id,
+                            price = %current_price,
+                            size = %fill_size,
+                            "resize remainder FOK FILLED"
+                        );
+                        let _ = self.feedback_tx.try_send(ExecutorFeedback::ResizeRemainderResult {
+                            success: true,
+                            price: current_price,
+                            size: fill_size,
+                            order_id: Some(resp.order_id),
+                        });
+                        return;
+                    } else if resp.status == OrderStatus::Rejected {
+                        warn!(price = %current_price, "resize remainder FOK rejected — escalating price");
+                        current_price += signal.tick_size;
+                        if current_price > dollar {
+                            error!("resize remainder FOK exceeded $1.00 cap — aborting");
+                            break;
+                        }
+                        continue;
+                    } else {
+                        let _ = self.feedback_tx.try_send(ExecutorFeedback::ResizeRemainderResult {
+                            success: true,
+                            price: current_price,
+                            size: safe_size,
+                            order_id: Some(resp.order_id),
+                        });
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("decimal places")
+                        || err_msg.contains("decimals")
+                        || err_msg.contains("invalid amounts")
+                        || err_msg.contains("Validation")
+                        || err_msg.contains("balance")
+                        || err_msg.contains("allowance")
+                    {
+                        error!(error = %e, "resize remainder FOK non-transient error — aborting");
+                        break;
+                    }
+                    warn!(error = %e, price = %current_price, "resize remainder FOK failed — escalating price");
+                    current_price += signal.tick_size;
+                    if current_price > dollar {
+                        error!("resize remainder FOK exceeded $1.00 cap — aborting");
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        // All attempts failed.
+        let _ = self.feedback_tx.try_send(ExecutorFeedback::ResizeRemainderResult {
             success: false,
             price: current_price,
             size: signal.size,

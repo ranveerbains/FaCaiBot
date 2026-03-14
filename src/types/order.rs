@@ -220,6 +220,8 @@ pub enum ExecutorCommand {
     CancelLeg2Order { order_id: String },
     /// Rebalance FOK: buy Leg 1 side after a double-fill race condition.
     RebalanceLeg1 { signal: TradeSignal },
+    /// FOK taker to cover unhedged Leg 1 shares after resize cancel failed.
+    ResizeRemainderFok { signal: TradeSignal },
     /// Cancel unfilled Leg 1 maker order (flow-based sustain failure or timeout).
     /// Engine tracks repost intent internally via `leg1_last_cancel_repost`.
     CancelLeg1Order { order_id: String },
@@ -377,6 +379,13 @@ pub enum ExecutorFeedback {
     },
     /// Result of a rebalance FOK after double-fill race condition.
     RebalanceResult {
+        success: bool,
+        price: Decimal,
+        size: Decimal,
+        order_id: Option<String>,
+    },
+    /// Result of a resize remainder FOK (additional Leg 1 fill recovery).
+    ResizeRemainderResult {
         success: bool,
         price: Decimal,
         size: Decimal,
