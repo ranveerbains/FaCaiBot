@@ -225,26 +225,40 @@ impl LiveExecutor {
         self.active_leg2_phase1_id = None;
         self.active_leg2_phase2_id = None;
 
-        // Round price to tick size (SDK requirement: price decimals <= tick decimals).
-        let rounded_price = crate::engine::confidence::round_to_tick(signal.price, signal.tick_size);
-        let safe_size = clob_safe_fok_size(rounded_price, signal.size);
+        // Fetch fresh best ask from CLOB REST — signal price may be stale.
+        let fresh_price = match self.poly.get_best_ask(&signal.token_id).await {
+            Ok(Some(ask)) => crate::engine::confidence::round_to_tick(ask, signal.tick_size),
+            Ok(None) => {
+                warn!("Leg 1 FOK: no asks on book — aborting");
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
+                self.log_signal_to_cold(signal, "no_asks");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "Leg 1 FOK: best_ask query failed — using signal price");
+                crate::engine::confidence::round_to_tick(signal.price, signal.tick_size)
+            }
+        };
+
+        let safe_size = clob_safe_fok_size(fresh_price, signal.size);
 
         let order = OrderRequest::emergency_fok(
             signal.token_id.clone(),
             signal.side,
-            rounded_price,
+            fresh_price,
             safe_size,
         );
 
         info!(
             side = ?signal.side,
             token = %signal.token_id,
-            price = %rounded_price,
+            signal_price = %signal.price,
+            fresh_price = %fresh_price,
             size = %safe_size,
             expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
-            "Leg 1: FOK taker at {}",
-            rounded_price,
+            "Leg 1: FOK taker at {} (signal was {})",
+            fresh_price, signal.price,
         );
 
         match self.poly.place_order(&order).await {
@@ -252,14 +266,14 @@ impl LiveExecutor {
                 if resp.status == OrderStatus::Filled {
                     info!(
                         order_id = %resp.order_id,
-                        price = %rounded_price,
+                        price = %fresh_price,
                         size = %safe_size,
                         "Leg 1: FOK filled"
                     );
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: false,
                         order_id: resp.order_id,
-                        price: signal.price,
+                        price: fresh_price,
                         size: safe_size,
                         fill_method: None,
                         already_filled: true,
