@@ -218,7 +218,7 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 1: maker post-only entry ──────────────────────────────────
+    // ─── Leg 1: FOK taker entry ─────────────────────────────────────────
 
     async fn handle_leg1(&mut self, signal: &TradeSignal) {
         // New trade — clear any stale Leg 2 IDs from previous trade.
@@ -227,58 +227,59 @@ impl LiveExecutor {
 
         // Round price to tick size (SDK requirement: price decimals <= tick decimals).
         let rounded_price = crate::engine::confidence::round_to_tick(signal.price, signal.tick_size);
+        let safe_size = clob_safe_fok_size(rounded_price, signal.size);
 
-        let order = OrderRequest::post_only_gtc(
+        let order = OrderRequest::emergency_fok(
             signal.token_id.clone(),
             signal.side,
             rounded_price,
-            signal.size,
+            safe_size,
         );
 
         info!(
             side = ?signal.side,
             token = %signal.token_id,
             price = %rounded_price,
-            size = %signal.size,
+            size = %safe_size,
             expected_pct = %signal.expected_pct,
             tier = signal.profit_target_tier.label(),
-            "Leg 1: maker post-only at {}",
+            "Leg 1: FOK taker at {}",
             rounded_price,
         );
 
         match self.poly.place_order(&order).await {
             Ok(resp) => {
-                if resp.status == OrderStatus::Rejected {
-                    // Post-only rejected — ask crossed our bid. Abort.
-                    warn!("Leg 1 maker REJECTED — aborting");
+                if resp.status == OrderStatus::Filled {
+                    info!(
+                        order_id = %resp.order_id,
+                        price = %rounded_price,
+                        size = %safe_size,
+                        "Leg 1: FOK filled"
+                    );
+                    let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                        is_leg2: false,
+                        order_id: resp.order_id,
+                        price: signal.price,
+                        size: safe_size,
+                        fill_method: None,
+                        already_filled: true,
+                        order_tag: None,
+                    });
+                    self.log_signal_to_cold(signal, "fok_filled");
+                } else {
+                    // FOK not filled (expired / rejected)
+                    warn!(
+                        status = ?resp.status,
+                        "Leg 1 FOK not filled — aborting"
+                    );
                     let _ = self
                         .feedback_tx
                         .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
-                    self.log_signal_to_cold(signal, "rejected");
-                    return;
+                    self.log_signal_to_cold(signal, "fok_not_filled");
                 }
-                // Order resting on book — waiting for fill via User WS.
-                // If already filled synchronously (rare for post-only), handle it.
-                let already_filled = resp.status == OrderStatus::Filled;
-                info!(
-                    order_id = %resp.order_id,
-                    status = ?resp.status,
-                    %already_filled,
-                    "Leg 1: maker posted"
-                );
-                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
-                    is_leg2: false,
-                    order_id: resp.order_id,
-                    price: signal.price,
-                    size: signal.size,
-                    fill_method: None,
-                    already_filled,
-                    order_tag: None,
-                });
-                self.log_signal_to_cold(signal, "maker_posted");
             }
             Err(e) => {
-                error!("Leg 1 maker placement FAILED: {e}");
+                error!("Leg 1 FOK placement FAILED: {e}");
                 let _ = self
                     .feedback_tx
                     .try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
@@ -286,6 +287,46 @@ impl LiveExecutor {
             }
         }
     }
+
+    // ─── Leg 1: maker post-only entry (disabled — kept for easy revert) ──
+    //
+    // async fn handle_leg1_maker(&mut self, signal: &TradeSignal) {
+    //     self.active_leg2_phase1_id = None;
+    //     self.active_leg2_phase2_id = None;
+    //     let rounded_price = crate::engine::confidence::round_to_tick(signal.price, signal.tick_size);
+    //     let order = OrderRequest::post_only_gtc(
+    //         signal.token_id.clone(),
+    //         signal.side,
+    //         rounded_price,
+    //         signal.size,
+    //     );
+    //     info!(side = ?signal.side, token = %signal.token_id, price = %rounded_price,
+    //         size = %signal.size, expected_pct = %signal.expected_pct,
+    //         tier = signal.profit_target_tier.label(),
+    //         "Leg 1: maker post-only at {}", rounded_price);
+    //     match self.poly.place_order(&order).await {
+    //         Ok(resp) => {
+    //             if resp.status == OrderStatus::Rejected {
+    //                 warn!("Leg 1 maker REJECTED — aborting");
+    //                 let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
+    //                 self.log_signal_to_cold(signal, "rejected");
+    //                 return;
+    //             }
+    //             let already_filled = resp.status == OrderStatus::Filled;
+    //             info!(order_id = %resp.order_id, status = ?resp.status, %already_filled, "Leg 1: maker posted");
+    //             let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+    //                 is_leg2: false, order_id: resp.order_id, price: signal.price,
+    //                 size: signal.size, fill_method: None, already_filled, order_tag: None,
+    //             });
+    //             self.log_signal_to_cold(signal, "maker_posted");
+    //         }
+    //         Err(e) => {
+    //             error!("Leg 1 maker placement FAILED: {e}");
+    //             let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed { is_leg2: false });
+    //             self.log_signal_to_cold(signal, "failed");
+    //         }
+    //     }
+    // }
 
     // ─── Leg 1 cancel (flow-based sustain failure) ─────────────────────
 

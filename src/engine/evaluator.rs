@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use crate::types::market::{Direction, MarketState, OrderBook, OrderState, SpikeInfo};
-use crate::executor::fill_engine::compute_maker_rebate;
+use crate::executor::fill_engine::compute_taker_fee;
 use crate::types::order::{ExitReason, ProfitTier, Side, TradeSignal};
 
 use super::confidence::{compute_expected_repricing, round_to_tick};
@@ -346,7 +346,7 @@ impl Leg1Evaluator {
             tick_size: tick,
             atr: state.atr.unwrap_or(Decimal::ZERO),
             bot_contested,
-            leg1_fee: -compute_maker_rebate(ask_price, entry_size),
+            leg1_fee: compute_taker_fee(ask_price, entry_size),
             best_ask: Some(best_ask_price),
             book_snapshot: match direction {
                 Direction::Up => state.poly_yes_book.clone().or(state.poly_book.clone()),
