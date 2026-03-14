@@ -191,7 +191,9 @@ Both result in immediate exits and are correctly classified in session/market su
 5. If not filled -> cancel -> FOK taker fallback (existing path). `fill_method=FavorableTaker`
 6. If cancel NOT confirmed (order may have filled) -> send `OrderPosted` with `already_filled=false`, let User WS determine outcome
 
-Guards: `clob_safe_fok_size()` zero-size check and `price x size >= $1` notional minimum. `already_filled` set if sync fill. Emergency FOK paths (`emergency_fok_fallback`) send `fill_method=EmergencyTaker` -- distinct from favorable exits. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags even though the executor autonomously converted the signal.
+**All FOK exits use the same retry loop:** Both `favorable_exit_fok()` and `emergency_fok_fallback()` use a price-escalating retry loop that queries `GET /book` for the live best ask before each attempt. If the live ask is above the current price, the FOK jumps directly to the live ask (avoiding blind +1 tick walking). If rejected or on transient error, walks +1 tick. Aborts on empty book, non-transient errors, $1.00 cap, or market expiry. On loop exhaustion, fires `ORPHANED POSITION` Telegram alert.
+
+Guards: `clob_safe_fok_size()` zero-size check and `$1.00` cap. `already_filled` set if sync fill. Emergency FOK paths send `fill_method=EmergencyTaker`, favorable paths send `fill_method=FavorableTaker`. The `FillMethod` metadata allows the engine to set the correct `LiveTradeMeta` flags even though the executor autonomously converted the signal.
 
 **Leg 2 cancel-not-confirmed meta reset:** When a Leg 2 cancel returns `was_cancelled = false` and the order's Posted state is restored, `LiveTradeMeta` is reset and hedge emergency state (`emergency_submitted`, `exit_reason`) is cleared. This prevents a successful maker fill from being mislabeled as `[EMERGENCY POST-ONLY]`.
 
@@ -205,8 +207,9 @@ Leg 1 entry size is clamped to `max(raw_size, 5, ceil($1/price))` in the evaluat
 
 The `emergency_fok_fallback()` price-escalation loop enforces several safety constraints:
 
+- **Live best-ask targeting:** Each attempt queries `GET /book` for the current best ask. If the ask is above the current FOK price, the loop jumps directly to the live ask — avoiding the catastrophic slippage of blind +1 tick walking (e.g. 38 attempts walking $0.27→$0.65 over 13s). If the ask query returns empty (`Ok(None)`), the loop aborts (no liquidity). If the query fails, falls back to +1 tick.
 - **$1.00 minimum notional floor:** `clob_safe_fok_size()` increases the FOK size if `price × size < $1.00`. Sizes are rounded up to meet the CLOB notional minimum — the executor never sends a sub-dollar FOK.
-- **Maximum 10 attempts:** The loop is capped at 10 price-escalation attempts. If the position is still unhedged after 10 FOK attempts, the loop exits and fires a Telegram orphaned-position alert ("ORPHANED POSITION — FOK loop exhausted without fill") for manual intervention.
+- **Time-based cutoff:** The loop retries until the market deadline (no fixed attempt count), so we maximise hedge probability without risking retries on a settled market.
 - **Non-retryable errors (immediate abort):** Two error classes cause the loop to abort immediately rather than retrying at a higher price:
   - `"too old"` — the market has expired or the order timestamp is stale. Retrying at a higher price cannot resolve this; further attempts are futile.
   - `"min size"` — the computed FOK size is below the exchange minimum even after the $1.00 notional adjustment. Escalating price would only reduce the computed size further, so the loop aborts.

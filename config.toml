@@ -23,9 +23,9 @@ max_alloc_per_trade = 10
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
-reprice_scale = 0.065
+reprice_scale = 0.055
 # Minimum model output to enter a trade (0.02 = 2.0%)
-min_reprice_pct = 0.02
+min_reprice_pct = 0.017
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
 phase1_target_dampen = 1
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
@@ -39,7 +39,7 @@ max_time_factor = 2.5
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 3500
+phase1_timeout_ms = 2500
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
 phase1_breach_threshold = 1.02
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
@@ -49,9 +49,9 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.3
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.1
+cancel_threshold = 0.15
 # Max wait (ms) for Leg 1 maker fill before cancelling
 cancel_window_ms = 3000
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)

@@ -572,47 +572,73 @@ impl LiveExecutor {
     }
 
     /// FOK taker fallback for favorable exits.
+    ///
+    /// Uses the same retry loop as `emergency_fok_fallback()`: queries the
+    /// live best ask each attempt, retries until filled or market expires.
     async fn favorable_exit_fok(&mut self, signal: &TradeSignal) {
-        let safe_size = clob_safe_fok_size(signal.price, signal.size);
-        if safe_size.is_zero() {
-            error!(price = %signal.price, size = %signal.size, "favorable FOK size zero — aborting");
-            self.active_leg2_phase1_id = None;
-            self.active_leg2_phase2_id = None;
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            return;
-        }
-        if signal.price * safe_size < Decimal::ONE {
-            warn!(price = %signal.price, size = %safe_size, "favorable FOK below $1 minimum — aborting");
-            self.active_leg2_phase1_id = None;
-            self.active_leg2_phase2_id = None;
-            let _ = self
-                .feedback_tx
-                .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            return;
-        }
-        let order = OrderRequest::emergency_fok(
-            signal.token_id.clone(),
-            signal.side,
-            signal.price,
-            safe_size,
-        );
+        let deadline_ms = signal.market_end_timestamp_ms;
+        let mut current_price = signal.price;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let now_ms = epoch_ms();
+            if now_ms >= deadline_ms {
+                error!(attempts = attempt, "favorable FOK deadline reached (market expired) — aborting");
+                break;
+            }
+            // Query live best ask to target actual liquidity.
+            match self.poly.get_best_ask(&signal.token_id).await {
+                Ok(Some(ask)) if ask > current_price => {
+                    info!(old_price = %current_price, new_price = %ask, "favorable FOK: jumping to live best ask");
+                    current_price = ask;
+                }
+                Ok(Some(_)) => {} // ask <= current_price, keep current
+                Ok(None) => {
+                    error!("favorable FOK: order book empty — aborting");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "favorable FOK: best ask query failed — using current price");
+                }
+            }
+            if current_price > Decimal::ONE {
+                error!("favorable FOK price exceeded $1.00 cap — aborting");
+                break;
+            }
+            let safe_size = clob_safe_fok_size(current_price, signal.size);
+            if safe_size.is_zero() {
+                error!(price = %current_price, size = %signal.size, "favorable FOK size zero — aborting");
+                break;
+            }
+            let order = OrderRequest::emergency_fok(
+                signal.token_id.clone(),
+                signal.side,
+                current_price,
+                safe_size,
+            );
 
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                if resp.status == OrderStatus::Rejected {
-                    warn!("Leg 2 favorable exit: FOK rejected — hedge continues");
-                    self.active_leg2_phase1_id = None;
-                    self.active_leg2_phase2_id = None;
-                    let _ = self
-                        .feedback_tx
-                        .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-                } else {
+            match self.poly.place_order(&order).await {
+                Ok(resp) => {
+                    if resp.status == OrderStatus::Rejected {
+                        warn!(
+                            order_id = %resp.order_id,
+                            price = %current_price,
+                            attempt,
+                            "favorable FOK rejected — escalating"
+                        );
+                        current_price += signal.tick_size;
+                        if current_price > Decimal::ONE {
+                            error!("favorable FOK price exceeded $1.00 cap — aborting");
+                            break;
+                        }
+                        continue;
+                    }
+
                     info!(
                         order_id = %resp.order_id,
-                        price = %signal.price,
-                        "Leg 2 favorable exit: FOK filled"
+                        status = ?resp.status,
+                        price = %current_price,
+                        "Leg 2 favorable exit: FOK placed"
                     );
                     if resp.status == OrderStatus::Filled {
                         self.active_leg2_phase1_id = None;
@@ -620,28 +646,64 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
-                    // Use actual fill from REST response; fall back to posted size if zero.
                     let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
-                        price: signal.price,
+                        price: current_price,
                         size: fill_size,
                         fill_method: Some(FillMethod::FavorableTaker),
                         already_filled: resp.status == OrderStatus::Filled,
                         order_tag: None,
                     });
+                    return;
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("decimal places")
+                        || err_msg.contains("decimals")
+                        || err_msg.contains("invalid amounts")
+                        || err_msg.contains("Validation")
+                        || err_msg.contains("balance")
+                        || err_msg.contains("allowance")
+                        || err_msg.contains("too old")
+                        || err_msg.contains("min size")
+                    {
+                        error!(error = %e, "favorable FOK non-transient error — aborting retries");
+                        break;
+                    }
+                    warn!(error = %e, price = %current_price, attempt, "favorable FOK FAILED — escalating");
+                    current_price += signal.tick_size;
+                    if current_price > Decimal::ONE {
+                        error!("favorable FOK price exceeded $1.00 cap — aborting");
+                        break;
+                    }
+                    continue;
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Leg 2 favorable exit: FOK FAILED");
-                self.active_leg2_phase1_id = None;
-                self.active_leg2_phase2_id = None;
-                let _ = self
-                    .feedback_tx
-                    .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
-            }
         }
+        // Favorable FOK loop exhausted without fill.
+        error!(
+            token_id = %signal.token_id,
+            size = %signal.size,
+            attempts = attempt,
+            "Leg 2 favorable FOK loop exhausted — unhedged"
+        );
+        self.reporter.fire_critical(format!(
+            "<b>ORPHANED POSITION</b>\n\n\
+            Leg 2 favorable FOK loop failed after {} attempts.\n\
+            Token: <code>{}</code>\n\
+            Size: {} shares\n\n\
+            Manual intervention required.",
+            attempt.saturating_sub(1),
+            signal.token_id,
+            signal.size,
+        ));
+        self.active_leg2_phase1_id = None;
+        self.active_leg2_phase2_id = None;
+        let _ = self
+            .feedback_tx
+            .try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
     }
 
     // ─── Leg 2 emergency: price-chase post-only or deadline FOK ─────────
@@ -695,10 +757,14 @@ impl LiveExecutor {
         signal: &TradeSignal,
         exit_reason: crate::types::order::ExitReason,
     ) {
-        // Price-escalating FOK: walk up the book +1 tick per attempt until
-        // filled, $1.00 cap reached, or market expires. After Leg 1 fills we
-        // hold a directional position — Leg 2 *must* fill. The ~1.2s HTTP
-        // round-trip per attempt is the natural rate limiter.
+        // Price-escalating FOK: query the live best ask each attempt to jump
+        // directly to where liquidity sits, avoiding blind +1 tick walking that
+        // causes catastrophic slippage (e.g. 38 attempts over 13s). Falls back
+        // to +1 tick only when the best ask query fails or returns a price we
+        // already tried. Aborts if the book is empty.
+        //
+        // After Leg 1 fills we hold a directional position — Leg 2 *must* fill.
+        // The ~1.2s HTTP round-trip per attempt is the natural rate limiter.
         //
         // Time-based cutoff: retry until the market ends rather than a fixed
         // attempt count, so we maximise hedge probability without risking
@@ -733,9 +799,26 @@ impl LiveExecutor {
                             price = %current_price,
                             reason = ?exit_reason,
                             attempt,
-                            "Leg 2 emergency: FOK rejected — escalating price"
+                            "Leg 2 emergency: FOK rejected — querying live best ask"
                         );
-                        current_price += signal.tick_size;
+                        match self.poly.get_best_ask(&signal.token_id).await {
+                            Ok(Some(ask)) if ask > current_price => {
+                                info!(old_price = %current_price, new_price = %ask, "FOK: jumping to live best ask");
+                                current_price = ask;
+                            }
+                            Ok(Some(_)) => {
+                                // Best ask <= current_price: already tried, walk +1 tick
+                                current_price += signal.tick_size;
+                            }
+                            Ok(None) => {
+                                error!("FOK: order book empty — aborting");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "FOK: best ask query failed — walking +1 tick");
+                                current_price += signal.tick_size;
+                            }
+                        }
                         if current_price > Decimal::ONE {
                             error!(reason = ?exit_reason, "FOK price exceeded $1.00 cap — aborting");
                             break;
@@ -786,8 +869,24 @@ impl LiveExecutor {
                         error!(error = %e, "FOK non-transient error — aborting retries");
                         break;
                     }
-                    warn!(error = %e, price = %current_price, attempt, "Leg 2 emergency: FOK FAILED — escalating price");
-                    current_price += signal.tick_size;
+                    warn!(error = %e, price = %current_price, attempt, "Leg 2 emergency: FOK FAILED — querying live best ask");
+                    match self.poly.get_best_ask(&signal.token_id).await {
+                        Ok(Some(ask)) if ask > current_price => {
+                            info!(old_price = %current_price, new_price = %ask, "FOK: jumping to live best ask");
+                            current_price = ask;
+                        }
+                        Ok(Some(_)) => {
+                            current_price += signal.tick_size;
+                        }
+                        Ok(None) => {
+                            error!("FOK: order book empty — aborting");
+                            break;
+                        }
+                        Err(e2) => {
+                            warn!(error = %e2, "FOK: best ask query failed — walking +1 tick");
+                            current_price += signal.tick_size;
+                        }
+                    }
                     if current_price > Decimal::ONE {
                         error!(reason = ?exit_reason, "FOK price exceeded $1.00 cap — aborting");
                         break;
