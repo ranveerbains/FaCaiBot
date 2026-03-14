@@ -2224,8 +2224,30 @@ impl StrategyEngine {
                 self.pending_leg2_resize_cancels.clear();
 
                 if remainder > Decimal::ZERO {
-                    self.resize_remainder_pending = true;
-                    self.pending_resize_remainder = Some(self.build_resize_remainder_fok(remainder));
+                    // CLOB rejects orders below 5 shares or $1 notional — skip if too small.
+                    let leg1_price = match &self.state.leg1_state {
+                        OrderState::Filled { price, .. } => *price,
+                        _ => Decimal::ZERO,
+                    };
+                    let hedge_price = Decimal::ONE - leg1_price;
+                    let notional = remainder * hedge_price;
+                    if remainder < Decimal::new(5, 0) || notional < Decimal::ONE {
+                        info!(
+                            %remainder, %notional,
+                            "Resize remainder skipped — below CLOB minimum"
+                        );
+                        if let Some(ref reporter) = self.reporter {
+                            reporter.fire_critical(format!(
+                                "RESIZE REMAINDER SKIPPED\nAdditional Leg 1 fill too small to hedge\n\
+                                 Remainder: {} shares, Notional: ${:.2}\nMin: 5 shares / $1.00\n\
+                                 Completing trade with partial hedge",
+                                remainder, notional,
+                            ));
+                        }
+                    } else {
+                        self.resize_remainder_pending = true;
+                        self.pending_resize_remainder = Some(self.build_resize_remainder_fok(remainder));
+                    }
                 }
 
                 if let Some(reporter) = self.reporter.as_ref() {
@@ -2515,6 +2537,26 @@ impl StrategyEngine {
             return None;
         }
         let orphan = self.post_trade_orphan.as_ref()?;
+
+        // CLOB rejects orders below 5 shares or $1 notional — skip if too small.
+        let breakeven = Decimal::ONE - orphan.leg1_price;
+        let notional = orphan.size * breakeven;
+        if orphan.size < Decimal::new(5, 0) || notional < Decimal::ONE {
+            info!(
+                size = %orphan.size, notional = %notional,
+                "Rebalance skipped — below CLOB minimum (5 shares / $1 notional)"
+            );
+            if let Some(ref reporter) = self.reporter {
+                reporter.fire_critical(format!(
+                    "REBALANCE SKIPPED\nDouble-fill detected but orphan too small for CLOB\n\
+                     Size: {} shares, Notional: ${:.2}\nMin: 5 shares / $1.00\n\
+                     Accepting imbalance — no action needed",
+                    orphan.size, notional,
+                ));
+            }
+            self.rebalance_in_progress = false;
+            return None;
+        }
 
         // Build a rebalance signal: buy Leg 1 side (same direction as original entry).
         let (token_id, book) = match orphan.leg1_direction {

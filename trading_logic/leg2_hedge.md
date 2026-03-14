@@ -204,6 +204,13 @@ Guards: `clob_safe_fok_size()` zero-size check and `price x size >= $1` notional
 
 Leg 1 entry size is clamped to `max(raw_size, 5, ceil($1/price))` in the evaluator. This ensures all trades meet both the CLOB 5-share maker minimum and the $1.00 FOK notional floor. Since Leg 2 inherits Leg 1's filled size, it always satisfies these minimums too.
 
+### 8a-1. Minimum Size Gates on Rebalance and Resize Remainder
+
+Two secondary FOK paths bypass the Leg 1 size clamping and can produce undersized orders:
+
+- **Rebalance** (`take_rebalance_signal()`): Double-fill recovery orphan may be small. Gated at `5 shares / $1 notional` — if below, rebalance is skipped with a Telegram alert and `rebalance_in_progress` is cleared.
+- **Resize remainder** (resize cancel-failed path in `on_leg2_cancel_result()`): The `leg1_size - old_leg2_size` remainder may be small. Gated at `5 shares / $1 notional` — if below, `resize_remainder_pending` is not set, Telegram alert fired, and the trade completes with a partial hedge.
+
 ### 8b. FOK Emergency Loop Constraints
 
 The `emergency_fok_fallback()` price-escalation loop enforces several safety constraints:

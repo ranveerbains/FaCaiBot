@@ -318,35 +318,20 @@ impl LiveExecutor {
         }
     }
 
-    // ─── Leg 2 hedge: cancel previous + repost at new price ────────────
+    // ─── Leg 2 hedge: post Phase 1 order (reject if one already active) ─
 
     async fn handle_leg2_hedge(&mut self, signal: &TradeSignal) {
-        // Defensive: cancel existing Phase 1 Leg 2 order if one is resting.
-        // With post-once-and-wait, this block should never fire on the initial call
-        // (active_leg2_phase1_id is None). Kept as defense-in-depth.
-        if let Some(ref prev_order_id) = self.active_leg2_phase1_id {
-            info!(order_id = %prev_order_id, "Leg 2 hedge: cancelling previous Phase 1 order");
-            match self.poly.cancel_order(prev_order_id).await {
-                Ok(true) => {
-                    self.active_leg2_phase1_id = None;
-                }
-                Ok(false) => {
-                    warn!(
-                        order_id = %prev_order_id,
-                        "Leg 2 cancel NOT confirmed — order may have filled, skipping replacement"
-                    );
-                    let _ =
-                        self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
-                            order_id: prev_order_id.clone(),
-                            was_cancelled: false,
-                            is_leg2: true,
-                        });
-                    return;
-                }
-                Err(e) => {
-                    warn!(error = %e, "Leg 2 hedge: cancel failed — posting replacement anyway");
-                }
-            }
+        // Guard: if a Phase 1 order is already resting, reject the duplicate signal.
+        // This prevents a cancel-and-replace loop when OrderPosted feedback and
+        // CANCELED TradeStatusUpdate are processed in the same main-loop iteration.
+        if let Some(ref existing_id) = self.active_leg2_phase1_id {
+            warn!(
+                existing_order = %existing_id,
+                signal_price = %signal.price,
+                "Leg 2 hedge: Phase 1 order already active — ignoring duplicate signal"
+            );
+            let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
         }
 
         // Post new Leg 2 order at the hedge price.

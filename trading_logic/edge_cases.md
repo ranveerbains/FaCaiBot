@@ -372,3 +372,17 @@ A `"too old"` error response from the CLOB during the FOK escalation loop now ca
 ### 17e. FOK Attempt Cap (10)
 
 The `emergency_fok_fallback()` price-escalation loop is now capped at a maximum of 10 attempts. Previously the loop could run indefinitely if the book was thin or the price kept moving. After 10 failed attempts, the loop exits and fires a Telegram orphaned-position alert for manual intervention.
+
+### 17f. Leg 2 Phase 1 Duplicate Signal Cancel Loop
+
+**Root cause:** A race condition where `OrderPosted` feedback and `CANCELED` TradeStatusUpdate are processed in the same main-loop iteration. This clears both `leg2_command_pending` and `leg2_state` simultaneously, causing `evaluate_leg2()` to emit another Phase1Post while the executor still has `active_leg2_phase1_id` set — triggering a cancel-and-replace cycle that burns API calls in a ~30ms loop.
+
+**Fix:** `handle_leg2_hedge()` in `executor/live.rs` now rejects duplicate Phase 1 signals with an early return when `active_leg2_phase1_id` is already set. Instead of cancelling the existing order and replacing, it logs a warning and sends `OrderFailed { is_leg2: true }` feedback. This is scoped to Phase 1 hedge only — does not affect Phase 2, rebalance, or resize paths.
+
+### 17g. Minimum Size Gates on Rebalance and Resize Remainder
+
+**Problem:** Rebalance and resize remainder FOK paths lacked CLOB minimum checks (5 shares, $1 notional). Undersized orders were submitted and always rejected.
+
+**Fix — Rebalance:** `take_rebalance_signal()` in `strategy.rs` checks `orphan.size < 5` or `size × breakeven_price < $1` before building the FOK. If gated, logs info, sends Telegram alert ("REBALANCE SKIPPED"), and clears `rebalance_in_progress`.
+
+**Fix — Resize remainder:** The resize cancel-failed path in `on_leg2_cancel_result()` checks `remainder < 5` or `remainder × hedge_price < $1` before setting `resize_remainder_pending`. If gated, logs info and sends Telegram alert ("RESIZE REMAINDER SKIPPED").
