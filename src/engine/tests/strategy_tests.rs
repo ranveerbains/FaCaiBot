@@ -946,15 +946,12 @@ fn test_on_event_ignores_control_variants() {
     assert!(engine.has_no_open_position());
 }
 
-// ── Repost cap tests ─────────────────────────────────────────────────
+// ── Opposite-direction cancel tests ──────────────────────────────────
 
-/// Helper: set up engine with Leg 1 Posted and configure repost params.
-fn setup_repost_scenario(max_repost_count: u32, max_chase_ticks: u32) -> StrategyEngine {
+/// Helper: set up engine with Leg 1 Posted in a given direction.
+fn setup_posted_leg1(direction: Direction) -> StrategyEngine {
     let mut engine = make_engine_with_market(600);
-    engine.max_repost_count = max_repost_count;
-    engine.max_chase_ticks = max_chase_ticks;
-    engine.leg1_repost_tick_threshold = 1;
-    // Set Leg 1 as Posted at ask=0.50 with a real order ID.
+    engine.in_quiet_period = false; // clear post-rotation quiet period for test
     engine.state.leg1_state = OrderState::Posted {
         order_id: "clob-leg1-001".to_string(),
         price: Decimal::new(50, 2),
@@ -962,60 +959,177 @@ fn setup_repost_scenario(max_repost_count: u32, max_chase_ticks: u32) -> Strateg
         timestamp_ms: now_epoch_ms(),
     };
     engine.state.leg1_posted_ask = Some(Decimal::new(50, 2));
-    engine.leg1_original_signal_price = Some(Decimal::new(50, 2));
-    engine.leg1_direction = Some(Direction::Up);
-    // Set book with ask at 0.52 (2 ticks of drift).
+    engine.leg1_direction = Some(direction);
     set_book(&mut engine, "0.49", "0.52");
     engine
 }
 
 #[test]
-fn test_repost_capped_at_max() {
-    let mut engine = setup_repost_scenario(2, 0); // max 2 reposts, unlimited chase
-    // Simulate 2 reposts already completed.
-    engine.leg1_repost_count = 2;
+fn test_opposite_direction_buildup_cancels_leg1() {
+    let mut engine = setup_posted_leg1(Direction::Up);
 
-    // Trigger flow update with strong composite (0.5 > cancel_threshold 0.25).
-    let now = now_epoch_ms();
-    engine.handle_flow_update(0.5, Direction::Up, now);
-
-    // Repost capped → should issue a NON-repost cancel (kills the stale order).
-    assert!(engine.pending_leg1_cancel.is_some(), "stale order should be cancelled when repost capped");
-    assert!(!engine.leg1_last_cancel_repost, "cancel should NOT be a repost");
-    assert_eq!(engine.diag_repost_capped, 1, "diag_repost_capped should increment");
-    assert_eq!(engine.diag_repost_attempts, 0, "diag_repost_attempts should NOT increment");
-}
-
-#[test]
-fn test_chase_distance_blocks_repost() {
-    let mut engine = setup_repost_scenario(0, 1); // unlimited reposts, max 1 tick chase
-    // Original signal at 0.50, current ask at 0.52 → chase = 2 ticks > max_chase_ticks=1.
-
-    let now = now_epoch_ms();
-    engine.handle_flow_update(0.5, Direction::Up, now);
-
-    // Chase distance exceeded → should issue a NON-repost cancel.
-    assert!(engine.pending_leg1_cancel.is_some(), "stale order should be cancelled when chase exceeded");
-    assert!(!engine.leg1_last_cancel_repost, "cancel should NOT be a repost");
-    assert_eq!(engine.diag_repost_capped, 1);
-}
-
-#[test]
-fn test_repost_counter_resets_on_trade_complete() {
-    let mut engine = setup_repost_scenario(2, 4);
-    engine.leg1_repost_count = 2;
-    engine.leg1_original_signal_price = Some(Decimal::new(50, 2));
-
-    // Simulate trade completion.
-    // First set to Filled state so on_trade_complete works.
-    engine.state.leg1_state = OrderState::Filled {
-        order_id: "clob-leg1-001".to_string(),
-        price: Decimal::new(50, 2),
-        size: Decimal::new(100, 0),
-        fill_timestamp_ms: now_epoch_ms(),
+    // Fire a buildup in the opposite direction (Down).
+    let buildup = BuildupInfo {
+        composite_score: Decimal::new(6, 1),
+        direction: Direction::Down,
+        cvd_accel: Decimal::ZERO,
+        spot_flow: Decimal::ZERO,
+        obi_velocity: Decimal::ZERO,
+        basis_delta: Decimal::ZERO,
+        liq_pressure: Decimal::ZERO,
+        atr_displacement: Decimal::ZERO,
+        signal_atr_ratio: Decimal::ZERO,
+        obi: Decimal::ZERO,
+        timestamp_ms: now_epoch_ms(),
+        cvd_norm: 0.0,
+        basis_norm: 0.0,
+        spot_flow_norm: 0.0,
+        obi_norm: 0.0,
+        liq_norm: 0.0,
+        atr_norm: 0.0,
+        cvd_age_ms: 0,
+        basis_age_ms: 0,
+        spot_flow_age_ms: 0,
+        obi_age_ms: 0,
+        liq_age_ms: 0,
+        atr_age_ms: 0,
     };
-    engine.on_trade_complete();
+    let now = now_epoch_ms();
+    engine.handle_buildup_confirmed(buildup, now);
 
-    assert_eq!(engine.leg1_repost_count, 0, "repost count should reset on trade complete");
-    assert!(engine.leg1_original_signal_price.is_none(), "original signal price should clear on trade complete");
+    assert!(engine.pending_leg1_cancel.is_some(), "opposite-direction buildup should queue cancel");
+    assert!(engine.leg1_cancel_inflight, "cancel inflight flag should be set");
+    assert_eq!(engine.diag_opposite_dir_cancels, 1, "opposite_dir_cancels counter should increment");
+}
+
+#[test]
+fn test_same_direction_buildup_ignored_when_posted() {
+    let mut engine = setup_posted_leg1(Direction::Up);
+
+    // Fire a buildup in the SAME direction (Up).
+    let buildup = BuildupInfo {
+        composite_score: Decimal::new(6, 1),
+        direction: Direction::Up,
+        cvd_accel: Decimal::ZERO,
+        spot_flow: Decimal::ZERO,
+        obi_velocity: Decimal::ZERO,
+        basis_delta: Decimal::ZERO,
+        liq_pressure: Decimal::ZERO,
+        atr_displacement: Decimal::ZERO,
+        signal_atr_ratio: Decimal::ZERO,
+        obi: Decimal::ZERO,
+        timestamp_ms: now_epoch_ms(),
+        cvd_norm: 0.0,
+        basis_norm: 0.0,
+        spot_flow_norm: 0.0,
+        obi_norm: 0.0,
+        liq_norm: 0.0,
+        atr_norm: 0.0,
+        cvd_age_ms: 0,
+        basis_age_ms: 0,
+        spot_flow_age_ms: 0,
+        obi_age_ms: 0,
+        liq_age_ms: 0,
+        atr_age_ms: 0,
+    };
+    let now = now_epoch_ms();
+    engine.handle_buildup_confirmed(buildup, now);
+
+    assert!(engine.pending_leg1_cancel.is_none(), "same-direction buildup should NOT queue cancel");
+    assert_eq!(engine.diag_opposite_dir_cancels, 0, "opposite_dir_cancels should remain 0");
+}
+
+// ── Heartbeat system tests ──────────────────────────────────────────────
+
+#[test]
+fn test_heartbeat_gates_leg1_entry() {
+    let mut engine = make_engine_with_market(600);
+    set_book(&mut engine, "0.48", "0.52");
+    engine.state.binance_price = Some(Decimal::new(50_000, 0));
+
+    // Mark heartbeat as down.
+    engine.connectivity.heartbeat_healthy = false;
+    engine.connectivity.consecutive_heartbeat_failures = 5;
+
+    // Inject a valid buildup.
+    inject_buildup(&mut engine, Direction::Up);
+    assert!(engine.state.buildup_detected);
+
+    // evaluate() should return None and clear buildup.
+    let result = engine.evaluate();
+    assert!(result.is_none(), "heartbeat down should block Leg 1 entry");
+    assert!(!engine.state.buildup_detected, "buildup_detected should be cleared");
+    assert_eq!(engine.diag_rej_heartbeat, 1, "should count heartbeat rejection");
+}
+
+#[test]
+fn test_heartbeat_proactive_reset() {
+    let mut engine = make_engine_with_market(600);
+    set_book(&mut engine, "0.48", "0.52");
+
+    // Put Leg 1 in Posted state.
+    engine.state.leg1_state = OrderState::Posted {
+        order_id: "test-order-123".to_string(),
+        price: Decimal::new(52, 2),
+        size: Decimal::new(10, 0),
+        timestamp_ms: now_epoch_ms(),
+    };
+    engine.leg1_direction = Some(Direction::Up);
+
+    // Fire heartbeat failures up to threshold (default = 5).
+    for i in 1..=5 {
+        engine.on_event(IngestorEvent::HeartbeatStatus {
+            success: false,
+            latency_ms: 0,
+        });
+        if i < 5 {
+            // Before threshold: Leg 1 should still be posted.
+            assert!(
+                matches!(engine.state.leg1_state, OrderState::Posted { .. }),
+                "Leg 1 should stay Posted before threshold (failure {i})"
+            );
+        }
+    }
+
+    // After threshold: Leg 1 should be reset to None.
+    assert!(
+        matches!(engine.state.leg1_state, OrderState::None),
+        "Leg 1 should be reset to None after heartbeat dead threshold"
+    );
+    assert!(engine.leg1_direction.is_none(), "leg1_direction should be cleared");
+    assert_eq!(engine.diag_heartbeat_resets, 1, "should count one heartbeat reset");
+
+    // Should have queued a cancel command.
+    let cancel = engine.take_heartbeat_cancel();
+    assert!(cancel.is_some(), "should queue CancelLeg1Order");
+    match cancel.unwrap() {
+        ExecutorCommand::CancelLeg1Order { order_id } => {
+            assert_eq!(order_id, "test-order-123");
+        }
+        _ => panic!("expected CancelLeg1Order"),
+    }
+}
+
+#[test]
+fn test_heartbeat_recovery_logging() {
+    let mut engine = make_engine_with_market(600);
+
+    // Simulate failures (below threshold, so no reset).
+    for _ in 0..3 {
+        engine.on_event(IngestorEvent::HeartbeatStatus {
+            success: false,
+            latency_ms: 0,
+        });
+    }
+    assert!(!engine.connectivity.heartbeat_healthy);
+    assert_eq!(engine.connectivity.consecutive_heartbeat_failures, 3);
+
+    // Recovery.
+    engine.on_event(IngestorEvent::HeartbeatStatus {
+        success: true,
+        latency_ms: 5,
+    });
+    assert!(engine.connectivity.heartbeat_healthy);
+    assert_eq!(engine.connectivity.consecutive_heartbeat_failures, 0);
+    assert_eq!(engine.connectivity.last_heartbeat_latency_ms, 5);
 }

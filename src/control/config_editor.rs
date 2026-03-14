@@ -17,6 +17,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.stale_book_ms", min: 50.0, max: 5000.0 },
     ParamSpec { name: "entry_guards.rotation_quiet_ms", min: 0.0, max: 120000.0 },
     ParamSpec { name: "entry_guards.trade_cooldown_ms", min: 0.0, max: 60000.0 },
+    ParamSpec { name: "entry_guards.heartbeat_dead_threshold", min: 2.0, max: 20.0 },
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
     // repricing
@@ -27,7 +28,6 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "repricing.time_exponent", min: 0.0, max: 2.0 },
     ParamSpec { name: "repricing.max_time_factor", min: 1.0, max: 10.0 },
     ParamSpec { name: "repricing.phase1_target_dampen", min: 0.1, max: 1.0 },
-    ParamSpec { name: "repricing.min_obi_alignment", min: 0.0, max: 0.5 },
     // risk
     ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
 ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
@@ -39,9 +39,6 @@ ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     ParamSpec { name: "buildup.entry_threshold", min: 0.0, max: 1.0 },
     ParamSpec { name: "buildup.cancel_threshold", min: 0.0, max: 1.0 },
     ParamSpec { name: "buildup.cancel_window_ms", min: 100.0, max: 5000.0 },
-    ParamSpec { name: "buildup.leg1_repost_tick_threshold", min: 0.0, max: 10.0 },
-    ParamSpec { name: "buildup.max_repost_count", min: 0.0, max: 20.0 },
-    ParamSpec { name: "buildup.max_chase_ticks", min: 0.0, max: 20.0 },
     ParamSpec { name: "buildup.max_dissenters", min: 0.0, max: 4.0 },
     ParamSpec { name: "buildup.w_cvd", min: 0.0, max: 1.0 },
     ParamSpec { name: "buildup.w_spot_flow", min: 0.0, max: 1.0 },

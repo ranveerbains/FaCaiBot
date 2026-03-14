@@ -155,9 +155,16 @@ pub fn handle_status(status: &BotStatus) -> String {
         ""
     };
 
+    let heartbeat_str = if status.heartbeat_healthy {
+        format!("OK ({}ms)", status.heartbeat_latency_ms)
+    } else {
+        format!("DOWN ({} consecutive)", status.heartbeat_failures)
+    };
+
     format!(
         "Uptime: {uptime_h}h {uptime_m:02}m {uptime_s:02}s{drain}\n\
          Mode: {mode}\n\
+         Heartbeat: {heartbeat}\n\
          Market: {market}\n\
          Leg 1: {leg1}\n\
          Leg 2: {leg2}\n\
@@ -168,6 +175,7 @@ pub fn handle_status(status: &BotStatus) -> String {
          Summary notify: {summary_on}",
         drain = drain_status,
         mode = status.mode,
+        heartbeat = heartbeat_str,
         market = market,
         leg1 = status.leg1_state,
         leg2 = status.leg2_state,

@@ -405,7 +405,6 @@ The diagram below shows the complete live-mode trade lifecycle. Every state tran
 | Active trade | `leg1_state != None` | `rej_busy` counts valid-book buildups lost to busy executor |
 | Expiry | < `entry_cutoff_secs` (see config.toml) | Defence-in-depth; normally caught upstream |
 | Repricing model | `expected_pct < min_reprice_pct` (2.0%) | Model output too low |
-| OBI alignment | Binance OBI contradicts buildup direction | `ObiMismatch` — rejects if book imbalance strongly against buildup |
 | Paused/Draining | `paused` or `draining` flag set | `/stop` or `/shutdown` in effect |
 
 **Pricing**: `signal.price = best_ask`. Executor posts a single post-only GTC maker order at this price.
@@ -567,8 +566,7 @@ The raw model output drives entry gate and allocation. Phase 1 profit target is 
 **Entry guards** (in order):
 1. Hard skew cap: YES mid > `hard_skew_cap` (0.90) or < 0.10 → reject
 2. Min repricing: model output < `min_reprice_pct` (2.0%) → reject (`InsufficientRepricing`)
-3. OBI alignment: Binance book imbalance contradicts buildup direction → reject (`ObiMismatch`)
-4. Dynamic allocation: `clamp(output / reprice_scale, min_alloc_pct, 1.0)`
+3. Dynamic allocation: `clamp(output / reprice_scale, min_alloc_pct, 1.0)`
 
 **Allocation**: `alloc = max(round(max_alloc_per_trade × alloc_fraction, 2dp), $0.01)`. Dynamic — better signals get more capital.
 
@@ -644,9 +642,9 @@ rotation_quiet_ms, trade_cooldown_ms
 [capital]              # 1 param
 max_alloc_per_trade
 
-[repricing]            # 8 params
+[repricing]            # 7 params
 reprice_scale, min_reprice_pct, min_alloc_pct, hard_skew_cap, time_exponent,
-max_time_factor, phase1_target_dampen, min_obi_alignment
+max_time_factor, phase1_target_dampen
 
 [risk]                 # 4 params
 phase1_timeout_ms, phase1_breach_threshold,

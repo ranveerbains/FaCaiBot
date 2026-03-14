@@ -32,6 +32,32 @@ Emergency FOK sizing uses full `leg1_size` (no depth cap). The executor's price-
 
 Once `emergency_submitted = true`, the evaluator returns None on subsequent evaluations (not re-triggering). The `exit_reason` is preserved from the original trigger. The executor's FOK retry loop handles the exit -- no further signals are needed from the engine.
 
+### Heartbeat dead — proactive state reset
+
+**Scenario:** The CLOB heartbeat (`POST /heartbeat` every 5s) fails consecutively. After ~10-15s of heartbeat silence, the CLOB auto-cancels all resting orders. The engine's `leg1_state` / `leg2_state` still show `Posted`, creating a stale state mismatch.
+
+**Handle:** After `heartbeat_dead_threshold` consecutive failures (default: 5 = 25s), `handle_heartbeat_dead()` fires:
+1. If `leg1_state == Posted`: queues `CancelLeg1Order` (fire-and-forget — may already be cancelled on CLOB), resets state to `None`, clears `leg1_direction`, `pending_leg1_signal`, `buildup_detected`, `last_buildup`.
+2. If `leg2_state == Posted`: resets state to `None`, clears dual-order tracking and command-pending flags.
+3. `Filled` states are NOT touched — those are matched positions that survive heartbeat death.
+4. Sends a Telegram alert via `fire_critical()`.
+
+**Gating:** While `heartbeat_healthy == false`:
+- `evaluate()` blocks all new Leg 1 entries (buildups are dropped and counted in `diag_rej_heartbeat`).
+- `evaluate_leg2()` blocks non-emergency Leg 2 posts. Emergency FOK exits (breach, timeout, flow reversal) are NOT gated — they protect open positions.
+
+**Recovery:** When the heartbeat succeeds again, `heartbeat_healthy` is set back to `true`, counters reset to 0, and normal trading resumes. No `cancel_all` is sent — if the proactive reset fired, state is already clean; if the threshold wasn't reached, orders are likely still alive.
+
+**Edge cases:**
+- User WS `Canceled` arrives before proactive reset → state already reset by WS handler → proactive reset finds `OrderState::None`, no-op.
+- User WS `Canceled` arrives after proactive reset → `order_id` match fails (state is `None`) → event goes to `pending_fills` buffer, harmless.
+- Leg 1 Filled + Leg 2 Posted when heartbeat dies → Leg 2 reset to `None`. Position is naked until heartbeat recovers and `evaluate_leg2()` re-posts. Emergency FOK still allowed.
+- Intermittent failures (2-3 then recovery) → threshold never hit, no reset, orders survive. Correct behavior.
+
+**Config:** `entry_guards.heartbeat_dead_threshold` (range 2-20, default 5). Editable via `/set`.
+
+**Diagnostics:** `hb_rej` (Leg 1 rejections), `hb_resets` (proactive resets), `hb_failures` (current consecutive failures) in 60s terminal + Telegram diagnostics. `/status` shows heartbeat health and latency.
+
 ### Sustain cancel race with fill (live)
 
 **Scenario:** CLOB fills the Leg 1 maker order at the same moment the engine dispatches a `CancelLeg1Order` (sustain failure or timeout).

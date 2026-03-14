@@ -41,8 +41,11 @@ pub(crate) enum Leg1RejectReason {
     PriceSkewed,
     /// Model output below `min_reprice_pct` — insufficient expected repricing.
     InsufficientRepricing,
-    /// OBI (Order Book Imbalance) contradicts spike direction.
-    ObiMismatch,
+    /// Heartbeat is down — CLOB may have cancelled resting orders.
+    /// Not constructed directly (heartbeat gate is in strategy.rs before evaluator),
+    /// but kept for match exhaustiveness in rejection counting.
+    #[allow(dead_code)]
+    HeartbeatDown,
     /// Other guard failed (no active market, bid cap invalid, zero size, etc.).
     Other,
 }
@@ -78,8 +81,6 @@ pub(crate) struct Leg1Evaluator {
     pub max_time_factor: f64,
     /// Phase 1 target dampening — only affects profit target, not entry gate or allocation.
     pub phase1_target_dampen: Decimal,
-    /// Minimum OBI alignment — rejects if Binance book imbalance contradicts spike direction.
-    pub min_obi_alignment: Decimal,
 }
 
 impl Leg1Evaluator {
@@ -246,17 +247,6 @@ impl Leg1Evaluator {
         if expected_pct < self.min_reprice_pct {
             debug!(%expected_pct, min = %self.min_reprice_pct, "evaluate() BLOCKED: insufficient repricing");
             return Leg1Outcome::Rejected(Leg1RejectReason::InsufficientRepricing);
-        }
-
-        // OBI gate: reject if Binance book imbalance contradicts buildup direction.
-        let obi_aligned = match buildup.direction {
-            Direction::Up => buildup.obi >= -self.min_obi_alignment,   // Up signal, OBI not strongly bearish
-            Direction::Down => buildup.obi <= self.min_obi_alignment,  // Down signal, OBI not strongly bullish
-        };
-        if !obi_aligned {
-            debug!(obi = %buildup.obi, direction = ?buildup.direction, min = %self.min_obi_alignment,
-                "evaluate() BLOCKED: OBI contradicts buildup direction");
-            return Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch);
         }
 
         let alloc_fraction = (expected_pct / self.reprice_scale)

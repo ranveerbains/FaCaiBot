@@ -494,6 +494,13 @@ async fn async_main() -> Result<()> {
                 error!(error = %e, "failed to send Leg 1 cancel to executor");
             }
 
+            // Drain heartbeat-dead cancel (proactive state reset).
+            if let Some(hb_cmd) = engine.take_heartbeat_cancel()
+                && let Err(e) = executor_tx.send(hb_cmd)
+            {
+                error!(error = %e, "failed to send heartbeat cancel to executor");
+            }
+
             // Evaluate Leg 1 signals.
             if let Some(signal) = engine.evaluate() {
                 if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {

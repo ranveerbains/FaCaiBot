@@ -161,7 +161,9 @@ Normal `BinanceTick` events update `binance_price` and feed the buildup detector
 obi = (bid_depth - ask_depth) / (bid_depth + ask_depth)
 ```
 
-Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish). Computed by `BinanceDepth::obi()` and stored by the buildup detector (`last_obi`). Used as an entry guard: signals whose OBI contradicts the buildup direction (e.g., Up signal with strongly bearish OBI) are rejected (`ObiMismatch`). Config: `min_obi_alignment` (default 0.2).
+Range [-1, +1]: positive = bid-heavy (bullish), negative = ask-heavy (bearish). Computed by `BinanceDepth::obi()` and stored by the buildup detector (`last_obi`). OBI feeds the buildup detector's OBI velocity metric and participates in direction consensus voting.
+
+**Note (2026-03-14):** The standalone OBI alignment entry guard (`min_obi_alignment`, `ObiMismatch` rejection) was removed. OBI quality filtering is now handled solely by the buildup detector's OBI velocity metric (weight 0.20) and direction consensus (§2a). A contradictory OBI will reduce the composite score and may trigger a direction consensus veto, but there is no longer a separate binary guard.
 
 ---
 
@@ -180,8 +182,7 @@ When `buildup_detected = true`, the evaluator checks every guard in sequence. **
 | 7 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After book** -- `rej_busy` counts only signals that had a valid book |
 | 8 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
 | 9 | **Repricing model** | `expected_pct < min_reprice_pct` (2.0%) | `InsufficientRepricing` | Model output too low to justify entry |
-| 10 | **OBI alignment** | Binance book imbalance contradicts buildup direction | `ObiMismatch` | Signal quality confirmation from order flow |
-| 11 | **Min size clamp** | Entry size clamped to `max(5, ceil($1/price))` | n/a (clamped, not rejected) | CLOB minimum: 5 shares for maker, $1.00 notional for FOK |
+| 10 | **Min size clamp** | Entry size clamped to `max(5, ceil($1/price))` | n/a (clamped, not rejected) | CLOB minimum: 5 shares for maker, $1.00 notional for FOK |
 
 ### Direction-aware book selection
 
@@ -279,72 +280,32 @@ Leg 1 uses a single **post-only GTC** (Good-Til-Cancelled) maker order placed at
 
 If the CLOB rejects the order (`Rejected` status -- e.g., price crosses the book), `OrderFailed` feedback is sent and the slot is freed. For SDK/network errors, same `OrderFailed` path.
 
-### Leg 1 sustain (flow-based cancel)
+### Leg 1 sustain (post-once, cancel-on-condition)
 
-After Leg 1 is posted (maker resting on book), the engine monitors the composite flow score on every event. Two cancel triggers:
+After Leg 1 is posted (maker resting on book), the order rests until it fills or one of these conditions triggers cancellation:
 
 1. **Flow fade:** `current_composite_score < cancel_threshold` (default 0.25) -- the buildup that triggered entry has dissipated. Cancel the unfilled maker
 2. **Timeout:** `cancel_window_ms` elapsed since posting (configurable) -- prevent indefinite resting
+3. **Opposite-direction buildup:** A new `BuildupConfirmed` fires in the opposite direction to the posted Leg 1 -- the market is reversing, so cancel to avoid filling into a reversed market
 
-Both triggers dispatch `CancelLeg1Order { order_id }` to the executor. The cancel is a fire-and-confirm operation:
-- **Cancel confirmed** (`was_cancelled = true`): Engine resets `leg1_state = None`, `leg1_direction = None`, `pending_leg1_signal = None`, `buildup_detected = false`. Ready for next signal
-- **Cancel NOT confirmed** (`was_cancelled = false`): Order may have filled before cancel reached CLOB. Engine keeps `leg1_state = Posted` and waits for User WS fill notification. If User WS sends MATCHED, Leg 1 transitions to `Filled` and hedge begins normally
+All triggers dispatch `CancelLeg1Order { order_id }` to the executor. The cancel is a fire-and-confirm operation:
+- **Cancel confirmed** (`was_cancelled = true`): Engine performs full state reset: `leg1_state = None`, `leg1_direction = None`, `pending_leg1_signal = None`, `buildup_detected = false`, `last_buildup = None`, `leg1_posted_ask = None`. Ready for next signal
+- **Cancel NOT confirmed** (`was_cancelled = false`): Order may have filled before cancel reached CLOB. Engine keeps `leg1_cancel_inflight = true` (prevents sustain monitor retries) and waits for User WS fill notification. If User WS sends MATCHED, Leg 1 transitions to `Filled` and hedge begins normally
+
+There is no repost/chase logic. The maker order is placed once and rests until fill or cancel. This avoids losing queue priority from same-price reposts and prevents the leaky-bucket problem where chase caps reset between buildup episodes.
+
+**Opposite-direction cancel details:**
+- Checked in `handle_buildup_confirmed()` when `leg1_state` is `Posted`
+- Only fires when the new buildup direction differs from `leg1_direction`
+- Does NOT re-arm the opposite direction signal -- after cancel confirms, full reset occurs. The opposite buildup will fire again naturally if it persists
+- Same-direction buildups while Posted are silently ignored (existing order already tracks the correct side)
 
 Guards:
 - `pending_leg1_cancel.is_none()` -- prevents duplicate cancel dispatch while waiting for CLOB response
-- **Provisional ID guard**: Sustain checks (timeout, flow fade, and ask-drift repost) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The cancel window and flow fade only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip.
+- `!leg1_cancel_inflight` -- prevents retry when cancel-not-confirmed
+- **Provisional ID guard**: Sustain checks (timeout, flow fade) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The cancel window and flow fade only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip.
 
-Diagnostic counters: `diag_sustain_cancels` (flow fade), `diag_sustain_timeouts` (timeout).
-
-**Immediate drift check on order confirmation**: `on_order_posted()` installs the real CLOB order ID and immediately runs a drift check. If the ask has moved ≥ `leg1_repost_tick_threshold` ticks since evaluation time, the order is cancelled for repost right away — without waiting for the next flow update. This catches the case where the ask drifted significantly during the ~1.3s SDK round-trip and the sustain checks were suppressed (provisional ID guard) throughout that window.
-
-### 5a. Adaptive Leg 1 Repost
-
-After Leg 1 is posted at `best_ask`, the market maker's ask price may drift upward while the buildup composite score remains strong (`> cancel_threshold`). If the ask moves ≥ `leg1_repost_tick_threshold` ticks away, the order sits stranded below the market. A repost at the new ask recovers this case — but is bounded by two hard limits to prevent the chase loop that destroys entry advantage.
-
-**Repost trigger logic** (runs on every event in sustain block + on_order_posted):
-```
-if leg1_state == Posted AND composite_score > cancel_threshold:
-    if current_ask - posted_ask >= leg1_repost_tick_threshold * tick_size:
-        repost_allowed = (max_repost_count == 0) OR (repost_count < max_repost_count)
-        chase_allowed  = (max_chase_ticks == 0)  OR (current_ask - original_signal_price <= max_chase_ticks * tick_size)
-        if repost_allowed AND chase_allowed:
-            cancel(repost: true)
-        else:
-            cancel(repost: false)  // kill stale order — fill at this price would lose on hedge
-```
-
-**Repost flow:**
-1. Engine detects ask drift ≥ threshold while composite live
-2. Checks two guards: `repost_count < max_repost_count` AND `chase_distance ≤ max_chase_ticks`
-3. If either guard fails: issues a **non-repost cancel** (kills the stale order), increments `diag_repost_capped`. A fill at the stranded price would produce a losing hedge
-4. If both pass: dispatches `CancelLeg1Order` to executor, increments `diag_repost_attempts`
-5. Executor cancels the order on CLOB
-6. Engine receives cancel confirmation with `was_cancelled = true`
-7. **Repost path**: increments `leg1_repost_count`, re-arms `buildup_detected = true`, keeping `last_buildup`, `current_composite_score`, and `leg1_original_signal_price` live
-8. Main loop calls `evaluate()` on the next event
-9. `evaluate()` re-runs all entry guards (book, Binance price, skew, repricing) and emits a fresh Leg 1 signal at the new best ask
-10. If any guard rejects the repost (e.g., buildup faded between cancel dispatch and confirm), full state reset as normal
-
-**Chase anchor**: `leg1_original_signal_price` is captured on the first Leg 1 post (in `evaluate()` and `on_order_posted()`). All subsequent reposts measure chase distance from this anchor, not from the most recent posted price. This prevents incremental drift from bypassing the cap.
-
-**Config:**
-- `leg1_repost_tick_threshold` (default: 1) — minimum ask drift in ticks to trigger repost. Set to 0 to disable
-- `max_repost_count` (default: 2) — maximum reposts per buildup episode. Set to 0 for unlimited
-- `max_chase_ticks` (default: 4) — maximum chase distance in ticks from original signal price. Set to 0 for unlimited
-
-**State resets**: `leg1_repost_count` and `leg1_original_signal_price` are cleared in: `on_trade_complete()`, MarketRotation handler, `reset_leg1_state()`, and the "composite faded" / non-repost branches of `on_cancel_result()`.
-
-**Why no sustain window on reversal?**
-Repost is only triggered when composite **remains live** (`> cancel_threshold`). It does NOT require a sustain window for composite decay — if the composite fades, the cancel defaults to `repost: false` and state is fully reset. This allows rapid adaptive reposting as long as the buildup signal is hot, but immediately stops when the signal dies.
-
-**Scenario examples:**
-- **Ask drifts 1 tick (within cap):** Composite = 0.45 (still live), ask moves 1 tick up, repost_count=0 → cancel + repost. Entry at original+1tick.
-- **Ask drifts 5 ticks (chase cap hit):** Composite = 0.60 (very hot), ask moves 5 ticks from original, max_chase_ticks=4 → stale order cancelled (no repost). Prevents fill at stranded price.
-- **3rd repost attempt (count cap hit):** After 2 successful reposts, ask drifts again, max_repost_count=2 → stale order cancelled (no repost). No further chasing.
-- **Ask drifts + buildup fades:** Composite drops below cancel_threshold → cancel with `repost: false` → full reset including repost counters.
-
-Diagnostic counters: `diag_repost_attempts` (reposts issued), `diag_repost_capped` (reposts blocked by limits). Both logged every 60s.
+Diagnostic counters: `diag_sustain_cancels` (flow fade + opposite-direction), `diag_sustain_timeouts` (timeout), `diag_opposite_dir_cancels` (opposite-direction buildup).
 
 ### Fill models
 

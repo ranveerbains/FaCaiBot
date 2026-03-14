@@ -139,27 +139,11 @@ pub struct StrategyEngine {
     /// still open. Drained by main loop before sending the rotation command.
     rotation_emergency_buffer: Vec<TradeSignal>,
 
-    /// Repost threshold (ticks). 0 = disabled.
-    leg1_repost_tick_threshold: u32,
     /// Cancel window (ms) for unfilled Leg 1 maker.
     cancel_window_ms: u64,
-    /// Tracks whether the last Leg 1 cancel was a repost request.
-    leg1_last_cancel_repost: bool,
     /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
     /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
     leg1_cancel_inflight: bool,
-
-    /// Number of reposts completed in the current buildup episode.
-    leg1_repost_count: u32,
-    /// Maximum reposts per buildup episode (0 = unlimited). From config.
-    max_repost_count: u32,
-    /// Ask price at time of first Leg 1 post (chase distance anchor).
-    leg1_original_signal_price: Option<Decimal>,
-    /// Maximum chase distance in ticks from original signal price (0 = unlimited). From config.
-    max_chase_ticks: u32,
-    /// Set `true` after first "repost CAPPED" log per episode. Prevents log spam
-    /// from the sustain monitor firing on every Binance event while capped.
-    leg1_repost_cap_logged: bool,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -179,6 +163,12 @@ pub struct StrategyEngine {
     /// Prevents stale hedge commands from queuing while the executor is still processing
     /// a previous Leg 2 command (e.g., favorable exit takes ~3.6s for 3 HTTP calls).
     leg2_command_pending: bool,
+
+    /// Pending cancel command from heartbeat dead proactive reset.
+    /// Drained by main loop via `take_heartbeat_cancel()`.
+    pending_heartbeat_cancel: Option<ExecutorCommand>,
+    /// Consecutive heartbeat failure threshold for proactive state reset.
+    heartbeat_dead_threshold: u32,
 
     /// Set `true` when the engine's 60s terminal log fires. Cleared after the
     /// Telegram diagnostic is sent.
@@ -217,7 +207,6 @@ pub struct StrategyEngine {
     diag_rej_stale: u64,   // StaleBook
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
-    diag_rej_obi: u64,    // ObiMismatch: OBI contradicts spike direction
     diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
     diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
     diag_leg1_signals: u64,
@@ -243,8 +232,9 @@ pub struct StrategyEngine {
     diag_order_failures: u64,
     diag_sustain_cancels: u64,    // Leg 1 cancelled: composite < cancel_threshold
     diag_sustain_timeouts: u64,   // Leg 1 cancelled: cancel_window_ms timeout
-    diag_repost_attempts: u64,    // Leg 1 cancelled + reposted: ask drifted, composite still strong
-    diag_repost_capped: u64,      // Repost blocked by max_repost_count or max_chase_ticks
+    diag_opposite_dir_cancels: u64, // Leg 1 cancelled: opposite-direction buildup confirmed
+    diag_rej_heartbeat: u64,       // Leg 1 rejected: heartbeat down
+    diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
     last_diag_ms: u64,
 
     // ── Dual-order tracking (Phase 1 + Phase 2) ────────────────────────
@@ -317,16 +307,11 @@ impl StrategyEngine {
             trade_cooldown_ms: config.bot.entry_guards.trade_cooldown_ms,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
-            leg1_repost_tick_threshold: config.bot.buildup.leg1_repost_tick_threshold,
             cancel_window_ms: config.bot.buildup.cancel_window_ms,
-            leg1_last_cancel_repost: false,
             leg1_cancel_inflight: false,
-            leg1_repost_count: 0,
-            max_repost_count: config.bot.buildup.max_repost_count,
-            leg1_original_signal_price: None,
-            max_chase_ticks: config.bot.buildup.max_chase_ticks,
-            leg1_repost_cap_logged: false,
             pending_tick_size_cmd: None,
+            pending_heartbeat_cancel: None,
+            heartbeat_dead_threshold: config.bot.entry_guards.heartbeat_dead_threshold,
             emergency_signal_in_flight: false,
             leg2_command_pending: false,
             pending_leg1_cancel: None,
@@ -351,7 +336,6 @@ impl StrategyEngine {
             diag_rej_stale: 0,
             diag_rej_skew: 0,
             diag_rej_reprice: 0,
-            diag_rej_obi: 0,
             diag_rej_paused: 0,
             diag_rej_other: 0,
             diag_leg1_signals: 0,
@@ -377,8 +361,9 @@ impl StrategyEngine {
             diag_order_failures: 0,
             diag_sustain_cancels: 0,
             diag_sustain_timeouts: 0,
-            diag_repost_attempts: 0,
-            diag_repost_capped: 0,
+            diag_opposite_dir_cancels: 0,
+            diag_rej_heartbeat: 0,
+            diag_heartbeat_resets: 0,
             last_diag_ms: 0,
             leg2_phase1_order_id: None,
             leg2_phase2_order_id: None,
@@ -403,7 +388,6 @@ impl StrategyEngine {
                 time_exponent: config.time_exponent,
                 max_time_factor: config.max_time_factor,
                 phase1_target_dampen: config.phase1_target_dampen,
-                min_obi_alignment: config.min_obi_alignment,
             },
             leg2: Leg2Evaluator {
                 phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
@@ -792,9 +776,6 @@ impl StrategyEngine {
                 self.pending_fills.clear();
                 self.pending_partial_fills.clear();
                 self.state.leg1_posted_ask = None;
-                self.leg1_last_cancel_repost = false;
-                self.leg1_repost_count = 0;
-                self.leg1_original_signal_price = None;
                 // Dual-order: clear ALL state on rotation (new market).
                 self.leg2_phase1_order_id = None;
                 self.leg2_phase2_order_id = None;
@@ -849,6 +830,17 @@ impl StrategyEngine {
                                 fill_timestamp_ms: now_ms,
                             };
                             self.init_leg2(price, actual_size, now_ms);
+
+                            // Cancel remaining shares on the CLOB to prevent unhedged fills.
+                            if actual_size < size {
+                                info!(%order_id, filled = %actual_size, posted = %size,
+                                    "partial fill — cancelling remaining order on CLOB");
+                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                    order_id: order_id.clone(),
+                                });
+                                self.leg1_cancel_inflight = true;
+                            }
+
                             // Reset live trade meta for the new trade.
                             self.live_trade_meta = LiveTradeMeta::default();
 
@@ -1105,16 +1097,26 @@ impl StrategyEngine {
                 latency_ms,
             } => {
                 if success {
+                    let was_unhealthy = !self.connectivity.heartbeat_healthy;
                     self.connectivity.heartbeat_healthy = true;
                     self.connectivity.consecutive_heartbeat_failures = 0;
-                    debug!(latency_ms, "heartbeat OK");
+                    self.connectivity.last_heartbeat_latency_ms = latency_ms;
+                    if was_unhealthy {
+                        info!(latency_ms, "heartbeat RECOVERED");
+                    } else {
+                        debug!(latency_ms, "heartbeat OK");
+                    }
                 } else {
                     self.connectivity.consecutive_heartbeat_failures += 1;
                     self.connectivity.heartbeat_healthy = false;
+                    let failures = self.connectivity.consecutive_heartbeat_failures;
                     warn!(
-                        failures = self.connectivity.consecutive_heartbeat_failures,
+                        failures,
                         "heartbeat FAILED — orders may be auto-cancelled by CLOB"
                     );
+                    if failures == self.heartbeat_dead_threshold {
+                        self.handle_heartbeat_dead();
+                    }
                 }
             }
 
@@ -1231,7 +1233,6 @@ impl StrategyEngine {
                         self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
                             order_id: order_id.clone(),
                         });
-                        self.leg1_last_cancel_repost = false;
                         self.leg1_cancel_inflight = true;
                         self.diag_sustain_timeouts += 1;
                     }
@@ -1260,10 +1261,31 @@ impl StrategyEngine {
             return;
         }
 
-        // Don't process new buildups if an order is already active. Without this guard,
-        // evaluate() clears buildup_detected on ActiveTrade rejection, causing the next
-        // feed event to re-trigger this function in an infinite loop.
+        // If Leg 1 is already active, don't process new buildups — but cancel on
+        // opposite-direction buildup to avoid filling into a reversed market.
         if !matches!(self.state.leg1_state, OrderState::None) {
+            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
+                if !Self::is_provisional_order(order_id)
+                    && self.pending_leg1_cancel.is_none()
+                    && !self.leg1_cancel_inflight
+                {
+                    if let Some(leg1_dir) = self.leg1_direction {
+                        if leg1_dir != buildup.direction {
+                            info!(
+                                leg1_dir = ?leg1_dir,
+                                new_dir = ?buildup.direction,
+                                "opposite direction buildup — cancelling Leg 1"
+                            );
+                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                order_id: order_id.clone(),
+                            });
+                            self.leg1_cancel_inflight = true;
+                            self.diag_opposite_dir_cancels += 1;
+                            self.diag_sustain_cancels += 1;
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -1303,81 +1325,20 @@ impl StrategyEngine {
         }
 
         // ── Leg 1 sustain monitoring ──
-        // If Leg 1 is Posted and no cancel is already pending, check:
-        // 1. Ask-drift repost (composite still strong but ask moved)
-        // 2. Composite fade cancel
+        // If Leg 1 is Posted and no cancel is already pending, check composite fade.
         // Skip if order ID is provisional (real CLOB ID not yet received).
         if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
             if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
                 if !Self::is_provisional_order(order_id) {
-                    let order_id = order_id.clone();
-
-                    // 1. Ask-drift repost: ask moved ≥ threshold ticks while composite > cancel_threshold
-                    if self.leg1_repost_tick_threshold > 0
-                        && composite_score > self.leg2.cancel_threshold
-                    {
-                        if let Some(posted_ask) = self.state.leg1_posted_ask {
-                            let current_ask = self.get_current_best_ask();
-                            if let Some(current) = current_ask {
-                                let drift = current - posted_ask;
-                                let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
-                                if drift >= threshold {
-                                    // Check repost cap and chase distance before cancelling.
-                                    let repost_allowed = self.max_repost_count == 0
-                                        || self.leg1_repost_count < self.max_repost_count;
-                                    let chase_allowed = self.max_chase_ticks == 0
-                                        || self.leg1_original_signal_price.map_or(true, |orig| {
-                                            let chase = current - orig;
-                                            chase <= self.state.tick_size * Decimal::from(self.max_chase_ticks)
-                                        });
-
-                                    if repost_allowed && chase_allowed {
-                                        info!(
-                                            %posted_ask, current_ask = %current, %drift,
-                                            repost_count = self.leg1_repost_count,
-                                            "Leg 1 ask drifted — cancelling for repost"
-                                        );
-                                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                            order_id: order_id.clone(),
-                                        });
-                                        self.leg1_last_cancel_repost = true;
-                                        self.leg1_cancel_inflight = true;
-                                        self.diag_repost_attempts += 1;
-                                    } else if !self.leg1_repost_cap_logged {
-                                        // Repost capped: cancel the stale order entirely
-                                        // (no repost). A fill at this stale price would
-                                        // produce a losing hedge.
-                                        info!(
-                                            %posted_ask, current_ask = %current, %drift,
-                                            repost_count = self.leg1_repost_count,
-                                            max_repost = self.max_repost_count,
-                                            max_chase = self.max_chase_ticks,
-                                            "repost CAPPED — cancelling stale order"
-                                        );
-                                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                            order_id: order_id.clone(),
-                                        });
-                                        self.leg1_last_cancel_repost = false;
-                                        self.leg1_cancel_inflight = true;
-                                        self.leg1_repost_cap_logged = true;
-                                        self.diag_repost_capped += 1;
-                                        self.diag_sustain_cancels += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 2. Composite fade: composite fell below cancel_threshold → cancel (no repost)
-                    if self.pending_leg1_cancel.is_none() && composite_score < self.leg2.cancel_threshold {
+                    // Composite fade: composite fell below cancel_threshold → cancel
+                    if composite_score < self.leg2.cancel_threshold {
                         info!(
                             %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
                             "Leg 1 sustain — composite faded below cancel threshold"
                         );
                         self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                            order_id,
+                            order_id: order_id.clone(),
                         });
-                        self.leg1_last_cancel_repost = false;
                         self.leg1_cancel_inflight = true;
                         self.diag_sustain_cancels += 1;
                     }
@@ -1399,6 +1360,15 @@ impl StrategyEngine {
         if self.draining || self.paused {
             if self.state.buildup_detected {
                 self.diag_rej_paused += 1;
+            }
+            self.state.buildup_detected = false;
+            return None;
+        }
+
+        // Heartbeat down: block new Leg 1 entries.
+        if !self.connectivity.heartbeat_healthy {
+            if self.state.buildup_detected {
+                self.diag_rej_heartbeat += 1;
             }
             self.state.buildup_detected = false;
             return None;
@@ -1433,12 +1403,8 @@ impl StrategyEngine {
                     size,
                     timestamp_ms: now_ms,
                 };
-                // Record best_ask at time of post for adaptive repost drift detection.
+                // Record best_ask at time of post for sustain monitoring.
                 self.state.leg1_posted_ask = Some(price);
-                // Capture original signal price on first post (chase distance anchor).
-                if self.leg1_original_signal_price.is_none() {
-                    self.leg1_original_signal_price = Some(price);
-                }
                 self.state.cumulative_used += alloc;
                 self.leg1_direction = Some(direction);
                 self.pending_leg1_signal = Some(signal.clone());
@@ -1457,7 +1423,7 @@ impl StrategyEngine {
                     Leg1RejectReason::StaleBook => self.diag_rej_stale += 1,
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
                     Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
-                    Leg1RejectReason::ObiMismatch => self.diag_rej_obi += 1,
+                    Leg1RejectReason::HeartbeatDown => self.diag_rej_heartbeat += 1,
                     Leg1RejectReason::Other => self.diag_rej_other += 1,
                 }
                 None
@@ -1522,6 +1488,12 @@ impl StrategyEngine {
         // ── Apply mutations based on decision type ────────────────────────
         let (price, size) = (decision.price(), decision.size());
         let is_emergency = decision.is_emergency();
+
+        // Heartbeat down: block non-emergency Leg 2 posts (emergency FOK must always fire).
+        if !self.connectivity.heartbeat_healthy && !is_emergency {
+            debug!("heartbeat down — blocking non-emergency Leg 2 post");
+            return None;
+        }
 
         // Save current Leg 2 order before overwriting with provisional ID.
         if let OrderState::Posted { ref order_id, price: p, size: s, .. } = self.state.leg2_state
@@ -1662,6 +1634,57 @@ impl StrategyEngine {
         self.pending_leg1_cancel.take()
     }
 
+    /// Take the pending heartbeat-dead cancel command (if any).
+    /// Called by the main loop after `on_event()` to forward to the executor.
+    pub fn take_heartbeat_cancel(&mut self) -> Option<ExecutorCommand> {
+        self.pending_heartbeat_cancel.take()
+    }
+
+    /// Proactive state reset when heartbeat failure count reaches the dead threshold.
+    /// CLOB cancels resting orders ~10-15s after heartbeat death. This resets
+    /// engine state to match, preventing stale `OrderState::Posted` entries.
+    fn handle_heartbeat_dead(&mut self) {
+        warn!("HEARTBEAT DEAD — assuming CLOB cancelled all resting orders");
+        self.diag_heartbeat_resets += 1;
+
+        // Telegram alert
+        if let Some(ref reporter) = self.reporter {
+            reporter.fire_critical(format!(
+                "⚠️ <b>HEARTBEAT DEAD</b> — {} consecutive failures\n\
+                 Assuming CLOB cancelled all resting orders.\n\
+                 Leg 1: {:?}  Leg 2: {:?}",
+                self.connectivity.consecutive_heartbeat_failures,
+                std::mem::discriminant(&self.state.leg1_state),
+                std::mem::discriminant(&self.state.leg2_state),
+            ));
+        }
+
+        // Reset Leg 1 if posted (unfilled) — CLOB likely already cancelled it.
+        if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
+            self.pending_heartbeat_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                order_id: order_id.clone(),
+            });
+            self.state.leg1_state = OrderState::None;
+            self.state.leg1_posted_ask = None;
+            self.leg1_direction = None;
+            self.pending_leg1_signal = None;
+            self.leg1_cancel_inflight = false;
+            self.state.buildup_detected = false;
+            self.state.last_buildup = None;
+        }
+
+        // Reset Leg 2 if posted (unfilled) — naked position until heartbeat recovers.
+        if matches!(self.state.leg2_state, OrderState::Posted { .. }) {
+            self.state.leg2_state = OrderState::None;
+            self.leg2_phase1_order_id = None;
+            self.leg2_phase2_order_id = None;
+            self.last_leg2_was_phase2_alongside = false;
+            self.emergency_signal_in_flight = false;
+            self.leg2_command_pending = false;
+            self.prev_leg2_order = None;
+        }
+    }
+
     // ─── Rotation emergency drain ─────────────────────────────────────
 
     /// Drain any emergency signals buffered during the last `MarketRotation`.
@@ -1703,7 +1726,6 @@ impl StrategyEngine {
             rej_stale = self.diag_rej_stale,
             rej_skew = self.diag_rej_skew,
             rej_reprice = self.diag_rej_reprice,
-            rej_obi = self.diag_rej_obi,
             rej_other = self.diag_rej_other,
             leg1_sig = self.diag_leg1_signals,
             leg1_fill = self.diag_leg1_fills,
@@ -1728,8 +1750,10 @@ impl StrategyEngine {
             order_fail = self.diag_order_failures,
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
-            repost_attempts = self.diag_repost_attempts,
-            repost_capped = self.diag_repost_capped,
+            opposite_dir_cancels = self.diag_opposite_dir_cancels,
+            hb_rej = self.diag_rej_heartbeat,
+            hb_resets = self.diag_heartbeat_resets,
+            hb_failures = self.connectivity.consecutive_heartbeat_failures,
             det_signals = self.detector.diag_signals_emitted(),
             det_dir_veto = self.detector.diag_direction_vetoes(),
             det_causal_veto = self.detector.diag_causal_vetoes(),
@@ -1756,11 +1780,11 @@ impl StrategyEngine {
              \n\
              <b>Leg 1 Rejections</b>\n\
              Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Skewed: {skew}\n\
-             Reprice: {reprice}  OBI: {obi}  Other: {other}\n\
+             Reprice: {reprice}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  reposts: {sustain_reposts}  capped: {repost_capped}\n\
+             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
@@ -1768,6 +1792,9 @@ impl StrategyEngine {
              Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
              Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
              Double-fill: detected={double_fills}  rebalance={rebal_attempts}  success={rebal_success}\n\
+             \n\
+             <b>Heartbeat</b>\n\
+             {hb_status}  Failures: {hb_failures}  Latency: {hb_latency}ms  Rej: {hb_rej}  Resets: {hb_resets}\n\
              \n\
              <b>BuildupDetector</b>\n\
              Signals: {det_signals}  Dir vetoes: {det_dir_veto}  Causal vetoes: {det_causal_veto}\n\
@@ -1785,15 +1812,13 @@ impl StrategyEngine {
             stale = self.diag_rej_stale,
             skew = self.diag_rej_skew,
             reprice = self.diag_rej_reprice,
-            obi = self.diag_rej_obi,
             other = self.diag_rej_other,
             sig = self.diag_leg1_signals,
             fill = self.diag_leg1_fills,
             failed = self.diag_order_failures,
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
-            sustain_reposts = self.diag_repost_attempts,
-            repost_capped = self.diag_repost_capped,
+            opposite_dir_cancels = self.diag_opposite_dir_cancels,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -1812,6 +1837,11 @@ impl StrategyEngine {
             double_fills = self.diag_double_fills,
             rebal_attempts = self.diag_rebalance_attempts,
             rebal_success = self.diag_rebalance_successes,
+            hb_status = if self.connectivity.heartbeat_healthy { "OK" } else { "DOWN" },
+            hb_failures = self.connectivity.consecutive_heartbeat_failures,
+            hb_latency = self.connectivity.last_heartbeat_latency_ms,
+            hb_rej = self.diag_rej_heartbeat,
+            hb_resets = self.diag_heartbeat_resets,
             det_signals = self.detector.diag_signals_emitted(),
             det_dir_veto = self.detector.diag_direction_vetoes(),
             det_causal_veto = self.detector.diag_causal_vetoes(),
@@ -1835,15 +1865,6 @@ impl StrategyEngine {
     /// Returns `true` if the order ID is a provisional placeholder (real CLOB ID pending).
     fn is_provisional_order(order_id: &str) -> bool {
         order_id.starts_with("sim-leg1-")
-    }
-
-    fn get_current_best_ask(&self) -> Option<Decimal> {
-        let book = match self.leg1_direction {
-            Some(Direction::Up) => self.state.poly_yes_book.as_ref().or(self.state.poly_book.as_ref()),
-            Some(Direction::Down) => self.state.poly_no_book.as_ref().or(self.state.poly_book.as_ref()),
-            None => self.state.poly_book.as_ref(),
-        };
-        book.and_then(|b| b.best_ask()).map(|l| l.price)
     }
 
     /// Called by the Executor when an order is successfully posted to the CLOB.
@@ -1967,9 +1988,6 @@ impl StrategyEngine {
             return;
         }
 
-        // Clone order_id before moving into state (needed for Leg 1 drift check).
-        let order_id_for_drift = if !is_leg2 { Some(order_id.clone()) } else { None };
-
         let leg = if is_leg2 {
             &mut self.state.leg2_state
         } else {
@@ -1982,55 +2000,9 @@ impl StrategyEngine {
             timestamp_ms: now_ms,
         };
 
-        // Leg 1: immediate drift check — ask may have moved during SDK round-trip (~1.3s).
-        if let Some(oid) = order_id_for_drift {
+        // Leg 1: record posted ask for sustain monitoring.
+        if !is_leg2 {
             self.state.leg1_posted_ask = Some(price);
-            // Capture original signal price on first post (chase distance anchor).
-            if self.leg1_original_signal_price.is_none() {
-                self.leg1_original_signal_price = Some(price);
-            }
-            if self.pending_leg1_cancel.is_none()
-                && !self.leg1_cancel_inflight
-                && self.leg1_repost_tick_threshold > 0
-                && self.state.current_composite_score > self.leg2.cancel_threshold
-            {
-                if let Some(current_ask) = self.get_current_best_ask() {
-                    let drift = current_ask - price;
-                    let threshold = self.state.tick_size * Decimal::from(self.leg1_repost_tick_threshold);
-                    if drift >= threshold {
-                        // Check repost cap and chase distance before cancelling.
-                        let repost_allowed = self.max_repost_count == 0
-                            || self.leg1_repost_count < self.max_repost_count;
-                        let chase_allowed = self.max_chase_ticks == 0
-                            || self.leg1_original_signal_price.map_or(true, |orig| {
-                                let chase = current_ask - orig;
-                                chase <= self.state.tick_size * Decimal::from(self.max_chase_ticks)
-                            });
-
-                        if repost_allowed && chase_allowed {
-                            info!(%price, %current_ask, %drift,
-                                repost_count = self.leg1_repost_count,
-                                "Leg 1 posted — immediate drift detected, cancelling for repost");
-                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid.clone() });
-                            self.leg1_last_cancel_repost = true;
-                            self.leg1_cancel_inflight = true;
-                            self.diag_repost_attempts += 1;
-                        } else {
-                            // Repost capped on first post: cancel stale order entirely.
-                            info!(%price, %current_ask, %drift,
-                                repost_count = self.leg1_repost_count,
-                                max_repost = self.max_repost_count,
-                                max_chase = self.max_chase_ticks,
-                                "repost CAPPED on order posted — cancelling stale order");
-                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order { order_id: oid });
-                            self.leg1_last_cancel_repost = false;
-                            self.leg1_cancel_inflight = true;
-                            self.diag_repost_capped += 1;
-                            self.diag_sustain_cancels += 1;
-                        }
-                    }
-                }
-            }
         }
 
         self.replay_pending_fills(now_ms);
@@ -2126,50 +2098,29 @@ impl StrategyEngine {
             // Leg 1 cancel result
             if was_cancelled {
                 self.leg1_cancel_inflight = false;
-                if self.leg1_last_cancel_repost {
-                    // Repost path: partial reset, re-arm evaluation if composite still alive
-                    self.state.leg1_state = OrderState::None;
-                    self.leg1_last_cancel_repost = false;
-                    self.leg1_repost_count += 1;
-
-                    let composite_alive = self.state.current_composite_score > self.leg2.cancel_threshold
-                        && self.state.last_buildup.is_some();
-
-                    if composite_alive {
-                        info!(%order_id, repost_count = self.leg1_repost_count,
-                            "Leg 1 cancel confirmed — re-arming for repost");
-                        self.state.buildup_detected = true; // re-arm evaluate()
-                        // Keep: leg1_direction, last_buildup, pending_leg1_signal, leg1_original_signal_price
-                    } else {
-                        info!(%order_id, "Leg 1 cancel confirmed — composite faded, full reset");
-                        self.leg1_direction = None;
-                        self.pending_leg1_signal = None;
-                        self.state.buildup_detected = false;
-                        self.state.last_buildup = None;
-                        self.state.leg1_posted_ask = None;
-                        self.leg1_repost_count = 0;
-                        self.leg1_original_signal_price = None;
-                    }
+                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
+                    // Partial-fill cleanup — trade is actively hedging, don't reset.
+                    debug!(%order_id, "Leg 1 partial-fill remainder cancelled — trade continues");
                 } else {
-                    // Non-repost cancel confirmed (sustain fade, timeout): full Leg 1 reset.
+                    // Normal sustain-fade cancel — full reset.
                     debug!(%order_id, "Leg 1 cancel confirmed — resetting Leg 1 state");
                     self.state.leg1_state = OrderState::None;
                     self.state.leg1_posted_ask = None;
                     self.leg1_direction = None;
+                    self.state.buildup_detected = false;
                     self.state.last_buildup = None;
                     self.pending_leg1_signal = None;
-                    self.leg1_cancel_inflight = false;
-                    self.leg1_last_cancel_repost = false;
-                    self.leg1_repost_count = 0;
-                    self.leg1_original_signal_price = None;
                 }
             } else {
-                // NOT cancelled — order filled before cancel reached CLOB.
-                // Leave leg1_cancel_inflight=true so sustain monitor does NOT retry.
-                // User WS TradeStatusUpdate (MATCHED) will call on_order_filled() → on_trade_complete().
-                // on_trade_complete() clears leg1_cancel_inflight.
-                debug!(%order_id, "Leg 1 cancel NOT confirmed — order filled or gone, no retry");
-                self.leg1_last_cancel_repost = false;
+                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
+                    // Partial-fill cancel failed — remaining shares may have also filled unhedged.
+                    self.leg1_cancel_inflight = false;
+                    warn!(%order_id, "partial-fill remainder cancel failed — additional fills may be unhedged");
+                } else {
+                    // Normal sustain cancel not confirmed — order likely filled.
+                    // Leave leg1_cancel_inflight=true so sustain monitor does NOT retry.
+                    debug!(%order_id, "Leg 1 cancel NOT confirmed — order filled or gone, no retry");
+                }
             }
             let now_ms = now_epoch_ms();
             self.replay_pending_fills(now_ms);
@@ -2617,16 +2568,13 @@ impl StrategyEngine {
         self.pending_leg1_signal = None;
         self.pending_tick_size_cmd = None;
         self.pending_leg1_cancel = None;
+        self.pending_heartbeat_cancel = None;
         self.emergency_signal_in_flight = false;
         self.leg2_command_pending = false;
         self.prev_leg2_order = None;
         self.pending_fills.clear();
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
-        self.leg1_last_cancel_repost = false;
-        self.leg1_repost_count = 0;
-        self.leg1_original_signal_price = None;
-        self.leg1_repost_cap_logged = false;
         // Dual-order tracking: clear IDs but keep post_trade_orphan (may fill after trade reset).
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
@@ -3392,11 +3340,7 @@ impl StrategyEngine {
         self.state.buildup_detected = false;
         self.state.last_buildup = None;
         self.state.leg1_posted_ask = None;
-        self.leg1_last_cancel_repost = false;
         self.leg1_cancel_inflight = false;
-        self.leg1_repost_count = 0;
-        self.leg1_original_signal_price = None;
-        self.leg1_repost_cap_logged = false;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).
@@ -3436,6 +3380,9 @@ impl StrategyEngine {
             summary_enabled: true, // updated by main loop from NotifyFlags
             draining: self.draining,
             paused: self.paused,
+            heartbeat_healthy: self.connectivity.heartbeat_healthy,
+            heartbeat_failures: self.connectivity.consecutive_heartbeat_failures,
+            heartbeat_latency_ms: self.connectivity.last_heartbeat_latency_ms,
         }
     }
 }

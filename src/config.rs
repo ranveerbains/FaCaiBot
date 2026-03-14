@@ -18,6 +18,8 @@ pub struct EntryGuardsConfig {
     pub rotation_quiet_ms: u64,
     /// Cooldown (ms) after trade completion before allowing new entries.
     pub trade_cooldown_ms: u64,
+    /// Consecutive heartbeat failures before assuming CLOB cancelled all resting orders.
+    pub heartbeat_dead_threshold: u32,
 }
 
 impl Default for EntryGuardsConfig {
@@ -28,6 +30,7 @@ impl Default for EntryGuardsConfig {
             stale_book_ms: 1000,
             rotation_quiet_ms: 30000,
             trade_cooldown_ms: 5000,
+            heartbeat_dead_threshold: 5,
         }
     }
 }
@@ -105,8 +108,6 @@ pub struct RepricingConfig {
     /// Phase 1 target dampening factor (0.8 = target 80% of expected repricing).
     /// Only affects Phase 1 profit target — entry gate and allocation use raw expected_pct.
     pub phase1_target_dampen: f64,
-    /// Minimum OBI alignment (0.0–0.5). Rejects if Binance book imbalance contradicts spike.
-    pub min_obi_alignment: f64,
 }
 
 impl Default for RepricingConfig {
@@ -119,7 +120,6 @@ impl Default for RepricingConfig {
             time_exponent: 0.5,
             max_time_factor: 2.0,
             phase1_target_dampen: 0.8,
-            min_obi_alignment: 0.2,
         }
     }
 }
@@ -133,13 +133,6 @@ pub struct BuildupTomlConfig {
     pub cancel_threshold: f64,
     /// Max wait (ms) for Leg 1 maker fill before cancelling.
     pub cancel_window_ms: u64,
-    /// Repost threshold — if ask moves ≥ this many ticks while composite > cancel_threshold,
-    /// cancel and repost at new best_ask (0 = disabled).
-    pub leg1_repost_tick_threshold: u32,
-    /// Maximum number of reposts per buildup episode (0 = unlimited).
-    pub max_repost_count: u32,
-    /// Maximum chase distance in ticks from original signal price (0 = unlimited).
-    pub max_chase_ticks: u32,
     /// Maximum dissenting directional metrics allowed in consensus vote (default 1).
     pub max_dissenters: u32,
     // Metric weights (must sum to 1.0)
@@ -183,9 +176,6 @@ impl Default for BuildupTomlConfig {
             entry_threshold: 0.40,
             cancel_threshold: 0.25,
             cancel_window_ms: 500,
-            leg1_repost_tick_threshold: 1,
-            max_repost_count: 2,
-            max_chase_ticks: 4,
             max_dissenters: 1,
             w_cvd: 0.30,
             w_spot_flow: 0.15,
@@ -298,8 +288,6 @@ pub struct Config {
     pub max_time_factor: f64,
     /// Phase 1 target dampening factor (only affects profit target, not entry gate or allocation).
     pub phase1_target_dampen: Decimal,
-    /// Minimum OBI alignment to accept a spike.
-    pub min_obi_alignment: Decimal,
 }
 
 impl Config {
@@ -365,9 +353,6 @@ impl Config {
         let max_time_factor = bot.repricing.max_time_factor;
         let phase1_target_dampen = Decimal::try_from(bot.repricing.phase1_target_dampen)
             .context("repricing.phase1_target_dampen: invalid decimal")?;
-        let min_obi_alignment = Decimal::try_from(bot.repricing.min_obi_alignment)
-            .context("repricing.min_obi_alignment: invalid decimal")?;
-
         let config = Self {
             polymarket_api_key,
             polymarket_secret,
@@ -394,7 +379,6 @@ impl Config {
             time_exponent,
             max_time_factor,
             phase1_target_dampen,
-            min_obi_alignment,
         };
 
         // ── Validation ───────────────────────────────────────────────
@@ -419,8 +403,6 @@ impl Config {
         let time_exponent = bot.repricing.time_exponent;
         let max_time_factor = bot.repricing.max_time_factor;
         let phase1_target_dampen = Decimal::try_from(bot.repricing.phase1_target_dampen).unwrap();
-        let min_obi_alignment = Decimal::try_from(bot.repricing.min_obi_alignment).unwrap();
-
         Self {
             polymarket_api_key: String::new(),
             polymarket_secret: String::new(),
@@ -444,7 +426,6 @@ impl Config {
             time_exponent,
             max_time_factor,
             phase1_target_dampen,
-            min_obi_alignment,
         }
     }
 }

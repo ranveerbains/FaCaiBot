@@ -281,7 +281,7 @@ fn test_phase2_no_repost_on_price_improvement() {
 
 // ── Dampening tests ──────────────────────────────────────────────────
 
-fn make_leg1_evaluator(dampen: &str, min_obi: &str) -> Leg1Evaluator {
+fn make_leg1_evaluator(dampen: &str) -> Leg1Evaluator {
     Leg1Evaluator {
         entry_cutoff_secs: 25,
         stale_book_ms: 5000,
@@ -293,7 +293,6 @@ fn make_leg1_evaluator(dampen: &str, min_obi: &str) -> Leg1Evaluator {
         time_exponent: 0.5,
         max_time_factor: 2.0,
         phase1_target_dampen: dampen.parse().unwrap(),
-        min_obi_alignment: min_obi.parse().unwrap(),
     }
 }
 
@@ -373,7 +372,7 @@ fn make_leg1_test_state(now_ms: u64) -> MarketState {
 #[test]
 fn test_dampening_reduces_target_not_allocation() {
     let now_ms = 100_000;
-    let eval = make_leg1_evaluator("0.8", "0.0");
+    let eval = make_leg1_evaluator("0.8");
     let state = make_leg1_test_state(now_ms);
 
     let outcome = eval.evaluate(&state, now_ms);
@@ -393,7 +392,7 @@ fn test_dampening_reduces_target_not_allocation() {
 #[test]
 fn test_dampening_1_0_is_noop() {
     let now_ms = 100_000;
-    let eval_damped = make_leg1_evaluator("1.0", "0.0");
+    let eval_damped = make_leg1_evaluator("1.0");
     let state = make_leg1_test_state(now_ms);
 
     let outcome = eval_damped.evaluate(&state, now_ms);
@@ -408,7 +407,7 @@ fn test_dampening_1_0_is_noop() {
     }
 }
 
-// ── OBI tests ────────────────────────────────────────────────────────
+// ── OBI computation tests ─────────────────────────────────────────────
 
 #[test]
 fn test_obi_computation() {
@@ -448,33 +447,3 @@ fn test_obi_computation_bullish() {
     assert_eq!(obi, Decimal::new(6, 1));
 }
 
-#[test]
-fn test_obi_gate_rejects_misaligned() {
-    let now_ms = 100_000;
-    let eval = make_leg1_evaluator("0.8", "0.2");
-    let mut state = make_leg1_test_state(now_ms);
-    // Up buildup with OBI = -0.3 (ask-heavy, contradicts Up direction).
-    // min_obi_alignment = 0.2, so gate checks obi >= -0.2. -0.3 < -0.2 → reject.
-    let mut buildup = test_buildup_info(Direction::Up, now_ms);
-    buildup.obi = Decimal::new(-3, 1);  // -0.3
-    state.last_buildup = Some(buildup);
-
-    match eval.evaluate(&state, now_ms) {
-        Leg1Outcome::Rejected(Leg1RejectReason::ObiMismatch) => {} // expected
-        other => panic!("expected ObiMismatch, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_obi_gate_allows_aligned() {
-    let now_ms = 100_000;
-    let eval = make_leg1_evaluator("0.8", "0.2");
-    let state = make_leg1_test_state(now_ms);
-    // Default buildup has obi = 0.3 (bid-heavy, aligns with Up direction).
-    // Gate checks obi >= -0.2. 0.3 >= -0.2 → passes.
-
-    match eval.evaluate(&state, now_ms) {
-        Leg1Outcome::Signal(_) => {} // expected
-        other => panic!("expected Signal, got {other:?}"),
-    }
-}

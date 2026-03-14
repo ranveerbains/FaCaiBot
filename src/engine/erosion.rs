@@ -98,13 +98,27 @@ impl HedgeState {
 
 // ─── Connectivity State ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct ConnectivityState {
     pub binance_connected: bool,
     pub polymarket_market_connected: bool,
     pub polymarket_user_connected: bool,
     pub heartbeat_healthy: bool,
     pub consecutive_heartbeat_failures: u32,
+    pub last_heartbeat_latency_ms: u64,
+}
+
+impl Default for ConnectivityState {
+    fn default() -> Self {
+        Self {
+            binance_connected: false,
+            polymarket_market_connected: false,
+            polymarket_user_connected: false,
+            heartbeat_healthy: true, // assume healthy until first failure
+            consecutive_heartbeat_failures: 0,
+            last_heartbeat_latency_ms: 0,
+        }
+    }
 }
 
 // ─── Hedge Snapshot ───────────────────────────────────────────────────────

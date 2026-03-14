@@ -53,6 +53,9 @@ pub struct BotStatus {
     pub summary_enabled: bool,
     pub draining: bool,
     pub paused: bool,
+    pub heartbeat_healthy: bool,
+    pub heartbeat_failures: u32,
+    pub heartbeat_latency_ms: u64,
 }
 
 impl Default for BotStatus {
@@ -70,6 +73,9 @@ impl Default for BotStatus {
             summary_enabled: true,
             draining: false,
             paused: false,
+            heartbeat_healthy: true,
+            heartbeat_failures: 0,
+            heartbeat_latency_ms: 0,
         }
     }
 }
