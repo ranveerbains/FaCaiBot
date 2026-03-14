@@ -275,10 +275,9 @@ impl Leg1Evaluator {
             },
         };
 
-        // Leg 1 maker price — one tick below the best ask.
-        // Posting AT the ask crosses the book when resting sells exist there (post-only rejected).
-        // Posting at ask-1-tick places us inside the spread as a resting bid: valid maker order.
-        let ask_price = (best_ask_price - tick).max(tick);
+        // FOK taker: take at the best ask price directly.
+        // (Maker era: was ask-1-tick to avoid crossing as post-only.)
+        let ask_price = best_ask_price;
 
         debug!(
             spike_direction = ?direction,
