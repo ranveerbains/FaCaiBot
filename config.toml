@@ -49,13 +49,13 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.3
+entry_threshold = 0.25
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.1
 # Max wait (ms) for Leg 1 maker fill before cancelling
 cancel_window_ms = 3000
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
-max_dissenters = 1
+max_dissenters = 0
 
 # Metric weights (must sum to 1.0)
 # Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot

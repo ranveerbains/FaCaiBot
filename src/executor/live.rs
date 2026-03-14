@@ -22,6 +22,7 @@ use crate::gateway::polymarket::PolymarketGateway;
 use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
 use crate::types::market::Direction;
+use crate::utils::time::epoch_ms;
 use crate::types::order::{
     ExecutorCommand, ExecutorFeedback, FillMethod, OrderRequest, OrderStatus, OrderTag, TradeSignal,
 };
@@ -695,16 +696,21 @@ impl LiveExecutor {
         exit_reason: crate::types::order::ExitReason,
     ) {
         // Price-escalating FOK: walk up the book +1 tick per attempt until
-        // filled or $1.00 cap reached. After Leg 1 fills we hold a directional
-        // position — Leg 2 *must* fill. The ~1.2s HTTP round-trip per attempt
-        // is the natural rate limiter.
-        const MAX_FOK_ATTEMPTS: u32 = 10;
+        // filled, $1.00 cap reached, or market expires. After Leg 1 fills we
+        // hold a directional position — Leg 2 *must* fill. The ~1.2s HTTP
+        // round-trip per attempt is the natural rate limiter.
+        //
+        // Time-based cutoff: retry until the market ends rather than a fixed
+        // attempt count, so we maximise hedge probability without risking
+        // retries on a settled market.
+        let deadline_ms = signal.market_end_timestamp_ms;
         let mut current_price = signal.price;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            if attempt > MAX_FOK_ATTEMPTS {
-                error!(attempts = MAX_FOK_ATTEMPTS, reason = ?exit_reason, "FOK max attempts reached — aborting");
+            let now_ms = epoch_ms();
+            if now_ms >= deadline_ms {
+                error!(attempts = attempt, reason = ?exit_reason, "FOK deadline reached (market expired) — aborting");
                 break;
             }
             let safe_size = clob_safe_fok_size(current_price, signal.size);
@@ -800,7 +806,7 @@ impl LiveExecutor {
         );
         self.reporter.fire_critical(format!(
             "<b>ORPHANED POSITION</b>\n\n\
-            Leg 2 FOK loop failed after {} attempts.\n\
+            Leg 2 FOK loop failed after {} attempts (market expired).\n\
             Token: <code>{}</code>\n\
             Size: {} shares\n\
             Reason: {:?}\n\n\
