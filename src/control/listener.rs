@@ -233,15 +233,7 @@ async fn handle_message(
 
     let text = msg.text.as_deref()?.trim();
 
-    // Rate limit: 2s between commands.
-    let now_ms = crate::utils::time::epoch_ms();
-    if now_ms.saturating_sub(*last_command_ms) < COMMAND_RATE_LIMIT_MS {
-        debug!("command rate limited");
-        return None;
-    }
-    *last_command_ms = now_ms;
-
-    // Parse command and args.
+    // Parse command and args before rate limiting so we can exempt critical commands.
     let rest = text.strip_prefix('/')?;
     let (cmd, args) = match rest.split_once(' ') {
         Some((c, a)) => (c, a),
@@ -250,6 +242,15 @@ async fn handle_message(
 
     // Strip bot username suffix (e.g. /status@f4c4ibot).
     let cmd = cmd.split('@').next().unwrap_or(cmd);
+
+    // Rate limit: 2s between commands. Safety-critical commands are exempt.
+    let now_ms = crate::utils::time::epoch_ms();
+    let is_critical = matches!(cmd, "stop" | "shutdown" | "resume");
+    if !is_critical && now_ms.saturating_sub(*last_command_ms) < COMMAND_RATE_LIMIT_MS {
+        debug!(cmd, "command rate limited");
+        return Some("Rate limited — wait 2s between commands.".to_string());
+    }
+    *last_command_ms = now_ms;
 
     let reply = match cmd {
         "trades" => handlers::handle_trades(args, notify_flags),
