@@ -122,8 +122,8 @@ pub struct StrategyEngine {
     /// still open. Drained by main loop before sending the rotation command.
     rotation_emergency_buffer: Vec<TradeSignal>,
 
-    /// Cancel window (ms) for unfilled Leg 1 maker.
-    cancel_window_ms: u64,
+    /// Cancel Leg 1 if ask drifts up ≥ this many $ from posted ask.
+    ask_drift_cancel_cents: Decimal,
     /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
     /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
     leg1_cancel_inflight: bool,
@@ -212,8 +212,9 @@ pub struct StrategyEngine {
     diag_buildup_failures: u64,
     diag_order_failures: u64,
     diag_sustain_cancels: u64,    // Leg 1 cancelled: composite < cancel_threshold
-    diag_sustain_timeouts: u64,   // Leg 1 cancelled: cancel_window_ms timeout
+    diag_sustain_timeouts: u64,   // Leg 1 cancelled: timeout (legacy, no longer incremented)
     diag_opposite_dir_cancels: u64, // Leg 1 cancelled: opposite-direction buildup confirmed
+    diag_ask_drift_cancels: u64,   // Leg 1 cancelled: ask drifted beyond threshold
     diag_rej_heartbeat: u64,       // Leg 1 rejected: heartbeat down
     diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
     last_diag_ms: u64,
@@ -279,7 +280,7 @@ impl StrategyEngine {
             trade_cooldown_ms: config.bot.entry_guards.trade_cooldown_ms,
             pending_leg1_signal: None,
             rotation_emergency_buffer: Vec::new(),
-            cancel_window_ms: config.bot.buildup.cancel_window_ms,
+            ask_drift_cancel_cents: Decimal::try_from(config.bot.buildup.ask_drift_cancel_cents).unwrap_or(Decimal::new(2, 2)),
             leg1_cancel_inflight: false,
             pending_tick_size_cmd: None,
             pending_heartbeat_cancel: None,
@@ -332,6 +333,7 @@ impl StrategyEngine {
             diag_sustain_cancels: 0,
             diag_sustain_timeouts: 0,
             diag_opposite_dir_cancels: 0,
+            diag_ask_drift_cancels: 0,
             diag_rej_heartbeat: 0,
             diag_heartbeat_resets: 0,
             last_diag_ms: 0,
@@ -794,40 +796,49 @@ impl StrategyEngine {
                                 size: actual_size,
                                 fill_timestamp_ms: now_ms,
                             };
-                            self.init_leg2(price, actual_size, now_ms);
 
-                            // Cancel remaining shares on the CLOB to prevent unhedged fills.
-                            if actual_size < size {
-                                info!(%order_id, filled = %actual_size, posted = %size,
-                                    "partial fill — cancelling remaining order on CLOB");
-                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                    order_id: order_id.clone(),
-                                });
-                                self.leg1_cancel_inflight = true;
-                            }
+                            if self.leg1_cancel_inflight {
+                                // Cancel in-flight — defer Leg 2 init to on_cancel_result()
+                                // which has the authoritative size_matched from get_order_status().
+                                info!(%order_id, %actual_size, "Leg 1 fill detected but cancel in-flight — deferring Leg 2 init");
+                            } else {
+                                // No cancel in-flight — safe to init Leg 2 immediately.
+                                self.init_leg2(price, actual_size, now_ms);
+                                self.diag_leg1_fills += 1;
 
-                            // Reset live trade meta for the new trade.
-                            self.live_trade_meta = LiveTradeMeta::default();
-
-                            // Send opportunity alert via Telegram in live mode.
-                            if let (Some(reporter), Some(signal)) = (
-                                self.reporter.clone(),
-                                self.pending_leg1_signal.clone(),
-                            ) {
-                                let book = signal
-                                    .book_snapshot
-                                    .clone()
-                                    .or_else(|| self.state.poly_book.clone())
-                                    .unwrap_or_else(|| OrderBook {
-                                        asset_id: signal.token_id.clone(),
-                                        bids: vec![],
-                                        asks: vec![],
-                                        timestamp_ms: now_ms,
+                                // Cancel remaining shares on the CLOB to prevent unhedged fills.
+                                if actual_size < size {
+                                    info!(%order_id, filled = %actual_size, posted = %size,
+                                        "partial fill — cancelling remaining order on CLOB");
+                                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                        order_id: order_id.clone(),
                                     });
-                                reporter.send_opportunity_alert(&signal, price, size, &book);
-                                self.live_market_signals += 1;
-                                if signal.bot_contested {
-                                    self.live_market_walls += 1;
+                                    self.leg1_cancel_inflight = true;
+                                }
+
+                                // Reset live trade meta for the new trade.
+                                self.live_trade_meta = LiveTradeMeta::default();
+
+                                // Send opportunity alert via Telegram in live mode.
+                                if let (Some(reporter), Some(signal)) = (
+                                    self.reporter.clone(),
+                                    self.pending_leg1_signal.clone(),
+                                ) {
+                                    let book = signal
+                                        .book_snapshot
+                                        .clone()
+                                        .or_else(|| self.state.poly_book.clone())
+                                        .unwrap_or_else(|| OrderBook {
+                                            asset_id: signal.token_id.clone(),
+                                            bids: vec![],
+                                            asks: vec![],
+                                            timestamp_ms: now_ms,
+                                        });
+                                    reporter.send_opportunity_alert(&signal, price, size, &book);
+                                    self.live_market_signals += 1;
+                                    if signal.bot_contested {
+                                        self.live_market_walls += 1;
+                                    }
                                 }
                             }
                         }
@@ -1135,18 +1146,30 @@ impl StrategyEngine {
             }
         }
 
-        // ── Leg 1 sustain timeout (runs on every event) ─────────
+        // ── Leg 1 sustain: ask-drift cancel (runs on every event) ─────────
         if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
-            if let OrderState::Posted { ref order_id, timestamp_ms: post_ms, .. } = self.state.leg1_state {
+            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
                 if !Self::is_provisional_order(order_id) {
-                    let elapsed = now_ms.saturating_sub(post_ms);
-                    if elapsed >= self.cancel_window_ms {
-                        info!(elapsed_ms = elapsed, "Leg 1 sustain — cancel_window_ms timeout");
-                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                            order_id: order_id.clone(),
-                        });
-                        self.leg1_cancel_inflight = true;
-                        self.diag_sustain_timeouts += 1;
+                    if let (Some(posted_ask), Some(dir)) = (self.state.leg1_posted_ask, self.leg1_direction) {
+                        let current_ask = match dir {
+                            Direction::Up => self.state.poly_yes_book.as_ref()
+                                .or(self.state.poly_book.as_ref()),
+                            Direction::Down => self.state.poly_no_book.as_ref()
+                                .or(self.state.poly_book.as_ref()),
+                        }.and_then(|b| b.best_ask()).map(|a| a.price);
+
+                        if let Some(current) = current_ask {
+                            if current - posted_ask >= self.ask_drift_cancel_cents {
+                                info!(%current, %posted_ask, drift = %(current - posted_ask),
+                                    "Leg 1 sustain — ask drifted beyond threshold");
+                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+                                    order_id: order_id.clone(),
+                                });
+                                self.leg1_cancel_inflight = true;
+                                self.diag_ask_drift_cancels += 1;
+                                self.diag_sustain_cancels += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1315,8 +1338,8 @@ impl StrategyEngine {
                     size,
                     timestamp_ms: now_ms,
                 };
-                // Record best_ask at time of post for sustain monitoring.
-                self.state.leg1_posted_ask = Some(price);
+                // Record best_ask at time of signal for ask-drift sustain monitoring.
+                self.state.leg1_posted_ask = signal.best_ask;
                 self.state.cumulative_used += alloc;
                 self.leg1_direction = Some(direction);
                 self.pending_leg1_signal = Some(signal.clone());
@@ -1651,6 +1674,7 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
+            ask_drift_cancels = self.diag_ask_drift_cancels,
             hb_rej = self.diag_rej_heartbeat,
             hb_resets = self.diag_heartbeat_resets,
             hb_failures = self.connectivity.consecutive_heartbeat_failures,
@@ -1684,7 +1708,7 @@ impl StrategyEngine {
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}\n\
+             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}  ask-drift: {ask_drift_cancels}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
@@ -1719,6 +1743,7 @@ impl StrategyEngine {
             sustain_cancels = self.diag_sustain_cancels,
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
+            ask_drift_cancels = self.diag_ask_drift_cancels,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -1898,10 +1923,7 @@ impl StrategyEngine {
             timestamp_ms: now_ms,
         };
 
-        // Leg 1: record posted ask for sustain monitoring.
-        if !is_leg2 {
-            self.state.leg1_posted_ask = Some(price);
-        }
+        // leg1_posted_ask already set in evaluate() at signal generation time.
 
         self.replay_pending_fills(now_ms);
     }
@@ -2044,7 +2066,8 @@ impl StrategyEngine {
                             }
                         }
                     }
-                    OrderState::Filled { size: current_size, .. } => {
+                    OrderState::Filled { size: current_size, price, .. } => {
+                        let fill_price = *price;
                         // Already Filled (User WS MATCHED arrived first). Update size if larger.
                         if filled.round_dp(2) > *current_size {
                             let new_size = filled.round_dp(2);
@@ -2053,7 +2076,35 @@ impl StrategyEngine {
                             if let OrderState::Filled { ref mut size, .. } = self.state.leg1_state {
                                 *size = new_size;
                             }
-                            // evaluate_leg2() reads size from leg1_state — will naturally repost at correct size.
+                        }
+                        // If Leg 2 was deferred (cancel was in-flight when fill arrived), init now.
+                        if self.hedge.is_none() {
+                            let final_size = match &self.state.leg1_state {
+                                OrderState::Filled { size, .. } => *size,
+                                _ => unreachable!(),
+                            };
+                            info!(%order_id, %fill_price, %final_size,
+                                "deferred Leg 2 init — using authoritative size from cancel result");
+                            self.init_leg2(fill_price, final_size, now_ms);
+                            self.diag_leg1_fills += 1;
+                            self.live_trade_meta = LiveTradeMeta::default();
+
+                            // Send Telegram opportunity alert.
+                            if let (Some(reporter), Some(signal)) = (
+                                self.reporter.clone(),
+                                self.pending_leg1_signal.clone(),
+                            ) {
+                                let book = signal.book_snapshot.clone()
+                                    .or_else(|| self.state.poly_book.clone())
+                                    .unwrap_or_else(|| OrderBook {
+                                        asset_id: signal.token_id.clone(),
+                                        bids: vec![], asks: vec![],
+                                        timestamp_ms: now_ms,
+                                    });
+                                reporter.send_opportunity_alert(&signal, fill_price, final_size, &book);
+                                self.live_market_signals += 1;
+                                if signal.bot_contested { self.live_market_walls += 1; }
+                            }
                         }
                     }
                     OrderState::None => {
@@ -2065,6 +2116,35 @@ impl StrategyEngine {
                 if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
                     // Partial-fill remainder cancelled — trade continues with hedge.
                     debug!(%order_id, "Leg 1 partial-fill remainder cancelled — trade continues");
+                    // If Leg 2 was deferred (cancel was in-flight when fill arrived), init now.
+                    if self.hedge.is_none() {
+                        if let OrderState::Filled { price, size, .. } = &self.state.leg1_state {
+                            let fill_price = *price;
+                            let fill_size = *size;
+                            let now_ms = now_epoch_ms();
+                            info!(%order_id, %fill_price, %fill_size,
+                                "deferred Leg 2 init (remainder cancelled, 0 additional fills)");
+                            self.init_leg2(fill_price, fill_size, now_ms);
+                            self.diag_leg1_fills += 1;
+                            self.live_trade_meta = LiveTradeMeta::default();
+
+                            if let (Some(reporter), Some(signal)) = (
+                                self.reporter.clone(),
+                                self.pending_leg1_signal.clone(),
+                            ) {
+                                let book = signal.book_snapshot.clone()
+                                    .or_else(|| self.state.poly_book.clone())
+                                    .unwrap_or_else(|| OrderBook {
+                                        asset_id: signal.token_id.clone(),
+                                        bids: vec![], asks: vec![],
+                                        timestamp_ms: now_ms,
+                                    });
+                                reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
+                                self.live_market_signals += 1;
+                                if signal.bot_contested { self.live_market_walls += 1; }
+                            }
+                        }
+                    }
                 } else {
                     // Normal sustain-fade cancel — full reset.
                     debug!(%order_id, "Leg 1 cancel confirmed (0 filled) — resetting Leg 1 state");
@@ -2127,28 +2207,34 @@ impl StrategyEngine {
                             size: fill_size,
                             fill_timestamp_ms: now_ms,
                         };
-                        self.init_leg2(price, fill_size, now_ms);
-                        self.live_trade_meta = LiveTradeMeta::default();
 
-                        // Send opportunity alert for replayed Leg 1 fill.
-                        if let (Some(reporter), Some(signal)) = (
-                            self.reporter.clone(),
-                            self.pending_leg1_signal.clone(),
-                        ) {
-                            let book = signal
-                                .book_snapshot
-                                .clone()
-                                .or_else(|| self.state.poly_book.clone())
-                                .unwrap_or_else(|| OrderBook {
-                                    asset_id: signal.token_id.clone(),
-                                    bids: vec![],
-                                    asks: vec![],
-                                    timestamp_ms: now_ms,
-                                });
-                            reporter.send_opportunity_alert(&signal, price, size, &book);
-                            self.live_market_signals += 1;
-                            if signal.bot_contested {
-                                self.live_market_walls += 1;
+                        if self.leg1_cancel_inflight {
+                            info!(fill_size = %fill_size, "replayed Leg 1 fill but cancel in-flight — deferring Leg 2 init");
+                        } else {
+                            self.init_leg2(price, fill_size, now_ms);
+                            self.diag_leg1_fills += 1;
+                            self.live_trade_meta = LiveTradeMeta::default();
+
+                            // Send opportunity alert for replayed Leg 1 fill.
+                            if let (Some(reporter), Some(signal)) = (
+                                self.reporter.clone(),
+                                self.pending_leg1_signal.clone(),
+                            ) {
+                                let book = signal
+                                    .book_snapshot
+                                    .clone()
+                                    .or_else(|| self.state.poly_book.clone())
+                                    .unwrap_or_else(|| OrderBook {
+                                        asset_id: signal.token_id.clone(),
+                                        bids: vec![],
+                                        asks: vec![],
+                                        timestamp_ms: now_ms,
+                                    });
+                                reporter.send_opportunity_alert(&signal, price, size, &book);
+                                self.live_market_signals += 1;
+                                if signal.bot_contested {
+                                    self.live_market_walls += 1;
+                                }
                             }
                         }
                     }

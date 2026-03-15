@@ -21,23 +21,23 @@ max_entry_spread = 0.02
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 10
+max_alloc_per_trade = 15
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
-reprice_scale = 0.055
+reprice_scale = 0.06
 # Minimum model output to enter a trade (0.02 = 2.0%)
-min_reprice_pct = 0.017
+min_reprice_pct = 0.02
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
 phase1_target_dampen = 1
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 0.5
+min_alloc_pct = 0.3
 # Hard reject: YES mid beyond this regardless of model
 hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
-max_time_factor = 2.5
+max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
@@ -54,8 +54,8 @@ favorable_maker_timeout_ms = 2000
 entry_threshold = 0.4
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.2
-# Max wait (ms) for Leg 1 maker fill before cancelling
-cancel_window_ms = 3000
+# Cancel Leg 1 if ask drifts up >= this many $ from posted ask
+ask_drift_cancel_cents = 0.02
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
 max_dissenters = 1
 

@@ -39,7 +39,7 @@ ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
     // buildup
     ParamSpec { name: "buildup.entry_threshold", min: 0.0, max: 1.0 },
     ParamSpec { name: "buildup.cancel_threshold", min: 0.0, max: 1.0 },
-    ParamSpec { name: "buildup.cancel_window_ms", min: 100.0, max: 5000.0 },
+    ParamSpec { name: "buildup.ask_drift_cancel_cents", min: 0.005, max: 0.10 },
     ParamSpec { name: "buildup.max_dissenters", min: 0.0, max: 4.0 },
     ParamSpec { name: "buildup.w_cvd", min: 0.0, max: 1.0 },
     ParamSpec { name: "buildup.w_spot_flow", min: 0.0, max: 1.0 },

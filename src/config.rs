@@ -135,8 +135,8 @@ pub struct BuildupTomlConfig {
     pub entry_threshold: f64,
     /// Cancel threshold — cancel unfilled Leg 1 if composite drops below.
     pub cancel_threshold: f64,
-    /// Max wait (ms) for Leg 1 maker fill before cancelling.
-    pub cancel_window_ms: u64,
+    /// Cancel Leg 1 if ask drifts up ≥ this many $ from posted ask.
+    pub ask_drift_cancel_cents: f64,
     /// Maximum dissenting directional metrics allowed in consensus vote (default 1).
     pub max_dissenters: u32,
     // Metric weights (must sum to 1.0)
@@ -179,7 +179,7 @@ impl Default for BuildupTomlConfig {
         Self {
             entry_threshold: 0.40,
             cancel_threshold: 0.25,
-            cancel_window_ms: 500,
+            ask_drift_cancel_cents: 0.02,
             max_dissenters: 1,
             w_cvd: 0.30,
             w_spot_flow: 0.15,

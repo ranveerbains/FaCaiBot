@@ -286,14 +286,26 @@ If the CLOB rejects the order (`Rejected` status -- e.g., price crosses the book
 After Leg 1 is posted (maker resting on book), the order rests until it fills or one of these conditions triggers cancellation:
 
 1. **Flow fade:** `current_composite_score < cancel_threshold` (default 0.25) -- the buildup that triggered entry has dissipated. Cancel the unfilled maker
-2. **Timeout:** `cancel_window_ms` elapsed since posting (configurable) -- prevent indefinite resting
+2. **Ask drift:** Best ask on the directional book moves up by ≥ `ask_drift_cancel_cents` (default $0.02) from the ask at signal time -- the opportunity has passed. `leg1_posted_ask` stores the actual best ask at evaluation time (not the order price). Checked on every event in the tail of `on_event()`
 3. **Opposite-direction buildup:** A new `BuildupConfirmed` fires in the opposite direction to the posted Leg 1 -- the market is reversing, so cancel to avoid filling into a reversed market
 
+All three triggers share the same mutual exclusion guard: `pending_leg1_cancel.is_none() && !leg1_cancel_inflight`. Once any trigger fires and sets `leg1_cancel_inflight = true`, the other two are locked out until `on_cancel_result()` clears the flag. No duplicate cancels are possible.
+
 All triggers dispatch `CancelLeg1Order { order_id }` to the executor. The cancel is a fire-and-confirm operation:
-- **Cancel confirmed** (`was_cancelled = true`): Engine performs full state reset: `leg1_state = None`, `leg1_direction = None`, `pending_leg1_signal = None`, `buildup_detected = false`, `last_buildup = None`, `leg1_posted_ask = None`. Ready for next signal
-- **Cancel NOT confirmed** (`was_cancelled = false`): Order may have filled before cancel reached CLOB. Engine keeps `leg1_cancel_inflight = true` (prevents sustain monitor retries) and waits for User WS fill notification. If User WS sends MATCHED, Leg 1 transitions to `Filled` and hedge begins normally
+- **Cancel confirmed** (`was_cancelled = true`, zero fill): Engine performs full state reset: `leg1_state = None`, `leg1_direction = None`, `pending_leg1_signal = None`, `buildup_detected = false`, `last_buildup = None`, `leg1_posted_ask = None`. Ready for next signal
+- **Cancel with fill** (`size_matched > 0`): Cancel race -- order filled before cancel reached CLOB. Engine transitions to `Filled` and initializes hedge with the authoritative `size_matched` from `get_order_status()`
+- **Cancel NOT confirmed** (`was_cancelled = false`): Order may have filled before cancel reached CLOB. Engine waits for User WS fill notification
 
 There is no repost/chase logic. The maker order is placed once and rests until fill or cancel. This avoids losing queue priority from same-price reposts and prevents the leaky-bucket problem where chase caps reset between buildup episodes.
+
+**Deferred Leg 2 initialization (cancel race fix):**
+When a cancel is in-flight (`leg1_cancel_inflight = true`) and a User WS MATCHED event arrives, the engine transitions `leg1_state` to `Filled` but does NOT call `init_leg2()`. Instead, Leg 2 initialization is deferred to `on_cancel_result()`, which has the authoritative `size_matched` from `get_order_status()`. This prevents the race condition where User WS reports a stale partial fill size while the CLOB has actually matched more shares.
+
+The deferred init applies to all three fill paths:
+- `TradeStatusUpdate` MATCHED handler (primary path)
+- `replay_pending_fills()` Leg 1 handler (buffered fills)
+- `on_cancel_result()` Filled branch (cancel-race detection + deferred init)
+- `on_cancel_result()` zero-fill Filled branch (partial-fill remainder cancelled + deferred init)
 
 **Opposite-direction cancel details:**
 - Checked in `handle_buildup_confirmed()` when `leg1_state` is `Posted`
@@ -304,9 +316,9 @@ There is no repost/chase logic. The maker order is placed once and rests until f
 Guards:
 - `pending_leg1_cancel.is_none()` -- prevents duplicate cancel dispatch while waiting for CLOB response
 - `!leg1_cancel_inflight` -- prevents retry when cancel-not-confirmed
-- **Provisional ID guard**: Sustain checks (timeout, flow fade) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The cancel window and flow fade only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip.
+- **Provisional ID guard**: Sustain checks (ask drift, flow fade) are skipped while the order ID starts with `"sim-leg1-"` (provisional). The checks only activate after `on_order_posted()` replaces the provisional ID with the real CLOB order ID and resets `timestamp_ms` to the confirmation time. This prevents futile cancel attempts against a non-existent CLOB order during the ~1.3s SDK round-trip.
 
-Diagnostic counters: `diag_sustain_cancels` (flow fade + opposite-direction), `diag_sustain_timeouts` (timeout), `diag_opposite_dir_cancels` (opposite-direction buildup).
+Diagnostic counters: `diag_sustain_cancels` (flow fade + ask drift + opposite-direction), `diag_sustain_timeouts` (legacy, no longer incremented), `diag_opposite_dir_cancels` (opposite-direction buildup), `diag_ask_drift_cancels` (ask drift).
 
 ### Fill models
 

@@ -82,7 +82,7 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 3. [Sustain monitoring] On each event while Leg 1 is Posted:
    - Composite score < cancel_threshold -> CancelLeg1Order -> STOP (if confirmed)
-   - cancel_window_ms elapsed -> CancelLeg1Order -> STOP (if confirmed)
+   - Ask drift >= ask_drift_cancel_cents -> CancelLeg1Order -> STOP (if confirmed)
    - Cancel NOT confirmed -> keep Posted, wait for User WS fill
    - Whipsaw (opposite direction signal) -> CancelLeg1Order -> STOP (if confirmed)
 
@@ -91,7 +91,10 @@ record_leg1_fill()                record_leg2_fill() / record_emergency_*()
 
 4b. [LIVE] Executor posts maker post-only GTC
     OrderPosted feedback -> engine stores order_id
-    User WS fill (MATCHED event) -> leg1_state = Filled, init_leg2() (stores entry expected_pct)
+    User WS fill (MATCHED event):
+      - If cancel NOT in-flight -> leg1_state = Filled, init_leg2() immediately
+      - If cancel in-flight -> leg1_state = Filled, defer init_leg2() to on_cancel_result()
+        (uses authoritative size_matched from get_order_status())
 
 5. evaluate_leg2() runs on each event:
    - Phase 1: post at profit target, hold until fill or timeout

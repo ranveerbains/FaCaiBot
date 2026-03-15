@@ -952,15 +952,18 @@ fn test_on_event_ignores_control_variants() {
 fn setup_posted_leg1(direction: Direction) -> StrategyEngine {
     let mut engine = make_engine_with_market(600);
     engine.in_quiet_period = false; // clear post-rotation quiet period for test
+    // Set book FIRST, before setting Leg 1 state — avoids ask-drift cancel firing
+    // during on_event() when the Leg 1 is already Posted with a stale posted_ask.
+    set_book(&mut engine, "0.49", "0.52");
     engine.state.leg1_state = OrderState::Posted {
         order_id: "clob-leg1-001".to_string(),
         price: Decimal::new(50, 2),
         size: Decimal::new(100, 0),
         timestamp_ms: now_epoch_ms(),
     };
-    engine.state.leg1_posted_ask = Some(Decimal::new(50, 2));
+    // Store actual best ask (matches current book ask) to prevent ask-drift cancel.
+    engine.state.leg1_posted_ask = Some(Decimal::new(52, 2));
     engine.leg1_direction = Some(direction);
-    set_book(&mut engine, "0.49", "0.52");
     engine
 }
 
@@ -1037,6 +1040,138 @@ fn test_same_direction_buildup_ignored_when_posted() {
 
     assert!(engine.pending_leg1_cancel.is_none(), "same-direction buildup should NOT queue cancel");
     assert_eq!(engine.diag_opposite_dir_cancels, 0, "opposite_dir_cancels should remain 0");
+}
+
+// ── Ask-drift cancel tests ───────────────────────────────────────────────
+
+#[test]
+fn test_ask_drift_cancel_fires_when_ask_moves_up() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    // Set initial book with ask=0.52, then post Leg 1 with posted_ask=0.52.
+    set_book(&mut engine, "0.49", "0.52");
+    engine.state.leg1_state = OrderState::Posted {
+        order_id: "clob-leg1-drift".to_string(),
+        price: Decimal::new(51, 2),
+        size: Decimal::new(100, 0),
+        timestamp_ms: now_epoch_ms(),
+    };
+    engine.state.leg1_posted_ask = Some(Decimal::new(52, 2)); // actual best ask at signal time
+    engine.leg1_direction = Some(Direction::Up);
+
+    // Move ask up by 0.02 (= threshold) → should trigger cancel.
+    engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
+        asset_id: "yes".to_string(),
+        bids: vec![PriceLevel { price: Decimal::new(49, 2), size: Decimal::new(500, 0) }],
+        asks: vec![PriceLevel { price: Decimal::new(54, 2), size: Decimal::new(500, 0) }],
+        timestamp_ms: now_epoch_ms(),
+    }));
+
+    assert!(engine.pending_leg1_cancel.is_some(), "ask-drift should queue cancel");
+    assert!(engine.leg1_cancel_inflight, "cancel inflight flag should be set");
+    assert_eq!(engine.diag_ask_drift_cancels, 1, "ask_drift_cancels counter should increment");
+}
+
+#[test]
+fn test_ask_drift_cancel_does_not_fire_below_threshold() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.49", "0.52");
+    engine.state.leg1_state = OrderState::Posted {
+        order_id: "clob-leg1-nodrift".to_string(),
+        price: Decimal::new(51, 2),
+        size: Decimal::new(100, 0),
+        timestamp_ms: now_epoch_ms(),
+    };
+    engine.state.leg1_posted_ask = Some(Decimal::new(52, 2));
+    engine.leg1_direction = Some(Direction::Up);
+
+    // Move ask up by only 0.01 (< 0.02 threshold) → should NOT cancel.
+    engine.on_event(IngestorEvent::PolymarketBook(OrderBook {
+        asset_id: "yes".to_string(),
+        bids: vec![PriceLevel { price: Decimal::new(49, 2), size: Decimal::new(500, 0) }],
+        asks: vec![PriceLevel { price: Decimal::new(53, 2), size: Decimal::new(500, 0) }],
+        timestamp_ms: now_epoch_ms(),
+    }));
+
+    assert!(engine.pending_leg1_cancel.is_none(), "drift below threshold should NOT cancel");
+    assert_eq!(engine.diag_ask_drift_cancels, 0);
+}
+
+// ── Deferred Leg 2 init tests ────────────────────────────────────────────
+
+#[test]
+fn test_deferred_leg2_init_on_cancel_result() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    // Generate Leg 1 signal.
+    let _signal = engine.evaluate().expect("should generate Leg 1 signal");
+    assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
+
+    // Simulate CLOB order confirmation (replace provisional ID).
+    engine.on_order_posted(false, "clob-leg1-real".to_string(), Decimal::new(495, 3), Decimal::new(20, 0), None, false, None);
+
+    // Simulate cancel in-flight (e.g., composite fade triggered cancel).
+    engine.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+        order_id: "clob-leg1-real".to_string(),
+    });
+    engine.leg1_cancel_inflight = true;
+
+    // User WS reports fill while cancel is in-flight.
+    engine.on_event(IngestorEvent::TradeStatusUpdate {
+        order_id: "clob-leg1-real".to_string(),
+        status: TradeStatus::Matched,
+        size_matched: Some(Decimal::new(1265, 2)), // 12.65
+        original_size: Some(Decimal::new(20, 0)),
+    });
+
+    // Leg 1 should be Filled but hedge should NOT be initialized yet.
+    assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
+    assert!(engine.hedge.is_none(), "hedge should be deferred while cancel in-flight");
+
+    // Cancel result arrives with authoritative size = 19.99.
+    engine.on_cancel_result(
+        "clob-leg1-real".to_string(),
+        true,
+        false,
+        Some(Decimal::new(1999, 2)), // 19.99
+    );
+
+    // Now Leg 2 should be initialized with the authoritative size.
+    assert!(engine.hedge.is_some(), "hedge should be initialized after cancel result");
+    match &engine.state.leg1_state {
+        OrderState::Filled { size, .. } => {
+            assert_eq!(*size, Decimal::new(1999, 2), "size should be updated to authoritative value");
+        }
+        _ => panic!("expected Filled"),
+    }
+}
+
+#[test]
+fn test_leg2_inits_immediately_when_no_cancel_inflight() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+    engine.state.atr = Some(Decimal::new(2, 3));
+
+    let _signal = engine.evaluate().expect("should generate Leg 1 signal");
+    engine.on_order_posted(false, "clob-leg1-real".to_string(), Decimal::new(495, 3), Decimal::new(20, 0), None, false, None);
+
+    // No cancel in-flight — fill should init Leg 2 immediately.
+    assert!(!engine.leg1_cancel_inflight);
+    engine.on_event(IngestorEvent::TradeStatusUpdate {
+        order_id: "clob-leg1-real".to_string(),
+        status: TradeStatus::Matched,
+        size_matched: None,
+        original_size: None,
+    });
+
+    assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
+    assert!(engine.hedge.is_some(), "hedge should init immediately when no cancel in-flight");
 }
 
 // ── Heartbeat system tests ──────────────────────────────────────────────

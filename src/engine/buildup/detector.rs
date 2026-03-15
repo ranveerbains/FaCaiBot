@@ -8,6 +8,7 @@
 //! 5. Return (composite, direction) or (0, None) if vetoed
 
 use rust_decimal::Decimal;
+use tracing::trace;
 
 use crate::types::market::{
     BuildupInfo, Direction, FuturesAggTrade, FuturesBookTicker, FuturesForceOrder, SpotTrade,
@@ -324,6 +325,13 @@ impl BuildupDetector {
     pub fn tick(&mut self, now_ms: u64) -> (f64, Option<Direction>, Option<BuildupInfo>) {
         self.dirty = false;
         let (score, direction) = self.evaluate(now_ms);
+
+        trace!(
+            score = format!("{:.4}", score),
+            dir = ?direction,
+            threshold = format!("{:.2}", self.entry_threshold),
+            "composite"
+        );
 
         // Direction flip → reset edge-trigger so a new signal can fire immediately.
         if let Some(dir) = direction {
