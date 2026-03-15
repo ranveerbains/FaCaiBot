@@ -188,6 +188,7 @@ pub struct StrategyEngine {
     diag_rej_no_book: u64,    // NoBook: Polymarket book missing
     diag_rej_no_binance: u64, // NoBinance: no Binance reference price
     diag_rej_stale: u64,   // StaleBook
+    diag_rej_spread: u64,  // WideSpread
     diag_rej_skew: u64,    // PriceSkewed
     diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
     diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
@@ -305,6 +306,7 @@ impl StrategyEngine {
             diag_rej_no_book: 0,
             diag_rej_no_binance: 0,
             diag_rej_stale: 0,
+            diag_rej_spread: 0,
             diag_rej_skew: 0,
             diag_rej_reprice: 0,
             diag_rej_paused: 0,
@@ -345,6 +347,7 @@ impl StrategyEngine {
             leg1: Leg1Evaluator {
                 entry_cutoff_secs: config.bot.entry_guards.entry_cutoff_secs,
                 stale_book_ms: config.bot.entry_guards.stale_book_ms,
+                max_entry_spread: Decimal::try_from(config.bot.entry_guards.max_entry_spread).unwrap_or(Decimal::new(3, 2)),
                 max_alloc_per_trade: config.max_alloc_per_trade,
                 reprice_scale: config.reprice_scale,
                 min_reprice_pct: config.min_reprice_pct,
@@ -1330,6 +1333,7 @@ impl StrategyEngine {
                     Leg1RejectReason::NoBook => self.diag_rej_no_book += 1,
                     Leg1RejectReason::NoBinance => self.diag_rej_no_binance += 1,
                     Leg1RejectReason::StaleBook => self.diag_rej_stale += 1,
+                    Leg1RejectReason::WideSpread => self.diag_rej_spread += 1,
                     Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
                     Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
                     Leg1RejectReason::HeartbeatDown => self.diag_rej_heartbeat += 1,
@@ -1622,6 +1626,7 @@ impl StrategyEngine {
             rej_no_book = self.diag_rej_no_book,
             rej_no_bnc = self.diag_rej_no_binance,
             rej_stale = self.diag_rej_stale,
+            rej_spread = self.diag_rej_spread,
             rej_skew = self.diag_rej_skew,
             rej_reprice = self.diag_rej_reprice,
             rej_other = self.diag_rej_other,
@@ -1674,7 +1679,7 @@ impl StrategyEngine {
              Markets rotated: {mkts}  Buildups: {buildups}  Buildup fails: {buildup_fail}  Cutoff drops: {buildups_cut}  Quiet drops: {buildups_quiet}  Cooldown drops: {buildups_cooldown}\n\
              \n\
              <b>Leg 1 Rejections</b>\n\
-             Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Skewed: {skew}\n\
+             Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Spread: {spread}  Skewed: {skew}\n\
              Reprice: {reprice}  Other: {other}\n\
              \n\
              <b>Leg 1</b>\n\
@@ -1704,6 +1709,7 @@ impl StrategyEngine {
             no_book = self.diag_rej_no_book,
             no_bnc = self.diag_rej_no_binance,
             stale = self.diag_rej_stale,
+            spread = self.diag_rej_spread,
             skew = self.diag_rej_skew,
             reprice = self.diag_rej_reprice,
             other = self.diag_rej_other,

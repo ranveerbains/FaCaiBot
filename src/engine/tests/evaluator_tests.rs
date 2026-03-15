@@ -285,6 +285,7 @@ fn make_leg1_evaluator(dampen: &str) -> Leg1Evaluator {
     Leg1Evaluator {
         entry_cutoff_secs: 25,
         stale_book_ms: 5000,
+        max_entry_spread: Decimal::new(10, 1), // 1.0 — wide enough that tests don't trigger
         max_alloc_per_trade: Decimal::new(15, 0),
         reprice_scale: Decimal::new(5, 2),    // 0.05
         min_reprice_pct: Decimal::new(1, 3),  // 0.001 — low so tests pass easily

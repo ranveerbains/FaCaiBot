@@ -20,6 +20,9 @@ pub struct EntryGuardsConfig {
     pub trade_cooldown_ms: u64,
     /// Consecutive heartbeat failures before assuming CLOB cancelled all resting orders.
     pub heartbeat_dead_threshold: u32,
+    /// Maximum bid-ask spread on the directional book to allow Leg 1 entry.
+    /// Prevents entries on stale/illiquid Polymarket books (e.g. off-hours).
+    pub max_entry_spread: f64,
 }
 
 impl Default for EntryGuardsConfig {
@@ -31,6 +34,7 @@ impl Default for EntryGuardsConfig {
             rotation_quiet_ms: 30000,
             trade_cooldown_ms: 5000,
             heartbeat_dead_threshold: 5,
+            max_entry_spread: 0.03,
         }
     }
 }

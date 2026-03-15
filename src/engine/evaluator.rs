@@ -39,6 +39,8 @@ pub(crate) enum Leg1RejectReason {
     StaleBook,
     /// YES mid-price outside the tradeable range (too skewed toward resolution).
     PriceSkewed,
+    /// Bid-ask spread on directional book exceeds `max_entry_spread`.
+    WideSpread,
     /// Model output below `min_reprice_pct` — insufficient expected repricing.
     InsufficientRepricing,
     /// Heartbeat is down — CLOB may have cancelled resting orders.
@@ -71,6 +73,7 @@ pub(crate) enum Leg1Outcome {
 pub(crate) struct Leg1Evaluator {
     pub entry_cutoff_secs: u64,
     pub stale_book_ms: u64,
+    pub max_entry_spread: Decimal,
     pub max_alloc_per_trade: Decimal,
     // Repricing model fields
     pub reprice_scale: Decimal,
@@ -190,6 +193,14 @@ impl Leg1Evaluator {
         if book_age_ms > self.stale_book_ms {
             debug!(book_age_ms, "evaluate() BLOCKED: poly book stale");
             return Leg1Outcome::Rejected(Leg1RejectReason::StaleBook);
+        }
+
+        // Guard: wide spread — reject if bid-ask spread on the directional book is too wide.
+        // Prevents entries on illiquid/stale Polymarket books (e.g. off US market hours).
+        let spread = best_ask_price - best_bid_price;
+        if spread > self.max_entry_spread {
+            debug!(%spread, max = %self.max_entry_spread, "evaluate() BLOCKED: spread too wide");
+            return Leg1Outcome::Rejected(Leg1RejectReason::WideSpread);
         }
 
         // Guard: hard skew cap — reject if YES mid beyond safe range.

@@ -178,11 +178,12 @@ When `buildup_detected = true`, the evaluator checks every guard in sequence. **
 | 3 | **Direction book** | Book for YES (Up) or NO (Down) token exists with bid+ask | `NoBook` | Can't price without book |
 | 4 | **Binance price** | `binance_price` exists | `NoBinance` | Reference price needed |
 | 5 | **Stale book** | `book_age_ms > stale_book_ms` (500ms) | `StaleBook` | Stale data = unreliable pricing |
-| 6 | **Hard skew cap** | YES mid > `hard_skew_cap` or < `1 - hard_skew_cap` (default 0.90) | `PriceSkewed` | Extreme markets have negligible repricing capacity |
-| 7 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After book** -- `rej_busy` counts only signals that had a valid book |
-| 8 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
-| 9 | **Repricing model** | `expected_pct < min_reprice_pct` (2.0%) | `InsufficientRepricing` | Model output too low to justify entry |
-| 10 | **Min size clamp** | Entry size clamped to `max(5, ceil($1/price))` | n/a (clamped, not rejected) | CLOB minimum: 5 shares for maker, $1.00 notional for FOK |
+| 6 | **Wide spread** | `best_ask - best_bid > max_entry_spread` (default 0.03) | `WideSpread` | Illiquid book = wide pair cost, likely Phase 1 breach |
+| 7 | **Hard skew cap** | YES mid > `hard_skew_cap` or < `1 - hard_skew_cap` (default 0.90) | `PriceSkewed` | Extreme markets have negligible repricing capacity |
+| 8 | **Active trade** | `leg1_state != None` | `ActiveTrade` | **After book** -- `rej_busy` counts only signals that had a valid book |
+| 9 | **Entry cutoff** | `time_remaining_secs < entry_cutoff_secs` (see config.toml) | `Other` | Defence-in-depth |
+| 10 | **Repricing model** | `expected_pct < min_reprice_pct` (2.0%) | `InsufficientRepricing` | Model output too low to justify entry |
+| 11 | **Min size clamp** | Entry size clamped to `max(5, ceil($1/price))` | n/a (clamped, not rejected) | CLOB minimum: 5 shares for maker, $1.00 notional for FOK |
 
 ### Direction-aware book selection
 

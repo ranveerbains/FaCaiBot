@@ -16,6 +16,8 @@ rotation_quiet_ms = 0
 trade_cooldown_ms = 0
 # Consecutive heartbeat failures before assuming CLOB cancelled resting orders
 heartbeat_dead_threshold = 5
+# Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
+max_entry_spread = 0.02
 
 [capital]
 # Maximum USDC per leg per trade
@@ -41,7 +43,7 @@ max_time_factor = 2.5
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 2500
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.02
+phase1_breach_threshold = 1.03
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -49,9 +51,9 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.35
+entry_threshold = 0.4
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.15
+cancel_threshold = 0.2
 # Max wait (ms) for Leg 1 maker fill before cancelling
 cancel_window_ms = 3000
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
@@ -59,13 +61,13 @@ max_dissenters = 1
 
 # Metric weights (must sum to 1.0)
 # Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
-w_basis = 0.35
+w_basis = 0.4
 # Net aggressive buying/selling acceleration on futures — SUPPORTING, empirical (no peer review)
 w_cvd = 0.20
 # Rate of change of bid/ask depth imbalance on spot — CONFIRMING, academically validated
 w_obi = 0.20
 # Net aggressive buy vs sell flow on spot trades — CONFIRMING, VPIN-backed but lags futures
-w_spot_flow = 0.15
+w_spot_flow = 0.10
 # Forced liquidation volume on futures — REACTIVE risk gauge, not predictive
 w_liq = 0.05
 # Spot displacement from EMA normalized by ATR — VOLATILITY only, no direction prediction
