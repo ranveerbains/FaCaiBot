@@ -41,9 +41,9 @@ max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 2500
+phase1_timeout_ms = 6000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.03
+phase1_breach_threshold = 1.05
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -51,9 +51,9 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.1
+entry_threshold = 0.4
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.05
+cancel_threshold = 0.2
 # Cancel Leg 1 if ask drifts up >= this many $ from posted ask
 ask_drift_cancel_cents = 0.02
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
@@ -61,7 +61,7 @@ max_dissenters = 1
 
 # Metric weights (must sum to 1.0)
 # Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
-w_basis = 0.4
+w_basis = 0.40
 # Net aggressive buying/selling acceleration on futures — SUPPORTING, empirical (no peer review)
 w_cvd = 0.20
 # Rate of change of bid/ask depth imbalance on spot — CONFIRMING, academically validated
@@ -99,8 +99,8 @@ atr_saturation = 15.0
 
 # EMA half-lives (ms) — time for old value to decay to 50% weight
 # Time-based: consistent smoothing regardless of data arrival rate
-cvd_fast_halflife_ms = 500
-cvd_slow_halflife_ms = 100
-spot_flow_halflife_ms = 500
-obi_velocity_halflife_ms = 500
-basis_halflife_ms = 1000
+cvd_fast_halflife_ms = 200
+cvd_slow_halflife_ms = 500
+spot_flow_halflife_ms = 250
+obi_velocity_halflife_ms = 250
+basis_halflife_ms = 250
