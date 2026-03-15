@@ -266,11 +266,17 @@ impl LiveExecutor {
                     %already_filled,
                     "Leg 1: maker posted"
                 );
+                // Use actual fill from REST response when available; fall back to posted size.
+                let fill_size = if already_filled && resp.size_matched > Decimal::ZERO {
+                    resp.size_matched
+                } else {
+                    signal.size
+                };
                 let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                     is_leg2: false,
                     order_id: resp.order_id,
                     price: signal.price,
-                    size: signal.size,
+                    size: fill_size,
                     fill_method: None,
                     already_filled,
                     order_tag: None,
