@@ -409,11 +409,12 @@ impl BuildupDetector {
             (self.w_atr, self.atr_displacement.normalized(now_ms), self.atr_displacement.direction()),
         ];
 
-        // 2. Direction consensus from directional metrics (indices 0-4: CVD, spot_flow, OBI, basis, liq).
-        // ATR (index 5) is excluded — it measures volatility magnitude only, not direction.
+        // 2. Direction consensus from predictive/confirming metrics (indices 0-3: CVD, spot_flow, OBI, basis).
+        // Liq pressure (index 4) excluded — reactive signal (fires after price already moved).
+        // ATR (index 5) excluded — measures volatility magnitude only, not direction.
         let mut up_count = 0u32;
         let mut down_count = 0u32;
-        for i in 0..5 {
+        for i in 0..4 {
             let (_, norm, dir) = metrics[i];
             if norm > 0.0 {
                 match dir {

@@ -13,19 +13,18 @@ fn test_empty_returns_zero() {
 }
 
 #[test]
-fn test_causal_veto_spot_only() {
-    // 3 bullish non-leading metrics (OBI + spot_flow + liq): direction check passes
-    // (majority=3, minority=0), but causal check fails (no CVD or basis_delta) → causal veto.
+fn test_direction_veto_spot_only() {
+    // Only 2 confirming metrics (OBI + spot_flow) are bullish — majority=2 < 3 → direction veto.
+    // (Liq excluded from direction voting as a reactive signal.)
     let mut det = default_detector();
     for i in 0..50u64 {
         det.obi_velocity.update(0.01 * i as f64, i * 50);
         det.spot_flow.update(1.0, false, i * 50);
-        det.liq_pressure.update("BUY", 1.0, i * 50); // short liquidations = bullish
     }
     let (score, _) = det.evaluate(2500);
-    // Should be 0 due to causal veto (no leading).
+    // Should be 0 due to direction veto (majority < 3).
     assert_eq!(score, 0.0);
-    assert_eq!(det.diag_causal_vetoes, 1);
+    assert!(det.diag_direction_vetoes > 0);
 }
 
 #[test]
@@ -44,23 +43,19 @@ fn test_causal_veto_futures_only() {
 #[test]
 fn test_direction_consensus_veto() {
     let mut det = default_detector();
-    // Push 3 metrics bullish, 2 metrics bearish → minority=2 > 1 → veto.
-    // CVD needs increasing quantity to produce acceleration with time-based EMA.
-    // Basis needs staggered spot/futures updates (different timestamps) so
-    // the delta EMA actually accumulates (dt=0 → alpha=0 would zero it out).
+    // Push 2 metrics bullish, 2 metrics bearish → tie (majority=2 < 3) → veto.
     for i in 0..50u64 {
         let t = i * 10;
         det.cvd.update((i + 1) as f64, false, t);       // bullish (increasing buy volume)
-        det.spot_flow.update(1.0, false, t);  // bullish
         det.obi_velocity.update(0.01 * i as f64, t); // bullish (rising OBI)
+        // Spot flow bearish (sell-side).
+        det.spot_flow.update(1.0, true, t);
         // Basis bearish (futures mid dropping) — stagger by 5ms so dt > 0.
         det.basis_delta.update_spot_mid(50000.0, t);
         det.basis_delta.update_futures_mid(49999.0 - i as f64, 49999.5 - i as f64, t + 5);
-        // Liq bearish (long liquidations).
-        det.liq_pressure.update("SELL", 1.0, t);
     }
     let (score, dir) = det.evaluate(500);
-    // Majority is Up (3 up), minority is Down (2) > 1 → should be vetoed.
+    // 2 up (CVD, OBI), 2 down (spot_flow, basis) → majority=2 < 3 → vetoed.
     assert_eq!(score, 0.0);
     assert!(dir.is_none());
     assert!(det.diag_direction_vetoes > 0);
@@ -112,25 +107,24 @@ fn test_below_cancel_threshold_when_stale() {
 
 #[test]
 fn test_max_dissenters_zero() {
-    // With max_dissenters=0, a 4-1 vote (1 dissenter) should be vetoed.
+    // With max_dissenters=0, a 3-1 vote (1 dissenter) should be vetoed.
     let mut cfg = BuildupConfig::default();
     cfg.max_dissenters = 0;
     let mut det = BuildupDetector::new(&cfg);
 
-    // Push 4 metrics bullish, 1 bearish → minority=1 > max_dissenters=0 → veto.
+    // Push 3 metrics bullish, 1 bearish → minority=1 > max_dissenters=0 → veto.
     for i in 0..50u64 {
         let t = i * 10;
-        // Bullish: CVD, spot_flow, OBI, basis (4 metrics).
+        // Bullish: CVD, OBI, basis (3 metrics).
         det.cvd.update((i + 1) as f64 * 2.0, false, t);
-        det.spot_flow.update(2.0, false, t);
         det.obi_velocity.update(0.01 * i as f64, t);
         det.basis_delta.update_spot_mid(50000.0, t);
         det.basis_delta.update_futures_mid(50001.0 + i as f64 * 0.1, 50002.0 + i as f64 * 0.1, t);
-        // Bearish: liq (long liquidations = bearish).
-        det.liq_pressure.update("SELL", 1.0, t);
+        // Bearish: spot_flow (sell-side).
+        det.spot_flow.update(2.0, true, t);
     }
     let (score, dir) = det.evaluate(500);
-    // 4 up, 1 down → minority=1 > max_dissenters=0 → vetoed.
+    // 3 up, 1 down → minority=1 > max_dissenters=0 → vetoed.
     assert_eq!(score, 0.0, "should be vetoed with max_dissenters=0 and 1 dissenter");
     assert!(dir.is_none());
     assert!(det.diag_direction_vetoes > 0);

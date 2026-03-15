@@ -11,7 +11,7 @@ binance_stale_event_ms = 150
 # Max age (ms) of Polymarket book before blocking entry
 stale_book_ms = 850
 # Quiet period (ms) after market rotation before allowing trades
-rotation_quiet_ms = 0
+rotation_quiet_ms = 5000
 # Cooldown (ms) after trade completion before allowing new entries
 trade_cooldown_ms = 0
 # Consecutive heartbeat failures before assuming CLOB cancelled resting orders
@@ -51,9 +51,9 @@ favorable_maker_timeout_ms = 2000
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.4
+entry_threshold = 0.35
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.2
+cancel_threshold = 0.15
 # Cancel Leg 1 if ask drifts up >= this many $ from posted ask
 ask_drift_cancel_cents = 0.02
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
