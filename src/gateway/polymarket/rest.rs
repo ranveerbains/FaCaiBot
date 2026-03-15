@@ -240,7 +240,9 @@ impl PolymarketGateway {
             order_id: resp.order_id,
             status,
             timestamp_ms: now_ms(),
-            size_matched: resp.taking_amount.max(resp.making_amount),
+            // All our orders are BUY: taking_amount = shares received (correct unit).
+            // making_amount is USDC paid — using max() would pick USDC when price > $0.50.
+            size_matched: resp.taking_amount,
         })
     }
 
