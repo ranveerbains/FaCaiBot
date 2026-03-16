@@ -29,7 +29,7 @@ reprice_scale = 0.065
 # Minimum model output to enter a trade (0.02 = 2.0%)
 min_reprice_pct = 0.03
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
-phase1_target_dampen = 1
+phase1_target_dampen = 0.7
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
 min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model
@@ -37,13 +37,13 @@ hard_skew_cap = 0.90
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
-max_time_factor = 2.25
+max_time_factor = 2
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 10000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.12
+phase1_breach_threshold = 1.08
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -51,7 +51,7 @@ favorable_maker_timeout_ms = 2500
 
 [buildup]
 # Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.60
+entry_threshold = 0.65
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.10
 # Cancel Leg 1 if ask drifts up >= this many $ from posted ask
