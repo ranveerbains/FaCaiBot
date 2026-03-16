@@ -810,7 +810,10 @@ impl StrategyEngine {
                             // Partial fill detection — defer alert to MINED/CONFIRMED.
                             // Round to 2dp: CLOB fills in fractional shares — dust is a full fill.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                if matched.round_dp(2) < original.round_dp(2) {
+                                let dust_threshold = Decimal::new(1, 2); // 0.01 shares
+                                if matched.round_dp(2) < original.round_dp(2)
+                                    && (original - matched) >= dust_threshold
+                                {
                                     warn!(%order_id, %matched, %original, "partial fill on Leg 1 — deferring alert to MINED");
                                     self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
                                         leg: "Leg 1", size_matched: matched, original_size: original,
@@ -972,7 +975,10 @@ impl StrategyEngine {
                             // Round to 2dp before comparing: CLOB fills in fractional shares
                             // (e.g., 17.967825 vs 17.97) — dust differences are full fills.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                if matched.round_dp(2) < original.round_dp(2) {
+                                let dust_threshold = Decimal::new(1, 2); // 0.01 shares
+                                if matched.round_dp(2) < original.round_dp(2)
+                                    && (original - matched) >= dust_threshold
+                                {
                                     // Partial fill — order still resting. Track but DON'T transition.
                                     info!(%order_id, %matched, %original, "Leg 2 partial fill — order still resting");
                                     self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
@@ -2144,6 +2150,9 @@ impl StrategyEngine {
                 self.leg1_retry_count = 0;
                 self.leg1_cancel_retryable = false;
                 self.original_signal_ask = None;
+                // Activate cooldown to prevent re-entry on decaying buildup metrics.
+                self.in_trade_cooldown = true;
+                self.last_trade_complete_ms = now_epoch_ms();
             }
         }
         warn!(is_leg2, "order placement failed — leg state reset to None");
@@ -2325,8 +2334,8 @@ impl StrategyEngine {
                         warn!(%order_id, %filled, "Leg 1 cancel result: size_matched > 0 but leg1_state=None — ignoring");
                     }
                 }
-            } else if was_cancelled || size_matched.is_some() {
-                // filled == 0 and either cancel confirmed or query succeeded → nothing filled.
+            } else if was_cancelled {
+                // filled == 0 and cancel confirmed → nothing filled, order is gone.
                 if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
                     // Partial-fill remainder cancelled — trade continues with hedge.
                     debug!(%order_id, "Leg 1 partial-fill remainder cancelled — trade continues");
@@ -2413,9 +2422,50 @@ impl StrategyEngine {
                         self.pending_leg1_signal = None;
                         self.leg1_retry_count = 0;
                         self.original_signal_ask = None;
+                        // Activate cooldown to prevent re-entry on decaying buildup metrics.
+                        self.in_trade_cooldown = true;
+                        self.last_trade_complete_ms = now_epoch_ms();
                     }
                     self.leg1_cancel_retryable = false;
                 }
+            } else if size_matched.is_some() {
+                // Cancel NOT confirmed but query succeeded (filled == 0) — order is still live.
+                // Do NOT reset state or retry. Let sustain re-evaluate on next tick.
+                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
+                    // User WS fill arrived during cancel — trust it, init deferred Leg 2.
+                    if self.hedge.is_none() {
+                        if let OrderState::Filled { price, size, .. } = &self.state.leg1_state {
+                            let fill_price = *price;
+                            let fill_size = *size;
+                            let now_ms = now_epoch_ms();
+                            info!(%order_id, %fill_price, %fill_size,
+                                "Leg 1 cancel NOT confirmed but filled — deferred Leg 2 init");
+                            self.init_leg2(fill_price, fill_size, now_ms);
+                            self.diag_leg1_fills += 1;
+                            self.live_trade_meta = LiveTradeMeta::default();
+
+                            if let (Some(reporter), Some(signal)) = (
+                                self.reporter.clone(),
+                                self.pending_leg1_signal.clone(),
+                            ) {
+                                let book = signal.book_snapshot.clone()
+                                    .or_else(|| self.state.poly_book.clone())
+                                    .unwrap_or_else(|| OrderBook {
+                                        asset_id: signal.token_id.clone(),
+                                        bids: vec![], asks: vec![],
+                                        timestamp_ms: now_ms,
+                                    });
+                                reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
+                                self.live_market_signals += 1;
+                                if signal.bot_contested { self.live_market_walls += 1; }
+                            }
+                        }
+                    }
+                } else {
+                    // Order is still live on CLOB — keep Posted state, sustain will re-evaluate.
+                    warn!(%order_id, "Leg 1 cancel NOT confirmed (0 filled) — order still live, keeping Posted state");
+                }
+                self.leg1_cancel_retryable = false;
             } else {
                 // Query failed AND was_cancelled=false → defensive fallback.
                 // Keep state as-is, wait for User WS.

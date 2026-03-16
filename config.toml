@@ -12,8 +12,8 @@ binance_stale_event_ms = 150
 stale_book_ms = 850
 # Quiet period (ms) after market rotation before allowing trades
 rotation_quiet_ms = 5000
-# Cooldown (ms) after trade completion before allowing new entries
-trade_cooldown_ms = 0
+# Cooldown (ms) after trade completion or Leg 1 cancel before allowing new entries
+trade_cooldown_ms = 2000
 # Consecutive heartbeat failures before assuming CLOB cancelled resting orders
 heartbeat_dead_threshold = 5
 # Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
@@ -29,21 +29,21 @@ reprice_scale = 0.065
 # Minimum model output to enter a trade (0.02 = 2.0%)
 min_reprice_pct = 0.03
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
-phase1_target_dampen = 0.8
+phase1_target_dampen = 0.9
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
 min_alloc_pct = 0.5
 # Hard reject: YES mid beyond this regardless of model
-hard_skew_cap = 0.90
+hard_skew_cap = 0.85
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
-max_time_factor = 2
+max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 10000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.08
+phase1_breach_threshold = 1.10
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book

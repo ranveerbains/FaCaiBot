@@ -1480,3 +1480,91 @@ fn test_leg1_retry_reset_on_fill() {
     engine.on_trade_complete();
     assert_eq!(engine.leg1_retry_count, 0, "retry count should reset on trade complete");
 }
+
+#[test]
+fn test_leg1_cancel_not_confirmed_keeps_posted() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    engine.on_order_posted(
+        false,
+        "clob-phantom".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate ask-drift cancel attempt (retryable).
+    engine.leg1_cancel_retryable = true;
+    engine.leg1_cancel_inflight = true;
+
+    // Cancel NOT confirmed, but query succeeded with 0 filled — order is still live.
+    engine.on_cancel_result(
+        "clob-phantom".to_string(),
+        false, // was_cancelled = false
+        false,
+        Some(Decimal::ZERO), // size_matched = 0
+    );
+
+    // Order should remain Posted — no retry, no reset.
+    assert!(
+        matches!(engine.state.leg1_state, OrderState::Posted { .. }),
+        "leg1_state should stay Posted when cancel not confirmed"
+    );
+    assert!(!engine.leg1_cancel_retryable, "retryable flag should be cleared");
+    assert!(!engine.leg1_cancel_inflight, "cancel_inflight should be cleared");
+    // Should NOT have entered retry path.
+    assert_eq!(engine.leg1_retry_count, 0, "should not retry when cancel not confirmed");
+    // buildup_detected should remain as-is (not re-armed, not cleared).
+    assert!(engine.state.last_buildup.is_some(), "last_buildup should not be cleared");
+}
+
+#[test]
+fn test_leg1_cancel_not_confirmed_with_fill_inits_leg2() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    engine.on_order_posted(
+        false,
+        "clob-phantom-fill".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate cancel in-flight + User WS fill arriving first.
+    engine.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
+        order_id: "clob-phantom-fill".to_string(),
+    });
+    engine.leg1_cancel_inflight = true;
+
+    // User WS reports fill while cancel is in-flight → deferred.
+    engine.on_event(IngestorEvent::TradeStatusUpdate {
+        order_id: "clob-phantom-fill".to_string(),
+        status: TradeStatus::Matched,
+        size_matched: Some(Decimal::new(20, 0)),
+        original_size: Some(Decimal::new(20, 0)),
+    });
+
+    assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
+    assert!(engine.hedge.is_none(), "hedge should be deferred while cancel in-flight");
+
+    // Cancel NOT confirmed (was_cancelled=false), query says 0 filled (stale).
+    // But leg1_state is already Filled from User WS — trust User WS.
+    engine.on_cancel_result(
+        "clob-phantom-fill".to_string(),
+        false, // was_cancelled = false
+        false,
+        Some(Decimal::ZERO), // stale query result
+    );
+
+    // Leg 2 should be initialized from the User WS fill.
+    assert!(engine.hedge.is_some(), "hedge should init when cancel not confirmed but filled");
+    assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
+}
