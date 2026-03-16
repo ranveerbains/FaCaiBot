@@ -418,6 +418,10 @@ impl Leg2Evaluator {
         if leg1_size <= Decimal::ZERO {
             return None;
         }
+        // CLOB rejects orders < 5 shares or < $1 notional — don't generate a signal.
+        if leg1_size < Decimal::new(5, 0) {
+            return None;
+        }
 
         let reference_price = state.binance_price?;
         let tick = state.tick_size;

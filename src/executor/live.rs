@@ -965,9 +965,9 @@ impl LiveExecutor {
         // Cancel Phase 1 order first (sequential, not alongside).
         // After cancel, query fill status to determine how much Phase 1 actually filled.
         let mut phase1_filled = Decimal::ZERO;
-        if let Some(ref phase1_id) = self.active_leg2_phase1_id {
+        if let Some(phase1_id) = self.active_leg2_phase1_id.clone() {
             info!(%phase1_id, "Phase 2: cancelling Phase 1 order first");
-            let was_cancelled = match self.poly.cancel_order(phase1_id).await {
+            let was_cancelled = match self.poly.cancel_order(&phase1_id).await {
                 Ok(cancelled) => {
                     info!(%phase1_id, %cancelled, "Phase 2: Phase 1 cancel result");
                     cancelled
@@ -978,35 +978,61 @@ impl LiveExecutor {
                 }
             };
             // Query authoritative fill status after cancel.
-            let size_matched = match self.poly.get_order_status(phase1_id).await {
+            let size_matched = match self.poly.get_order_status(&phase1_id).await {
                 Ok((_status, matched, _original)) => Some(matched),
                 Err(e) => {
                     warn!(%phase1_id, error = %e, "Phase 2: get_order_status failed — assuming zero fill");
                     None
                 }
             };
-            // Send CancelResult so engine knows Phase 1 fill status.
+            phase1_filled = size_matched.unwrap_or(Decimal::ZERO);
+            self.active_leg2_phase1_id = None;
+
+            // Compute remainder: leg1_size - phase1_filled.
+            let remainder = (signal.size - phase1_filled).max(Decimal::ZERO).round_dp(2);
+            // CLOB rejects orders < 5 shares or < $1 notional — treat as fully filled.
+            let min_notional_size = (Decimal::ONE / signal.price).ceil();
+            let remainder_too_small = remainder < Decimal::new(5, 0)
+                || remainder < min_notional_size;
+            if remainder <= Decimal::ZERO || remainder_too_small {
+                info!(
+                    phase1_filled = %phase1_filled,
+                    signal_size = %signal.size,
+                    %remainder,
+                    "Phase 1 sufficiently filled during cancel — no Phase 2 needed"
+                );
+                // Phase 1 fully filled — tell the engine so it transitions leg2_state to Filled.
+                // Use the Phase 1 price from the hedge.
+                // NOTE: Do NOT send CancelResult here — it would store leg2_phase1_fill,
+                // and the OrderPosted{already_filled} below would double-count via weighted avg.
+                let phase1_price = signal.leg1_fill_price
+                    .map(|l1p| Decimal::ONE - l1p - signal.profit_target_pct)
+                    .unwrap_or(signal.price);
+                let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
+                    is_leg2: true,
+                    order_id: format!("phase1-filled-{}", epoch_ms()),
+                    price: phase1_price,
+                    size: phase1_filled.round_dp(2),
+                    fill_method: None,
+                    already_filled: true,
+                    order_tag: None,
+                });
+                return;
+            }
+
+            // Actual partial fill — send CancelResult so engine stores leg2_phase1_fill
+            // for weighted averaging when Phase 2 eventually fills.
             let _ = self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
                 order_id: phase1_id.to_string(),
                 was_cancelled,
                 is_leg2: true,
                 size_matched,
             });
-            phase1_filled = size_matched.unwrap_or(Decimal::ZERO);
-            self.active_leg2_phase1_id = None;
         }
 
-        // Compute remainder: leg1_size - phase1_filled.
+        // Compute remainder for Phase 2: leg1_size - phase1_filled.
+        // (If no Phase 1 order existed, phase1_filled = 0, so remainder = signal.size.)
         let remainder = (signal.size - phase1_filled).max(Decimal::ZERO).round_dp(2);
-        if remainder <= Decimal::ZERO {
-            info!(
-                phase1_filled = %phase1_filled,
-                signal_size = %signal.size,
-                "Phase 1 fully filled during cancel — no Phase 2 needed"
-            );
-            return;
-        }
-
         let order = OrderRequest::post_only_gtc(
             signal.token_id.clone(),
             signal.side,
