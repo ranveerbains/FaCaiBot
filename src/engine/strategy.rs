@@ -133,6 +133,11 @@ pub struct StrategyEngine {
     max_leg1_retries: u32,
     /// Whether the current pending cancel is retryable (ask-drift = true, composite-fade/opposite = false).
     leg1_cancel_retryable: bool,
+    /// Maximum cumulative ask chase ($) for ask-drift retries (from config).
+    max_ask_chase_cents: Decimal,
+    /// Best ask at the time of the ORIGINAL signal (first attempt). Preserved across retries
+    /// to measure cumulative chase. Cleared on full reset / trade complete / rotation.
+    original_signal_ask: Option<Decimal>,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -298,6 +303,8 @@ impl StrategyEngine {
             leg1_retry_count: 0,
             max_leg1_retries: config.bot.buildup.max_leg1_retries,
             leg1_cancel_retryable: false,
+            max_ask_chase_cents: Decimal::try_from(config.bot.buildup.max_ask_chase_cents).unwrap_or(Decimal::new(3, 2)),
+            original_signal_ask: None,
             pending_tick_size_cmd: None,
             pending_heartbeat_cancel: None,
             heartbeat_dead_threshold: config.bot.entry_guards.heartbeat_dead_threshold,
@@ -761,6 +768,7 @@ impl StrategyEngine {
                 self.leg1_cancel_inflight = false;
                 self.leg1_retry_count = 0;
                 self.leg1_cancel_retryable = false;
+                self.original_signal_ask = None;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
                 self.prev_leg2_order = None;
@@ -1376,6 +1384,7 @@ impl StrategyEngine {
         // Fresh buildup resets retry counter (new signal, new budget).
         self.leg1_retry_count = 0;
         self.leg1_cancel_retryable = false;
+        self.original_signal_ask = None;
 
         info!(
             direction = ?buildup.direction,
@@ -1482,6 +1491,10 @@ impl StrategyEngine {
                 };
                 // Record best_ask at time of signal for ask-drift sustain monitoring.
                 self.state.leg1_posted_ask = signal.best_ask;
+                // Store original ask on first attempt only — used for cumulative chase cap.
+                if self.original_signal_ask.is_none() {
+                    self.original_signal_ask = signal.best_ask;
+                }
                 self.state.cumulative_used += alloc;
                 self.leg1_direction = Some(direction);
                 self.pending_leg1_signal = Some(signal.clone());
@@ -1741,6 +1754,7 @@ impl StrategyEngine {
             self.leg1_cancel_inflight = false;
             self.leg1_retry_count = 0;
             self.leg1_cancel_retryable = false;
+            self.original_signal_ask = None;
             self.state.buildup_detected = false;
             self.state.last_buildup = None;
         }
@@ -2129,6 +2143,7 @@ impl StrategyEngine {
                 self.pending_leg1_signal = None;
                 self.leg1_retry_count = 0;
                 self.leg1_cancel_retryable = false;
+                self.original_signal_ask = None;
             }
         }
         warn!(is_leg2, "order placement failed — leg state reset to None");
@@ -2221,6 +2236,7 @@ impl StrategyEngine {
                 // Shares were filled before/during cancel — handle based on current state.
                 self.leg1_retry_count = 0;
                 self.leg1_cancel_retryable = false;
+                self.original_signal_ask = None;
                 let now_ms = now_epoch_ms();
                 match &self.state.leg1_state {
                     OrderState::Posted { price, .. } => {
@@ -2344,8 +2360,35 @@ impl StrategyEngine {
                         }
                     }
                 } else {
-                    // Cancel confirmed with 0 filled — retry if cancel was retryable (ask-drift).
-                    if self.leg1_cancel_retryable
+                    // Cancel confirmed with 0 filled — retry if ask-drift and chase within bounds.
+                    let chase_ok = if self.leg1_cancel_retryable {
+                        // Check cumulative chase from original signal ask.
+                        if let (Some(orig_ask), Some(dir)) = (self.original_signal_ask, self.leg1_direction) {
+                            let current_ask = match dir {
+                                Direction::Up => self.state.poly_yes_book.as_ref()
+                                    .or(self.state.poly_book.as_ref()),
+                                Direction::Down => self.state.poly_no_book.as_ref()
+                                    .or(self.state.poly_book.as_ref()),
+                            }.and_then(|b| b.best_ask()).map(|a| a.price);
+                            if let Some(cur) = current_ask {
+                                let chase = cur - orig_ask;
+                                if chase > self.max_ask_chase_cents {
+                                    info!(%cur, %orig_ask, %chase, max = %self.max_ask_chase_cents,
+                                        "ask-drift retry blocked — cumulative chase exceeds cap");
+                                    false
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false // no book → can't retry
+                            }
+                        } else {
+                            false // no original ask or direction → can't retry
+                        }
+                    } else {
+                        false // not retryable (composite fade / opposite dir)
+                    };
+                    if chase_ok
                         && self.leg1_retry_count < self.max_leg1_retries
                         && self.state.last_buildup.is_some()
                     {
@@ -2369,6 +2412,7 @@ impl StrategyEngine {
                         self.state.last_buildup = None;
                         self.pending_leg1_signal = None;
                         self.leg1_retry_count = 0;
+                        self.original_signal_ask = None;
                     }
                     self.leg1_cancel_retryable = false;
                 }
@@ -2706,6 +2750,7 @@ impl StrategyEngine {
         self.leg1_cancel_inflight = false;
         self.leg1_retry_count = 0;
         self.leg1_cancel_retryable = false;
+        self.original_signal_ask = None;
         // Dual-order tracking: clear IDs on trade reset.
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
@@ -3476,6 +3521,7 @@ impl StrategyEngine {
         self.leg1_cancel_inflight = false;
         self.leg1_retry_count = 0;
         self.leg1_cancel_retryable = false;
+        self.original_signal_ask = None;
         // Leg 2 partial fill tracking: clear on Leg 1 reset.
         self.leg2_partial_filled = Decimal::ZERO;
         self.leg2_phase1_fill = None;

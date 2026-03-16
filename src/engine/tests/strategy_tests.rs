@@ -1396,6 +1396,47 @@ fn test_leg1_retry_blocked_on_true_cancel() {
 }
 
 #[test]
+fn test_leg1_ask_drift_retry_blocked_by_chase_cap() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    // original_signal_ask should be set to 0.505 (the ask at first signal time).
+    assert_eq!(engine.original_signal_ask, Some(Decimal::new(505, 3)));
+
+    engine.on_order_posted(
+        false,
+        "clob-chase-cap".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate ask-drift cancel (retryable).
+    engine.leg1_cancel_retryable = true;
+    engine.leg1_cancel_inflight = true;
+
+    // Move the book ask far away: 0.505 → 0.55 (chase = 4.5¢ > 3¢ cap).
+    set_book(&mut engine, "0.53", "0.55");
+
+    engine.on_cancel_result(
+        "clob-chase-cap".to_string(),
+        true,
+        false,
+        Some(Decimal::ZERO),
+    );
+
+    // Chase exceeds cap — should NOT retry, full reset instead.
+    assert!(!engine.state.buildup_detected, "should NOT retry when chase exceeds cap");
+    assert!(engine.state.last_buildup.is_none());
+    assert!(engine.leg1_direction.is_none());
+    assert_eq!(engine.leg1_retry_count, 0);
+    assert!(engine.original_signal_ask.is_none());
+}
+
+#[test]
 fn test_leg1_retry_reset_on_fill() {
     let mut engine = make_engine_with_market(600);
     engine.in_quiet_period = false;

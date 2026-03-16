@@ -137,8 +137,10 @@ pub struct BuildupTomlConfig {
     pub cancel_threshold: f64,
     /// Cancel Leg 1 if ask drifts up ≥ this many $ from posted ask.
     pub ask_drift_cancel_cents: f64,
-    /// Maximum Leg 1 repost attempts after crosses-book or ask-drift cancel.
+    /// Maximum Leg 1 repost attempts after crosses-book rejection.
     pub max_leg1_retries: u32,
+    /// Maximum cumulative ask chase ($) for ask-drift retries.
+    pub max_ask_chase_cents: f64,
     /// Maximum dissenting directional metrics allowed in consensus vote (default 1).
     pub max_dissenters: u32,
     // Metric weights (must sum to 1.0)
@@ -182,7 +184,8 @@ impl Default for BuildupTomlConfig {
             entry_threshold: 0.40,
             cancel_threshold: 0.25,
             ask_drift_cancel_cents: 0.02,
-            max_leg1_retries: 3,
+            max_leg1_retries: 2,
+            max_ask_chase_cents: 0.03,
             max_dissenters: 1,
             w_cvd: 0.30,
             w_spot_flow: 0.15,
