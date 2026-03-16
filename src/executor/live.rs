@@ -441,9 +441,15 @@ impl LiveExecutor {
                 }
                 if resp.status == OrderStatus::Filled {
                     // Instant fill — rare but possible.
+                    let fill_size = if resp.size_matched > Decimal::ZERO {
+                        resp.size_matched.min(signal.size).round_dp(2)
+                    } else {
+                        signal.size
+                    };
                     info!(
                         order_id = %resp.order_id,
                         price = %maker_price,
+                        %fill_size,
                         "favorable maker: instant fill"
                     );
                     self.active_leg2_phase1_id = None;
@@ -452,7 +458,7 @@ impl LiveExecutor {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: maker_price,
-                        size: signal.size,
+                        size: fill_size,
                         fill_method: Some(FillMethod::FavorableMaker),
                         already_filled: true,
                         order_tag: None,
@@ -470,6 +476,7 @@ impl LiveExecutor {
                 let poll_interval_ms = 200u64;
                 let max_polls = (self.favorable_maker_timeout_ms / poll_interval_ms).max(1);
                 let mut filled = false;
+                let mut polled_size_matched: Option<Decimal> = None;
                 let breakeven = Decimal::ONE
                     - signal.leg1_fill_price.unwrap_or(Decimal::ONE);
 
@@ -478,12 +485,14 @@ impl LiveExecutor {
 
                     // Check for fill via REST poll.
                     match self.poly.get_order_status(&maker_order_id).await {
-                        Ok((status, ..)) if status == OrderStatus::Filled => {
+                        Ok((status, matched, _orig)) if status == OrderStatus::Filled => {
                             info!(
                                 order_id = %maker_order_id,
                                 price = %maker_price,
+                                %matched,
                                 "favorable maker: fill detected via polling"
                             );
+                            polled_size_matched = Some(matched);
                             filled = true;
                             break;
                         }
@@ -515,13 +524,18 @@ impl LiveExecutor {
                 }
 
                 if filled {
+                    let fill_size = if let Some(matched) = polled_size_matched {
+                        if matched > Decimal::ZERO { matched.min(signal.size).round_dp(2) } else { signal.size }
+                    } else {
+                        signal.size
+                    };
                     self.active_leg2_phase1_id = None;
                     self.active_leg2_phase2_id = None;
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: maker_order_id,
                         price: maker_price,
-                        size: signal.size,
+                        size: fill_size,
                         fill_method: Some(FillMethod::FavorableMaker),
                         already_filled: true,
                         order_tag: None,
@@ -652,7 +666,11 @@ impl LiveExecutor {
                     } else {
                         self.active_leg2_phase1_id = Some(resp.order_id.clone());
                     }
-                    let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
+                    let fill_size = if resp.size_matched > Decimal::ZERO {
+                        resp.size_matched.min(safe_size).round_dp(2)
+                    } else {
+                        safe_size
+                    };
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
@@ -848,7 +866,12 @@ impl LiveExecutor {
                     }
 
                     // Use actual fill from REST response; fall back to posted size if zero.
-                    let fill_size = if resp.size_matched > Decimal::ZERO { resp.size_matched } else { safe_size };
+                    // Cap at order size — SDK `taking_amount` can exceed requested size.
+                    let fill_size = if resp.size_matched > Decimal::ZERO {
+                        resp.size_matched.min(safe_size).round_dp(2)
+                    } else {
+                        safe_size
+                    };
                     let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderPosted {
                         is_leg2: true,
                         order_id: resp.order_id,
@@ -940,24 +963,55 @@ impl LiveExecutor {
         }
 
         // Cancel Phase 1 order first (sequential, not alongside).
+        // After cancel, query fill status to determine how much Phase 1 actually filled.
+        let mut phase1_filled = Decimal::ZERO;
         if let Some(ref phase1_id) = self.active_leg2_phase1_id {
             info!(%phase1_id, "Phase 2: cancelling Phase 1 order first");
-            match self.poly.cancel_order(phase1_id).await {
+            let was_cancelled = match self.poly.cancel_order(phase1_id).await {
                 Ok(cancelled) => {
                     info!(%phase1_id, %cancelled, "Phase 2: Phase 1 cancel result");
+                    cancelled
                 }
                 Err(e) => {
                     warn!(%phase1_id, error = %e, "Phase 2: Phase 1 cancel failed — proceeding");
+                    false
                 }
-            }
+            };
+            // Query authoritative fill status after cancel.
+            let size_matched = match self.poly.get_order_status(phase1_id).await {
+                Ok((_status, matched, _original)) => Some(matched),
+                Err(e) => {
+                    warn!(%phase1_id, error = %e, "Phase 2: get_order_status failed — assuming zero fill");
+                    None
+                }
+            };
+            // Send CancelResult so engine knows Phase 1 fill status.
+            let _ = self.feedback_tx.try_send(ExecutorFeedback::CancelResult {
+                order_id: phase1_id.to_string(),
+                was_cancelled,
+                is_leg2: true,
+                size_matched,
+            });
+            phase1_filled = size_matched.unwrap_or(Decimal::ZERO);
             self.active_leg2_phase1_id = None;
+        }
+
+        // Compute remainder: leg1_size - phase1_filled.
+        let remainder = (signal.size - phase1_filled).max(Decimal::ZERO).round_dp(2);
+        if remainder <= Decimal::ZERO {
+            info!(
+                phase1_filled = %phase1_filled,
+                signal_size = %signal.size,
+                "Phase 1 fully filled during cancel — no Phase 2 needed"
+            );
+            return;
         }
 
         let order = OrderRequest::post_only_gtc(
             signal.token_id.clone(),
             signal.side,
             signal.price,
-            signal.size,
+            remainder,
         );
 
         match self.poly.place_order(&order).await {
@@ -981,7 +1035,7 @@ impl LiveExecutor {
                         is_leg2: true,
                         order_id: resp.order_id,
                         price: signal.price,
-                        size: signal.size,
+                        size: remainder,
                         fill_method: None,
                         already_filled: false,
                         order_tag: Some(OrderTag::Leg2Phase2),
@@ -1101,6 +1155,14 @@ impl LiveExecutor {
                     .map(|bi| (bi.cvd_age_ms, bi.basis_age_ms, bi.spot_flow_age_ms, bi.obi_age_ms, bi.liq_age_ms, bi.atr_age_ms))
                     .unwrap_or((0, 0, 0, 0, 0, 0));
 
+            let composite_score = signal.buildup_info.as_ref()
+                .map(|bi| bi.composite_score)
+                .unwrap_or(Decimal::ZERO);
+
+            let dissenter_count = signal.buildup_info.as_ref()
+                .map(|bi| bi.dissenter_count)
+                .unwrap_or(0);
+
             if let Err(e) = c.record_signal(
                 &signal.token_id,
                 direction_str,
@@ -1116,7 +1178,7 @@ impl LiveExecutor {
                 signal.alloc_amount,
                 action,
                 signal.spike_info.timestamp_ms,
-                signal.expected_pct,
+                composite_score,
                 cvd_norm,
                 basis_norm,
                 spot_flow_norm,
@@ -1129,6 +1191,7 @@ impl LiveExecutor {
                 obi_age_ms,
                 liq_age_ms,
                 atr_age_ms,
+                dissenter_count,
             ) {
                 warn!(error = %e, "failed to record signal to QuestDB");
             }

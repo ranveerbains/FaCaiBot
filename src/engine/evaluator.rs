@@ -412,6 +412,13 @@ impl Leg2Evaluator {
             return None;
         }
 
+        // Subtract any partial fills already accumulated on Leg 2.
+        // This ensures subsequent Leg 2 signals post for the remainder only.
+        let leg1_size = leg1_size - state.leg2_partial_filled;
+        if leg1_size <= Decimal::ZERO {
+            return None;
+        }
+
         let reference_price = state.binance_price?;
         let tick = state.tick_size;
         let market_end_ms = state.market_end_timestamp_ms;

@@ -14,7 +14,7 @@
 
 ### State reset
 
-On completion: `leg1_state`, `leg2_state`, and `hedge` all reset to None. `cumulative_used` persists (capital stays allocated within this market). After reset, the engine can immediately accept a new buildup signal.
+On completion: `leg1_state`, `leg2_state`, `hedge`, `leg2_partial_filled`, and `leg2_phase1_fill` all reset to None/zero. `cumulative_used` persists (capital stays allocated within this market). After reset, the engine can immediately accept a new buildup signal.
 
 ### PnL computation (simulation)
 

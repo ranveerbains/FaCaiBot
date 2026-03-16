@@ -324,7 +324,7 @@ impl BuildupDetector {
     /// Clears the dirty flag. Only call when `is_dirty()` to avoid redundant work.
     pub fn tick(&mut self, now_ms: u64) -> (f64, Option<Direction>, Option<BuildupInfo>) {
         self.dirty = false;
-        let (score, direction) = self.evaluate(now_ms);
+        let (score, direction, minority) = self.evaluate(now_ms);
 
         trace!(
             score = format!("{:.4}", score),
@@ -352,7 +352,7 @@ impl BuildupDetector {
                     // First crossing above threshold — emit signal (edge-triggered).
                     self.above_threshold = true;
                     self.diag_signals_emitted += 1;
-                    Some(self.build_info(score, dir, now_ms))
+                    Some(self.build_info(score, dir, now_ms, minority))
                 } else {
                     // Already above threshold — suppress until score drops and recovers.
                     None
@@ -368,7 +368,7 @@ impl BuildupDetector {
     }
 
     /// Build a `BuildupInfo` from the current detector state.
-    fn build_info(&self, score: f64, direction: Direction, now_ms: u64) -> BuildupInfo {
+    fn build_info(&self, score: f64, direction: Direction, now_ms: u64, dissenter_count: u32) -> BuildupInfo {
         let d = |v: f64| Decimal::try_from(v).unwrap_or(Decimal::ZERO);
         BuildupInfo {
             composite_score: d(score),
@@ -394,11 +394,12 @@ impl BuildupDetector {
             obi_age_ms: self.obi_velocity.age_ms(now_ms),
             liq_age_ms: self.liq_pressure.age_ms(now_ms),
             atr_age_ms: self.atr_displacement.age_ms(now_ms),
+            dissenter_count,
         }
     }
 
-    /// Compute composite score. Returns (score, direction) or (0, None) if vetoed.
-    pub fn evaluate(&mut self, now_ms: u64) -> (f64, Option<Direction>) {
+    /// Compute composite score. Returns (score, direction, dissenter_count) or (0, None, 0) if vetoed.
+    pub fn evaluate(&mut self, now_ms: u64) -> (f64, Option<Direction>, u32) {
         // 1. Collect normalized values and directions from fresh metrics.
         let metrics: [(f64, f64, Option<Direction>); 6] = [
             (self.w_cvd, self.cvd.normalized(now_ms), self.cvd.direction()),
@@ -437,7 +438,7 @@ impl BuildupDetector {
 
         if majority < 3 || minority > self.max_dissenters {
             self.diag_direction_vetoes += 1;
-            return (0.0, None);
+            return (0.0, None, minority);
         }
 
         // 3. Causal ordering: at least 1 leading AND 1 confirming must be fresh + non-zero.
@@ -448,19 +449,19 @@ impl BuildupDetector {
 
         if !has_leading || !has_confirming {
             self.diag_causal_vetoes += 1;
-            return (0.0, None);
+            return (0.0, None, minority);
         }
 
         // 4. Weighted sum (entry_threshold check happens downstream).
         let composite: f64 = metrics.iter().map(|(w, n, _)| w * n).sum();
 
-        (composite, Some(dominant))
+        (composite, Some(dominant), minority)
     }
 
     /// Check if composite exceeds entry threshold (used by tests).
     #[cfg(test)]
     pub fn check_entry(&mut self, now_ms: u64) -> Option<BuildupInfo> {
-        let (score, direction) = self.evaluate(now_ms);
+        let (score, direction, minority) = self.evaluate(now_ms);
         let direction = direction?;
 
         if score < self.entry_threshold {
@@ -495,13 +496,14 @@ impl BuildupDetector {
             obi_age_ms: self.obi_velocity.age_ms(now_ms),
             liq_age_ms: self.liq_pressure.age_ms(now_ms),
             atr_age_ms: self.atr_displacement.age_ms(now_ms),
+            dissenter_count: minority,
         })
     }
 
     /// Check if composite has dropped below cancel threshold (used by tests).
     #[cfg(test)]
     pub fn below_cancel_threshold(&mut self, now_ms: u64) -> bool {
-        let (score, _) = self.evaluate(now_ms);
+        let (score, _, _) = self.evaluate(now_ms);
         score < self.cancel_threshold
     }
 

@@ -323,6 +323,7 @@ fn test_buildup_info(direction: Direction, now_ms: u64) -> BuildupInfo {
         obi_age_ms: 0,
         liq_age_ms: 0,
         atr_age_ms: 0,
+        dissenter_count: 0,
     }
 }
 

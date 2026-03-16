@@ -616,7 +616,7 @@ Timeline:
 | **Stale book entries** | Post-rotation quiet period (`rotation_quiet_ms`) blocks entries after market rotation, preventing trades on stale/repricing books |
 | **Rapid re-entry** | Post-trade cooldown (`trade_cooldown_ms`) blocks new entries after trade completion, preventing rapid-fire losses on the same market |
 | **Signal flooding** | Self-gating on both success and failure. One trade at a time |
-| **Taker fees** | Both legs post-only (maker — negative fee = rebate). Emergency exits are immediate FOK taker. Fee: `C × 0.25 × (p×(1-p))²`, max 1.56% at p=0.50. Maker fills earn est. rebate: 20% of fee-equivalent |
+| **Taker fees** | Both legs post-only (maker — negative fee = rebate). Emergency exits are immediate FOK taker. Fee: `C × p × 0.25 × (p×(1-p))²`, max ~0.86% at p≈0.60. Maker fills earn est. rebate: 20% of fee-equivalent |
 | **Competing bots** | Leg 1: predictive entry at best ask before price move (queue priority). Leg 2: post-once-and-wait at target (executor handles crosses-book). Post-only = unfilled orders cost nothing |
 | **Stale data** | Discard events where `now_ms - timestamp > 500ms` |
 | **Heartbeat failure** (live) | Dedicated async task, 5s interval. 2 consecutive failures → reset executor state + Telegram alert |

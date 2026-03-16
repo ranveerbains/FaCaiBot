@@ -1056,12 +1056,12 @@ mod formatter {
     }
 
     /// Compute the taker fee per share at a given price.
-    /// `fee = 0.25 * (price * (1 - price))^2`
+    /// `fee = price * 0.25 * (price * (1 - price))^2`
     fn compute_taker_fee_per_share(price: Decimal) -> Decimal {
         let one = Decimal::ONE;
         let factor = Decimal::new(25, 2); // 0.25
         let inner = price * (one - price);
-        factor * inner * inner
+        price * factor * inner * inner
     }
 
     /// Produce a shortened market identifier for display (last 5 chars of condition ID).

@@ -56,6 +56,7 @@ fn inject_buildup(engine: &mut StrategyEngine, direction: Direction) {
         obi_age_ms: 0,
         liq_age_ms: 0,
         atr_age_ms: 0,
+        dissenter_count: 0,
     });
     engine.state.atr = Some(Decimal::new(2, 3));
     engine.state.binance_price = Some(Decimal::new(50_000, 0));
@@ -296,6 +297,7 @@ fn test_leg1_fill_initialises_hedge() {
         obi_age_ms: 0,
         liq_age_ms: 0,
         atr_age_ms: 0,
+        dissenter_count: 0,
     });
     engine.state.atr = Some(Decimal::new(2, 3));
 
@@ -996,6 +998,7 @@ fn test_opposite_direction_buildup_cancels_leg1() {
         obi_age_ms: 0,
         liq_age_ms: 0,
         atr_age_ms: 0,
+        dissenter_count: 0,
     };
     let now = now_epoch_ms();
     engine.handle_buildup_confirmed(buildup, now);
@@ -1034,6 +1037,7 @@ fn test_same_direction_buildup_ignored_when_posted() {
         obi_age_ms: 0,
         liq_age_ms: 0,
         atr_age_ms: 0,
+        dissenter_count: 0,
     };
     let now = now_epoch_ms();
     engine.handle_buildup_confirmed(buildup, now);

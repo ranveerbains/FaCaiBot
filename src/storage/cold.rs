@@ -220,6 +220,7 @@ impl ColdStorage {
         obi_age_ms: u64,
         liq_age_ms: u64,
         atr_age_ms: u64,
+        dissenter_count: u32,
     ) -> Result<()> {
         self.buffer
             .table("trade_signals")?
@@ -234,6 +235,7 @@ impl ColdStorage {
             .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
             .column_i64("spike_detected_ms", spike_detected_ms as i64)?
             .column_f64("composite_score", composite_score.try_into().unwrap_or(0.0))?
+            .column_i64("dissenter_count", i64::from(dissenter_count))?
             // Metric normalized values (0.0-1.0)
             .column_f64("cvd_norm", cvd_norm)?
             .column_f64("basis_norm", basis_norm)?

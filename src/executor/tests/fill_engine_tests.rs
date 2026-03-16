@@ -27,13 +27,13 @@ fn test_compute_taker_fee() {
     let fee = compute_taker_fee(d("0.50"), d("100.00"));
     assert!(fee > Decimal::ZERO);
     // At p=0.50: inner = 0.50 * 0.50 = 0.25, inner^2 = 0.0625
-    // fee = 100 * 0.25 * 0.0625 = 1.5625
-    assert_eq!(fee, d("1.5625"));
+    // fee = 100 * 0.50 * 0.25 * 0.0625 = 0.78125
+    assert_eq!(fee, d("0.78125"));
 }
 
 #[test]
 fn test_compute_maker_rebate() {
     let rebate = compute_maker_rebate(d("0.50"), d("100.00"));
-    // 20% of taker fee: 1.5625 * 0.20 = 0.3125
-    assert_eq!(rebate, d("0.312500"));
+    // 20% of taker fee: 0.78125 * 0.20 = 0.15625
+    assert_eq!(rebate, d("0.156250"));
 }

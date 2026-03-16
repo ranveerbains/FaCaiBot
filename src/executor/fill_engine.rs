@@ -30,13 +30,13 @@ pub(crate) fn round_to_tick(price: Decimal, tick: Decimal) -> Decimal {
 
 /// Compute taker fee for a fill at the given price and size.
 ///
-/// Polymarket 5-min crypto: fee = C × feeRate × (p × (1 - p))^2
-/// where C = shares, feeRate = 0.25, exponent = 2.
+/// Polymarket 5-min crypto: fee = C × p × feeRate × (p × (1 - p))^2
+/// where C = shares, p = price, feeRate = 0.25, exponent = 2.
 pub(crate) fn compute_taker_fee(price: Decimal, size: Decimal) -> Decimal {
     let one = Decimal::ONE;
     let factor = Decimal::new(25, 2); // 0.25
     let inner = price * (one - price);
-    size * factor * inner * inner
+    size * price * factor * inner * inner
 }
 
 /// Estimated maker rebate for a fill at the given price and size.

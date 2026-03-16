@@ -259,6 +259,9 @@ pub struct BuildupInfo {
     pub obi_age_ms: u64,
     pub liq_age_ms: u64,
     pub atr_age_ms: u64,
+    /// Number of directional metrics that dissented (voted against the majority direction).
+    /// 0 = unanimous, 1 = one dissenter allowed by max_dissenters config.
+    pub dissenter_count: u32,
 }
 
 // ─── Spike Info ──────────────────────────────────────────────────────────────
@@ -348,6 +351,11 @@ pub struct MarketState {
     /// Timestamp of the last composite update.
     pub composite_update_ms: u64,
 
+    // ── Leg 2 partial fill tracking ──────────────────────────────────────
+    /// Cumulative Leg 2 fills so far (before trade completion).
+    /// Used by the evaluator to compute remainder size for subsequent Leg 2 signals.
+    pub leg2_partial_filled: Decimal,
+
     // ── Capital tracking ─────────────────────────────────────────────────
     /// Total USDC allocated in the current market window.
     pub cumulative_used: Decimal,
@@ -380,6 +388,7 @@ impl MarketState {
             current_composite_score: Decimal::ZERO,
             current_composite_direction: None,
             composite_update_ms: 0,
+            leg2_partial_filled: Decimal::ZERO,
             cumulative_used: Decimal::ZERO,
             available_capital: Decimal::ZERO,
             last_update_ms: 0,

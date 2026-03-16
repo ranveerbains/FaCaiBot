@@ -19,12 +19,20 @@ The hedge system uses two phases with a single cancel/repost at the transition -
 - If `phase1_timeout_ms` elapses without fill -> transition to Phase 2
 
 **Phase 2 -- Break-even pursuit / Sequential** (`phase2_timeout_ms`, default 2000ms):
-- Executor **cancels Phase 1** first, then posts Phase 2 at `best_ask - 1 tick` (sequential, one order at a time)
+- Executor **cancels Phase 1** first, queries `get_order_status()` for authoritative fill status, then posts Phase 2 for the **remainder** only (`signal.size - phase1_filled`)
+- If Phase 1 fully filled during cancel -> no Phase 2 posted (trade completes via fill tracking)
+- Executor sends `CancelResult` with `size_matched` so engine can track Phase 1 partial fills for weighted average pricing
 - **No reposts** -- preserve FIFO queue priority
 - Phase 2 timeout (`phase2_timeout_ms` elapsed) -> immediate FOK taker at best ask
 - If `ask > phase2_posted_price` -> Phase 2 breach -> immediate FOK taker at best ask (Section 7)
 - **Phase 2 entry guard**: If `ask - 1tick > breakeven_hedge_price` (`$1.00 - leg1_price`), even the best maker fill would give pair cost > $1.00 -> skip posting Phase 2, FOK immediately
 - If Phase 2 post fails (`OrderFailed`), evaluator re-emits a `Phase1Post` signal (reused decision type) to retry posting at `ask - 1tick`
+
+**Leg 2 partial fill handling:**
+- MATCHED events with `size_matched < original_size` do NOT transition to `OrderState::Filled` -- the order is still resting. Tracked via `leg2_partial_filled` accumulator
+- Terminal MINED/CONFIRMED events with `size_matched < original_size` reset `leg2_state = None` and accumulate into `leg2_phase1_fill` for weighted average. Evaluator sees `leg2_state=None + leg1_state=Filled` and generates a new signal with `effective_size = leg1_size - leg2_partial_filled`
+- When Phase 2 fills after Phase 1 partial: final price = weighted average of Phase 1 fill price × Phase 1 fill size + Phase 2 fill price × Phase 2 fill size. Final size = sum of both fills
+- All Leg 2 FOK `size_matched` values are capped at order size (`resp.size_matched.min(safe_size)`) to prevent SDK `taking_amount` inflation
 
 ### Phase 1 target price computation
 

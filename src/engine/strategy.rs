@@ -219,6 +219,12 @@ pub struct StrategyEngine {
     diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
     last_diag_ms: u64,
 
+    // ── Leg 2 partial fill & multi-phase tracking ──────────────────────
+    /// Cumulative Leg 2 fills before trade completion (mirrors state.leg2_partial_filled).
+    leg2_partial_filled: Decimal,
+    /// Phase 1 partial fill stored for weighted average when Phase 2 fills: (price, size).
+    leg2_phase1_fill: Option<(Decimal, Decimal)>,
+
     // ── Dual-order tracking (Phase 1 + Phase 2) ────────────────────────
     /// Phase 1 Leg 2 order ID (persists into Phase 2 when dual-order active).
     leg2_phase1_order_id: Option<String>,
@@ -337,6 +343,8 @@ impl StrategyEngine {
             diag_rej_heartbeat: 0,
             diag_heartbeat_resets: 0,
             last_diag_ms: 0,
+            leg2_partial_filled: Decimal::ZERO,
+            leg2_phase1_fill: None,
             leg2_phase1_order_id: None,
             leg2_phase2_order_id: None,
             last_leg2_was_phase2_alongside: false,
@@ -749,6 +757,10 @@ impl StrategyEngine {
                 // Dual-order: clear ALL state on rotation (new market).
                 self.leg2_phase1_order_id = None;
                 self.leg2_phase2_order_id = None;
+                // Leg 2 partial fill tracking: clear on rotation.
+                self.leg2_partial_filled = Decimal::ZERO;
+                self.leg2_phase1_fill = None;
+                self.state.leg2_partial_filled = Decimal::ZERO;
                 self.in_cutoff_window = false;
                 self.in_quiet_period = true;
                 self.in_trade_cooldown = false;
@@ -834,7 +846,7 @@ impl StrategyEngine {
                                             asks: vec![],
                                             timestamp_ms: now_ms,
                                         });
-                                    reporter.send_opportunity_alert(&signal, price, size, &book);
+                                    reporter.send_opportunity_alert(&signal, price, actual_size, &book);
                                     self.live_market_signals += 1;
                                     if signal.bot_contested {
                                         self.live_market_walls += 1;
@@ -924,26 +936,106 @@ impl StrategyEngine {
                         Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
                         _ => fill_size,
                     };
+                    // Cap at leg1 size — Leg 2 should never exceed Leg 1.
+                    let expected_max = match &self.state.leg1_state {
+                        OrderState::Filled { size, .. } => *size,
+                        _ => fill_size,
+                    };
+                    let fill_size = fill_size.min(expected_max);
 
                     match status {
-                        TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
-                            info!(%order_id, %fill_price, %fill_size, status = ?status, "Leg 2 fill — pair complete");
-                            // Partial fill detection — defer alert to MINED/CONFIRMED.
+                        TradeStatus::Matched => {
+                            // MATCHED events carry *cumulative* size_matched (not delta).
+                            // Check for partial fill — order may still be resting.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
                                 if matched < original {
-                                    warn!(%order_id, %matched, %original, "partial fill on Leg 2 — deferring alert to MINED");
+                                    // Partial fill — order still resting. Track but DON'T transition.
+                                    info!(%order_id, %matched, %original, "Leg 2 partial fill — order still resting");
                                     self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
                                         leg: "Leg 2", size_matched: matched, original_size: original,
                                     });
+                                    // Don't transition to Filled — Leg 2 order is still resting.
+                                    return;
                                 }
+                                // matched >= original — full fill, fall through to transition.
+                            } else {
+                                // No size info on MATCHED — non-informative.
+                                // Don't transition; wait for authoritative MINED/CONFIRMED.
+                                debug!(%order_id, "Leg 2 MATCHED without size info — waiting for MINED/CONFIRMED");
+                                return;
                             }
+                            // Full fill (matched >= original).
+                            // Apply weighted average if Phase 1 had a partial fill.
+                            let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
+                                let total_size = p1_size + fill_size;
+                                let weighted_price = if total_size > Decimal::ZERO {
+                                    ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
+                                } else {
+                                    fill_price
+                                };
+                                (weighted_price.round_dp(4), total_size.round_dp(2))
+                            } else {
+                                (fill_price, fill_size)
+                            };
+                            info!(%order_id, %final_price, %final_size, "Leg 2 fill — pair complete");
                             self.state.leg2_state = OrderState::Filled {
                                 order_id: order_id.clone(),
-                                price: fill_price,
-                                size: fill_size,
+                                price: final_price,
+                                size: final_size,
                                 fill_timestamp_ms: now_ms,
                             };
-
+                            // hedge cleared by on_trade_complete() after Telegram + recording
+                        }
+                        TradeStatus::Mined | TradeStatus::Confirmed => {
+                            // Terminal state — CLOB order is settled. size_matched is authoritative.
+                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                                if matched < original && matched > Decimal::ZERO {
+                                    // Terminal partial fill — order closed with unfilled remainder.
+                                    warn!(%order_id, %matched, %original, "Leg 2 terminal partial fill — resetting for remainder");
+                                    let phase_price = fill_price;
+                                    // `matched` is the authoritative cumulative total for THIS order.
+                                    // Combine with any prior partial fill from a DIFFERENT order
+                                    // (e.g., Phase 1 partial before Phase 2 was posted).
+                                    if let Some((existing_price, existing_size)) = self.leg2_phase1_fill.take() {
+                                        let combined_size = existing_size + matched.round_dp(2);
+                                        let combined_price = if combined_size > Decimal::ZERO {
+                                            ((existing_price * existing_size) + (phase_price * matched.round_dp(2))) / combined_size
+                                        } else {
+                                            phase_price
+                                        };
+                                        self.leg2_phase1_fill = Some((combined_price.round_dp(4), combined_size));
+                                    } else {
+                                        self.leg2_phase1_fill = Some((phase_price, matched.round_dp(2)));
+                                    }
+                                    self.state.leg2_partial_filled = self.leg2_phase1_fill
+                                        .map(|(_, s)| s)
+                                        .unwrap_or(Decimal::ZERO);
+                                    self.leg2_partial_filled = self.state.leg2_partial_filled;
+                                    self.state.leg2_state = OrderState::None;
+                                    // Evaluator will see leg2_state=None + leg1_state=Filled →
+                                    // generate new signal with size = leg1_size - leg2_partial_filled.
+                                    return;
+                                }
+                            }
+                            // Full fill or no size info — apply weighted average and transition.
+                            let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
+                                let total_size = p1_size + fill_size;
+                                let weighted_price = if total_size > Decimal::ZERO {
+                                    ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
+                                } else {
+                                    fill_price
+                                };
+                                (weighted_price.round_dp(4), total_size.round_dp(2))
+                            } else {
+                                (fill_price, fill_size)
+                            };
+                            info!(%order_id, %final_price, %final_size, status = ?status, "Leg 2 fill — pair complete");
+                            self.state.leg2_state = OrderState::Filled {
+                                order_id: order_id.clone(),
+                                price: final_price,
+                                size: final_size,
+                                fill_timestamp_ms: now_ms,
+                            };
                             // hedge cleared by on_trade_complete() after Telegram + recording
                         }
                         TradeStatus::Failed => {
@@ -1855,11 +1947,23 @@ impl StrategyEngine {
             // Bug 3 fix: FOK returned Filled synchronously from REST API.
             // Transition directly to Filled state — don't wait for User WS MATCHED.
             if already_filled {
-                info!(%order_id, %price, %size, "FOK already filled — direct transition to Filled");
+                // Apply weighted average if Phase 1 had a partial fill.
+                let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
+                    let total_size = p1_size + size;
+                    let weighted_price = if total_size > Decimal::ZERO {
+                        ((p1_price * p1_size) + (price * size)) / total_size
+                    } else {
+                        price
+                    };
+                    (weighted_price.round_dp(4), total_size.round_dp(2))
+                } else {
+                    (price, size)
+                };
+                info!(%order_id, %final_price, %final_size, "FOK already filled — direct transition to Filled");
                 self.state.leg2_state = OrderState::Filled {
                     order_id,
-                    price,
-                    size,
+                    price: final_price,
+                    size: final_size,
                     fill_timestamp_ms: now_ms,
                 };
                 // Re-evaluate favorable_taker based on actual fill price
@@ -1976,7 +2080,7 @@ impl StrategyEngine {
     ///
     /// For Leg 1: uses authoritative `size_matched` from `get_order_status()` to detect
     /// fills that the cancel response alone can't reveal (race condition fix).
-    /// For Leg 2: `size_matched` is always `None`.
+    /// For Leg 2: `size_matched` may contain Phase 1 fill data (from Phase 2 transition).
     pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool, size_matched: Option<Decimal>) {
         if is_leg2 {
             self.emergency_signal_in_flight = false;
@@ -1984,6 +2088,19 @@ impl StrategyEngine {
         }
 
         if is_leg2 {
+            // Track Phase 1 partial fills for weighted average when Phase 2 fills.
+            if let Some(matched) = size_matched {
+                if matched > Decimal::ZERO {
+                    let phase1_price = self.hedge.as_ref()
+                        .map(|h| h.phase1_target_price)
+                        .unwrap_or(Decimal::ZERO);
+                    self.leg2_phase1_fill = Some((phase1_price, matched.round_dp(2)));
+                    self.state.leg2_partial_filled = matched.round_dp(2);
+                    self.leg2_partial_filled = matched.round_dp(2);
+                    info!(%matched, %phase1_price, "Phase 1 partial fill stored for weighted average");
+                }
+            }
+
             if was_cancelled {
                 self.prev_leg2_order = None;
                 debug!(%order_id, "Leg 2 cancel confirmed by CLOB");
@@ -2491,6 +2608,10 @@ impl StrategyEngine {
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
         self.last_leg2_was_phase2_alongside = false;
+        // Leg 2 partial fill tracking: clear on trade completion.
+        self.leg2_partial_filled = Decimal::ZERO;
+        self.leg2_phase1_fill = None;
+        self.state.leg2_partial_filled = Decimal::ZERO;
         // cumulative_used is NOT reset — capital stays allocated within this market.
     }
 
@@ -3251,6 +3372,10 @@ impl StrategyEngine {
         self.state.last_buildup = None;
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
+        // Leg 2 partial fill tracking: clear on Leg 1 reset.
+        self.leg2_partial_filled = Decimal::ZERO;
+        self.leg2_phase1_fill = None;
+        self.state.leg2_partial_filled = Decimal::ZERO;
     }
 
     /// Returns `true` if no position is open (safe to exit immediately).

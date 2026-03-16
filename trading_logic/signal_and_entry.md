@@ -18,7 +18,7 @@ Buildup detected -> Buy YES (Leg 1, maker post-only at best ask)
 - Leg 1 uses a **maker post-only** order -- earns maker rebate (negative fee) instead of paying taker fees
 - Leg 2 targets post-only execution (maker, zero fee) where possible
 - Additional taker fees apply to Leg 2 FOK emergency exits (Phase 1 breach, break-even breach, Phase 2 timeout, whipsaw reversal, flow reversal, flow collapse, market expiry) and favorable taker fills
-- Taker fee formula: `C * 0.25 * (p*(1-p))^2`, max 1.56% at p=0.50
+- Taker fee formula: `C * p * 0.25 * (p*(1-p))^2`, max ~0.86% at p≈0.60
 - Maker rebate estimate: `taker_fee * 0.20` (upper-bound of Polymarket daily maker rebate)
 - Unfilled Leg 1 makers are cancelled (sustain failure or timeout) at zero cost (post-only)
 

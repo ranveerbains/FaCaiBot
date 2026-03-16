@@ -17,7 +17,7 @@ trade_cooldown_ms = 0
 # Consecutive heartbeat failures before assuming CLOB cancelled resting orders
 heartbeat_dead_threshold = 5
 # Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
-max_entry_spread = 0.025
+max_entry_spread = 0.02
 
 [capital]
 # Maximum USDC per leg per trade
@@ -43,7 +43,7 @@ max_time_factor = 2.25
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
 phase1_timeout_ms = 6000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.03
+phase1_breach_threshold = 1.04
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2000
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
