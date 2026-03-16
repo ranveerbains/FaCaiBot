@@ -25,7 +25,7 @@ max_alloc_per_trade = 20
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
-reprice_scale = 0.065
+reprice_scale = 0.06
 # Minimum model output to enter a trade (0.02 = 2.0%)
 min_reprice_pct = 0.03
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
