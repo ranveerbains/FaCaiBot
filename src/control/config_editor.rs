@@ -30,8 +30,8 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "repricing.max_time_factor", min: 1.0, max: 10.0 },
     ParamSpec { name: "repricing.phase1_target_dampen", min: 0.1, max: 1.0 },
     // risk
-    ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 10000.0 },
-ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.10 },
+    ParamSpec { name: "risk.phase1_timeout_ms", min: 500.0, max: 15000.0 },
+ParamSpec { name: "risk.phase1_breach_threshold", min: 1.001, max: 1.20 },
     ParamSpec { name: "risk.phase2_timeout_ms", min: 500.0, max: 10000.0 },
     ParamSpec { name: "risk.favorable_maker_timeout_ms", min: 200.0, max: 5000.0 },
     // rotation
