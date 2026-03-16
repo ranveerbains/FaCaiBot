@@ -127,6 +127,12 @@ pub struct StrategyEngine {
     /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
     /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
     leg1_cancel_inflight: bool,
+    /// Current Leg 1 retry attempt (0 = first try).
+    leg1_retry_count: u32,
+    /// Maximum allowed Leg 1 retries (from config).
+    max_leg1_retries: u32,
+    /// Whether the current pending cancel is retryable (ask-drift = true, composite-fade/opposite = false).
+    leg1_cancel_retryable: bool,
 
     /// Tick size change command to forward to executor (SDK cache update).
     /// Drained by main loop after on_event().
@@ -215,6 +221,7 @@ pub struct StrategyEngine {
     diag_sustain_timeouts: u64,   // Leg 1 cancelled: timeout (legacy, no longer incremented)
     diag_opposite_dir_cancels: u64, // Leg 1 cancelled: opposite-direction buildup confirmed
     diag_ask_drift_cancels: u64,   // Leg 1 cancelled: ask drifted beyond threshold
+    diag_leg1_retries: u64,        // Leg 1 retry attempts (crosses-book or ask-drift repost)
     diag_rej_heartbeat: u64,       // Leg 1 rejected: heartbeat down
     diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
     last_diag_ms: u64,
@@ -288,6 +295,9 @@ impl StrategyEngine {
             rotation_emergency_buffer: Vec::new(),
             ask_drift_cancel_cents: Decimal::try_from(config.bot.buildup.ask_drift_cancel_cents).unwrap_or(Decimal::new(2, 2)),
             leg1_cancel_inflight: false,
+            leg1_retry_count: 0,
+            max_leg1_retries: config.bot.buildup.max_leg1_retries,
+            leg1_cancel_retryable: false,
             pending_tick_size_cmd: None,
             pending_heartbeat_cancel: None,
             heartbeat_dead_threshold: config.bot.entry_guards.heartbeat_dead_threshold,
@@ -340,6 +350,7 @@ impl StrategyEngine {
             diag_sustain_timeouts: 0,
             diag_opposite_dir_cancels: 0,
             diag_ask_drift_cancels: 0,
+            diag_leg1_retries: 0,
             diag_rej_heartbeat: 0,
             diag_heartbeat_resets: 0,
             last_diag_ms: 0,
@@ -748,6 +759,8 @@ impl StrategyEngine {
                 self.pending_tick_size_cmd = None;
                 self.pending_leg1_cancel = None;
                 self.leg1_cancel_inflight = false;
+                self.leg1_retry_count = 0;
+                self.leg1_cancel_retryable = false;
                 self.emergency_signal_in_flight = false;
                 self.leg2_command_pending = false;
                 self.prev_leg2_order = None;
@@ -1285,6 +1298,7 @@ impl StrategyEngine {
                             if current - posted_ask >= self.ask_drift_cancel_cents {
                                 info!(%current, %posted_ask, drift = %(current - posted_ask),
                                     "Leg 1 sustain — ask drifted beyond threshold");
+                                self.leg1_cancel_retryable = true; // ask drift = repost opportunity
                                 self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
                                     order_id: order_id.clone(),
                                 });
@@ -1334,6 +1348,7 @@ impl StrategyEngine {
                                 new_dir = ?buildup.direction,
                                 "opposite direction buildup — cancelling Leg 1"
                             );
+                            self.leg1_cancel_retryable = false; // market reversed, don't retry old direction
                             self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
                                 order_id: order_id.clone(),
                             });
@@ -1358,6 +1373,9 @@ impl StrategyEngine {
 
         self.state.buildup_detected = true;
         self.state.last_buildup = Some(buildup.clone());
+        // Fresh buildup resets retry counter (new signal, new budget).
+        self.leg1_retry_count = 0;
+        self.leg1_cancel_retryable = false;
 
         info!(
             direction = ?buildup.direction,
@@ -1394,6 +1412,7 @@ impl StrategyEngine {
                             %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
                             "Leg 1 sustain — composite faded below cancel threshold"
                         );
+                        self.leg1_cancel_retryable = false; // signal died, don't retry
                         self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
                             order_id: order_id.clone(),
                         });
@@ -1471,9 +1490,12 @@ impl StrategyEngine {
                 Some(signal)
             }
             Leg1Outcome::Rejected(reason) => {
-                // Buildup consumed (rejected) — clear both flags.
+                // Buildup consumed (rejected) — clear detected flag.
                 self.state.buildup_detected = false;
-                self.state.last_buildup = None;
+                // During retries, preserve last_buildup so on_order_failed can re-arm.
+                if self.leg1_retry_count == 0 {
+                    self.state.last_buildup = None;
+                }
                 match reason {
                     Leg1RejectReason::ActiveTrade => self.diag_rej_busy += 1,
                     Leg1RejectReason::NoBook => self.diag_rej_no_book += 1,
@@ -1717,6 +1739,8 @@ impl StrategyEngine {
             self.leg1_direction = None;
             self.pending_leg1_signal = None;
             self.leg1_cancel_inflight = false;
+            self.leg1_retry_count = 0;
+            self.leg1_cancel_retryable = false;
             self.state.buildup_detected = false;
             self.state.last_buildup = None;
         }
@@ -1798,6 +1822,7 @@ impl StrategyEngine {
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
             ask_drift_cancels = self.diag_ask_drift_cancels,
+            leg1_retries = self.diag_leg1_retries,
             hb_rej = self.diag_rej_heartbeat,
             hb_resets = self.diag_heartbeat_resets,
             hb_failures = self.connectivity.consecutive_heartbeat_failures,
@@ -1831,7 +1856,7 @@ impl StrategyEngine {
              \n\
              <b>Leg 1</b>\n\
              Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}  ask-drift: {ask_drift_cancels}\n\
+             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}  ask-drift: {ask_drift_cancels}  retries: {leg1_retries}\n\
              \n\
              <b>Leg 2</b>\n\
              P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
@@ -1867,6 +1892,7 @@ impl StrategyEngine {
             sustain_timeouts = self.diag_sustain_timeouts,
             opposite_dir_cancels = self.diag_opposite_dir_cancels,
             ask_drift_cancels = self.diag_ask_drift_cancels,
+            leg1_retries = self.diag_leg1_retries,
             l2_p1_posts = self.diag_leg2_phase1_posts,
             transitions = self.diag_phase_transitions,
             l2_maker = self.diag_leg2_fills_maker,
@@ -2081,7 +2107,29 @@ impl StrategyEngine {
             self.leg2_command_pending = false;
             self.state.leg2_state = OrderState::None;
         } else {
-            self.state.leg1_state = OrderState::None;
+            // Leg 1 failed (e.g. crosses-book) — retry if budget remains and buildup is live.
+            if self.leg1_retry_count < self.max_leg1_retries && self.state.last_buildup.is_some() {
+                // Reclaim capital so evaluate() can re-allocate at current prices.
+                if let Some(ref sig) = self.pending_leg1_signal {
+                    self.state.cumulative_used = self.state.cumulative_used.saturating_sub(sig.alloc_amount);
+                }
+                self.leg1_retry_count += 1;
+                self.diag_leg1_retries += 1;
+                self.state.leg1_state = OrderState::None;
+                self.state.leg1_posted_ask = None;
+                self.state.buildup_detected = true;
+                info!(retry = self.leg1_retry_count, max = self.max_leg1_retries,
+                    "Leg 1 order failed — retrying with current book prices");
+            } else {
+                // Exhausted retries or no buildup — full reset.
+                self.state.leg1_state = OrderState::None;
+                self.state.leg1_posted_ask = None;
+                self.leg1_direction = None;
+                self.state.last_buildup = None;
+                self.pending_leg1_signal = None;
+                self.leg1_retry_count = 0;
+                self.leg1_cancel_retryable = false;
+            }
         }
         warn!(is_leg2, "order placement failed — leg state reset to None");
     }
@@ -2171,6 +2219,8 @@ impl StrategyEngine {
 
             if filled > Decimal::ZERO {
                 // Shares were filled before/during cancel — handle based on current state.
+                self.leg1_retry_count = 0;
+                self.leg1_cancel_retryable = false;
                 let now_ms = now_epoch_ms();
                 match &self.state.leg1_state {
                     OrderState::Posted { price, .. } => {
@@ -2294,14 +2344,33 @@ impl StrategyEngine {
                         }
                     }
                 } else {
-                    // Normal sustain-fade cancel — full reset.
-                    debug!(%order_id, "Leg 1 cancel confirmed (0 filled) — resetting Leg 1 state");
-                    self.state.leg1_state = OrderState::None;
-                    self.state.leg1_posted_ask = None;
-                    self.leg1_direction = None;
-                    self.state.buildup_detected = false;
-                    self.state.last_buildup = None;
-                    self.pending_leg1_signal = None;
+                    // Cancel confirmed with 0 filled — retry if cancel was retryable (ask-drift).
+                    if self.leg1_cancel_retryable
+                        && self.leg1_retry_count < self.max_leg1_retries
+                        && self.state.last_buildup.is_some()
+                    {
+                        if let Some(ref sig) = self.pending_leg1_signal {
+                            self.state.cumulative_used = self.state.cumulative_used.saturating_sub(sig.alloc_amount);
+                        }
+                        self.leg1_retry_count += 1;
+                        self.diag_leg1_retries += 1;
+                        self.state.leg1_state = OrderState::None;
+                        self.state.leg1_posted_ask = None;
+                        self.state.buildup_detected = true;
+                        info!(retry = self.leg1_retry_count, max = self.max_leg1_retries,
+                            "Leg 1 cancel (0 filled) — retrying with current book prices");
+                    } else {
+                        // True cancel (composite fade, opposite dir, or retries exhausted) — full reset.
+                        debug!(%order_id, "Leg 1 cancel confirmed (0 filled) — resetting Leg 1 state");
+                        self.state.leg1_state = OrderState::None;
+                        self.state.leg1_posted_ask = None;
+                        self.leg1_direction = None;
+                        self.state.buildup_detected = false;
+                        self.state.last_buildup = None;
+                        self.pending_leg1_signal = None;
+                        self.leg1_retry_count = 0;
+                    }
+                    self.leg1_cancel_retryable = false;
                 }
             } else {
                 // Query failed AND was_cancelled=false → defensive fallback.
@@ -2635,6 +2704,8 @@ impl StrategyEngine {
         self.pending_fills.clear();
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
+        self.leg1_retry_count = 0;
+        self.leg1_cancel_retryable = false;
         // Dual-order tracking: clear IDs on trade reset.
         self.leg2_phase1_order_id = None;
         self.leg2_phase2_order_id = None;
@@ -3403,6 +3474,8 @@ impl StrategyEngine {
         self.state.last_buildup = None;
         self.state.leg1_posted_ask = None;
         self.leg1_cancel_inflight = false;
+        self.leg1_retry_count = 0;
+        self.leg1_cancel_retryable = false;
         // Leg 2 partial fill tracking: clear on Leg 1 reset.
         self.leg2_partial_filled = Decimal::ZERO;
         self.leg2_phase1_fill = None;

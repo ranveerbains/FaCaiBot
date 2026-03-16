@@ -1272,3 +1272,170 @@ fn test_heartbeat_recovery_logging() {
     assert_eq!(engine.connectivity.consecutive_heartbeat_failures, 0);
     assert_eq!(engine.connectivity.last_heartbeat_latency_ms, 5);
 }
+
+// ── Leg 1 retry loop tests ──────────────────────────────────────────────
+
+#[test]
+fn test_leg1_retry_on_order_failed() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    // Generate and consume Leg 1 signal.
+    let _signal = engine.evaluate().expect("should generate signal");
+    assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
+    assert!(!engine.state.buildup_detected);
+
+    // Simulate order failure (e.g., crosses-book).
+    engine.on_order_failed(false);
+
+    // Should re-arm buildup for retry.
+    assert!(engine.state.buildup_detected, "buildup_detected should be re-armed after failure");
+    assert!(engine.state.last_buildup.is_some(), "last_buildup should be preserved");
+    assert_eq!(engine.leg1_retry_count, 1);
+    assert_eq!(engine.diag_leg1_retries, 1);
+    assert!(matches!(engine.state.leg1_state, OrderState::None));
+
+    // Re-evaluate should produce a new signal at current book prices.
+    let _signal2 = engine.evaluate().expect("retry should generate new signal");
+    assert!(matches!(engine.state.leg1_state, OrderState::Posted { .. }));
+}
+
+#[test]
+fn test_leg1_retry_on_cancel_zero_filled() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    engine.on_order_posted(
+        false,
+        "clob-retry-cancel".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate ask-drift cancel (retryable).
+    engine.leg1_cancel_retryable = true;
+    engine.leg1_cancel_inflight = true;
+
+    // Cancel result: 0 filled, was_cancelled = true.
+    engine.on_cancel_result(
+        "clob-retry-cancel".to_string(),
+        true,
+        false,
+        Some(Decimal::ZERO),
+    );
+
+    // Should re-arm buildup for retry.
+    assert!(engine.state.buildup_detected, "buildup should be re-armed after retryable cancel");
+    assert_eq!(engine.leg1_retry_count, 1);
+    assert!(matches!(engine.state.leg1_state, OrderState::None));
+}
+
+#[test]
+fn test_leg1_retry_exhausted() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    // Exhaust retries.
+    let max = engine.max_leg1_retries;
+    for i in 0..max {
+        let _signal = engine.evaluate().expect("should generate signal");
+        engine.on_order_failed(false);
+        assert_eq!(engine.leg1_retry_count, i + 1);
+        assert!(engine.state.buildup_detected, "should re-arm on retry {}", i + 1);
+    }
+
+    // One more failure should trigger full reset (retries exhausted).
+    let _signal = engine.evaluate().expect("should generate signal for final attempt");
+    engine.on_order_failed(false);
+    assert!(!engine.state.buildup_detected, "should NOT re-arm after retries exhausted");
+    assert!(engine.state.last_buildup.is_none(), "last_buildup should be cleared");
+    assert_eq!(engine.leg1_retry_count, 0, "retry count should reset");
+    assert!(engine.leg1_direction.is_none(), "direction should be cleared");
+}
+
+#[test]
+fn test_leg1_retry_blocked_on_true_cancel() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    engine.on_order_posted(
+        false,
+        "clob-true-cancel".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate composite-fade cancel (NOT retryable).
+    engine.leg1_cancel_retryable = false;
+    engine.leg1_cancel_inflight = true;
+
+    engine.on_cancel_result(
+        "clob-true-cancel".to_string(),
+        true,
+        false,
+        Some(Decimal::ZERO),
+    );
+
+    // Should NOT re-arm — full reset instead.
+    assert!(!engine.state.buildup_detected, "composite-fade cancel should NOT retry");
+    assert!(engine.state.last_buildup.is_none(), "last_buildup should be cleared");
+    assert!(engine.leg1_direction.is_none(), "direction should be cleared");
+    assert_eq!(engine.leg1_retry_count, 0);
+}
+
+#[test]
+fn test_leg1_retry_reset_on_fill() {
+    let mut engine = make_engine_with_market(600);
+    engine.in_quiet_period = false;
+    set_book(&mut engine, "0.495", "0.505");
+    inject_buildup(&mut engine, Direction::Up);
+
+    let _signal = engine.evaluate().expect("should generate signal");
+    // Simulate first failure → retry.
+    engine.on_order_failed(false);
+    assert_eq!(engine.leg1_retry_count, 1);
+
+    // Re-evaluate for retry.
+    let _signal2 = engine.evaluate().expect("retry should generate signal");
+    engine.on_order_posted(
+        false,
+        "clob-retry-fill".to_string(),
+        Decimal::new(495, 3),
+        Decimal::new(20, 0),
+        None, false, None,
+    );
+
+    // Simulate fill via User WS (no cancel in-flight).
+    engine.on_event(IngestorEvent::TradeStatusUpdate {
+        order_id: "clob-retry-fill".to_string(),
+        status: TradeStatus::Matched,
+        size_matched: None,
+        original_size: None,
+    });
+
+    // Leg 1 should be filled — trade proceeds normally.
+    assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
+    assert!(engine.hedge.is_some(), "hedge should init on fill");
+
+    // Complete the trade — retry count should be reset.
+    engine.state.leg2_state = OrderState::Filled {
+        order_id: "leg2".to_string(),
+        price: Decimal::new(50, 2),
+        size: Decimal::new(20, 0),
+        fill_timestamp_ms: 0,
+    };
+    engine.on_trade_complete();
+    assert_eq!(engine.leg1_retry_count, 0, "retry count should reset on trade complete");
+}
