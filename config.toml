@@ -24,7 +24,7 @@ max_ask_pair_price = 1.03
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 10
+max_alloc_per_trade = 15
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
@@ -32,9 +32,9 @@ reprice_scale = 0.065
 # Minimum model output to enter a trade (0.02 = 2.0%)
 min_reprice_pct = 0.03
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
-phase1_target_dampen = 0.9
+phase1_target_dampen = 1
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 0.5
+min_alloc_pct = 0.4
 # Hard reject: YES mid beyond this regardless of model
 hard_skew_cap = 0.85
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
@@ -44,9 +44,9 @@ max_time_factor = 2.25
 
 [risk]
 # Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 10000
+phase1_timeout_ms = 8000
 # Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.10
+phase1_breach_threshold = 1.05
 # Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
 phase2_timeout_ms = 2500
 # Timeout (ms) for favorable maker try before FOK fallback on crosses-book
@@ -62,7 +62,7 @@ ask_drift_cancel_cents = 0.01
 # Maximum Leg 1 repost attempts after crosses-book rejection (0 = no retries)
 max_leg1_retries = 3
 # Maximum cumulative ask chase ($) for ask-drift retries — don't retry if market moved > this from original ask
-max_ask_chase_cents = 0.04
+max_ask_chase_cents = 0.03
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
 max_dissenters = 1
 
