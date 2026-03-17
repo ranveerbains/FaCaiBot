@@ -48,6 +48,8 @@ pub(crate) enum Leg1RejectReason {
     /// but kept for match exhaustiveness in rejection counting.
     #[allow(dead_code)]
     HeartbeatDown,
+    /// Combined ask price (leg1_ask + hedge_ask) exceeds `max_ask_pair_price`.
+    AskPairTooExpensive,
     /// Other guard failed (no active market, bid cap invalid, zero size, etc.).
     Other,
 }
@@ -80,6 +82,7 @@ pub(crate) struct Leg1Evaluator {
     pub min_reprice_pct: Decimal,
     pub min_alloc_pct: Decimal,
     pub hard_skew_cap: Decimal,
+    pub max_ask_pair_price: Decimal,
     pub time_exponent: f64,
     pub max_time_factor: f64,
     /// Phase 1 target dampening — only affects profit target, not entry gate or allocation.
@@ -201,6 +204,22 @@ impl Leg1Evaluator {
         if spread > self.max_entry_spread {
             debug!(%spread, max = %self.max_entry_spread, "evaluate() BLOCKED: spread too wide");
             return Leg1Outcome::Rejected(Leg1RejectReason::WideSpread);
+        }
+
+        // Guard: ask pair price — reject if leg1_ask + hedge_ask exceeds max.
+        // Prevents entries where the hedge book is already too expensive for a profitable pair.
+        let hedge_book_opt = match direction {
+            Direction::Up => state.poly_no_book.as_ref().or(state.poly_book.as_ref()),
+            Direction::Down => state.poly_yes_book.as_ref().or(state.poly_book.as_ref()),
+        };
+        if let Some(hb) = hedge_book_opt {
+            if let Some(hedge_ask_lvl) = hb.best_ask() {
+                let ask_pair = best_ask_price + hedge_ask_lvl.price;
+                if ask_pair > self.max_ask_pair_price {
+                    debug!(%ask_pair, max = %self.max_ask_pair_price, "evaluate() BLOCKED: ask pair too expensive");
+                    return Leg1Outcome::Rejected(Leg1RejectReason::AskPairTooExpensive);
+                }
+            }
         }
 
         // Guard: hard skew cap — reject if YES mid beyond safe range.

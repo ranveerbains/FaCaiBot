@@ -19,6 +19,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "entry_guards.trade_cooldown_ms", min: 0.0, max: 60000.0 },
     ParamSpec { name: "entry_guards.heartbeat_dead_threshold", min: 2.0, max: 20.0 },
     ParamSpec { name: "entry_guards.max_entry_spread", min: 0.005, max: 0.20 },
+    ParamSpec { name: "entry_guards.max_ask_pair_price", min: 0.90, max: 1.10 },
     // capital
     ParamSpec { name: "capital.max_alloc_per_trade", min: 0.01, max: 10000.0 },
     // repricing

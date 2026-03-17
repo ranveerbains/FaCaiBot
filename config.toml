@@ -18,6 +18,9 @@ trade_cooldown_ms = 2000
 heartbeat_dead_threshold = 5
 # Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
 max_entry_spread = 0.03
+# Maximum combined ask price (leg1_ask + hedge_ask). Rejects entries where
+# the hedge book is already too expensive for a profitable pair.
+max_ask_pair_price = 1.03
 
 [capital]
 # Maximum USDC per leg per trade

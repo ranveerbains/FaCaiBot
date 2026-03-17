@@ -291,6 +291,7 @@ fn make_leg1_evaluator(dampen: &str) -> Leg1Evaluator {
         min_reprice_pct: Decimal::new(1, 3),  // 0.001 — low so tests pass easily
         min_alloc_pct: Decimal::new(25, 2),   // 0.25
         hard_skew_cap: Decimal::new(90, 2),   // 0.90
+        max_ask_pair_price: Decimal::new(103, 2), // 1.03
         time_exponent: 0.5,
         max_time_factor: 2.0,
         phase1_target_dampen: dampen.parse().unwrap(),
@@ -447,5 +448,39 @@ fn test_obi_computation_bullish() {
     // bid=80, ask=20, total=100, OBI = 60/100 = 0.6
     let obi = depth.obi().unwrap();
     assert_eq!(obi, Decimal::new(6, 1));
+}
+
+// ── Ask pair price guard tests ──────────────────────────────────────
+
+#[test]
+fn test_ask_pair_guard_blocks() {
+    let now_ms = 100_000;
+    let mut eval = make_leg1_evaluator("1.0");
+    eval.max_ask_pair_price = Decimal::new(100, 2); // 1.00 — very tight
+
+    // Direction::Up → leg1 buys YES (ask 0.52), hedge is NO book (ask 0.49)
+    // Combined = 0.52 + 0.49 = 1.01 > 1.00 → should block
+    let state = make_leg1_test_state(now_ms);
+    let outcome = eval.evaluate(&state, now_ms);
+    assert!(
+        matches!(outcome, Leg1Outcome::Rejected(Leg1RejectReason::AskPairTooExpensive)),
+        "ask pair 1.01 > max 1.00 should block, got {outcome:?}"
+    );
+}
+
+#[test]
+fn test_ask_pair_guard_passes() {
+    let now_ms = 100_000;
+    let mut eval = make_leg1_evaluator("1.0");
+    eval.max_ask_pair_price = Decimal::new(103, 2); // 1.03
+
+    // Direction::Up → leg1 buys YES (ask 0.52), hedge is NO book (ask 0.49)
+    // Combined = 0.52 + 0.49 = 1.01 <= 1.03 → should pass
+    let state = make_leg1_test_state(now_ms);
+    let outcome = eval.evaluate(&state, now_ms);
+    assert!(
+        matches!(outcome, Leg1Outcome::Signal(_)),
+        "ask pair 1.01 <= max 1.03 should pass, got {outcome:?}"
+    );
 }
 

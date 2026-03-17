@@ -23,6 +23,9 @@ pub struct EntryGuardsConfig {
     /// Maximum bid-ask spread on the directional book to allow Leg 1 entry.
     /// Prevents entries on stale/illiquid Polymarket books (e.g. off-hours).
     pub max_entry_spread: f64,
+    /// Maximum combined ask price (leg1_ask + hedge_ask). Rejects entries where
+    /// the hedge book is already too expensive for a profitable pair.
+    pub max_ask_pair_price: f64,
 }
 
 impl Default for EntryGuardsConfig {
@@ -35,6 +38,7 @@ impl Default for EntryGuardsConfig {
             trade_cooldown_ms: 5000,
             heartbeat_dead_threshold: 5,
             max_entry_spread: 0.03,
+            max_ask_pair_price: 1.03,
         }
     }
 }
