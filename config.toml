@@ -17,14 +17,14 @@ trade_cooldown_ms = 2000
 # Consecutive heartbeat failures before assuming CLOB cancelled resting orders
 heartbeat_dead_threshold = 5
 # Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
-max_entry_spread = 0.03
+max_entry_spread = 0.04
 # Maximum combined ask price (leg1_ask + hedge_ask). Rejects entries where
 # the hedge book is already too expensive for a profitable pair.
-max_ask_pair_price = 1.03
+max_ask_pair_price = 1.04
 
 [capital]
 # Maximum USDC per leg per trade
-max_alloc_per_trade = 15
+max_alloc_per_trade = 25
 
 [repricing]
 # Target profit for ideal signal and full allocation; may be increased by time amplification.
@@ -34,9 +34,9 @@ min_reprice_pct = 0.03
 # Phase 1 target dampening (0.8 = target 80% of expected repricing)
 phase1_target_dampen = 1
 # Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 0.4
+min_alloc_pct = 0.3
 # Hard reject: YES mid beyond this regardless of model
-hard_skew_cap = 0.85
+hard_skew_cap = 0.9
 # Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
 time_exponent = 0.5
 # Maximum time amplification factor (2.0 = time can at most double the output)
@@ -58,11 +58,11 @@ entry_threshold = 0.6
 # Cancel threshold — cancel unfilled Leg 1 if composite drops below
 cancel_threshold = 0.10
 # Cancel Leg 1 if ask drifts up >= this many $ from posted ask
-ask_drift_cancel_cents = 0.01
+ask_drift_cancel_cents = 0.02
 # Maximum Leg 1 repost attempts after crosses-book rejection (0 = no retries)
-max_leg1_retries = 3
+max_leg1_retries = 2
 # Maximum cumulative ask chase ($) for ask-drift retries — don't retry if market moved > this from original ask
-max_ask_chase_cents = 0.03
+max_ask_chase_cents = 0.04
 # Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
 max_dissenters = 1
 
