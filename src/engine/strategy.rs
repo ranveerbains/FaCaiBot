@@ -976,6 +976,7 @@ impl StrategyEngine {
                             // (e.g., 17.967825 vs 17.97) — dust differences are full fills.
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
                                 let dust_threshold = Decimal::new(1, 2); // 0.01 shares
+                                // Primary check: CLOB original_size vs size_matched.
                                 if matched.round_dp(2) < original.round_dp(2)
                                     && (original - matched) >= dust_threshold
                                 {
@@ -984,10 +985,24 @@ impl StrategyEngine {
                                     self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
                                         leg: "Leg 2", size_matched: matched, original_size: original,
                                     });
-                                    // Don't transition to Filled — Leg 2 order is still resting.
                                     return;
                                 }
-                                // matched >= original — full fill, fall through to transition.
+                                // Secondary check: CLOB may report original_size == size_matched
+                                // when balance constrains the order. Compare against our posted_size.
+                                let posted_size = match &self.state.leg2_state {
+                                    OrderState::Posted { size, .. } => *size,
+                                    _ => matched, // fallback — can't detect
+                                };
+                                if matched.round_dp(2) < posted_size.round_dp(2)
+                                    && (posted_size - matched) >= dust_threshold
+                                {
+                                    info!(%order_id, %matched, posted = %posted_size, "Leg 2 partial fill (posted-size check) — order still resting");
+                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                        leg: "Leg 2", size_matched: matched, original_size: posted_size,
+                                    });
+                                    return;
+                                }
+                                // matched >= original AND matched >= posted_size — full fill.
                             } else {
                                 // No size info on MATCHED — non-informative.
                                 // Don't transition; wait for authoritative MINED/CONFIRMED.
@@ -1019,8 +1034,19 @@ impl StrategyEngine {
                         TradeStatus::Mined | TradeStatus::Confirmed => {
                             // Terminal state — CLOB order is settled. size_matched is authoritative.
                             // Round to 2dp: CLOB fills in fractional shares — dust is a full fill.
+                            let posted_size_for_check = match &self.state.leg2_state {
+                                OrderState::Posted { size, .. } => *size,
+                                _ => Decimal::ZERO,
+                            };
                             if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                if matched.round_dp(2) < original.round_dp(2) && matched > Decimal::ZERO {
+                                let is_partial_clob = matched.round_dp(2) < original.round_dp(2) && matched > Decimal::ZERO;
+                                // Secondary check: CLOB original_size may equal size_matched when
+                                // balance constrains the order. Compare against our posted_size.
+                                let is_partial_posted = posted_size_for_check > Decimal::ZERO
+                                    && matched.round_dp(2) < posted_size_for_check.round_dp(2)
+                                    && (posted_size_for_check - matched) >= Decimal::new(1, 2)
+                                    && matched > Decimal::ZERO;
+                                if is_partial_clob || is_partial_posted {
                                     // Terminal partial fill — order closed with unfilled remainder.
                                     // Compute total Leg 2 fills including any prior partial (Phase 1).
                                     let prior_filled = self.leg2_phase1_fill.map(|(_, s)| s).unwrap_or(Decimal::ZERO);
@@ -2566,27 +2592,138 @@ impl StrategyEngine {
                 }
             } else if is_leg2 {
                 info!(%order_id, ?status, "replaying buffered fill for Leg 2");
-                let (price, size) = match &self.state.leg2_state {
+                let (fill_price, posted_size) = match &self.state.leg2_state {
                     OrderState::Posted { price, size, .. } => (*price, *size),
                     _ => unreachable!(),
                 };
+
+                // Prefer actual CLOB fill size over state-derived value.
+                let fill_size = match size_matched {
+                    Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
+                    _ => posted_size,
+                };
+                // Cap at leg1 size — Leg 2 should never exceed Leg 1.
+                let expected_max = match &self.state.leg1_state {
+                    OrderState::Filled { size, .. } => *size,
+                    _ => fill_size,
+                };
+                let fill_size = fill_size.min(expected_max);
+
                 match status {
-                    TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
+                    TradeStatus::Matched => {
+                        let dust_threshold = Decimal::new(1, 2); // 0.01 shares
+                        // Primary check: CLOB original_size vs size_matched.
                         if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                            if matched < original {
-                                warn!(%order_id, %matched, %original, "partial fill on Leg 2 (replay) — deferring alert to MINED");
+                            if matched.round_dp(2) < original.round_dp(2)
+                                && (original - matched) >= dust_threshold
+                            {
+                                info!(%order_id, %matched, %original, "Leg 2 partial fill (replay) — order still resting");
                                 self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
                                     leg: "Leg 2", size_matched: matched, original_size: original,
                                 });
+                                continue;
                             }
+                            // Secondary check: CLOB may report original_size == size_matched
+                            // when balance constrains the order. Compare against our posted_size.
+                            if matched.round_dp(2) < posted_size.round_dp(2)
+                                && (posted_size - matched) >= dust_threshold
+                            {
+                                info!(%order_id, %matched, posted = %posted_size, "Leg 2 partial fill (replay, posted-size check) — order still resting");
+                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
+                                    leg: "Leg 2", size_matched: matched, original_size: posted_size,
+                                });
+                                continue;
+                            }
+                        } else {
+                            // No size info on MATCHED — wait for MINED/CONFIRMED.
+                            debug!(%order_id, "Leg 2 MATCHED (replay) without size info — waiting for MINED/CONFIRMED");
+                            continue;
                         }
+                        // Full fill — apply weighted average with any prior Phase 1 partial.
+                        let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
+                            let total_size = p1_size + fill_size;
+                            let weighted_price = if total_size > Decimal::ZERO {
+                                ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
+                            } else {
+                                fill_price
+                            };
+                            (weighted_price.round_dp(4), total_size.round_dp(2))
+                        } else {
+                            (fill_price, fill_size)
+                        };
+                        info!(%order_id, %final_price, %final_size, "Leg 2 fill (replay) — pair complete");
                         self.state.leg2_state = OrderState::Filled {
                             order_id,
-                            price,
-                            size,
+                            price: final_price,
+                            size: final_size,
                             fill_timestamp_ms: now_ms,
                         };
-                        // hedge cleared by on_trade_complete() after Telegram + recording
+                    }
+                    TradeStatus::Mined | TradeStatus::Confirmed => {
+                        // Terminal — size_matched is authoritative.
+                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
+                            let is_partial_clob = matched.round_dp(2) < original.round_dp(2) && matched > Decimal::ZERO;
+                            let is_partial_posted = matched.round_dp(2) < posted_size.round_dp(2)
+                                && (posted_size - matched) >= Decimal::new(1, 2);
+                            if is_partial_clob || is_partial_posted {
+                                let prior_filled = self.leg2_phase1_fill.map(|(_, s)| s).unwrap_or(Decimal::ZERO);
+                                let total_filled = prior_filled + matched.round_dp(2);
+                                let leg1_size = match &self.state.leg1_state {
+                                    OrderState::Filled { size, .. } => *size,
+                                    _ => Decimal::ZERO,
+                                };
+                                let unfilled_remainder = (leg1_size - total_filled).max(Decimal::ZERO).round_dp(2);
+
+                                let min_notional_size = if !fill_price.is_zero() {
+                                    (Decimal::ONE / fill_price).ceil()
+                                } else {
+                                    Decimal::new(5, 0)
+                                };
+                                let remainder_too_small = unfilled_remainder < Decimal::new(5, 0)
+                                    || unfilled_remainder < min_notional_size;
+
+                                if !remainder_too_small {
+                                    warn!(%order_id, %matched, %original, %unfilled_remainder, "Leg 2 terminal partial fill (replay) — resetting for remainder");
+                                    let phase_price = fill_price;
+                                    if let Some((existing_price, existing_size)) = self.leg2_phase1_fill.take() {
+                                        let combined_size = existing_size + matched.round_dp(2);
+                                        let combined_price = if combined_size > Decimal::ZERO {
+                                            ((existing_price * existing_size) + (phase_price * matched.round_dp(2))) / combined_size
+                                        } else {
+                                            phase_price
+                                        };
+                                        self.leg2_phase1_fill = Some((combined_price.round_dp(4), combined_size));
+                                    } else {
+                                        self.leg2_phase1_fill = Some((phase_price, matched.round_dp(2)));
+                                    }
+                                    self.state.leg2_partial_filled = self.leg2_phase1_fill
+                                        .map(|(_, s)| s)
+                                        .unwrap_or(Decimal::ZERO);
+                                    self.leg2_partial_filled = self.state.leg2_partial_filled;
+                                    self.state.leg2_state = OrderState::None;
+                                    continue;
+                                }
+                            }
+                        }
+                        // Full fill (or remainder too small) — apply weighted average.
+                        let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
+                            let total_size = p1_size + fill_size;
+                            let weighted_price = if total_size > Decimal::ZERO {
+                                ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
+                            } else {
+                                fill_price
+                            };
+                            (weighted_price.round_dp(4), total_size.round_dp(2))
+                        } else {
+                            (fill_price, fill_size)
+                        };
+                        info!(%order_id, %final_price, %final_size, status = ?status, "Leg 2 fill (replay) — pair complete");
+                        self.state.leg2_state = OrderState::Filled {
+                            order_id,
+                            price: final_price,
+                            size: final_size,
+                            fill_timestamp_ms: now_ms,
+                        };
                     }
                     TradeStatus::Failed => {
                         self.state.leg2_state = OrderState::None;

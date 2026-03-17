@@ -796,13 +796,33 @@ impl LiveExecutor {
         let deadline_ms = signal.market_end_timestamp_ms;
         let mut current_price = signal.price;
         let mut attempt: u32 = 0;
+
+        // Pre-loop check: if market already expired, skip FOK entirely.
+        let now_ms = epoch_ms();
+        if now_ms >= deadline_ms {
+            error!(reason = ?exit_reason, "FOK skipped — market already expired");
+            self.reporter.fire_critical(format!(
+                "<b>ORPHANED POSITION</b>\n\n\
+                Leg 2 FOK skipped — market already expired.\n\
+                Token: <code>{}</code>\n\
+                Size: {} shares\n\
+                Reason: {:?}\n\n\
+                Manual intervention required.",
+                signal.token_id, signal.size, exit_reason,
+            ));
+            self.active_leg2_phase1_id = None;
+            self.active_leg2_phase2_id = None;
+            let _ = self.feedback_tx.try_send(ExecutorFeedback::OrderFailed { is_leg2: true });
+            return;
+        }
+
         loop {
-            attempt += 1;
             let now_ms = epoch_ms();
             if now_ms >= deadline_ms {
                 error!(attempts = attempt, reason = ?exit_reason, "FOK deadline reached (market expired) — aborting");
                 break;
             }
+            attempt += 1;
             let safe_size = clob_safe_fok_size(current_price, signal.size);
             if safe_size.is_zero() {
                 error!(price = %current_price, size = %signal.size, "FOK size zero — aborting");
@@ -939,7 +959,7 @@ impl LiveExecutor {
             Size: {} shares\n\
             Reason: {:?}\n\n\
             Manual intervention required.",
-            attempt.saturating_sub(1),
+            attempt,
             signal.token_id,
             signal.size,
             exit_reason,

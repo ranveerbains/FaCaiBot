@@ -510,6 +510,24 @@ async fn async_main() -> Result<()> {
             if matches!(engine.state().leg1_state, OrderState::Filled { .. })
                 && matches!(engine.state().leg2_state, OrderState::Filled { .. })
             {
+                // Diagnostic: warn if Leg 2 fill size is significantly less than Leg 1.
+                if let (
+                    OrderState::Filled { size: l1_size, .. },
+                    OrderState::Filled { size: l2_size, .. },
+                ) = (&engine.state().leg1_state, &engine.state().leg2_state)
+                {
+                    let ratio = if !l1_size.is_zero() {
+                        (*l2_size * rust_decimal::Decimal::ONE_HUNDRED) / *l1_size
+                    } else {
+                        rust_decimal::Decimal::ONE_HUNDRED
+                    };
+                    if ratio < rust_decimal::Decimal::new(80, 0) {
+                        warn!(
+                            l1_size = %l1_size, l2_size = %l2_size, ratio = %ratio,
+                            "Leg 2 fill size < 80% of Leg 1 — possible incomplete hedge"
+                        );
+                    }
+                }
                 // Record to QuestDB before state reset.
                 if let Some(ref mut c) = cold
                     && let Err(e) = engine.record_live_trade(c)

@@ -1568,3 +1568,155 @@ fn test_leg1_cancel_not_confirmed_with_fill_inits_leg2() {
     assert!(engine.hedge.is_some(), "hedge should init when cancel not confirmed but filled");
     assert!(matches!(engine.state.leg1_state, OrderState::Filled { .. }));
 }
+
+// ── Leg 2 partial fill handling in replay_pending_fills ──────────────
+
+#[test]
+fn test_replay_leg2_partial_matched_does_not_transition() {
+    // Buffer a Leg 2 MATCHED with size_matched < original_size before Leg 2
+    // is Posted. After on_order_posted sets Leg 2 to Posted, replay should
+    // detect the partial fill and NOT transition to Filled.
+    let mut engine = make_engine_with_market(600);
+    let now_ms = now_epoch_ms();
+
+    // Set Leg 1 to Filled (required for Leg 2 on_order_posted guard).
+    engine.state.leg1_state = OrderState::Filled {
+        order_id: "leg1-ord".to_string(),
+        price: Decimal::new(24, 2), // $0.24
+        size: Decimal::new(2246, 2), // 22.46 shares
+        fill_timestamp_ms: now_ms - 500,
+    };
+    engine.leg1_direction = Some(Direction::Up);
+    inject_buildup(&mut engine, Direction::Up);
+    set_book(&mut engine, "0.495", "0.505");
+
+    // Initialize hedge state (required for Leg 2 evaluation).
+    engine.init_leg2(Decimal::new(24, 2), Decimal::new(2246, 2), now_ms - 400);
+
+    // Buffer a partial fill for the Leg 2 order ID (arrives before OrderPosted).
+    engine.pending_fills.push_back((
+        "leg2-ord".to_string(),
+        TradeStatus::Matched,
+        Some(Decimal::new(999, 2)),  // 9.99 shares filled
+        Some(Decimal::new(2246, 2)), // 22.46 original
+    ));
+
+    // on_order_posted sets Leg 2 to Posted, then calls replay_pending_fills().
+    engine.on_order_posted(
+        true, // is_leg2
+        "leg2-ord".to_string(),
+        Decimal::new(73, 2), // $0.73
+        Decimal::new(2246, 2), // 22.46 shares
+        None, false, None,
+    );
+
+    // Leg 2 should still be Posted — partial fill should NOT transition to Filled.
+    assert!(
+        matches!(engine.state.leg2_state, OrderState::Posted { .. }),
+        "Leg 2 should stay Posted on partial fill replay, got: {:?}",
+        engine.state.leg2_state,
+    );
+}
+
+#[test]
+fn test_replay_leg2_mined_partial_resets_for_remainder() {
+    // Buffer a Leg 2 MINED with partial fill. After replay, Leg 2 state
+    // should be reset to None (not Filled) so evaluator generates Phase 2
+    // for the remainder.
+    let mut engine = make_engine_with_market(600);
+    let now_ms = now_epoch_ms();
+
+    engine.state.leg1_state = OrderState::Filled {
+        order_id: "leg1-ord".to_string(),
+        price: Decimal::new(24, 2),
+        size: Decimal::new(2246, 2), // 22.46 shares
+        fill_timestamp_ms: now_ms - 500,
+    };
+    engine.leg1_direction = Some(Direction::Up);
+    inject_buildup(&mut engine, Direction::Up);
+    set_book(&mut engine, "0.495", "0.505");
+
+    engine.init_leg2(Decimal::new(24, 2), Decimal::new(2246, 2), now_ms - 400);
+
+    // Buffer a terminal partial fill.
+    engine.pending_fills.push_back((
+        "leg2-ord".to_string(),
+        TradeStatus::Mined,
+        Some(Decimal::new(999, 2)),  // 9.99 shares filled
+        Some(Decimal::new(2246, 2)), // 22.46 original
+    ));
+
+    engine.on_order_posted(
+        true,
+        "leg2-ord".to_string(),
+        Decimal::new(73, 2),
+        Decimal::new(2246, 2),
+        None, false, None,
+    );
+
+    // Leg 2 should be None — terminal partial resets for remainder.
+    assert!(
+        matches!(engine.state.leg2_state, OrderState::None),
+        "Leg 2 should be None after terminal partial fill (replay), got: {:?}",
+        engine.state.leg2_state,
+    );
+    // leg2_partial_filled should track the partial.
+    assert_eq!(
+        engine.leg2_partial_filled,
+        Decimal::new(999, 2),
+        "leg2_partial_filled should be 9.99"
+    );
+    // leg2_phase1_fill should store the partial for weighted average later.
+    assert!(
+        engine.leg2_phase1_fill.is_some(),
+        "leg2_phase1_fill should store the partial fill"
+    );
+    let (price, size) = engine.leg2_phase1_fill.unwrap();
+    assert_eq!(size, Decimal::new(999, 2));
+    assert_eq!(price, Decimal::new(73, 2));
+}
+
+#[test]
+fn test_leg2_partial_detected_via_posted_size() {
+    // Normal MATCHED handler: CLOB reports original_size == size_matched
+    // (balance-constrained), but both are less than our posted size.
+    // Secondary posted-size check should detect partial fill.
+    let mut engine = make_engine_with_market(600);
+    let now_ms = now_epoch_ms();
+
+    engine.state.leg1_state = OrderState::Filled {
+        order_id: "leg1-ord".to_string(),
+        price: Decimal::new(24, 2),
+        size: Decimal::new(2246, 2), // 22.46 shares
+        fill_timestamp_ms: now_ms - 500,
+    };
+    engine.leg1_direction = Some(Direction::Up);
+    inject_buildup(&mut engine, Direction::Up);
+    set_book(&mut engine, "0.495", "0.505");
+
+    engine.init_leg2(Decimal::new(24, 2), Decimal::new(2246, 2), now_ms - 400);
+
+    // Set Leg 2 to Posted with size 22.46.
+    engine.state.leg2_state = OrderState::Posted {
+        order_id: "leg2-ord".to_string(),
+        price: Decimal::new(73, 2),
+        size: Decimal::new(2246, 2), // 22.46 shares posted
+        timestamp_ms: now_ms - 100,
+    };
+
+    // CLOB sends MATCHED with original_size == size_matched == 9.99
+    // (balance constrained the order to 9.99 shares).
+    engine.on_event(IngestorEvent::TradeStatusUpdate {
+        order_id: "leg2-ord".to_string(),
+        status: TradeStatus::Matched,
+        size_matched: Some(Decimal::new(999, 2)),  // 9.99
+        original_size: Some(Decimal::new(999, 2)), // 9.99 (CLOB truncated)
+    });
+
+    // Secondary check should detect: 9.99 < 22.46 posted → partial fill.
+    assert!(
+        matches!(engine.state.leg2_state, OrderState::Posted { .. }),
+        "Leg 2 should stay Posted when partial detected via posted-size check, got: {:?}",
+        engine.state.leg2_state,
+    );
+}
