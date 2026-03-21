@@ -95,28 +95,6 @@ fn test_cvd_staleness() {
     assert_eq!(tracker.normalized(1000), 0.0);
 }
 
-// ── Spot Flow ────────────────────────────────────────────────────────
-
-#[test]
-fn test_spot_flow_buy_dominant() {
-    let mut tracker = SpotFlowTracker::new(300.0, 200, 0.0, 1.0);
-    for i in 0..50 {
-        tracker.update(1.0, false, i * 10); // buyer aggressor
-    }
-    assert!(tracker.raw() > 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Up));
-}
-
-#[test]
-fn test_spot_flow_sell_dominant() {
-    let mut tracker = SpotFlowTracker::new(300.0, 200, 0.0, 1.0);
-    for i in 0..50 {
-        tracker.update(1.0, true, i * 10); // seller aggressor
-    }
-    assert!(tracker.raw() < 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Down));
-}
-
 // ── OBI Velocity ─────────────────────────────────────────────────────
 
 #[test]
@@ -156,77 +134,74 @@ fn test_basis_delta_futures_premium_rising() {
     assert_eq!(tracker.direction(), Some(Direction::Up));
 }
 
-// ── Liquidation Pressure ─────────────────────────────────────────────
+// ── Realized Vol Tracker ─────────────────────────────────────────────
 
 #[test]
-fn test_liq_pressure_short_squeezes() {
-    let mut tracker = LiqPressureTracker::new(2000.0, 3000, 0.0, 10.0);
-    // Short liquidations (side="BUY") → bullish pressure.
-    tracker.update("BUY", 5.0, 1000);
-    tracker.update("BUY", 3.0, 1500);
-    assert!(tracker.raw() > 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Up));
-    assert!(tracker.normalized(1500) > 0.0);
+fn test_realized_vol_warmup() {
+    let tracker = RealizedVolTracker::new(600, 10, 0.00003, 20.0, 500);
+    // Before warmup, returns default vol
+    assert!((tracker.realized_vol() - 0.00003).abs() < 1e-10);
 }
 
 #[test]
-fn test_liq_pressure_long_liquidations() {
-    let mut tracker = LiqPressureTracker::new(2000.0, 3000, 0.0, 10.0);
-    // Long liquidations (side="SELL") → bearish pressure.
-    tracker.update("SELL", 5.0, 1000);
-    assert!(tracker.raw() < 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Down));
-}
-
-#[test]
-fn test_liq_pressure_decay() {
-    let mut tracker = LiqPressureTracker::new(2000.0, 3000, 0.0, 10.0);
-    tracker.update("BUY", 10.0, 0);
-    let raw_at_0 = tracker.decaying_sum(0);
-    let raw_at_2000 = tracker.decaying_sum(2000); // 1 half-life later
-    // Should be approximately half.
-    assert!((raw_at_2000 - raw_at_0 / 2.0).abs() < 0.01);
-}
-
-#[test]
-fn test_liq_pressure_pruning() {
-    let mut tracker = LiqPressureTracker::new(2000.0, 3000, 0.0, 10.0);
-    tracker.update("BUY", 10.0, 0);
-    // Update at 11000 (> 5 × half_life = 10000) → old event pruned.
-    tracker.update("BUY", 1.0, 11000);
-    assert_eq!(tracker.events.len(), 1);
-}
-
-// ── ATR Displacement ─────────────────────────────────────────────────
-
-#[test]
-fn test_atr_displacement_warmup() {
-    let tracker = AtrDisplacementTracker::new(0.002, 100, 0.0, 15.0, 50);
-    assert_eq!(tracker.normalized(0), 0.0);
-    assert!(tracker.direction().is_none());
-}
-
-#[test]
-fn test_atr_displacement_spike_up() {
-    let mut tracker = AtrDisplacementTracker::new(0.1, 100, 0.0, 5.0, 10);
-    // Warm up with stable prices.
+fn test_realized_vol_stable_prices() {
+    let mut tracker = RealizedVolTracker::new(600, 5, 0.00003, 20.0, 500);
+    // Feed stable prices → near-zero vol
     for i in 0..20 {
-        tracker.update(50000.0 + (i as f64 * 0.1), i as u64 * 50);
+        tracker.update(100_000.0, i * 50);
     }
-    // Big jump.
-    tracker.update(50010.0, 1050);
-    assert!(tracker.raw() > 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Up));
+    assert!(tracker.realized_vol() < 0.0001, "stable prices should have near-zero vol, got {}", tracker.realized_vol());
 }
 
 #[test]
-fn test_atr_displacement_spike_down() {
-    let mut tracker = AtrDisplacementTracker::new(0.1, 100, 0.0, 5.0, 10);
+fn test_realized_vol_with_movement() {
+    let mut tracker = RealizedVolTracker::new(600, 5, 0.00003, 20.0, 500);
+    // Feed prices with alternating movement
     for i in 0..20 {
-        tracker.update(50000.0 + (i as f64 * 0.1), i as u64 * 50);
+        let price = 100_000.0 + if i % 2 == 0 { 50.0 } else { -50.0 };
+        tracker.update(price, i * 50);
     }
-    // Big drop.
-    tracker.update(49990.0, 1050);
-    assert!(tracker.raw() < 0.0);
-    assert_eq!(tracker.direction(), Some(Direction::Down));
+    let vol = tracker.realized_vol();
+    assert!(vol > 0.0001, "moving prices should produce non-trivial vol, got {vol}");
+}
+
+#[test]
+fn test_realized_vol_time_scaling() {
+    let mut tracker = RealizedVolTracker::new(600, 5, 0.00003, 20.0, 500);
+    for i in 0..20 {
+        let price = 100_000.0 + (i as f64 * 10.0);
+        tracker.update(price, i * 50);
+    }
+    let vol_200s = tracker.scaled_vol(200.0);
+    let vol_100s = tracker.scaled_vol(100.0);
+    // More time remaining → higher scaled vol
+    assert!(vol_200s > vol_100s, "200s vol ({vol_200s}) should exceed 100s vol ({vol_100s})");
+    // Scaling should be sqrt(2) ratio
+    let ratio = vol_200s / vol_100s;
+    assert!((ratio - std::f64::consts::SQRT_2).abs() < 0.01,
+        "ratio should be ~sqrt(2), got {ratio}");
+}
+
+#[test]
+fn test_realized_vol_freshness() {
+    let mut tracker = RealizedVolTracker::new(600, 5, 0.00003, 20.0, 500);
+    for i in 0..10 {
+        tracker.update(100_000.0 + (i as f64), i * 50);
+    }
+    assert!(tracker.is_fresh(500));
+    assert!(!tracker.is_fresh(1500)); // 500ms freshness, last update at 450
+}
+
+#[test]
+fn test_realized_vol_ring_buffer_eviction() {
+    // Small capacity to test eviction
+    let mut tracker = RealizedVolTracker::new(5, 3, 0.00003, 20.0, 500);
+    // Fill beyond capacity
+    for i in 0..20 {
+        tracker.update(100_000.0 + (i as f64 * 5.0), i * 50);
+    }
+    // Vol should be finite and reasonable
+    let vol = tracker.realized_vol();
+    assert!(vol.is_finite(), "vol should be finite after eviction");
+    assert!(vol > 0.0, "vol should be positive with price movement");
 }

@@ -53,7 +53,7 @@ pub fn handle_diag(args: &str, flags: &Arc<NotifyFlags>) -> String {
     }
 }
 
-/// Handle `/stop`. Pauses trading (blocks new entries, Leg 2 continues, bot stays alive).
+/// Handle `/stop`. Pauses quoting. Closing phase still runs if active. Bot stays alive.
 pub fn handle_stop(ingestor_tx: &Sender<IngestorEvent>) -> String {
     match ingestor_tx.try_send(IngestorEvent::PauseTrading) {
         Ok(()) => "Trading paused. Use /resume to restart.".into(),
@@ -163,25 +163,25 @@ pub fn handle_status(status: &BotStatus) -> String {
 
     format!(
         "Uptime: {uptime_h}h {uptime_m:02}m {uptime_s:02}s{drain}\n\
-         Mode: {mode}\n\
+         Mode: {mode} [{phase}]\n\
          Heartbeat: {heartbeat}\n\
          Market: {market}\n\
-         Leg 1: {leg1}\n\
-         Leg 2: {leg2}\n\
-         Spikes: {spikes}\n\
-         Signals: {signals}\n\
-         Trades: {trades}\n\
-         Trades notify: {trades_on}\n\
-         Summary notify: {summary_on}",
+         Position: {position}\n\
+         Paired: {pairing}\n\
+         Unpaired: YES:{up_yes} | NO:{up_no}\n\
+         Markets: {markets} | Fills: {fills}\n\
+         Trades notify: {trades_on} | Summary notify: {summary_on}",
         drain = drain_status,
         mode = status.mode,
+        phase = status.phase,
         heartbeat = heartbeat_str,
         market = market,
-        leg1 = status.leg1_state,
-        leg2 = status.leg2_state,
-        spikes = status.spikes_received,
-        signals = status.signals_emitted,
-        trades = status.trades_completed,
+        position = status.position_summary,
+        pairing = status.pairing_summary,
+        up_yes = status.unpaired_yes,
+        up_no = status.unpaired_no,
+        markets = status.markets_traded,
+        fills = status.total_fills,
         trades_on = if status.trades_enabled { "on" } else { "off" },
         summary_on = if status.summary_enabled { "on" } else { "off" },
     )

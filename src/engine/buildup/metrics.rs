@@ -7,8 +7,6 @@
 //! - `is_fresh()` — whether the metric has been updated within its freshness window
 //! - `raw()` — current raw (unnormalized) value
 
-use std::collections::VecDeque;
-
 use crate::types::market::Direction;
 
 // ─── Common helpers ──────────────────────────────────────────────────────────
@@ -29,7 +27,7 @@ fn normalize(value: f64, min_threshold: f64, saturation: f64) -> f64 {
 
 /// Compute time-based EMA alpha from elapsed time and half-life.
 /// At dt = halflife_ms, alpha = 0.5 (old value halved).
-/// Uses base-2 exponential matching LiqPressureTracker's decay formula.
+/// Uses base-2 exponential decay formula.
 #[inline]
 fn time_alpha(dt_ms: f64, halflife_ms: f64) -> f64 {
     1.0 - 2.0_f64.powf(-dt_ms / halflife_ms)
@@ -127,97 +125,12 @@ impl CvdAccelTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
-    }
-
     pub fn raw(&self) -> f64 {
         self.accel
     }
 }
 
-// ─── 2. Spot Trade Flow Tracker ──────────────────────────────────────────────
-
-/// Net spot trade flow from Binance Spot SBE @trade.
-///
-/// Separate EMAs for buy vs sell volume. Flow = buy_ema - sell_ema.
-/// Positive flow → net buying → bullish.
-/// Uses time-based EMA for consistent smoothing regardless of trade frequency.
-pub struct SpotFlowTracker {
-    buy_vol_ema: f64,
-    sell_vol_ema: f64,
-    flow: f64,
-    halflife_ms: f64,
-    last_update_ms: u64,
-    freshness_max_ms: u64,
-    min_threshold: f64,
-    saturation: f64,
-    samples: u32,
-}
-
-impl SpotFlowTracker {
-    pub fn new(halflife_ms: f64, freshness_max_ms: u64, min_threshold: f64, saturation: f64) -> Self {
-        Self {
-            buy_vol_ema: 0.0,
-            sell_vol_ema: 0.0,
-            flow: 0.0,
-            halflife_ms,
-            last_update_ms: 0,
-            freshness_max_ms,
-            min_threshold,
-            saturation,
-            samples: 0,
-        }
-    }
-
-    /// Feed a spot trade.
-    pub fn update(&mut self, quantity: f64, is_buyer_maker: bool, now_ms: u64) {
-        let alpha = if self.samples == 0 {
-            1.0
-        } else {
-            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
-            time_alpha(dt, self.halflife_ms)
-        };
-        if is_buyer_maker {
-            // Seller is aggressor.
-            self.sell_vol_ema = alpha * quantity + (1.0 - alpha) * self.sell_vol_ema;
-        } else {
-            // Buyer is aggressor.
-            self.buy_vol_ema = alpha * quantity + (1.0 - alpha) * self.buy_vol_ema;
-        }
-        self.flow = self.buy_vol_ema - self.sell_vol_ema;
-        self.last_update_ms = now_ms;
-        self.samples += 1;
-    }
-
-    pub fn normalized(&self, now_ms: u64) -> f64 {
-        if !self.is_fresh(now_ms) || self.samples < 10 {
-            return 0.0;
-        }
-        normalize(self.flow, self.min_threshold, self.saturation)
-    }
-
-    pub fn direction(&self) -> Option<Direction> {
-        if self.samples < 10 {
-            return None;
-        }
-        sign_to_direction(self.flow)
-    }
-
-    pub fn is_fresh(&self, now_ms: u64) -> bool {
-        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
-    }
-
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
-    }
-
-    pub fn raw(&self) -> f64 {
-        self.flow
-    }
-}
-
-// ─── 3. OBI Velocity Tracker ─────────────────────────────────────────────────
+// ─── 2. OBI Velocity Tracker ─────────────────────────────────────────────────
 
 /// Order Book Imbalance velocity from Binance Spot @depth20.
 ///
@@ -279,16 +192,12 @@ impl ObiVelocityTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
-    }
-
     pub fn raw(&self) -> f64 {
         self.obi_delta_ema
     }
 }
 
-// ─── 4. Basis Delta Tracker ──────────────────────────────────────────────────
+// ─── 3. Basis Delta Tracker ──────────────────────────────────────────────────
 
 /// Futures-spot basis rate of change from @bookTicker + spot mid.
 ///
@@ -370,175 +279,120 @@ impl BasisDeltaTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
-    }
-
     pub fn raw(&self) -> f64 {
         self.basis_delta_ema
     }
 }
 
-// ─── 5. Liquidation Pressure Tracker ─────────────────────────────────────────
+// ─── 4. Realized Volatility Tracker ─────────────────────────────────────────
 
-/// Time-decaying sum of forced liquidation volume from @forceOrder.
+/// Rolling realized volatility from BinanceTick mid-price log-returns.
 ///
-/// Each liquidation contributes signed_qty × 2^(-(now - event_time) / half_life).
-/// Positive = short liquidations dominating → bullish.
-pub struct LiqPressureTracker {
-    events: VecDeque<(f64, u64)>, // (signed_qty, timestamp_ms)
-    half_life_ms: f64,
+/// Maintains a ring buffer of log-returns and computes per-tick standard
+/// deviation (zero-mean assumption, valid for short windows like 5 minutes).
+/// Two instances are used: short-window (~30s) for the base model, and
+/// session-window (full 5-min) for regime detection.
+pub struct RealizedVolTracker {
+    /// Ring buffer of log-returns.
+    returns: Vec<f64>,
+    /// Write position in ring buffer.
+    head: usize,
+    /// Number of samples collected (may exceed capacity).
+    count: usize,
+    /// Running sum of squared returns for fast vol computation.
+    sum_sq: f64,
+    /// Previous price for computing log-returns.
+    prev_price: f64,
+    /// Maximum capacity of the ring buffer.
+    capacity: usize,
+    /// Minimum samples before returning a valid vol.
+    min_warmup: usize,
+    /// Default vol to return when not warmed up.
+    default_vol: f64,
+    /// Estimated ticks per second (for time scaling).
+    ticks_per_sec: f64,
+    /// Timestamp of last update.
     last_update_ms: u64,
+    /// Maximum age before considered stale.
     freshness_max_ms: u64,
-    min_threshold: f64,
-    saturation: f64,
 }
 
-impl LiqPressureTracker {
-    pub fn new(half_life_ms: f64, freshness_max_ms: u64, min_threshold: f64, saturation: f64) -> Self {
-        Self {
-            events: VecDeque::new(),
-            half_life_ms,
-            last_update_ms: 0,
-            freshness_max_ms,
-            min_threshold,
-            saturation,
-        }
-    }
-
-    /// Feed a forced liquidation event.
-    /// `side`: "SELL" = long liquidated (bearish), "BUY" = short liquidated (bullish).
-    pub fn update(&mut self, side: &str, quantity: f64, now_ms: u64) {
-        let signed_qty = if side == "BUY" { quantity } else { -quantity };
-        self.events.push_back((signed_qty, now_ms));
-        self.last_update_ms = now_ms;
-        // Prune events older than 5 × half_life (contribution < 3%).
-        let cutoff = now_ms.saturating_sub((self.half_life_ms * 5.0) as u64);
-        while self.events.front().is_some_and(|(_, ts)| *ts < cutoff) {
-            self.events.pop_front();
-        }
-    }
-
-    /// Compute the time-decaying sum.
-    fn decaying_sum(&self, now_ms: u64) -> f64 {
-        self.events
-            .iter()
-            .map(|(qty, ts)| {
-                let age_ms = now_ms.saturating_sub(*ts) as f64;
-                qty * 2.0_f64.powf(-age_ms / self.half_life_ms)
-            })
-            .sum()
-    }
-
-    pub fn normalized(&self, now_ms: u64) -> f64 {
-        if !self.is_fresh(now_ms) || self.events.is_empty() {
-            return 0.0;
-        }
-        normalize(self.decaying_sum(now_ms), self.min_threshold, self.saturation)
-    }
-
-    pub fn direction(&self) -> Option<Direction> {
-        if self.events.is_empty() {
-            return None;
-        }
-        // Use last_update_ms as "now" for direction check.
-        sign_to_direction(self.decaying_sum(self.last_update_ms))
-    }
-
-    pub fn is_fresh(&self, now_ms: u64) -> bool {
-        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
-    }
-
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
-    }
-
-    pub fn raw(&self) -> f64 {
-        self.decaying_sum(self.last_update_ms)
-    }
-}
-
-// ─── 6. ATR Displacement Tracker ─────────────────────────────────────────────
-
-/// Price displacement in ATR multiples from Binance Spot @depth20.
-///
-/// Adapted from the existing SpikeDetector's EMA-ATR logic but as a continuous
-/// metric rather than a binary spike trigger.
-pub struct AtrDisplacementTracker {
-    ema_atr: f64,
-    prev_mid: f64,
-    displacement_ratio: f64,
-    atr_alpha: f64,
-    last_update_ms: u64,
-    freshness_max_ms: u64,
-    min_threshold: f64,
-    saturation: f64,
-    samples: u32,
-    min_warmup: u32,
-}
-
-impl AtrDisplacementTracker {
+impl RealizedVolTracker {
     pub fn new(
-        atr_alpha: f64,
+        capacity: usize,
+        min_warmup: usize,
+        default_vol: f64,
+        ticks_per_sec: f64,
         freshness_max_ms: u64,
-        min_threshold: f64,
-        saturation: f64,
-        min_warmup: u32,
     ) -> Self {
         Self {
-            ema_atr: 0.0,
-            prev_mid: 0.0,
-            displacement_ratio: 0.0,
-            atr_alpha,
+            returns: vec![0.0; capacity],
+            head: 0,
+            count: 0,
+            sum_sq: 0.0,
+            prev_price: 0.0,
+            capacity,
+            min_warmup,
+            default_vol,
+            ticks_per_sec,
             last_update_ms: 0,
             freshness_max_ms,
-            min_threshold,
-            saturation,
-            samples: 0,
-            min_warmup,
         }
     }
 
-    /// Feed a spot depth mid-price.
-    pub fn update(&mut self, mid: f64, now_ms: u64) {
-        if self.samples > 0 && self.prev_mid > 0.0 {
-            let abs_delta = (mid - self.prev_mid).abs();
-            self.ema_atr = self.atr_alpha * abs_delta + (1.0 - self.atr_alpha) * self.ema_atr;
-            if self.ema_atr > 0.0 {
-                self.displacement_ratio = (mid - self.prev_mid) / self.ema_atr;
+    /// Feed a new mid-price. Computes log-return and updates ring buffer.
+    pub fn update(&mut self, price: f64, now_ms: u64) {
+        if price <= 0.0 {
+            return;
+        }
+        if self.prev_price > 0.0 {
+            let log_return = (price / self.prev_price).ln();
+            // Evict oldest if buffer is full
+            if self.count >= self.capacity {
+                let old = self.returns[self.head];
+                self.sum_sq -= old * old;
             }
+            self.returns[self.head] = log_return;
+            self.sum_sq += log_return * log_return;
+            self.head = (self.head + 1) % self.capacity;
+            self.count += 1;
         }
-        self.prev_mid = mid;
+        self.prev_price = price;
         self.last_update_ms = now_ms;
-        self.samples += 1;
     }
 
-    pub fn normalized(&self, now_ms: u64) -> f64 {
-        if !self.is_fresh(now_ms) || self.samples < self.min_warmup {
-            return 0.0;
+    /// Per-tick standard deviation of log-returns.
+    pub fn realized_vol(&self) -> f64 {
+        let n = self.count.min(self.capacity);
+        if n < self.min_warmup {
+            return self.default_vol;
         }
-        normalize(self.displacement_ratio, self.min_threshold, self.saturation)
+        // Clamp sum_sq to avoid negative due to floating-point drift
+        let variance = (self.sum_sq / n as f64).max(0.0);
+        variance.sqrt()
     }
 
-    pub fn direction(&self) -> Option<Direction> {
-        if self.samples < self.min_warmup {
-            return None;
-        }
-        sign_to_direction(self.displacement_ratio)
+    /// Volatility scaled to remaining time: σ_tick × √(ticks_per_sec × remaining_secs).
+    pub fn scaled_vol(&self, remaining_secs: f64) -> f64 {
+        let ticks_remaining = self.ticks_per_sec * remaining_secs;
+        self.realized_vol() * ticks_remaining.max(1.0).sqrt()
     }
 
+    /// Whether the tracker has been updated recently.
     pub fn is_fresh(&self, now_ms: u64) -> bool {
-        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+        self.last_update_ms > 0
+            && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
-    pub fn age_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.last_update_ms)
+    /// Number of samples collected so far.
+    pub fn sample_count(&self) -> usize {
+        self.count
     }
 
-    pub fn raw(&self) -> f64 {
-        self.displacement_ratio
+    /// Whether the tracker has enough samples for valid vol computation.
+    pub fn is_warm(&self) -> bool {
+        self.count >= self.min_warmup
     }
-
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

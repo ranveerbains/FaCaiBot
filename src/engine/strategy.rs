@@ -1,657 +1,240 @@
-//! Strategy Engine — Layer 2 ("The Brain").
+//! V2 Strategy Engine — bilateral accumulation.
 //!
-//! Pulls [`IngestorEvent`]s from the ingestor crossbeam channel, maintains
-//! [`MarketState`], evaluates arbitrage conditions, and emits [`TradeSignal`]s
-//! to the Executor layer.
-//!
-//! # Architecture
-//! - Runs as a tokio task on the main multi-threaded runtime.
-//! - All state updates are O(1) — no sorting or searching in the critical path.
-//! - All pricing arithmetic uses `rust_decimal::Decimal` — zero f32/f64.
-//! - No I/O in the hot path (no Redis reads, no HTTP calls).
-//! - Latency target: <2ms from event pull to signal emit.
-//!
-//! # Buildup detection
-//! The internal BuildupDetector is fed raw Binance events and evaluated after each dirty tick.
-//! The engine posts a Leg 1 maker order on confirmed buildups only (no speculative posting).
+//! State machine: IDLE → QUIET → QUOTING → CLOSING
+//! Accumulates YES and NO shares independently, pairs at resolution.
 
 use rust_decimal::Decimal;
-use tracing::{debug, info, warn};
+use rust_decimal::prelude::ToPrimitive;
+use tracing::{debug, info};
 
 use crate::config::Config;
-use crate::engine::buildup::detector::{BuildupConfig, BuildupDetector};
-use crate::engine::confidence::round_to_tick;
+use crate::engine::closing::ClosingManager;
+use crate::engine::fair_value::{FairValueConfig, FairValueEstimator};
+use crate::engine::position::{BilateralPosition, MarketSide};
+use crate::engine::quoter::{ManagedOrder, QuoteAction, Quoter, QuotingConfig, RiskV2Config};
+use crate::executor::fill_engine::{compute_taker_fee, round_to_tick};
 use crate::reporting::telegram::TelegramReporter;
-use crate::types::market::{
-    BuildupInfo, DataSource, Direction, IngestorEvent, MarketState, OrderBook, OrderState,
-    PriceLevel, SpikeInfo, TradeStatus,
-};
-use crate::types::order::{
-    ExecutorCommand, ExitReason, FillInfo, FillMethod, LiveTradeReport, MarketSummary, OrderTag,
-    ProfitTier, SessionSummary, Side, TradeSignal,
-};
-use crate::utils::time::epoch_ms as now_epoch_ms;
+use crate::storage::cold::{FillRecord, MarketSummaryRecord};
+use crate::types::market::{IngestorEvent, MarketState, TradeStatus};
+use crate::types::order::{V2ExecutorCommand, V2ExecutorFeedback};
+use crate::utils::time::epoch_ms;
 
-use super::confidence::compute_expected_repricing;
-use super::erosion::{ConnectivityState, HedgePhase, HedgeSnap, HedgeState};
-use super::evaluator::{
-    Leg1Evaluator, Leg1Outcome, Leg1RejectReason, Leg2Decision, Leg2Evaluator, make_leg2_signal,
-};
+// ─── Market Phase ───────────────────────────────────────────────────────────
 
-// ─── Deferred partial fill tracking ──────────────────────────────────────────
-
-/// Tracks orders with partial `size_matched` at MATCHED time.
-/// Resolved when MINED/CONFIRMED arrives with the final cumulative size.
-/// Prevents false "PARTIAL FILL" alerts when the CLOB splits a fill across
-/// multiple rapid MATCHED events (~3ms apart).
-struct PendingPartialFill {
-    leg: &'static str,
-    size_matched: Decimal,
-    original_size: Decimal,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketPhase {
+    Idle,
+    Quiet,
+    Quoting,
+    Closing,
 }
 
-// ─── Per-trade Leg 2 metadata for live mode Telegram reporting ───────────────
+// ─── V2 Strategy Engine ─────────────────────────────────────────────────────
 
-/// Tracks Leg 2 exit metadata in live mode so `on_trade_complete()` can build
-/// the correct tags for the trade-completed Telegram message.
-/// Reset to default at the start of each trade (on Leg 1 fill).
-#[derive(Debug, Default, Clone)]
-struct LiveTradeMeta {
-    leg2_was_taker: bool,
-    emergency_maker: bool,
-    favorable_taker: bool,
-    /// `true` if Leg 2 filled via the favorable maker try-first path (no taker fee).
-    favorable_maker: bool,
-    phase1_breach: bool,
-    exit_reason: Option<ExitReason>,
-}
+pub struct V2StrategyEngine {
+    // ── Config ──
+    quoting_config: QuotingConfig,
+    risk_config: RiskV2Config,
+    fair_value_config: FairValueConfig,
+    min_edge: f64,
 
-// ─── Precomputed Decimal constants ───────────────────────────────────────────
-
-/// EMA alpha for avg_book_depth smoothing (0.1).
-const BOOK_DEPTH_ALPHA: Decimal = Decimal::from_parts(1, 0, 0, false, 1);
-/// 1.0 - BOOK_DEPTH_ALPHA = 0.9.
-const BOOK_DEPTH_ONE_MINUS: Decimal = Decimal::from_parts(9, 0, 0, false, 1);
-
-// ─── Strategy Engine ─────────────────────────────────────────────────────────
-
-/// Evaluates ingestor events against the current market state and produces trade signals.
-///
-/// Implements the full three-stage arbitrage strategy:
-/// 1. **Leg 1**: Detect Binance spike → enter directional position (post-only maker)
-/// 2. **Leg 2**: After Leg 1 fills → hedge with opposite side (post-only maker)
-/// 3. **Emergency**: FOK taker fills when breach, timeout, or flow reversal is detected
-///
-/// Signal evaluation logic (guard checks + signal building) lives in
-/// [`Leg1Evaluator`] and [`Leg2Evaluator`]. This struct owns shared mutable
-/// state and applies post-signal mutations after evaluator calls.
-pub struct StrategyEngine {
+    // ── Market state ──
     state: MarketState,
-    hedge: Option<HedgeState>,
-    connectivity: ConnectivityState,
-    /// EMA of total poly book depth (alpha=0.1) for depth wall detection.
-    avg_book_depth: Option<Decimal>,
-    /// Direction of the active Leg 1 trade. Set by evaluate(), cleared on completion/rotation.
-    leg1_direction: Option<Direction>,
+    phase: MarketPhase,
+    strike_price: Option<Decimal>,
+    quiet_until_ms: u64,
 
-    // ── Cutoff window tracking ────────────────────────────────────────────
-    /// `true` once the entry_cutoff window is entered for the current market.
-    /// Reset to `false` on `MarketRotation`.
-    in_cutoff_window: bool,
+    // ── Core modules ──
+    position: BilateralPosition,
+    fair_value: FairValueEstimator,
+    quoter: Quoter,
+    closing: ClosingManager,
 
-    /// `true` during the post-rotation quiet period. Set on `MarketRotation`,
-    /// cleared when `rotation_quiet_ms` elapses.
-    in_quiet_period: bool,
-    /// Epoch ms when the current market rotation occurred.
-    rotation_ms: u64,
-    /// Config: quiet period duration after rotation.
-    rotation_quiet_ms: u64,
-
-    /// `true` during post-trade cooldown. Set on trade completion,
-    /// cleared when `trade_cooldown_ms` elapses.
-    in_trade_cooldown: bool,
-    /// Epoch ms when the last trade completed.
-    last_trade_complete_ms: u64,
-    /// Config: cooldown duration after trade completion.
-    trade_cooldown_ms: u64,
-
-    /// Stored Leg 1 signal for building confirmed fill signals in advance_simulation().
-    pending_leg1_signal: Option<TradeSignal>,
-
-    /// Emergency Leg 2 signals generated during MarketRotation when a Leg 1 is
-    /// still open. Drained by main loop before sending the rotation command.
-    rotation_emergency_buffer: Vec<TradeSignal>,
-
-    /// Cancel Leg 1 if ask drifts up ≥ this many $ from posted ask.
-    ask_drift_cancel_cents: Decimal,
-    /// Set when a Leg 1 cancel command is queued; cleared on cancel result.
-    /// Gates sustain monitor to prevent retry loops when `was_cancelled=false`.
-    leg1_cancel_inflight: bool,
-    /// Current Leg 1 retry attempt (0 = first try).
-    leg1_retry_count: u32,
-    /// Maximum allowed Leg 1 retries (from config).
-    max_leg1_retries: u32,
-    /// Whether the current pending cancel is retryable (ask-drift = true, composite-fade/opposite = false).
-    leg1_cancel_retryable: bool,
-    /// Maximum cumulative ask chase ($) for ask-drift retries (from config).
-    max_ask_chase_cents: Decimal,
-    /// Best ask at the time of the ORIGINAL signal (first attempt). Preserved across retries
-    /// to measure cumulative chase. Cleared on full reset / trade complete / rotation.
-    original_signal_ask: Option<Decimal>,
-
-    /// Tick size change command to forward to executor (SDK cache update).
-    /// Drained by main loop after on_event().
-    pending_tick_size_cmd: Option<ExecutorCommand>,
-
-    /// Pending Leg 1 cancel command (flow-based sustain failure or timeout).
-    /// Drained by main loop via `take_leg1_cancel()`.
-    pending_leg1_cancel: Option<ExecutorCommand>,
-
-    /// Set `true` when an emergency Leg 2 signal is dispatched to the executor.
-    /// Cleared on feedback (OrderPosted, OrderFailed, CancelResult for leg2, trade complete).
-    /// Gates `evaluate_leg2()` to prevent signal stacking in the executor channel.
-    emergency_signal_in_flight: bool,
-
-    /// Set `true` when ANY Leg 2 command is dispatched to the executor (hedge or emergency).
-    /// Cleared on ANY Leg 2 feedback (OrderPosted, OrderFailed, CancelResult for leg2).
-    /// Prevents stale hedge commands from queuing while the executor is still processing
-    /// a previous Leg 2 command (e.g., favorable exit takes ~3.6s for 3 HTTP calls).
-    leg2_command_pending: bool,
-
-    /// Pending cancel command from heartbeat dead proactive reset.
-    /// Drained by main loop via `take_heartbeat_cancel()`.
-    pending_heartbeat_cancel: Option<ExecutorCommand>,
-    /// Consecutive heartbeat failure threshold for proactive state reset.
-    heartbeat_dead_threshold: u32,
-
-    /// Set `true` when the engine's 60s terminal log fires. Cleared after the
-    /// Telegram diagnostic is sent.
-    engine_diag_ready: bool,
-    /// Pending Telegram diagnostic message (engine counters).
-    /// Drained by main loop via `take_pending_telegram_diag()`.
-    pending_telegram_diag: Option<String>,
-
-    // ── Live mode Telegram reporting ───────────────────────────────────────
-    /// Telegram reporter for live mode. `None` in simulation mode.
+    // ── Reporting ──
     reporter: Option<TelegramReporter>,
-    /// Leg 2 metadata for the current live trade (reset on Leg 1 fill).
-    live_trade_meta: LiveTradeMeta,
-    /// Completed trades for the current market window (cleared on rotation).
-    live_market_trades: Vec<LiveTradeReport>,
-    /// Completed trades for the entire session.
-    live_session_trades: Vec<LiveTradeReport>,
-    /// Leg 1 signals sent for the current market window (cleared on rotation).
-    live_market_signals: u32,
-    /// Depth walls outbid for the current market window (cleared on rotation).
-    live_market_walls: u32,
-    /// Epoch ms when set_reporter() was called (used for session uptime).
-    live_session_start_ms: u64,
 
-    // ── Diagnostic counters (cumulative from app start, logged every 60s) ──
-    diag_markets_rotated: u64,
-    diag_buildups_received: u64,
-    diag_buildups_dropped_cutoff: u64,
-    diag_buildups_dropped_quiet: u64,
-    diag_buildups_dropped_cooldown: u64,
-    diag_emg_phase1_breach: u64,
-    // Leg 1 rejection distribution — only incremented when buildup_detected = true
-    diag_rej_busy: u64,    // ActiveTrade: trade already in flight
-    diag_rej_no_book: u64,    // NoBook: Polymarket book missing
-    diag_rej_no_binance: u64, // NoBinance: no Binance reference price
-    diag_rej_stale: u64,   // StaleBook
-    diag_rej_spread: u64,  // WideSpread
-    diag_rej_ask_pair: u64, // AskPairTooExpensive
-    diag_rej_skew: u64,    // PriceSkewed
-    diag_rej_reprice: u64, // InsufficientRepricing: model output below min_reprice_pct
-    diag_rej_paused: u64,  // Paused/Draining: spike dropped while paused or draining
-    diag_rej_other: u64,   // Other (no market, bid cap, zero size, etc.)
-    diag_leg1_signals: u64,
-    diag_leg1_fills: u64,
-    diag_leg2_phase1_posts: u64,
-    diag_phase_transitions: u64,
-    diag_leg2_fills_maker: u64,
-    diag_leg2_fills_taker: u64,
-    diag_emg_be_breach: u64,
-    diag_emg_phase2_timeout: u64,
-    diag_emg_phase2_price_breach: u64,
-    diag_emg_expiry: u64,
-    diag_favorable_exits: u64,
-    diag_emg_maker: u64,  // emergency exits filled as post-only maker
-    diag_emg_taker: u64,  // emergency exits filled as FOK taker
-    diag_favorable_maker_fills: u64,
-    diag_favorable_maker_timeouts: u64,
-    diag_phase2_entry_breach: u64,
-    diag_buildup_failures: u64,
-    diag_order_failures: u64,
-    diag_sustain_cancels: u64,    // Leg 1 cancelled: composite < cancel_threshold
-    diag_sustain_timeouts: u64,   // Leg 1 cancelled: timeout (legacy, no longer incremented)
-    diag_opposite_dir_cancels: u64, // Leg 1 cancelled: opposite-direction buildup confirmed
-    diag_ask_drift_cancels: u64,   // Leg 1 cancelled: ask drifted beyond threshold
-    diag_leg1_retries: u64,        // Leg 1 retry attempts (crosses-book or ask-drift repost)
-    diag_rej_heartbeat: u64,       // Leg 1 rejected: heartbeat down
-    diag_heartbeat_resets: u64,    // Proactive state resets triggered by heartbeat death
-    last_diag_ms: u64,
-
-    // ── Leg 2 partial fill & multi-phase tracking ──────────────────────
-    /// Cumulative Leg 2 fills before trade completion (mirrors state.leg2_partial_filled).
-    leg2_partial_filled: Decimal,
-    /// Phase 1 partial fill stored for weighted average when Phase 2 fills: (price, size).
-    leg2_phase1_fill: Option<(Decimal, Decimal)>,
-
-    // ── Dual-order tracking (Phase 1 + Phase 2) ────────────────────────
-    /// Phase 1 Leg 2 order ID (persists into Phase 2 when dual-order active).
-    leg2_phase1_order_id: Option<String>,
-    /// Phase 2 Leg 2 order ID (posted alongside Phase 1 at ask-1tick).
-    leg2_phase2_order_id: Option<String>,
-    /// Set `true` when the last `evaluate_leg2()` returned a Phase2Alongside signal.
-    /// Main loop checks this to send `PostLeg2Phase2` instead of `Signal`.
-    /// Cleared after being consumed.
-    last_leg2_was_phase2_alongside: bool,
-
-    // ── Drain / pause mode ─────────────────────────────────────────────
-    /// When `true`, `evaluate()` blocks new Leg 1 entries. Set by `/shutdown` or `/set`.
-    pub draining: bool,
-    /// When `true`, `evaluate()` blocks new Leg 1 entries but the bot stays alive.
-    /// Set by `/stop`, cleared by `/resume`. Unlike `draining`, does not exit.
+    // ── Control ──
+    draining: bool,
     paused: bool,
 
-    /// Saved previous Leg 2 order info before evaluate_leg2() overwrites
-    /// with a provisional ID. Restored if CancelResult reports not confirmed.
-    prev_leg2_order: Option<(String, Decimal, Decimal)>,
+    // ── Heartbeat ──
+    heartbeat_healthy: bool,
+    heartbeat_failures: u32,
+    heartbeat_latency_ms: u64,
 
-    /// Buffer for TradeStatusUpdate events that arrived before OrderPosted
-    /// feedback. Replayed after on_order_posted() or on_cancel_result().
-    pending_fills: std::collections::VecDeque<(String, TradeStatus, Option<Decimal>, Option<Decimal>)>,
+    // ── Diagnostics (60s log) ──
+    session_start_ms: u64,
+    diag_last_ms: u64,
+    diag_yes_fills: u32,
+    diag_no_fills: u32,
+    diag_requotes: u32,
+    diag_closing_foks: u32,
+    diag_markets_traded: u32,
 
-    /// Deferred partial fill checks — keyed by order_id.
-    /// Inserted on first MATCHED with `size_matched < original_size`,
-    /// resolved on subsequent MATCHED (if now fully filled) or MINED/CONFIRMED.
-    pending_partial_fills: std::collections::HashMap<String, PendingPartialFill>,
+    // ── Rebalance state ──
+    last_rebalance_ms: u64,
+    pending_rebalance: bool,
 
-    /// Epoch ms when the engine was created (for uptime calculation).
-    start_ms: u64,
+    // ── Pending commands ──
+    pending_commands: Vec<V2ExecutorCommand>,
 
-    // ── Sub-evaluators ────────────────────────────────────────────────────
-    leg1: Leg1Evaluator,
-    leg2: Leg2Evaluator,
+    // ── Pending tick size change ──
+    pending_tick_change: Option<V2ExecutorCommand>,
 
-    // ── BuildupDetector (internal — fed from raw Binance events) ─────────
-    detector: BuildupDetector,
+    // ── Pending Telegram diagnostics ──
+    pending_telegram_diag: Option<String>,
+
+    // ── Fill notifications (Task 2) ──
+    pending_fill_messages: Vec<String>,
+
+    // ── Market report / session summary gated by summary_enabled (Task 3) ──
+    pending_market_report: Option<String>,
+    pending_session_summary: Option<String>,
+
+    // ── QuestDB records (Task 5 & 6) ──
+    pending_fill_records: Vec<FillRecord>,
+    pending_market_summary: Option<MarketSummaryRecord>,
 }
 
-impl StrategyEngine {
+impl V2StrategyEngine {
     pub fn new(config: &Config) -> Self {
-        let state = MarketState::new();
-        let buildup_cfg = BuildupConfig::from_toml(&config.bot.buildup);
+        let fv_toml = &config.bot.fair_value;
+        let fair_value_config = FairValueConfig {
+            momentum_weight_basis: fv_toml.momentum_weight_basis,
+            momentum_weight_cvd: fv_toml.momentum_weight_cvd,
+            momentum_weight_obi: fv_toml.momentum_weight_obi,
+            max_momentum_adj: fv_toml.max_momentum_adj,
+            vol_edge_scale: fv_toml.vol_edge_scale,
+            time_edge_scale: fv_toml.time_edge_scale,
+            baseline_vol: fv_toml.baseline_vol,
+            vol_ring_capacity: fv_toml.vol_ring_capacity,
+            vol_session_capacity: fv_toml.vol_session_capacity,
+            vol_freshness_ms: fv_toml.vol_freshness_ms,
+            vol_min_warmup: fv_toml.vol_min_warmup,
+            vol_default: fv_toml.vol_default,
+            vol_ticks_per_sec: fv_toml.vol_ticks_per_sec,
+            tail_compression_factor: fv_toml.tail_compression_factor,
+            stale_data_edge_penalty: fv_toml.stale_data_edge_penalty,
+            regime_spike_threshold: fv_toml.regime_spike_threshold,
+            regime_spike_penalty: fv_toml.regime_spike_penalty,
+            strike_warmup_count: fv_toml.strike_warmup_count,
+            basis_halflife_ms: fv_toml.basis_halflife_ms,
+            basis_freshness_ms: fv_toml.basis_freshness_ms,
+            basis_min: fv_toml.basis_min,
+            basis_saturation: fv_toml.basis_saturation,
+            cvd_fast_halflife_ms: fv_toml.cvd_fast_halflife_ms,
+            cvd_slow_halflife_ms: fv_toml.cvd_slow_halflife_ms,
+            cvd_freshness_ms: fv_toml.cvd_freshness_ms,
+            cvd_min: fv_toml.cvd_min,
+            cvd_saturation: fv_toml.cvd_saturation,
+            obi_halflife_ms: fv_toml.obi_halflife_ms,
+            obi_freshness_ms: fv_toml.obi_freshness_ms,
+            obi_min: fv_toml.obi_min,
+            obi_saturation: fv_toml.obi_saturation,
+        };
 
+        let q_toml = &config.bot.quoting;
+        let quoting_config = QuotingConfig {
+            min_edge: q_toml.min_edge,
+            requote_threshold: q_toml.requote_threshold,
+            min_requote_interval_ms: q_toml.min_requote_interval_ms,
+            max_order_size: Decimal::try_from(q_toml.max_order_size).unwrap_or(Decimal::new(100, 0)),
+            min_order_size: Decimal::try_from(q_toml.min_order_size).unwrap_or(Decimal::new(5, 0)),
+            imbalance_edge_tightening: q_toml.imbalance_edge_tightening,
+            imbalance_edge_widening: q_toml.imbalance_edge_widening,
+            emergency_requote_threshold: q_toml.emergency_requote_threshold,
+            max_imbalance_skew: q_toml.max_imbalance_skew,
+        };
+
+        let r_toml = &config.bot.risk_v2;
+        let risk_config = RiskV2Config {
+            max_unpaired_shares: Decimal::try_from(r_toml.max_unpaired_shares).unwrap_or(Decimal::new(30, 0)),
+            max_unpaired_usdc: Decimal::try_from(r_toml.max_unpaired_usdc).unwrap_or(Decimal::new(25, 0)),
+            max_capital_per_market: Decimal::try_from(r_toml.max_capital_per_market).unwrap_or(Decimal::new(100, 0)),
+            closing_phase_secs: r_toml.closing_phase_secs,
+            rotation_quiet_ms: r_toml.rotation_quiet_ms,
+            max_closing_pair_cost: r_toml.max_closing_pair_cost,
+            max_closing_attempts: r_toml.max_closing_attempts,
+            closing_retry_price_increment: r_toml.closing_retry_price_increment,
+            rebalance_threshold: Decimal::try_from(r_toml.rebalance_threshold).unwrap_or(Decimal::new(20, 0)),
+            rebalance_size: Decimal::try_from(r_toml.rebalance_size).unwrap_or(Decimal::new(10, 0)),
+            rebalance_max_pair_cost: r_toml.rebalance_max_pair_cost,
+            min_rebalance_interval_ms: r_toml.min_rebalance_interval_ms,
+            stale_book_ms: r_toml.stale_book_ms,
+            max_entry_spread: r_toml.max_entry_spread,
+            heartbeat_dead_threshold: r_toml.heartbeat_dead_threshold,
+        };
+
+        let now = epoch_ms();
         Self {
-            state,
-            hedge: None,
-            connectivity: ConnectivityState::default(),
-            avg_book_depth: None,
-            leg1_direction: None,
-            in_cutoff_window: false,
-            in_quiet_period: false,
-            rotation_ms: 0,
-            rotation_quiet_ms: config.bot.entry_guards.rotation_quiet_ms,
-            in_trade_cooldown: false,
-            last_trade_complete_ms: 0,
-            trade_cooldown_ms: config.bot.entry_guards.trade_cooldown_ms,
-            pending_leg1_signal: None,
-            rotation_emergency_buffer: Vec::new(),
-            ask_drift_cancel_cents: Decimal::try_from(config.bot.buildup.ask_drift_cancel_cents).unwrap_or(Decimal::new(2, 2)),
-            leg1_cancel_inflight: false,
-            leg1_retry_count: 0,
-            max_leg1_retries: config.bot.buildup.max_leg1_retries,
-            leg1_cancel_retryable: false,
-            max_ask_chase_cents: Decimal::try_from(config.bot.buildup.max_ask_chase_cents).unwrap_or(Decimal::new(3, 2)),
-            original_signal_ask: None,
-            pending_tick_size_cmd: None,
-            pending_heartbeat_cancel: None,
-            heartbeat_dead_threshold: config.bot.entry_guards.heartbeat_dead_threshold,
-            emergency_signal_in_flight: false,
-            leg2_command_pending: false,
-            pending_leg1_cancel: None,
-            engine_diag_ready: false,
-            pending_telegram_diag: None,
+            min_edge: q_toml.min_edge,
+            quoting_config,
+            risk_config,
+            fair_value_config: fair_value_config.clone(),
+            state: MarketState::new(),
+            phase: MarketPhase::Idle,
+            strike_price: None,
+            quiet_until_ms: 0,
+            position: BilateralPosition::new(),
+            fair_value: FairValueEstimator::new(&fair_value_config),
+            quoter: Quoter::new(),
+            closing: ClosingManager::with_config(
+                r_toml.max_closing_attempts,
+                Decimal::try_from(r_toml.closing_retry_price_increment)
+                    .unwrap_or(Decimal::new(1, 2)),
+            ),
             reporter: None,
-            live_trade_meta: LiveTradeMeta::default(),
-            live_market_trades: Vec::new(),
-            live_session_trades: Vec::new(),
-            live_market_signals: 0,
-            live_market_walls: 0,
-            live_session_start_ms: 0,
-            diag_markets_rotated: 0,
-            diag_buildups_received: 0,
-            diag_buildups_dropped_cutoff: 0,
-            diag_buildups_dropped_quiet: 0,
-            diag_buildups_dropped_cooldown: 0,
-            diag_emg_phase1_breach: 0,
-            diag_rej_busy: 0,
-            diag_rej_no_book: 0,
-            diag_rej_no_binance: 0,
-            diag_rej_stale: 0,
-            diag_rej_spread: 0,
-            diag_rej_ask_pair: 0,
-            diag_rej_skew: 0,
-            diag_rej_reprice: 0,
-            diag_rej_paused: 0,
-            diag_rej_other: 0,
-            diag_leg1_signals: 0,
-            diag_leg1_fills: 0,
-            diag_leg2_phase1_posts: 0,
-            diag_phase_transitions: 0,
-            diag_leg2_fills_maker: 0,
-            diag_leg2_fills_taker: 0,
-            diag_emg_be_breach: 0,
-            diag_emg_phase2_timeout: 0,
-            diag_emg_phase2_price_breach: 0,
-            diag_emg_expiry: 0,
-            diag_favorable_exits: 0,
-            diag_emg_maker: 0,
-            diag_emg_taker: 0,
-            diag_favorable_maker_fills: 0,
-            diag_favorable_maker_timeouts: 0,
-            diag_phase2_entry_breach: 0,
-            diag_buildup_failures: 0,
-            diag_order_failures: 0,
-            diag_sustain_cancels: 0,
-            diag_sustain_timeouts: 0,
-            diag_opposite_dir_cancels: 0,
-            diag_ask_drift_cancels: 0,
-            diag_leg1_retries: 0,
-            diag_rej_heartbeat: 0,
-            diag_heartbeat_resets: 0,
-            last_diag_ms: 0,
-            leg2_partial_filled: Decimal::ZERO,
-            leg2_phase1_fill: None,
-            leg2_phase1_order_id: None,
-            leg2_phase2_order_id: None,
-            last_leg2_was_phase2_alongside: false,
             draining: false,
             paused: false,
-            prev_leg2_order: None,
-            pending_fills: std::collections::VecDeque::with_capacity(4),
-            pending_partial_fills: std::collections::HashMap::new(),
-            start_ms: now_epoch_ms(),
-            leg1: Leg1Evaluator {
-                entry_cutoff_secs: config.bot.entry_guards.entry_cutoff_secs,
-                stale_book_ms: config.bot.entry_guards.stale_book_ms,
-                max_entry_spread: Decimal::try_from(config.bot.entry_guards.max_entry_spread).unwrap_or(Decimal::new(3, 2)),
-                max_alloc_per_trade: config.max_alloc_per_trade,
-                reprice_scale: config.reprice_scale,
-                min_reprice_pct: config.min_reprice_pct,
-                min_alloc_pct: config.min_alloc_pct,
-                hard_skew_cap: config.hard_skew_cap,
-                max_ask_pair_price: Decimal::try_from(config.bot.entry_guards.max_ask_pair_price).unwrap_or(Decimal::new(103, 2)),
-                time_exponent: config.time_exponent,
-                max_time_factor: config.max_time_factor,
-                phase1_target_dampen: config.phase1_target_dampen,
-            },
-            leg2: Leg2Evaluator {
-                phase1_timeout_ms: config.bot.risk.phase1_timeout_ms,
-                phase1_breach_threshold: config.phase1_breach_threshold,
-                phase2_timeout_ms: config.bot.risk.phase2_timeout_ms,
-                entry_threshold: Decimal::try_from(config.bot.buildup.entry_threshold).unwrap_or(Decimal::new(40, 2)),
-                cancel_threshold: Decimal::try_from(config.bot.buildup.cancel_threshold).unwrap_or(Decimal::new(25, 2)),
-            },
-            detector: BuildupDetector::new(&buildup_cfg),
+            heartbeat_healthy: true,
+            heartbeat_failures: 0,
+            heartbeat_latency_ms: 0,
+            session_start_ms: now,
+            diag_last_ms: now,
+            diag_yes_fills: 0,
+            diag_no_fills: 0,
+            diag_requotes: 0,
+            diag_closing_foks: 0,
+            diag_markets_traded: 0,
+            last_rebalance_ms: 0,
+            pending_rebalance: false,
+            pending_commands: Vec::new(),
+            pending_tick_change: None,
+            pending_telegram_diag: None,
+            pending_fill_messages: Vec::new(),
+            pending_market_report: None,
+            pending_session_summary: None,
+            pending_fill_records: Vec::new(),
+            pending_market_summary: None,
         }
     }
 
-    // ─── Public Interface ─────────────────────────────────────────────────
+    pub fn set_reporter(&mut self, reporter: TelegramReporter) {
+        self.reporter = Some(reporter);
+    }
 
-    /// Process an inbound event and update internal state.
-    /// All 11 `IngestorEvent` variants are handled. All updates are O(1).
+    pub fn reporter(&self) -> &Option<TelegramReporter> {
+        &self.reporter
+    }
+
+    pub fn state(&self) -> &MarketState {
+        &self.state
+    }
+
+    pub fn phase(&self) -> MarketPhase {
+        self.phase
+    }
+
+    pub fn position(&self) -> &BilateralPosition {
+        &self.position
+    }
+
+    // ─── Event handling ─────────────────────────────────────────────────
+
     pub fn on_event(&mut self, event: IngestorEvent) {
-        let now_ms = now_epoch_ms();
+        let now = epoch_ms();
+
         match event {
-            // ── Full Polymarket book snapshot ─────────────────────────────
-            IngestorEvent::PolymarketBook(book) => {
-                let ts = book.timestamp_ms;
-                let total_depth = book.total_bid_depth() + book.total_ask_depth();
-                self.avg_book_depth = Some(match self.avg_book_depth {
-                    None => total_depth,
-                    Some(prev) => BOOK_DEPTH_ALPHA * total_depth + BOOK_DEPTH_ONE_MINUS * prev,
-                });
-                let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("");
-                if book.asset_id == yes_id {
-                    self.state.poly_yes_book = Some(book.clone());
-                } else {
-                    self.state.poly_no_book = Some(book.clone());
-                }
-                self.state.poly_book = Some(book);
-                self.state.last_update_ms = ts;
-            }
-
-            // ── Incremental price level update ────────────────────────────
-            IngestorEvent::PolymarketPriceChange {
-                asset_id,
-                price,
-                size,
-                side,
-                best_bid,
-                best_ask,
-            } => {
-                let _ = (best_bid, best_ask);
-
-                // Helper: apply a single level change to an order book.
-                macro_rules! apply_level {
-                    ($book:expr) => {
-                        if $book.asset_id == asset_id {
-                            let levels = match side {
-                                Side::Buy => &mut $book.bids,
-                                Side::Sell => &mut $book.asks,
-                            };
-                            if let Some(idx) = levels.iter().position(|l| l.price == price) {
-                                if size.is_zero() {
-                                    levels.remove(idx);
-                                } else {
-                                    levels[idx].size = size;
-                                }
-                            } else if !size.is_zero() {
-                                let insert_pos = match side {
-                                    Side::Buy => levels
-                                        .iter()
-                                        .position(|l| l.price < price)
-                                        .unwrap_or(levels.len()),
-                                    Side::Sell => levels
-                                        .iter()
-                                        .position(|l| l.price > price)
-                                        .unwrap_or(levels.len()),
-                                };
-                                levels.insert(insert_pos, PriceLevel { price, size });
-                            }
-                            $book.timestamp_ms = now_ms;
-                        }
-                    };
-                }
-
-                if let Some(ref mut book) = self.state.poly_book {
-                    apply_level!(book);
-                }
-
-                // Also keep directional books in sync so their timestamps stay
-                // fresh and the stale-book guard doesn't reject evaluations
-                // during periods when BestBidAsk events are sparse (e.g., at
-                // market open).
-                let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("").to_owned();
-                let is_yes = asset_id == yes_id;
-                if is_yes {
-                    if let Some(ref mut book) = self.state.poly_yes_book {
-                        apply_level!(book);
-                    }
-                } else {
-                    if let Some(ref mut book) = self.state.poly_no_book {
-                        apply_level!(book);
-                    }
-                }
-
-                self.state.last_update_ms = now_ms;
-            }
-
-            // ── Fast-path top-of-book update ──────────────────────────────
-            IngestorEvent::PolymarketBestBidAsk {
-                asset_id,
-                best_bid,
-                best_ask,
-            } => {
-                let yes_id = self.state.active_yes_token_id.as_deref().unwrap_or("");
-                let is_yes = asset_id == yes_id;
-                let synthetic_depth = Decimal::new(500, 0);
-
-                // Update poly_book (backward compat).
-                if let Some(ref mut book) = self.state.poly_book {
-                    if book.asset_id == asset_id {
-                        if let Some(top) = book.bids.first_mut() {
-                            top.price = best_bid;
-                        }
-                        if let Some(top) = book.asks.first_mut() {
-                            top.price = best_ask;
-                        }
-                        book.timestamp_ms = now_ms;
-                    }
-                } else if !best_bid.is_zero() && !best_ask.is_zero() {
-                    debug!(
-                        %asset_id, %best_bid, %best_ask,
-                        "bootstrapping poly_book from BestBidAsk (no full book yet)"
-                    );
-                    self.state.poly_book = Some(OrderBook {
-                        asset_id: asset_id.clone(),
-                        bids: vec![PriceLevel {
-                            price: best_bid,
-                            size: synthetic_depth,
-                        }],
-                        asks: vec![PriceLevel {
-                            price: best_ask,
-                            size: synthetic_depth,
-                        }],
-                        timestamp_ms: now_ms,
-                    });
-                }
-
-                // Update directional book.
-                if is_yes {
-                    if let Some(ref mut book) = self.state.poly_yes_book {
-                        if book.asset_id == asset_id {
-                            if let Some(top) = book.bids.first_mut() {
-                                top.price = best_bid;
-                            }
-                            if let Some(top) = book.asks.first_mut() {
-                                top.price = best_ask;
-                            }
-                            book.timestamp_ms = now_ms;
-                        }
-                    } else if !best_bid.is_zero() && !best_ask.is_zero() {
-                        self.state.poly_yes_book = Some(OrderBook {
-                            asset_id: asset_id.clone(),
-                            bids: vec![PriceLevel {
-                                price: best_bid,
-                                size: synthetic_depth,
-                            }],
-                            asks: vec![PriceLevel {
-                                price: best_ask,
-                                size: synthetic_depth,
-                            }],
-                            timestamp_ms: now_ms,
-                        });
-                    }
-                } else {
-                    if let Some(ref mut book) = self.state.poly_no_book {
-                        if book.asset_id == asset_id {
-                            if let Some(top) = book.bids.first_mut() {
-                                top.price = best_bid;
-                            }
-                            if let Some(top) = book.asks.first_mut() {
-                                top.price = best_ask;
-                            }
-                            book.timestamp_ms = now_ms;
-                        }
-                    } else if !best_bid.is_zero() && !best_ask.is_zero() {
-                        self.state.poly_no_book = Some(OrderBook {
-                            asset_id: asset_id.clone(),
-                            bids: vec![PriceLevel {
-                                price: best_bid,
-                                size: synthetic_depth,
-                            }],
-                            asks: vec![PriceLevel {
-                                price: best_ask,
-                                size: synthetic_depth,
-                            }],
-                            timestamp_ms: now_ms,
-                        });
-                    }
-                }
-
-                self.state.last_update_ms = now_ms;
-            }
-
-            // ── Tick size change (rare, at price extremes) ────────────────
-            IngestorEvent::PolymarketTickSizeChange {
-                asset_id,
-                old_tick_size,
-                new_tick_size,
-            } => {
-                let matches_active = self.state.active_yes_token_id.as_deref() == Some(&asset_id)
-                    || self.state.active_no_token_id.as_deref() == Some(&asset_id);
-                if matches_active {
-                    info!(%asset_id, %old_tick_size, %new_tick_size, "tick size changed — updating engine + SDK cache");
-                    self.state.tick_size = new_tick_size;
-                    if let (Some(yes_id), Some(no_id)) = (
-                        self.state.active_yes_token_id.clone(),
-                        self.state.active_no_token_id.clone(),
-                    ) {
-                        self.pending_tick_size_cmd = Some(ExecutorCommand::TickSizeChanged {
-                            yes_token_id: yes_id,
-                            no_token_id: no_id,
-                            new_tick_size,
-                        });
-                    }
-                } else {
-                    info!(%asset_id, %old_tick_size, %new_tick_size, "tick size changed for non-active asset — ignored");
-                }
-                self.state.last_update_ms = now_ms;
-            }
-
-            // ── Market resolved ───────────────────────────────────────────
-            IngestorEvent::PolymarketMarketResolved {
-                market,
-                winning_asset_id,
-            } => {
-                info!(%market, %winning_asset_id, "market resolved — suspending trading");
-                if self.state.active_condition_id.as_deref() == Some(&market) {
-                    self.state.active_condition_id = None;
-                }
-                self.state.last_update_ms = now_ms;
-            }
-
-            // ── Binance ticker update ─────────────────────────────────────
-            IngestorEvent::BinanceTick(tick) => {
-                let mid = tick.mid_price();
-                self.state.binance_price = Some(mid);
-                self.state.last_update_ms = tick.timestamp_ms;
-                // Feed BuildupDetector spot BBA
-                let mid_f64 = mid.to_string().parse::<f64>().unwrap_or(0.0);
-                self.detector.on_spot_bba(mid_f64, now_ms);
-            }
-
-            // ── Binance depth snapshot ────────────────────────────────────
-            IngestorEvent::BinanceDepth(depth) => {
-                if let Some(mid) = depth.mid_price() {
-                    self.state.binance_price = Some(mid);
-                    // Feed BuildupDetector with spot depth (OBI + ATR + basis spot side)
-                    let mid_f64 = mid.to_string().parse::<f64>().unwrap_or(0.0);
-                    let obi_f64 = depth.obi()
-                        .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
-                        .unwrap_or(0.0);
-                    self.detector.on_spot_depth(mid_f64, obi_f64, now_ms);
-                }
-                self.state.last_update_ms = depth.timestamp_ms;
-            }
-
-            // BuildupConfirmed removed — detector is now internal; see handle_buildup_confirmed()
-
-            // ── Market rotation ───────────────────────────────────────────
             IngestorEvent::MarketRotation {
                 condition_id,
                 yes_token_id,
@@ -659,3120 +242,938 @@ impl StrategyEngine {
                 end_timestamp_ms,
                 tick_size,
             } => {
-                info!(%condition_id, %yes_token_id, %no_token_id, end_timestamp_ms, %tick_size, "market rotated");
-
-                // ── Rotation emergency: protect open Leg 1 positions ─────
-                // If Leg 1 is filled but Leg 2 hasn't completed, build an
-                // emergency FOK signal BEFORE resetting state. The main loop
-                // drains this buffer and sends it to the executor before the
-                // MarketRotation command, ensuring the position is hedged
-                // (or best-effort attempted) instead of force-closed.
-                let leg1_filled = matches!(self.state.leg1_state, OrderState::Filled { .. });
-                let leg2_filled = matches!(self.state.leg2_state, OrderState::Filled { .. });
-                if leg1_filled && !leg2_filled {
-                    let fill_size = match &self.state.leg1_state {
-                        OrderState::Filled { size, .. } => *size,
-                        _ => unreachable!(),
-                    };
-                    // Opposing ask = the price we'd pay as taker on the hedge side.
-                    let opposing_ask = match self.leg1_direction {
-                        Some(Direction::Up) => self
-                            .state
-                            .poly_no_book
-                            .as_ref()
-                            .or(self.state.poly_book.as_ref()),
-                        Some(Direction::Down) => self
-                            .state
-                            .poly_yes_book
-                            .as_ref()
-                            .or(self.state.poly_book.as_ref()),
-                        None => None,
-                    }
-                    .and_then(|b| b.best_ask())
-                    .map(|a| a.price);
-
-                    if let Some(ask_price) = opposing_ask {
-                        if let Some(mut signal) =
-                            self.build_sim_leg2_fill_signal(ask_price, fill_size, now_ms)
-                        {
-                            signal.exit_reason = Some(ExitReason::MarketExpiry);
-                            warn!(
-                                %ask_price, %fill_size,
-                                "rotation emergency: Leg 1 filled, Leg 2 incomplete \
-                                 — emitting emergency FOK before state reset"
-                            );
-                            self.diag_emg_expiry += 1;
-                            self.rotation_emergency_buffer.push(signal);
-                        } else {
-                            warn!(
-                                "rotation emergency: could not build signal \
-                                 (missing hedge/token) — position will be force-closed"
-                            );
-                        }
-                    } else {
-                        warn!(
-                            "rotation emergency: no opposing ask available \
-                             — position will be force-closed"
-                        );
-                    }
-                }
-
-                // ── Telegram alert for abandoned positions ────────────────
-                if leg1_filled && !leg2_filled
-                    && let Some(ref reporter) = self.reporter
-                {
-                    let (l1_price, l1_size) = match &self.state.leg1_state {
-                        OrderState::Filled { price, size, .. } => (*price, *size),
-                        _ => (Decimal::ZERO, Decimal::ZERO),
-                    };
-                    let dir = match self.leg1_direction {
-                        Some(Direction::Up) => "YES",
-                        Some(Direction::Down) => "NO",
-                        None => "?",
-                    };
-                    let has_fok = !self.rotation_emergency_buffer.is_empty();
-                    reporter.fire_critical(format!(
-                        "ROTATION EMERGENCY\nOpen: {} @ {} ({})\nLeg 2: NOT FILLED\nFOK: {}",
-                        dir,
-                        l1_price,
-                        l1_size,
-                        if has_fok { "SUBMITTED" } else { "COULD NOT BUILD" },
-                    ));
-                }
-
-                // Persist condition ID for redemption if we traded in this market.
-                if !self.live_market_trades.is_empty()
-                    && let Some(ref cid) = self.state.active_condition_id
-                {
-                    crate::control::wallet::append_condition_id_sync(cid);
-                }
-
-                // ── Reset all state for the new market ───────────────────
-                self.state.active_condition_id = Some(condition_id);
-                self.state.active_yes_token_id = Some(yes_token_id);
-                self.state.active_no_token_id = Some(no_token_id);
-                self.state.market_end_timestamp_ms = end_timestamp_ms;
-                self.state.tick_size = tick_size;
-                self.state.poly_book = None;
-                self.state.poly_yes_book = None;
-                self.state.poly_no_book = None;
-                self.state.buildup_detected = false;
-                self.state.last_buildup = None;
-                self.state.leg1_state = OrderState::None;
-                self.state.leg2_state = OrderState::None;
-                self.state.cumulative_used = Decimal::ZERO;
-                self.state.last_update_ms = now_ms;
-                self.hedge = None;
-                self.avg_book_depth = None;
-                self.leg1_direction = None;
-                self.pending_leg1_signal = None;
-                self.pending_tick_size_cmd = None;
-                self.pending_leg1_cancel = None;
-                self.leg1_cancel_inflight = false;
-                self.leg1_retry_count = 0;
-                self.leg1_cancel_retryable = false;
-                self.original_signal_ask = None;
-                self.emergency_signal_in_flight = false;
-                self.leg2_command_pending = false;
-                self.prev_leg2_order = None;
-                self.pending_fills.clear();
-                self.pending_partial_fills.clear();
-                self.state.leg1_posted_ask = None;
-                // Dual-order: clear ALL state on rotation (new market).
-                self.leg2_phase1_order_id = None;
-                self.leg2_phase2_order_id = None;
-                // Leg 2 partial fill tracking: clear on rotation.
-                self.leg2_partial_filled = Decimal::ZERO;
-                self.leg2_phase1_fill = None;
-                self.state.leg2_partial_filled = Decimal::ZERO;
-                self.in_cutoff_window = false;
-                self.in_quiet_period = true;
-                self.in_trade_cooldown = false;
-                self.rotation_ms = now_ms;
-                self.diag_markets_rotated += 1;
-                // Reset per-market live reporting state.
-                self.live_market_trades.clear();
-                self.live_market_signals = 0;
-                self.live_market_walls = 0;
+                self.on_market_rotation(
+                    condition_id, yes_token_id, no_token_id,
+                    end_timestamp_ms, tick_size, now,
+                );
             }
 
-            // ── Trade status update (fill tracking via User WS) ───────────
-            IngestorEvent::TradeStatusUpdate { order_id, status, size_matched, original_size } => {
-                let is_leg1 = match &self.state.leg1_state {
-                    OrderState::Posted { order_id: oid, .. } => *oid == order_id,
-                    _ => false,
-                };
-                if is_leg1 {
-                    let (price, size) = match &self.state.leg1_state {
-                        OrderState::Posted { price, size, .. } => (*price, *size),
-                        _ => unreachable!(),
-                    };
-                    match status {
-                        TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
-                            info!(%order_id, %price, %size, status = ?status, "Leg 1 fill confirmed");
-                            // Partial fill detection — defer alert to MINED/CONFIRMED.
-                            // Round to 2dp: CLOB fills in fractional shares — dust is a full fill.
-                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                let dust_threshold = Decimal::new(1, 2); // 0.01 shares
-                                if matched.round_dp(2) < original.round_dp(2)
-                                    && (original - matched) >= dust_threshold
-                                {
-                                    warn!(%order_id, %matched, %original, "partial fill on Leg 1 — deferring alert to MINED");
-                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                        leg: "Leg 1", size_matched: matched, original_size: original,
-                                    });
-                                }
-                            }
-                            // Use actual fill size when partial fill detected.
-                            // Truncate to 2dp — CLOB max lot precision is 2 decimal places.
-                            let actual_size = if let (Some(matched), Some(_orig)) = (size_matched, original_size) {
-                                if matched > Decimal::ZERO && matched.round_dp(2) < size.round_dp(2) { matched.round_dp(2) } else { size.round_dp(2) }
-                            } else {
-                                size.round_dp(2)
-                            };
-                            self.state.leg1_state = OrderState::Filled {
-                                order_id: order_id.clone(),
-                                price,
-                                size: actual_size,
-                                fill_timestamp_ms: now_ms,
-                            };
+            IngestorEvent::BinanceTick(tick) => {
+                let mid = tick.mid_price();
+                let mid_f64 = mid.to_f64().unwrap_or(0.0);
+                self.state.binance_price = Some(mid);
+                self.fair_value.update_btc_price(mid_f64, now);
+                self.fair_value.update_vol(mid_f64, now);
+                self.fair_value.update_spot_mid(mid_f64, now);
+                self.state.last_update_ms = now;
 
-                            if self.leg1_cancel_inflight {
-                                // Cancel in-flight — defer Leg 2 init to on_cancel_result()
-                                // which has the authoritative size_matched from get_order_status().
-                                info!(%order_id, %actual_size, "Leg 1 fill detected but cancel in-flight — deferring Leg 2 init");
-                            } else {
-                                // No cancel in-flight — safe to init Leg 2 immediately.
-                                self.init_leg2(price, actual_size, now_ms);
-                                self.diag_leg1_fills += 1;
-
-                                // Cancel remaining shares on the CLOB to prevent unhedged fills.
-                                if actual_size < size {
-                                    info!(%order_id, filled = %actual_size, posted = %size,
-                                        "partial fill — cancelling remaining order on CLOB");
-                                    self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                        order_id: order_id.clone(),
-                                    });
-                                    self.leg1_cancel_inflight = true;
-                                }
-
-                                // Reset live trade meta for the new trade.
-                                self.live_trade_meta = LiveTradeMeta::default();
-
-                                // Send opportunity alert via Telegram in live mode.
-                                if let (Some(reporter), Some(signal)) = (
-                                    self.reporter.clone(),
-                                    self.pending_leg1_signal.clone(),
-                                ) {
-                                    let book = signal
-                                        .book_snapshot
-                                        .clone()
-                                        .or_else(|| self.state.poly_book.clone())
-                                        .unwrap_or_else(|| OrderBook {
-                                            asset_id: signal.token_id.clone(),
-                                            bids: vec![],
-                                            asks: vec![],
-                                            timestamp_ms: now_ms,
-                                        });
-                                    reporter.send_opportunity_alert(&signal, price, actual_size, &book);
-                                    self.live_market_signals += 1;
-                                    if signal.bot_contested {
-                                        self.live_market_walls += 1;
-                                    }
-                                }
-                            }
-                        }
-                        TradeStatus::Failed => {
-                            warn!(%order_id, "Leg 1 FAILED — resetting to None");
-                            self.state.leg1_state = OrderState::None;
-                        }
-                        TradeStatus::Canceled => {
-                            if self.leg1_cancel_inflight {
-                                // Our cancel is in flight — cancel result will handle cleanup.
-                                // Don't reset leg1_state here: if the order actually filled,
-                                // the MATCHED event arriving after this still needs to find
-                                // leg1_state=Posted to recognise it as a Leg 1 fill.
-                                debug!(%order_id, "Leg 1 CANCELED by CLOB (cancel in flight) — deferring to cancel result");
-                            } else {
-                                // Unexpected CLOB cancellation with no cancel in flight from our side.
-                                warn!(%order_id, "Leg 1 CANCELED by CLOB unexpectedly — full reset");
-                                self.state.leg1_state = OrderState::None;
-                                self.state.leg1_posted_ask = None;
-                                self.state.last_buildup = None;
-                                self.leg1_direction = None;
-                                self.pending_leg1_signal = None;
-                            }
-                        }
-                        TradeStatus::Retrying => {
-                            debug!(%order_id, "Leg 1 RETRYING");
-                        }
-                    }
+                // Set strike via warmup (median of first N ticks)
+                if self.strike_price.is_none()
+                    && self.state.active_condition_id.is_some()
+                    && self.fair_value.try_set_strike(mid_f64)
+                {
+                    self.strike_price = Some(self.fair_value.strike_price());
+                    info!(strike = %self.fair_value.strike_price(), "strike price set from warmup median");
                 }
-
-                // Leg 2 matching: check leg2_state AND both phase order IDs.
-                let is_leg2 = match &self.state.leg2_state {
-                    OrderState::Posted { order_id: oid, .. } => *oid == order_id,
-                    _ => false,
-                };
-                // Also check if order matches phase1 or phase2 tracked IDs
-                // (dual-order: the non-primary order may fill).
-                let is_leg2_phase1 = self.leg2_phase1_order_id.as_deref() == Some(&order_id);
-                let is_leg2_phase2 = self.leg2_phase2_order_id.as_deref() == Some(&order_id);
-                let is_any_leg2 = is_leg2 || is_leg2_phase1 || is_leg2_phase2;
-
-                if is_any_leg2 {
-                    // For dual-order fills, use the price/size from the matching order.
-                    // If the order matches leg2_state, use that. Otherwise find it
-                    // from the tracked phase IDs.
-                    let (fill_price, fill_size) = if is_leg2 {
-                        match &self.state.leg2_state {
-                            OrderState::Posted { price, size, .. } => (*price, *size),
-                            _ => unreachable!(),
-                        }
-                    } else if let Some(hedge) = &self.hedge {
-                        // Order matched a tracked phase ID but not leg2_state.
-                        // Use hedge state to determine price.
-                        if is_leg2_phase1 {
-                            let size_from_state = match &self.state.leg2_state {
-                                OrderState::Posted { size, .. } => *size,
-                                _ => match &self.state.leg1_state {
-                                    OrderState::Filled { size, .. } => *size,
-                                    _ => Decimal::ZERO,
-                                },
-                            };
-                            (hedge.phase1_target_price, size_from_state)
-                        } else {
-                            // Phase 2 order filled
-                            let p2_price = hedge.phase2_posted_price.unwrap_or(Decimal::ZERO);
-                            let size_from_state = match &self.state.leg2_state {
-                                OrderState::Posted { size, .. } => *size,
-                                _ => match &self.state.leg1_state {
-                                    OrderState::Filled { size, .. } => *size,
-                                    _ => Decimal::ZERO,
-                                },
-                            };
-                            (p2_price, size_from_state)
-                        }
-                    } else {
-                        // No hedge state — shouldn't happen, but fallback.
-                        (Decimal::ZERO, Decimal::ZERO)
-                    };
-
-                    // Prefer actual CLOB fill size over state-derived value.
-                    // State-derived size may be stale after resize resets leg2_state.
-                    let fill_size = match size_matched {
-                        Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
-                        _ => fill_size,
-                    };
-                    // Cap at leg1 size — Leg 2 should never exceed Leg 1.
-                    let expected_max = match &self.state.leg1_state {
-                        OrderState::Filled { size, .. } => *size,
-                        _ => fill_size,
-                    };
-                    let fill_size = fill_size.min(expected_max);
-
-                    match status {
-                        TradeStatus::Matched => {
-                            // MATCHED events carry *cumulative* size_matched (not delta).
-                            // Check for partial fill — order may still be resting.
-                            // Round to 2dp before comparing: CLOB fills in fractional shares
-                            // (e.g., 17.967825 vs 17.97) — dust differences are full fills.
-                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                let dust_threshold = Decimal::new(1, 2); // 0.01 shares
-                                // Primary check: CLOB original_size vs size_matched.
-                                if matched.round_dp(2) < original.round_dp(2)
-                                    && (original - matched) >= dust_threshold
-                                {
-                                    // Partial fill — order still resting. Track but DON'T transition.
-                                    info!(%order_id, %matched, %original, "Leg 2 partial fill — order still resting");
-                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                        leg: "Leg 2", size_matched: matched, original_size: original,
-                                    });
-                                    return;
-                                }
-                                // Secondary check: CLOB may report original_size == size_matched
-                                // when balance constrains the order. Compare against our posted_size.
-                                let posted_size = match &self.state.leg2_state {
-                                    OrderState::Posted { size, .. } => *size,
-                                    _ => matched, // fallback — can't detect
-                                };
-                                if matched.round_dp(2) < posted_size.round_dp(2)
-                                    && (posted_size - matched) >= dust_threshold
-                                {
-                                    info!(%order_id, %matched, posted = %posted_size, "Leg 2 partial fill (posted-size check) — order still resting");
-                                    self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                        leg: "Leg 2", size_matched: matched, original_size: posted_size,
-                                    });
-                                    return;
-                                }
-                                // matched >= original AND matched >= posted_size — full fill.
-                            } else {
-                                // No size info on MATCHED — non-informative.
-                                // Don't transition; wait for authoritative MINED/CONFIRMED.
-                                debug!(%order_id, "Leg 2 MATCHED without size info — waiting for MINED/CONFIRMED");
-                                return;
-                            }
-                            // Full fill (matched >= original).
-                            // Apply weighted average if Phase 1 had a partial fill.
-                            let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
-                                let total_size = p1_size + fill_size;
-                                let weighted_price = if total_size > Decimal::ZERO {
-                                    ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
-                                } else {
-                                    fill_price
-                                };
-                                (weighted_price.round_dp(4), total_size.round_dp(2))
-                            } else {
-                                (fill_price, fill_size)
-                            };
-                            info!(%order_id, %final_price, %final_size, "Leg 2 fill — pair complete");
-                            self.state.leg2_state = OrderState::Filled {
-                                order_id: order_id.clone(),
-                                price: final_price,
-                                size: final_size,
-                                fill_timestamp_ms: now_ms,
-                            };
-                            // hedge cleared by on_trade_complete() after Telegram + recording
-                        }
-                        TradeStatus::Mined | TradeStatus::Confirmed => {
-                            // Terminal state — CLOB order is settled. size_matched is authoritative.
-                            // Round to 2dp: CLOB fills in fractional shares — dust is a full fill.
-                            let posted_size_for_check = match &self.state.leg2_state {
-                                OrderState::Posted { size, .. } => *size,
-                                _ => Decimal::ZERO,
-                            };
-                            if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                                let is_partial_clob = matched.round_dp(2) < original.round_dp(2) && matched > Decimal::ZERO;
-                                // Secondary check: CLOB original_size may equal size_matched when
-                                // balance constrains the order. Compare against our posted_size.
-                                let is_partial_posted = posted_size_for_check > Decimal::ZERO
-                                    && matched.round_dp(2) < posted_size_for_check.round_dp(2)
-                                    && (posted_size_for_check - matched) >= Decimal::new(1, 2)
-                                    && matched > Decimal::ZERO;
-                                if is_partial_clob || is_partial_posted {
-                                    // Terminal partial fill — order closed with unfilled remainder.
-                                    // Compute total Leg 2 fills including any prior partial (Phase 1).
-                                    let prior_filled = self.leg2_phase1_fill.map(|(_, s)| s).unwrap_or(Decimal::ZERO);
-                                    let total_filled = prior_filled + matched.round_dp(2);
-                                    let leg1_size = match &self.state.leg1_state {
-                                        OrderState::Filled { size, .. } => *size,
-                                        _ => Decimal::ZERO,
-                                    };
-                                    let unfilled_remainder = (leg1_size - total_filled).max(Decimal::ZERO).round_dp(2);
-
-                                    // CLOB rejects orders < 5 shares or < $1 notional.
-                                    // If remainder is below minimum, treat as complete fill.
-                                    let min_notional_size = if !fill_price.is_zero() {
-                                        (Decimal::ONE / fill_price).ceil()
-                                    } else {
-                                        Decimal::new(5, 0)
-                                    };
-                                    let remainder_too_small = unfilled_remainder < Decimal::new(5, 0)
-                                        || unfilled_remainder < min_notional_size;
-
-                                    if remainder_too_small {
-                                        info!(
-                                            %order_id, %matched, %original, %unfilled_remainder,
-                                            "Leg 2 partial fill but remainder below CLOB minimum — treating as complete"
-                                        );
-                                        // Fall through to the full-fill path below.
-                                    } else {
-                                        warn!(%order_id, %matched, %original, %unfilled_remainder, "Leg 2 terminal partial fill — resetting for remainder");
-                                        let phase_price = fill_price;
-                                        // `matched` is the authoritative cumulative total for THIS order.
-                                        // Combine with any prior partial fill from a DIFFERENT order
-                                        // (e.g., Phase 1 partial before Phase 2 was posted).
-                                        if let Some((existing_price, existing_size)) = self.leg2_phase1_fill.take() {
-                                            let combined_size = existing_size + matched.round_dp(2);
-                                            let combined_price = if combined_size > Decimal::ZERO {
-                                                ((existing_price * existing_size) + (phase_price * matched.round_dp(2))) / combined_size
-                                            } else {
-                                                phase_price
-                                            };
-                                            self.leg2_phase1_fill = Some((combined_price.round_dp(4), combined_size));
-                                        } else {
-                                            self.leg2_phase1_fill = Some((phase_price, matched.round_dp(2)));
-                                        }
-                                        self.state.leg2_partial_filled = self.leg2_phase1_fill
-                                            .map(|(_, s)| s)
-                                            .unwrap_or(Decimal::ZERO);
-                                        self.leg2_partial_filled = self.state.leg2_partial_filled;
-                                        self.state.leg2_state = OrderState::None;
-                                        // Evaluator will see leg2_state=None + leg1_state=Filled →
-                                        // generate new signal with size = leg1_size - leg2_partial_filled.
-                                        return;
-                                    }
-                                }
-                            }
-                            // Full fill or no size info — apply weighted average and transition.
-                            let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
-                                let total_size = p1_size + fill_size;
-                                let weighted_price = if total_size > Decimal::ZERO {
-                                    ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
-                                } else {
-                                    fill_price
-                                };
-                                (weighted_price.round_dp(4), total_size.round_dp(2))
-                            } else {
-                                (fill_price, fill_size)
-                            };
-                            info!(%order_id, %final_price, %final_size, status = ?status, "Leg 2 fill — pair complete");
-                            self.state.leg2_state = OrderState::Filled {
-                                order_id: order_id.clone(),
-                                price: final_price,
-                                size: final_size,
-                                fill_timestamp_ms: now_ms,
-                            };
-                            // hedge cleared by on_trade_complete() after Telegram + recording
-                        }
-                        TradeStatus::Failed => {
-                            warn!(%order_id, "Leg 2 FAILED — re-entry via evaluate_leg2");
-                            self.state.leg2_state = OrderState::None;
-                        }
-                        TradeStatus::Canceled => {
-                            warn!(%order_id, "Leg 2 CANCELED by CLOB — resetting for re-evaluation");
-                            self.state.leg2_state = OrderState::None;
-                            self.prev_leg2_order = None;
-                        }
-                        TradeStatus::Retrying => {
-                            debug!(%order_id, "Leg 2 RETRYING");
-                        }
-                    }
-                }
-
-                // Buffer unmatched TradeStatusUpdate events (may arrive before
-                // OrderPosted feedback or after a cancel cleared state).
-                if !is_leg1 && !is_any_leg2 {
-                    if matches!(&self.state.leg1_state, OrderState::Filled { order_id: oid, .. } if *oid == order_id) {
-                        debug!(%order_id, "late TradeStatusUpdate for filled Leg 1 — ignored");
-                    } else if let Some(mut pending) = self.pending_partial_fills.remove(&order_id) {
-                        match status {
-                            TradeStatus::Matched => {
-                                // Another MATCHED — update cumulative size.
-                                if let Some(matched) = size_matched {
-                                    pending.size_matched = matched;
-                                }
-                                if pending.size_matched >= pending.original_size {
-                                    // Fully filled now — no alert needed.
-                                    info!(%order_id, "deferred partial fill resolved — fully filled");
-                                } else {
-                                    // Still partial — re-insert and wait for MINED.
-                                    self.pending_partial_fills.insert(order_id, pending);
-                                }
-                            }
-                            TradeStatus::Mined | TradeStatus::Confirmed => {
-                                // Terminal status — final size_matched is authoritative.
-                                let final_matched = size_matched.unwrap_or(pending.size_matched);
-                                if final_matched < pending.original_size {
-                                    warn!(
-                                        %order_id, matched = %final_matched, original = %pending.original_size,
-                                        "PARTIAL FILL confirmed at {}", if status == TradeStatus::Mined { "MINED" } else { "CONFIRMED" }
-                                    );
-                                    if let Some(reporter) = self.reporter.as_ref() {
-                                        reporter.send_partial_fill_alert(
-                                            pending.leg, &order_id, final_matched, pending.original_size,
-                                        );
-                                    }
-                                } else {
-                                    info!(%order_id, "deferred partial fill resolved at MINED — fully filled");
-                                }
-                            }
-                            _ => {
-                                // FAILED/CANCELED/RETRYING — discard, other handlers deal with these.
-                            }
-                        }
-                        self.state.last_update_ms = now_ms;
-                    } else if self.pending_fills.len() < 8 {
-                        warn!(%order_id, ?status, "TradeStatusUpdate unmatched — buffering");
-                        self.pending_fills.push_back((order_id, status, size_matched, original_size));
-                    } else {
-                        warn!(%order_id, ?status, "TradeStatusUpdate unmatched AND buffer full — DROPPED");
-                    }
-                }
-
-                self.state.last_update_ms = now_ms;
             }
 
-            // ── Heartbeat status ──────────────────────────────────────────
-            IngestorEvent::HeartbeatStatus {
-                success,
-                latency_ms,
+            IngestorEvent::BinanceDepth(depth) => {
+                if let Some(obi) = depth.obi() {
+                    let obi_f64 = obi.to_f64().unwrap_or(0.0);
+                    self.fair_value.update_obi(obi_f64, now);
+                }
+                if let Some(mid) = depth.mid_price() {
+                    let mid_f64 = mid.to_f64().unwrap_or(0.0);
+                    self.fair_value.update_vol(mid_f64, now);
+                    self.fair_value.update_spot_mid(mid_f64, now);
+                }
+                self.state.last_update_ms = now;
+            }
+
+            IngestorEvent::FuturesBookTicker(ticker) => {
+                let bid_f64 = ticker.bid_price.to_f64().unwrap_or(0.0);
+                let ask_f64 = ticker.ask_price.to_f64().unwrap_or(0.0);
+                self.fair_value.update_futures_mid(bid_f64, ask_f64, now);
+            }
+
+            IngestorEvent::FuturesAggTrade(trade) => {
+                let qty_f64 = trade.quantity.to_f64().unwrap_or(0.0);
+                self.fair_value.update_cvd(qty_f64, trade.is_buyer_maker, now);
+            }
+
+            IngestorEvent::PolymarketBook(book) => {
+                let asset_id = book.asset_id.clone();
+                if Some(&asset_id) == self.state.active_yes_token_id.as_ref() {
+                    self.state.poly_yes_book = Some(book.clone());
+                } else if Some(&asset_id) == self.state.active_no_token_id.as_ref() {
+                    self.state.poly_no_book = Some(book.clone());
+                }
+                self.state.poly_book = Some(book);
+                self.state.last_update_ms = now;
+            }
+
+            IngestorEvent::PolymarketPriceChange { asset_id, .. } |
+            IngestorEvent::PolymarketBestBidAsk { asset_id, .. } => {
+                let _ = asset_id;
+                self.state.last_update_ms = now;
+            }
+
+            IngestorEvent::PolymarketTickSizeChange {
+                asset_id: _,
+                old_tick_size: _,
+                new_tick_size,
             } => {
-                if success {
-                    let was_unhealthy = !self.connectivity.heartbeat_healthy;
-                    self.connectivity.heartbeat_healthy = true;
-                    self.connectivity.consecutive_heartbeat_failures = 0;
-                    self.connectivity.last_heartbeat_latency_ms = latency_ms;
-                    if was_unhealthy {
-                        info!(latency_ms, "heartbeat RECOVERED");
-                    } else {
-                        debug!(latency_ms, "heartbeat OK");
-                    }
-                } else {
-                    self.connectivity.consecutive_heartbeat_failures += 1;
-                    self.connectivity.heartbeat_healthy = false;
-                    let failures = self.connectivity.consecutive_heartbeat_failures;
-                    warn!(
-                        failures,
-                        "heartbeat FAILED — orders may be auto-cancelled by CLOB"
-                    );
-                    if failures == self.heartbeat_dead_threshold {
-                        self.handle_heartbeat_dead();
-                    }
-                }
-            }
-
-            // ── WebSocket connectivity ────────────────────────────────────
-            IngestorEvent::WsStatus { source, connected } => match source {
-                DataSource::Binance => {
-                    self.connectivity.binance_connected = connected;
-                    if !connected {
-                        warn!("Binance WS disconnected — buildup detection paused");
-                        self.state.buildup_detected = false;
-                    } else {
-                        info!("Binance WS reconnected");
-                    }
-                }
-                DataSource::PolymarketMarket => {
-                    self.connectivity.polymarket_market_connected = connected;
-                    if !connected {
-                        warn!("Polymarket Market WS disconnected");
-                    }
-                }
-                DataSource::PolymarketUser => {
-                    self.connectivity.polymarket_user_connected = connected;
-                    if !connected {
-                        warn!("Polymarket User WS disconnected");
-                    }
-                }
-                DataSource::BinanceFutures => {
-                    if !connected {
-                        warn!("Binance Futures WS disconnected");
-                    }
-                }
-            },
-
-            // ── Futures / Spot events → feed BuildupDetector ──────────────
-            IngestorEvent::FuturesAggTrade(ref trade) => {
-                self.detector.on_futures_agg_trade(trade, now_ms);
-            }
-            IngestorEvent::FuturesBookTicker(ref ticker) => {
-                self.detector.on_futures_book_ticker(ticker, now_ms);
-            }
-            IngestorEvent::FuturesForceOrder(ref order) => {
-                self.detector.on_futures_force_order(order, now_ms);
-            }
-            IngestorEvent::SpotTrade(ref trade) => {
-                self.detector.on_spot_trade(trade, now_ms);
-            }
-
-            // Control events are handled in main.rs before on_event() is called.
-            IngestorEvent::Shutdown
-            | IngestorEvent::DrainAndRestart
-            | IngestorEvent::PauseTrading
-            | IngestorEvent::ResumeTrading => {}
-        }
-
-        // ── BuildupDetector: evaluate after feeding ───────────────────
-        if self.detector.is_dirty() {
-            let (score, dir, entry) = self.detector.tick(now_ms);
-            if let Some(buildup) = entry {
-                self.handle_buildup_confirmed(buildup, now_ms);
-            }
-            if let Some(d) = dir {
-                self.handle_flow_update(score, d, now_ms);
-            }
-        }
-
-        // ── Cutoff window detection (runs on every event) ──────────────
-        // Checks time remaining on every event so the market summary is
-        // sent even if no spike arrives during the cutoff window.
-        if !self.in_cutoff_window && self.state.active_condition_id.is_some() {
-            let time_remaining_secs = self.state.time_remaining_ms(now_ms) / 1_000;
-            if time_remaining_secs < self.leg1.entry_cutoff_secs {
-                self.in_cutoff_window = true;
-                info!(
-                    time_remaining_secs,
-                    "entering cutoff window — trading suspended"
-                );
-                if matches!(
-                    self.state.leg1_state,
-                    OrderState::Filled { .. } | OrderState::Posted { .. }
+                self.state.tick_size = new_tick_size;
+                if let (Some(yes_id), Some(no_id)) = (
+                    self.state.active_yes_token_id.clone(),
+                    self.state.active_no_token_id.clone(),
                 ) {
-                    info!(
-                        "open position detected at cutoff — \
-                         Leg 2 will continue until rotation"
-                    );
-                }
-            }
-        }
-
-        // ── Rotation quiet period detection (runs on every event) ──────
-        if self.in_quiet_period {
-            let elapsed = now_ms.saturating_sub(self.rotation_ms);
-            if elapsed >= self.rotation_quiet_ms {
-                self.in_quiet_period = false;
-                info!(elapsed_ms = elapsed, "rotation quiet period ended — trading enabled");
-            }
-        }
-
-        // ── Post-trade cooldown timer (runs on every event) ─────────
-        if self.in_trade_cooldown {
-            let elapsed = now_ms.saturating_sub(self.last_trade_complete_ms);
-            if elapsed >= self.trade_cooldown_ms {
-                self.in_trade_cooldown = false;
-                info!(elapsed_ms = elapsed, "trade cooldown ended — trading enabled");
-            }
-        }
-
-        // ── Leg 1 sustain: ask-drift cancel (runs on every event) ─────────
-        if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
-            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-                if !Self::is_provisional_order(order_id) {
-                    if let (Some(posted_ask), Some(dir)) = (self.state.leg1_posted_ask, self.leg1_direction) {
-                        let current_ask = match dir {
-                            Direction::Up => self.state.poly_yes_book.as_ref()
-                                .or(self.state.poly_book.as_ref()),
-                            Direction::Down => self.state.poly_no_book.as_ref()
-                                .or(self.state.poly_book.as_ref()),
-                        }.and_then(|b| b.best_ask()).map(|a| a.price);
-
-                        if let Some(current) = current_ask {
-                            if current - posted_ask >= self.ask_drift_cancel_cents {
-                                info!(%current, %posted_ask, drift = %(current - posted_ask),
-                                    "Leg 1 sustain — ask drifted beyond threshold");
-                                self.leg1_cancel_retryable = true; // ask drift = repost opportunity
-                                self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                    order_id: order_id.clone(),
-                                });
-                                self.leg1_cancel_inflight = true;
-                                self.diag_ask_drift_cancels += 1;
-                                self.diag_sustain_cancels += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ─── BuildupDetector integration ────────────────────────────────────
-
-    /// Handle a buildup entry signal from the internal BuildupDetector.
-    /// Extracted from the former `IngestorEvent::BuildupConfirmed` match arm.
-    fn handle_buildup_confirmed(&mut self, buildup: BuildupInfo, now_ms: u64) {
-        let _ = now_ms; // available for future use
-        self.diag_buildups_received += 1;
-        // Drop buildup if within post-rotation quiet period.
-        if self.in_quiet_period {
-            self.diag_buildups_dropped_quiet += 1;
-            debug!("buildup ignored — within rotation quiet period");
-            return;
-        }
-        // Drop buildup if within entry_cutoff window — no new trades allowed.
-        if self.in_cutoff_window {
-            self.diag_buildups_dropped_cutoff += 1;
-            debug!("buildup ignored — within cutoff window");
-            return;
-        }
-
-        // If Leg 1 is already active, don't process new buildups — but cancel on
-        // opposite-direction buildup to avoid filling into a reversed market.
-        if !matches!(self.state.leg1_state, OrderState::None) {
-            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-                if !Self::is_provisional_order(order_id)
-                    && self.pending_leg1_cancel.is_none()
-                    && !self.leg1_cancel_inflight
-                {
-                    if let Some(leg1_dir) = self.leg1_direction {
-                        if leg1_dir != buildup.direction {
-                            info!(
-                                leg1_dir = ?leg1_dir,
-                                new_dir = ?buildup.direction,
-                                "opposite direction buildup — cancelling Leg 1"
-                            );
-                            self.leg1_cancel_retryable = false; // market reversed, don't retry old direction
-                            self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                                order_id: order_id.clone(),
-                            });
-                            self.leg1_cancel_inflight = true;
-                            self.diag_opposite_dir_cancels += 1;
-                            self.diag_sustain_cancels += 1;
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        // Gate: if buildup already active with same direction, skip repeated firing.
-        if self.state.buildup_detected {
-            if let Some(ref last) = self.state.last_buildup {
-                if last.direction == buildup.direction {
-                    return;
-                }
-            }
-        }
-
-        self.state.buildup_detected = true;
-        self.state.last_buildup = Some(buildup.clone());
-        // Fresh buildup resets retry counter (new signal, new budget).
-        self.leg1_retry_count = 0;
-        self.leg1_cancel_retryable = false;
-        self.original_signal_ask = None;
-
-        info!(
-            direction = ?buildup.direction,
-            composite_score = %buildup.composite_score,
-            buildup_detected_ms = buildup.timestamp_ms,
-            "buildup CONFIRMED"
-        );
-    }
-
-    /// Handle a flow update from the internal BuildupDetector (every dirty tick).
-    /// Updates composite score state and performs Leg 1 sustain monitoring.
-    /// Extracted from the former `IngestorEvent::BuildupUpdate` match arm.
-    fn handle_flow_update(&mut self, score: f64, direction: Direction, now_ms: u64) {
-        let composite_score = Decimal::try_from(score).unwrap_or(Decimal::ZERO);
-        self.state.current_composite_score = composite_score;
-        self.state.current_composite_direction = Some(direction);
-        self.state.composite_update_ms = now_ms;
-        // Update hedge flow monitoring if active.
-        if let Some(ref mut hedge) = self.hedge {
-            hedge.last_flow_score = composite_score;
-            hedge.last_flow_direction = Some(direction);
-            hedge.last_flow_update_ms = now_ms;
-        }
-
-        // ── Leg 1 sustain monitoring ──
-        // If Leg 1 is Posted and no cancel is already pending, check composite fade.
-        // Skip if order ID is provisional (real CLOB ID not yet received).
-        if self.pending_leg1_cancel.is_none() && !self.leg1_cancel_inflight {
-            if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-                if !Self::is_provisional_order(order_id) {
-                    // Composite fade: composite fell below cancel_threshold → cancel
-                    if composite_score < self.leg2.cancel_threshold {
-                        info!(
-                            %composite_score, cancel_threshold = %self.leg2.cancel_threshold,
-                            "Leg 1 sustain — composite faded below cancel threshold"
-                        );
-                        self.leg1_cancel_retryable = false; // signal died, don't retry
-                        self.pending_leg1_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                            order_id: order_id.clone(),
-                        });
-                        self.leg1_cancel_inflight = true;
-                        self.diag_sustain_cancels += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Evaluate current state and optionally emit a **Leg 1** trade signal.
-    ///
-    /// Delegates guard checking and signal building to [`Leg1Evaluator::evaluate`].
-    /// Applies post-signal state mutations here after a successful evaluation:
-    /// - Clears `buildup_detected`
-    /// - Sets `leg1_state` to `Posted`
-    /// - Increments `cumulative_used`
-    /// - Records `leg1_direction`
-    pub fn evaluate(&mut self) -> Option<TradeSignal> {
-        // Drain/pause mode: block new Leg 1 entries.
-        if self.draining || self.paused {
-            if self.state.buildup_detected {
-                self.diag_rej_paused += 1;
-            }
-            self.state.buildup_detected = false;
-            return None;
-        }
-
-        // Heartbeat down: block new Leg 1 entries.
-        if !self.connectivity.heartbeat_healthy {
-            if self.state.buildup_detected {
-                self.diag_rej_heartbeat += 1;
-            }
-            self.state.buildup_detected = false;
-            return None;
-        }
-
-        // Post-trade cooldown: block new Leg 1 entries.
-        if self.in_trade_cooldown {
-            if self.state.buildup_detected {
-                self.diag_buildups_dropped_cooldown += 1;
-            }
-            self.state.buildup_detected = false;
-            return None;
-        }
-
-        let now_ms = now_epoch_ms();
-        let outcome = self.leg1.evaluate(&self.state, now_ms);
-
-        match outcome {
-            Leg1Outcome::Signal(signal) => {
-                let direction = signal.direction;
-                let alloc = signal.alloc_amount;
-                let price = signal.price;
-                let size = signal.size;
-
-                // Consume the buildup: clear detected flag. last_buildup is preserved so
-                // init_leg2() can use it when Leg 1 fills. It will be cleared in
-                // on_trade_complete() and the MarketRotation handler.
-                self.state.buildup_detected = false;
-                self.state.leg1_state = OrderState::Posted {
-                    order_id: format!("sim-leg1-{}", now_ms),
-                    price,
-                    size,
-                    timestamp_ms: now_ms,
-                };
-                // Record best_ask at time of signal for ask-drift sustain monitoring.
-                self.state.leg1_posted_ask = signal.best_ask;
-                // Store original ask on first attempt only — used for cumulative chase cap.
-                if self.original_signal_ask.is_none() {
-                    self.original_signal_ask = signal.best_ask;
-                }
-                self.state.cumulative_used += alloc;
-                self.leg1_direction = Some(direction);
-                self.pending_leg1_signal = Some(signal.clone());
-                self.diag_leg1_signals += 1;
-
-                Some(signal)
-            }
-            Leg1Outcome::Rejected(reason) => {
-                // Buildup consumed (rejected) — clear detected flag.
-                self.state.buildup_detected = false;
-                // During retries, preserve last_buildup so on_order_failed can re-arm.
-                if self.leg1_retry_count == 0 {
-                    self.state.last_buildup = None;
-                }
-                match reason {
-                    Leg1RejectReason::ActiveTrade => self.diag_rej_busy += 1,
-                    Leg1RejectReason::NoBook => self.diag_rej_no_book += 1,
-                    Leg1RejectReason::NoBinance => self.diag_rej_no_binance += 1,
-                    Leg1RejectReason::StaleBook => self.diag_rej_stale += 1,
-                    Leg1RejectReason::WideSpread => self.diag_rej_spread += 1,
-                    Leg1RejectReason::AskPairTooExpensive => self.diag_rej_ask_pair += 1,
-                    Leg1RejectReason::PriceSkewed => self.diag_rej_skew += 1,
-                    Leg1RejectReason::InsufficientRepricing => self.diag_rej_reprice += 1,
-                    Leg1RejectReason::HeartbeatDown => self.diag_rej_heartbeat += 1,
-                    Leg1RejectReason::Other => self.diag_rej_other += 1,
-                }
-                None
-            }
-            Leg1Outcome::Skipped => {
-                // No spike — nothing to count or clear.
-                None
-            }
-        }
-    }
-
-    /// Evaluate Leg 2 hedge signal after Leg 1 fills.
-    ///
-    /// Delegates guard checking and signal building to [`Leg2Evaluator::evaluate_leg2`].
-    /// Applies post-signal state mutations here after a successful evaluation:
-    /// - Sets `leg2_state` to `Posted`
-    /// - On emergency: sets `hedge.emergency_submitted = true`
-    /// - On phase transition: sets `hedge.phase` to `Phase2`
-    pub fn evaluate_leg2(&mut self) -> Option<TradeSignal> {
-        if self.emergency_signal_in_flight {
-            return None;
-        }
-        if self.leg2_command_pending {
-            return None;
-        }
-        let now_ms = now_epoch_ms();
-
-        // Build borrow-free snapshot of hedge state to pass to evaluator.
-        let snap = match self.hedge.as_ref() {
-            None => return None,
-            Some(e) => HedgeSnap {
-                emergency_submitted: e.emergency_submitted,
-                break_even: e.break_even(),
-                leg1_fee: e.leg1_fee,
-                initial_profit_target: e.initial_profit_target,
-                direction: e.direction,
-                fill_ms: e.leg1_fill_ms,
-                tier: e.tier,
-                expected_pct: e.expected_pct,
-                spike_info: e.spike_info,
-                phase: e.phase,
-                phase1_target_price: e.phase1_target_price,
-                phase2_start_ms: e.phase2_start_ms,
-                phase2_posted_price: e.phase2_posted_price,
-                flow_monitoring_active: e.flow_monitoring_active,
-                last_flow_score: e.last_flow_score,
-                last_flow_direction: e.last_flow_direction,
-            },
-        };
-
-        let decision = match self
-            .leg2
-            .evaluate_leg2(&self.state, &snap, now_ms)
-        {
-            Some(d) => d,
-            None => {
-                // Evaluator returned None — skip guard, no improvement, or missing data.
-                return None;
-            }
-        };
-
-        // ── Apply mutations based on decision type ────────────────────────
-        let (price, size) = (decision.price(), decision.size());
-        let is_emergency = decision.is_emergency();
-
-        // Heartbeat down: block non-emergency Leg 2 posts (emergency FOK must always fire).
-        if !self.connectivity.heartbeat_healthy && !is_emergency {
-            debug!("heartbeat down — blocking non-emergency Leg 2 post");
-            return None;
-        }
-
-        // Save current Leg 2 order before overwriting with provisional ID.
-        if let OrderState::Posted { ref order_id, price: p, size: s, .. } = self.state.leg2_state
-            && !order_id.starts_with("sim-")
-        {
-            self.prev_leg2_order = Some((order_id.clone(), p, s));
-        }
-
-        if is_emergency {
-            let (reason, was_taker) = match &decision {
-                Leg2Decision::Emergency { signal, .. } => {
-                    (signal.exit_reason, true) // Emergency exits are always FOK taker
-                }
-                _ => (None, false),
-            };
-            match reason {
-                Some(ExitReason::BreakEvenBreach) => self.diag_emg_be_breach += 1,
-                Some(ExitReason::Phase2Timeout) => self.diag_emg_phase2_timeout += 1,
-                Some(ExitReason::Phase2PriceBreach) => self.diag_emg_phase2_price_breach += 1,
-                Some(ExitReason::MarketExpiry) => self.diag_emg_expiry += 1,
-                Some(ExitReason::FavorableTaker) => self.diag_favorable_exits += 1,
-                Some(ExitReason::Phase1Breach) => self.diag_emg_phase1_breach += 1,
-                Some(ExitReason::WhipsawReversal) => {} // flow reversal FOK — counted via flow monitoring
-                Some(ExitReason::FlowCollapse) => {} // composite flow collapse — counted via flow monitoring
-                None => {}
-            }
-            // Track for live mode trade-completed Telegram message.
-            self.live_trade_meta = LiveTradeMeta {
-                leg2_was_taker: was_taker,
-                exit_reason: reason,
-                emergency_maker: reason.is_some() && !was_taker,
-                favorable_taker: matches!(reason, Some(ExitReason::FavorableTaker)),
-                favorable_maker: false,
-                phase1_breach: matches!(reason, Some(ExitReason::Phase1Breach)),
-            };
-            if let Some(e) = self.hedge.as_mut() {
-                e.emergency_submitted = true;
-                e.exit_reason = match &decision {
-                    Leg2Decision::Emergency { signal, .. } => signal.exit_reason,
-                    _ => None,
-                };
-                if was_taker {
-                    e.fok_emitted = true;
-                }
-            }
-            self.emergency_signal_in_flight = true;
-            if self.reporter.is_some() {
-                self.leg2_command_pending = true;
-            }
-            self.state.leg2_state = OrderState::Posted {
-                order_id: format!("sim-leg2-emergency-{}", now_ms),
-                price,
-                size,
-                timestamp_ms: now_ms,
-            };
-        } else {
-            // Non-emergency hedge path: Phase1Post or Phase2Alongside.
-            match &decision {
-                Leg2Decision::Phase1Post { .. } => {
-                    // Initial post at profit target — no phase change needed.
-                    self.diag_leg2_phase1_posts += 1;
-                    self.last_leg2_was_phase2_alongside = false;
-                    if self.reporter.is_some() {
-                        self.leg2_command_pending = true;
-                    }
-                    self.state.leg2_state = OrderState::Posted {
-                        order_id: format!("sim-leg2-hedge-{}", now_ms),
-                        price,
-                        size,
-                        timestamp_ms: now_ms,
-                    };
-                }
-                Leg2Decision::Phase2Alongside { .. } => {
-                    // Sequential: executor cancels Phase 1, then posts Phase 2.
-                    if let Some(e) = self.hedge.as_mut() {
-                        e.phase = HedgePhase::Phase2;
-                        e.phase2_posted_price = Some(price);
-                        e.phase2_start_ms = Some(now_ms);
-                    }
-                    self.diag_phase_transitions += 1;
-                    self.last_leg2_was_phase2_alongside = true;
-                    if self.reporter.is_some() {
-                        self.leg2_command_pending = true;
-                    }
-                    // In live mode, executor cancels Phase 1 and posts Phase 2.
-                    // We track Phase 2 via leg2_phase2_order_id.
-                    // For sim mode, update leg2_state to Phase 2 price (sim only
-                    // tracks one order).
-                    self.leg2_phase2_order_id = Some(format!("sim-leg2-p2-{}", now_ms));
-                    if self.reporter.is_none() {
-                        // Sim mode: overwrite leg2_state (Phase 1 order doesn't
-                        // exist in CLOB, sim tracks it via phase1_target_price).
-                        self.state.leg2_state = OrderState::Posted {
-                            order_id: format!("sim-leg2-hedge-{}", now_ms),
-                            price,
-                            size,
-                            timestamp_ms: now_ms,
-                        };
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Some(decision.into_signal())
-    }
-
-    // ─── Spike cancel drain ─────────────────────────────────────────────
-
-    /// Returns `true` if the last `evaluate_leg2()` returned a Phase2Alongside signal.
-    /// Consumed (cleared) on read. Main loop uses this to send `PostLeg2Phase2`.
-    pub fn take_phase2_alongside_flag(&mut self) -> bool {
-        let v = self.last_leg2_was_phase2_alongside;
-        self.last_leg2_was_phase2_alongside = false;
-        v
-    }
-
-    /// Take the pending tick size change command (if any).
-    /// Called by the main loop after `on_event()` to forward to the executor.
-    pub fn take_tick_size_change(&mut self) -> Option<ExecutorCommand> {
-        self.pending_tick_size_cmd.take()
-    }
-
-    /// Take the pending Leg 1 cancel command (if any).
-    /// Called by the main loop after `on_event()` to forward to the executor.
-    pub fn take_leg1_cancel(&mut self) -> Option<ExecutorCommand> {
-        self.pending_leg1_cancel.take()
-    }
-
-    /// Take the pending heartbeat-dead cancel command (if any).
-    /// Called by the main loop after `on_event()` to forward to the executor.
-    pub fn take_heartbeat_cancel(&mut self) -> Option<ExecutorCommand> {
-        self.pending_heartbeat_cancel.take()
-    }
-
-    /// Proactive state reset when heartbeat failure count reaches the dead threshold.
-    /// CLOB cancels resting orders ~10-15s after heartbeat death. This resets
-    /// engine state to match, preventing stale `OrderState::Posted` entries.
-    fn handle_heartbeat_dead(&mut self) {
-        warn!("HEARTBEAT DEAD — assuming CLOB cancelled all resting orders");
-        self.diag_heartbeat_resets += 1;
-
-        // Telegram alert
-        if let Some(ref reporter) = self.reporter {
-            reporter.fire_critical(format!(
-                "⚠️ <b>HEARTBEAT DEAD</b> — {} consecutive failures\n\
-                 Assuming CLOB cancelled all resting orders.\n\
-                 Leg 1: {:?}  Leg 2: {:?}",
-                self.connectivity.consecutive_heartbeat_failures,
-                std::mem::discriminant(&self.state.leg1_state),
-                std::mem::discriminant(&self.state.leg2_state),
-            ));
-        }
-
-        // Reset Leg 1 if posted (unfilled) — CLOB likely already cancelled it.
-        if let OrderState::Posted { ref order_id, .. } = self.state.leg1_state {
-            self.pending_heartbeat_cancel = Some(ExecutorCommand::CancelLeg1Order {
-                order_id: order_id.clone(),
-            });
-            self.state.leg1_state = OrderState::None;
-            self.state.leg1_posted_ask = None;
-            self.leg1_direction = None;
-            self.pending_leg1_signal = None;
-            self.leg1_cancel_inflight = false;
-            self.leg1_retry_count = 0;
-            self.leg1_cancel_retryable = false;
-            self.original_signal_ask = None;
-            self.state.buildup_detected = false;
-            self.state.last_buildup = None;
-        }
-
-        // Reset Leg 2 if posted (unfilled) — naked position until heartbeat recovers.
-        if matches!(self.state.leg2_state, OrderState::Posted { .. }) {
-            self.state.leg2_state = OrderState::None;
-            self.leg2_phase1_order_id = None;
-            self.leg2_phase2_order_id = None;
-            self.last_leg2_was_phase2_alongside = false;
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-            self.prev_leg2_order = None;
-        }
-    }
-
-    // ─── Rotation emergency drain ─────────────────────────────────────
-
-    /// Drain any emergency signals buffered during the last `MarketRotation`.
-    ///
-    /// Called by the main loop immediately after `on_event()` and BEFORE sending
-    /// `ExecutorCommand::MarketRotation`, so the executor processes the emergency
-    /// hedge before cleaning up the old market's state.
-    pub fn take_rotation_emergencies(&mut self) -> Vec<TradeSignal> {
-        std::mem::take(&mut self.rotation_emergency_buffer)
-    }
-
-    // ─── Diagnostic ─────────────────────────────────────────────────────
-
-    /// Log cumulative engine diagnostics every 60 seconds (terminal only).
-    ///
-    /// Sets `engine_diag_ready` and calls `try_build_telegram_diag()`.
-    ///
-    /// Call this once per engine loop iteration (cheap — checks timestamp first).
-    pub fn check_diagnostic(&mut self) {
-        let now_ms = now_epoch_ms();
-        if self.last_diag_ms == 0 {
-            self.last_diag_ms = now_ms;
-            return;
-        }
-        if now_ms.saturating_sub(self.last_diag_ms) < 60_000 {
-            return;
-        }
-        info!(
-            markets = self.diag_markets_rotated,
-            buildups = self.diag_buildups_received,
-            buildups_cut = self.diag_buildups_dropped_cutoff,
-            buildups_quiet = self.diag_buildups_dropped_quiet,
-            buildups_cooldown = self.diag_buildups_dropped_cooldown,
-            emg_phase1_breach = self.diag_emg_phase1_breach,
-            rej_paused = self.diag_rej_paused,
-            rej_busy = self.diag_rej_busy,
-            rej_no_book = self.diag_rej_no_book,
-            rej_no_bnc = self.diag_rej_no_binance,
-            rej_stale = self.diag_rej_stale,
-            rej_spread = self.diag_rej_spread,
-            rej_ask_pair = self.diag_rej_ask_pair,
-            rej_skew = self.diag_rej_skew,
-            rej_reprice = self.diag_rej_reprice,
-            rej_other = self.diag_rej_other,
-            leg1_sig = self.diag_leg1_signals,
-            leg1_fill = self.diag_leg1_fills,
-            l2_p1_posts = self.diag_leg2_phase1_posts,
-            phase_transitions = self.diag_phase_transitions,
-            l2_maker = self.diag_leg2_fills_maker,
-            l2_taker = self.diag_leg2_fills_taker,
-            emg_be_breach = self.diag_emg_be_breach,
-            emg_p2_timeout = self.diag_emg_phase2_timeout,
-            emg_p2_price_breach = self.diag_emg_phase2_price_breach,
-            emg_expiry = self.diag_emg_expiry,
-            fav_exits = self.diag_favorable_exits,
-            fav_maker = self.diag_favorable_maker_fills,
-            fav_maker_timeout = self.diag_favorable_maker_timeouts,
-            emg_maker = self.diag_emg_maker,
-            emg_taker = self.diag_emg_taker,
-            p2_entry_breach = self.diag_phase2_entry_breach,
-            buildup_fail = self.diag_buildup_failures,
-            order_fail = self.diag_order_failures,
-            sustain_cancels = self.diag_sustain_cancels,
-            sustain_timeouts = self.diag_sustain_timeouts,
-            opposite_dir_cancels = self.diag_opposite_dir_cancels,
-            ask_drift_cancels = self.diag_ask_drift_cancels,
-            leg1_retries = self.diag_leg1_retries,
-            hb_rej = self.diag_rej_heartbeat,
-            hb_resets = self.diag_heartbeat_resets,
-            hb_failures = self.connectivity.consecutive_heartbeat_failures,
-            det_signals = self.detector.diag_signals_emitted(),
-            det_dir_veto = self.detector.diag_direction_vetoes(),
-            det_causal_veto = self.detector.diag_causal_vetoes(),
-            det_composite = %self.state.current_composite_score,
-            "engine 60s"
-        );
-        self.last_diag_ms = now_ms;
-        self.engine_diag_ready = true;
-        self.try_build_telegram_diag();
-    }
-
-    /// Build and store the Telegram diagnostic message when engine data is ready.
-    fn try_build_telegram_diag(&mut self) {
-        if !self.engine_diag_ready {
-            return;
-        }
-        self.engine_diag_ready = false;
-
-        self.pending_telegram_diag = Some(format!(
-            "<b>--- DIAGNOSTICS (60s) ---</b>\n\
-             \n\
-             <b>Engine</b>\n\
-             Markets rotated: {mkts}  Buildups: {buildups}  Buildup fails: {buildup_fail}  Cutoff drops: {buildups_cut}  Quiet drops: {buildups_quiet}  Cooldown drops: {buildups_cooldown}\n\
-             \n\
-             <b>Leg 1 Rejections</b>\n\
-             Paused: {paused}  Busy: {busy}  No book: {no_book}  No Binance: {no_bnc}  Stale: {stale}  Spread: {spread}  Ask pair: {ask_pair}  Skewed: {skew}\n\
-             Reprice: {reprice}  Other: {other}\n\
-             \n\
-             <b>Leg 1</b>\n\
-             Signals: {sig}  Fills: {fill}  Failed: {failed}\n\
-             Sustain — cancels: {sustain_cancels}  timeouts: {sustain_timeouts}  opposite-dir: {opposite_dir_cancels}  ask-drift: {ask_drift_cancels}  retries: {leg1_retries}\n\
-             \n\
-             <b>Leg 2</b>\n\
-             P1 Posts: {l2_p1_posts}  Transitions: {transitions}  Fills: {l2_maker} maker / {l2_taker} taker\n\
-             Favorable: exits={fav_exits}  maker={fav_maker}  maker-timeout={fav_maker_timeout}\n\
-             Emergency — p1-breach: {emg_p1b}  be-breach: {emg_beb}  p2-timeout: {emg_p2t}  p2-price-breach: {emg_p2pb}  p2-entry-breach: {p2_entry_breach}  expiry: {emg_exp}\n\
-             Emergency fills — {emg_mkr} maker / {emg_tkr} taker\n\
-             \n\
-             <b>Heartbeat</b>\n\
-             {hb_status}  Failures: {hb_failures}  Latency: {hb_latency}ms  Rej: {hb_rej}  Resets: {hb_resets}\n\
-             \n\
-             <b>BuildupDetector</b>\n\
-             Signals: {det_signals}  Dir vetoes: {det_dir_veto}  Causal vetoes: {det_causal_veto}\n\
-             Composite: {composite_score}",
-            mkts = self.diag_markets_rotated,
-            buildups = self.diag_buildups_received,
-            buildup_fail = self.diag_buildup_failures,
-            buildups_cut = self.diag_buildups_dropped_cutoff,
-            buildups_quiet = self.diag_buildups_dropped_quiet,
-            buildups_cooldown = self.diag_buildups_dropped_cooldown,
-            paused = self.diag_rej_paused,
-            busy = self.diag_rej_busy,
-            no_book = self.diag_rej_no_book,
-            no_bnc = self.diag_rej_no_binance,
-            stale = self.diag_rej_stale,
-            spread = self.diag_rej_spread,
-            ask_pair = self.diag_rej_ask_pair,
-            skew = self.diag_rej_skew,
-            reprice = self.diag_rej_reprice,
-            other = self.diag_rej_other,
-            sig = self.diag_leg1_signals,
-            fill = self.diag_leg1_fills,
-            failed = self.diag_order_failures,
-            sustain_cancels = self.diag_sustain_cancels,
-            sustain_timeouts = self.diag_sustain_timeouts,
-            opposite_dir_cancels = self.diag_opposite_dir_cancels,
-            ask_drift_cancels = self.diag_ask_drift_cancels,
-            leg1_retries = self.diag_leg1_retries,
-            l2_p1_posts = self.diag_leg2_phase1_posts,
-            transitions = self.diag_phase_transitions,
-            l2_maker = self.diag_leg2_fills_maker,
-            l2_taker = self.diag_leg2_fills_taker,
-            fav_exits = self.diag_favorable_exits,
-            fav_maker = self.diag_favorable_maker_fills,
-            fav_maker_timeout = self.diag_favorable_maker_timeouts,
-            emg_beb = self.diag_emg_be_breach,
-            emg_p2t = self.diag_emg_phase2_timeout,
-            emg_p2pb = self.diag_emg_phase2_price_breach,
-            p2_entry_breach = self.diag_phase2_entry_breach,
-            emg_exp = self.diag_emg_expiry,
-            emg_p1b = self.diag_emg_phase1_breach,
-            emg_mkr = self.diag_emg_maker,
-            emg_tkr = self.diag_emg_taker,
-            hb_status = if self.connectivity.heartbeat_healthy { "OK" } else { "DOWN" },
-            hb_failures = self.connectivity.consecutive_heartbeat_failures,
-            hb_latency = self.connectivity.last_heartbeat_latency_ms,
-            hb_rej = self.diag_rej_heartbeat,
-            hb_resets = self.diag_heartbeat_resets,
-            det_signals = self.detector.diag_signals_emitted(),
-            det_dir_veto = self.detector.diag_direction_vetoes(),
-            det_causal_veto = self.detector.diag_causal_vetoes(),
-            composite_score = self.state.current_composite_score,
-        ));
-    }
-
-    /// Drain the pending Telegram diagnostic message (if any).
-    /// Called by the main loop to send to Telegram after engine 60s diagnostics.
-    pub fn take_pending_telegram_diag(&mut self) -> Option<String> {
-        self.pending_telegram_diag.take()
-    }
-
-    // ─── Accessors and Executor callbacks ────────────────────────────────
-
-    pub fn state(&self) -> &MarketState {
-        &self.state
-    }
-
-    /// Get the current best ask from the direction-appropriate order book.
-    /// Returns `true` if the order ID is a provisional placeholder (real CLOB ID pending).
-    fn is_provisional_order(order_id: &str) -> bool {
-        order_id.starts_with("sim-leg1-")
-    }
-
-    /// Called by the Executor when an order is successfully posted to the CLOB.
-    pub fn on_order_posted(
-        &mut self,
-        is_leg2: bool,
-        order_id: String,
-        price: Decimal,
-        size: Decimal,
-        fill_method: Option<FillMethod>,
-        already_filled: bool,
-        order_tag: Option<OrderTag>,
-    ) {
-        // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
-        // has been reset (e.g., stale hedge command processed after trade completed).
-        if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-            warn!(%order_id, %price, %size,
-                "ignoring stale Leg 2 OrderPosted — no active Leg 1 fill");
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-            return;
-        }
-
-        let now_ms = now_epoch_ms();
-        if is_leg2 {
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-
-            // Bug 1 fix: executor-initiated favorable exits set live_trade_meta
-            // so Telegram shows the correct tag.
-            match fill_method {
-                Some(FillMethod::FavorableTaker) => {
-                    self.live_trade_meta.favorable_taker = true;
-                    self.live_trade_meta.leg2_was_taker = true;
-                }
-                Some(FillMethod::FavorableMaker) => {
-                    // Favorable maker try succeeded — no taker fee, maker rebate.
-                    self.live_trade_meta.favorable_taker = false;
-                    self.live_trade_meta.favorable_maker = true;
-                    self.live_trade_meta.leg2_was_taker = false;
-                    self.diag_favorable_maker_fills += 1;
-                    self.diag_favorable_exits += 1;
-                }
-                Some(FillMethod::EmergencyTaker) => {
-                    self.live_trade_meta.leg2_was_taker = true;
-                    self.live_trade_meta.emergency_maker = false;
-                }
-                None => {}
-            }
-
-            // Track dual-order IDs: update Phase 1 or Phase 2 based on OrderTag.
-            match order_tag {
-                Some(OrderTag::Leg2Phase1) => {
-                    self.leg2_phase1_order_id = Some(order_id.clone());
-                }
-                Some(OrderTag::Leg2Phase2) => {
-                    self.leg2_phase2_order_id = Some(order_id.clone());
-                    self.leg2_phase1_order_id = None; // Phase 1 was cancelled for Phase 2 transition
-                }
-                None => {
-                    // Backward compat: no tag → treat as Phase 1 (initial Leg 2 post).
-                    self.leg2_phase1_order_id = Some(order_id.clone());
-                }
-            }
-
-            // Bug 3 fix: FOK returned Filled synchronously from REST API.
-            // Transition directly to Filled state — don't wait for User WS MATCHED.
-            if already_filled {
-                // Apply weighted average if Phase 1 had a partial fill.
-                let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
-                    let total_size = p1_size + size;
-                    let weighted_price = if total_size > Decimal::ZERO {
-                        ((p1_price * p1_size) + (price * size)) / total_size
-                    } else {
-                        price
-                    };
-                    (weighted_price.round_dp(4), total_size.round_dp(2))
-                } else {
-                    (price, size)
-                };
-                info!(%order_id, %final_price, %final_size, "FOK already filled — direct transition to Filled");
-                self.state.leg2_state = OrderState::Filled {
-                    order_id,
-                    price: final_price,
-                    size: final_size,
-                    fill_timestamp_ms: now_ms,
-                };
-                // Re-evaluate favorable_taker based on actual fill price
-                if let OrderState::Filled { price: l1_price, .. } = &self.state.leg1_state {
-                    if *l1_price + price >= Decimal::ONE {
-                        self.live_trade_meta.favorable_taker = false;
-                    }
-                }
-                // Don't replay pending fills — go straight to trade completion
-                // (checked by main loop after feedback drain).
-                return;
-            }
-        }
-
-        // Leg 1 already_filled: batch FAK fills are confirmed synchronously.
-        // Transition directly to Filled, init Leg 2 hedge, and send opportunity alert.
-        if !is_leg2 && already_filled {
-            info!(%order_id, %price, %size, "Leg 1 FAK batch filled — direct transition to Filled");
-            self.state.leg1_state = OrderState::Filled {
-                order_id,
-                price,
-                size,
-                fill_timestamp_ms: now_ms,
-            };
-            self.init_leg2(price, size, now_ms);
-            self.live_trade_meta = LiveTradeMeta::default();
-
-            // Send opportunity alert via Telegram in live mode.
-            if let (Some(reporter), Some(signal)) = (
-                self.reporter.clone(),
-                self.pending_leg1_signal.clone(),
-            ) {
-                let book = signal
-                    .book_snapshot
-                    .clone()
-                    .or_else(|| self.state.poly_book.clone())
-                    .unwrap_or_else(|| OrderBook {
-                        asset_id: signal.token_id.clone(),
-                        bids: vec![],
-                        asks: vec![],
-                        timestamp_ms: now_ms,
+                    self.pending_tick_change = Some(V2ExecutorCommand::TickSizeChanged {
+                        yes_token_id: yes_id,
+                        no_token_id: no_id,
+                        new_tick_size,
                     });
-                reporter.send_opportunity_alert(&signal, price, size, &book);
-                self.live_market_signals += 1;
-                if signal.bot_contested {
-                    self.live_market_walls += 1;
-                }
-            }
-            return;
-        }
-
-        let leg = if is_leg2 {
-            &mut self.state.leg2_state
-        } else {
-            &mut self.state.leg1_state
-        };
-        *leg = OrderState::Posted {
-            order_id,
-            price,
-            size,
-            timestamp_ms: now_ms,
-        };
-
-        // leg1_posted_ask already set in evaluate() at signal generation time.
-
-        self.replay_pending_fills(now_ms);
-    }
-
-
-    /// Called by the live executor (via feedback channel) when order placement fails.
-    /// Resets the affected leg state to `None` so the engine can re-evaluate.
-    pub fn on_order_failed(&mut self, is_leg2: bool) {
-        // Stale feedback guard: ignore Leg 2 feedback that arrives after the trade
-        // has been reset (e.g., stale hedge command processed after trade completed).
-        if is_leg2 && !matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-            warn!(is_leg2, "ignoring stale Leg 2 OrderFailed — no active Leg 1 fill");
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-            return;
-        }
-        self.diag_order_failures += 1;
-        if is_leg2 {
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-            self.state.leg2_state = OrderState::None;
-        } else {
-            // Leg 1 failed (e.g. crosses-book) — retry if budget remains and buildup is live.
-            if self.leg1_retry_count < self.max_leg1_retries && self.state.last_buildup.is_some() {
-                // Reclaim capital so evaluate() can re-allocate at current prices.
-                if let Some(ref sig) = self.pending_leg1_signal {
-                    self.state.cumulative_used = self.state.cumulative_used.saturating_sub(sig.alloc_amount);
-                }
-                self.leg1_retry_count += 1;
-                self.diag_leg1_retries += 1;
-                self.state.leg1_state = OrderState::None;
-                self.state.leg1_posted_ask = None;
-                self.state.buildup_detected = true;
-                info!(retry = self.leg1_retry_count, max = self.max_leg1_retries,
-                    "Leg 1 order failed — retrying with current book prices");
-            } else {
-                // Exhausted retries or no buildup — full reset.
-                self.state.leg1_state = OrderState::None;
-                self.state.leg1_posted_ask = None;
-                self.leg1_direction = None;
-                self.state.last_buildup = None;
-                self.pending_leg1_signal = None;
-                self.leg1_retry_count = 0;
-                self.leg1_cancel_retryable = false;
-                self.original_signal_ask = None;
-                // Activate cooldown to prevent re-entry on decaying buildup metrics.
-                self.in_trade_cooldown = true;
-                self.last_trade_complete_ms = now_epoch_ms();
-            }
-        }
-        warn!(is_leg2, "order placement failed — leg state reset to None");
-    }
-
-    /// Called when the executor detects "not enough balance / allowance" on a Leg 2
-    /// placement. Sends a critical Telegram alert with position details so the
-    /// operator knows the position is stuck.
-    pub fn on_balance_exhausted(&mut self) {
-        if let Some(ref reporter) = self.reporter {
-            let dir = match self.leg1_direction {
-                Some(Direction::Up) => "YES",
-                Some(Direction::Down) => "NO",
-                None => "?",
-            };
-            let (price, size) = match &self.state.leg1_state {
-                OrderState::Filled { price, size, .. } => (price.to_string(), size.to_string()),
-                _ => ("?".into(), "?".into()),
-            };
-            reporter.fire_critical(format!(
-                "BALANCE EXHAUSTED\nLeg 1: {} @ {} ({})\nLeg 2: HALTED — insufficient balance/allowance\nWaiting for rotation",
-                dir, price, size,
-            ));
-        }
-    }
-
-    /// Called when a `CancelResult` feedback arrives from the executor.
-    ///
-    /// For Leg 1: uses authoritative `size_matched` from `get_order_status()` to detect
-    /// fills that the cancel response alone can't reveal (race condition fix).
-    /// For Leg 2: `size_matched` may contain Phase 1 fill data (from Phase 2 transition).
-    pub fn on_cancel_result(&mut self, order_id: String, was_cancelled: bool, is_leg2: bool, size_matched: Option<Decimal>) {
-        if is_leg2 {
-            self.emergency_signal_in_flight = false;
-            self.leg2_command_pending = false;
-        }
-
-        if is_leg2 {
-            // Track Phase 1 partial fills for weighted average when Phase 2 fills.
-            if let Some(matched) = size_matched {
-                if matched > Decimal::ZERO {
-                    let phase1_price = self.hedge.as_ref()
-                        .map(|h| h.phase1_target_price)
-                        .unwrap_or(Decimal::ZERO);
-                    self.leg2_phase1_fill = Some((phase1_price, matched.round_dp(2)));
-                    self.state.leg2_partial_filled = matched.round_dp(2);
-                    self.leg2_partial_filled = matched.round_dp(2);
-                    info!(%matched, %phase1_price, "Phase 1 partial fill stored for weighted average");
                 }
             }
 
-            if was_cancelled {
-                self.prev_leg2_order = None;
-                debug!(%order_id, "Leg 2 cancel confirmed by CLOB");
-            } else {
-                // NOT cancelled — order may have filled. Restore state so User WS events match.
-                let now_ms = now_epoch_ms();
-                if let Some((saved_id, price, size)) = self.prev_leg2_order.take()
-                    && saved_id == order_id
-                {
-                    let is_provisional = matches!(
-                        &self.state.leg2_state,
-                        OrderState::Posted { order_id: oid, .. } if oid.starts_with("sim-")
-                    );
-                    if is_provisional || matches!(self.state.leg2_state, OrderState::None) {
-                        warn!(%order_id, "Leg 2 cancel NOT confirmed — restoring Posted state");
-                        self.state.leg2_state = OrderState::Posted {
-                            order_id: saved_id,
-                            price,
-                            size,
-                            timestamp_ms: now_ms,
-                        };
-                        self.live_trade_meta = LiveTradeMeta::default();
-                        if let Some(e) = self.hedge.as_mut() {
-                            e.emergency_submitted = false;
-                            e.exit_reason = None;
-                        }
-                    }
-                } else {
-                    debug!(%order_id, "Leg 2 cancel NOT confirmed — no saved state to restore (trade may have completed)");
-                }
-                self.replay_pending_fills(now_ms);
-            }
-        } else {
-            // Leg 1 cancel result — use authoritative size_matched from get_order_status().
-            self.leg1_cancel_inflight = false;
-            let filled = size_matched.unwrap_or(Decimal::ZERO);
-
-            if filled > Decimal::ZERO {
-                // Shares were filled before/during cancel — handle based on current state.
-                self.leg1_retry_count = 0;
-                self.leg1_cancel_retryable = false;
-                self.original_signal_ask = None;
-                let now_ms = now_epoch_ms();
-                match &self.state.leg1_state {
-                    OrderState::Posted { price, .. } => {
-                        // Cancel-race: CLOB filled the order but cancel returned true.
-                        // Transition Posted → Filled and init hedge.
-                        let fill_price = *price;
-                        let fill_size = filled.round_dp(2);
-                        info!(%order_id, %fill_price, %fill_size,
-                            "Leg 1 cancel-race: order was filled — transitioning to Filled");
-                        self.state.leg1_state = OrderState::Filled {
-                            order_id: order_id.clone(),
-                            price: fill_price,
-                            size: fill_size,
-                            fill_timestamp_ms: now_ms,
-                        };
-                        self.init_leg2(fill_price, fill_size, now_ms);
-                        self.diag_leg1_fills += 1;
-
-                        // Reset live trade meta for the new trade.
-                        self.live_trade_meta = LiveTradeMeta::default();
-
-                        // Send opportunity alert via Telegram in live mode.
-                        if let (Some(reporter), Some(signal)) = (
-                            self.reporter.clone(),
-                            self.pending_leg1_signal.clone(),
-                        ) {
-                            let book = signal
-                                .book_snapshot
-                                .clone()
-                                .or_else(|| self.state.poly_book.clone())
-                                .unwrap_or_else(|| OrderBook {
-                                    asset_id: signal.token_id.clone(),
-                                    bids: vec![],
-                                    asks: vec![],
-                                    timestamp_ms: now_ms,
-                                });
-                            reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
-                            self.live_market_signals += 1;
-                            if signal.bot_contested {
-                                self.live_market_walls += 1;
-                            }
-                        }
-                    }
-                    OrderState::Filled { size: current_size, price, .. } => {
-                        let fill_price = *price;
-                        // Already Filled (User WS MATCHED arrived first). Update size if larger.
-                        if filled.round_dp(2) > *current_size {
-                            let new_size = filled.round_dp(2);
-                            info!(%order_id, old_size = %current_size, %new_size,
-                                "Leg 1 cancel result: size_matched > current — updating");
-                            if let OrderState::Filled { ref mut size, .. } = self.state.leg1_state {
-                                *size = new_size;
-                            }
-                        }
-                        // If Leg 2 was deferred (cancel was in-flight when fill arrived), init now.
-                        if self.hedge.is_none() {
-                            let final_size = match &self.state.leg1_state {
-                                OrderState::Filled { size, .. } => *size,
-                                _ => unreachable!(),
-                            };
-                            info!(%order_id, %fill_price, %final_size,
-                                "deferred Leg 2 init — using authoritative size from cancel result");
-                            self.init_leg2(fill_price, final_size, now_ms);
-                            self.diag_leg1_fills += 1;
-                            self.live_trade_meta = LiveTradeMeta::default();
-
-                            // Send Telegram opportunity alert.
-                            if let (Some(reporter), Some(signal)) = (
-                                self.reporter.clone(),
-                                self.pending_leg1_signal.clone(),
-                            ) {
-                                let book = signal.book_snapshot.clone()
-                                    .or_else(|| self.state.poly_book.clone())
-                                    .unwrap_or_else(|| OrderBook {
-                                        asset_id: signal.token_id.clone(),
-                                        bids: vec![], asks: vec![],
-                                        timestamp_ms: now_ms,
-                                    });
-                                reporter.send_opportunity_alert(&signal, fill_price, final_size, &book);
-                                self.live_market_signals += 1;
-                                if signal.bot_contested { self.live_market_walls += 1; }
-                            }
-                        }
-                    }
-                    OrderState::None => {
-                        warn!(%order_id, %filled, "Leg 1 cancel result: size_matched > 0 but leg1_state=None — ignoring");
-                    }
-                }
-            } else if was_cancelled {
-                // filled == 0 and cancel confirmed → nothing filled, order is gone.
-                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-                    // Partial-fill remainder cancelled — trade continues with hedge.
-                    debug!(%order_id, "Leg 1 partial-fill remainder cancelled — trade continues");
-                    // If Leg 2 was deferred (cancel was in-flight when fill arrived), init now.
-                    if self.hedge.is_none() {
-                        if let OrderState::Filled { price, size, .. } = &self.state.leg1_state {
-                            let fill_price = *price;
-                            let fill_size = *size;
-                            let now_ms = now_epoch_ms();
-                            info!(%order_id, %fill_price, %fill_size,
-                                "deferred Leg 2 init (remainder cancelled, 0 additional fills)");
-                            self.init_leg2(fill_price, fill_size, now_ms);
-                            self.diag_leg1_fills += 1;
-                            self.live_trade_meta = LiveTradeMeta::default();
-
-                            if let (Some(reporter), Some(signal)) = (
-                                self.reporter.clone(),
-                                self.pending_leg1_signal.clone(),
-                            ) {
-                                let book = signal.book_snapshot.clone()
-                                    .or_else(|| self.state.poly_book.clone())
-                                    .unwrap_or_else(|| OrderBook {
-                                        asset_id: signal.token_id.clone(),
-                                        bids: vec![], asks: vec![],
-                                        timestamp_ms: now_ms,
-                                    });
-                                reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
-                                self.live_market_signals += 1;
-                                if signal.bot_contested { self.live_market_walls += 1; }
-                            }
-                        }
-                    }
-                } else {
-                    // Cancel confirmed with 0 filled — retry if ask-drift and chase within bounds.
-                    let chase_ok = if self.leg1_cancel_retryable {
-                        // Check cumulative chase from original signal ask.
-                        if let (Some(orig_ask), Some(dir)) = (self.original_signal_ask, self.leg1_direction) {
-                            let current_ask = match dir {
-                                Direction::Up => self.state.poly_yes_book.as_ref()
-                                    .or(self.state.poly_book.as_ref()),
-                                Direction::Down => self.state.poly_no_book.as_ref()
-                                    .or(self.state.poly_book.as_ref()),
-                            }.and_then(|b| b.best_ask()).map(|a| a.price);
-                            if let Some(cur) = current_ask {
-                                let chase = cur - orig_ask;
-                                if chase > self.max_ask_chase_cents {
-                                    info!(%cur, %orig_ask, %chase, max = %self.max_ask_chase_cents,
-                                        "ask-drift retry blocked — cumulative chase exceeds cap");
-                                    false
-                                } else {
-                                    true
-                                }
-                            } else {
-                                false // no book → can't retry
-                            }
-                        } else {
-                            false // no original ask or direction → can't retry
-                        }
-                    } else {
-                        false // not retryable (composite fade / opposite dir)
-                    };
-                    if chase_ok
-                        && self.leg1_retry_count < self.max_leg1_retries
-                        && self.state.last_buildup.is_some()
-                    {
-                        if let Some(ref sig) = self.pending_leg1_signal {
-                            self.state.cumulative_used = self.state.cumulative_used.saturating_sub(sig.alloc_amount);
-                        }
-                        self.leg1_retry_count += 1;
-                        self.diag_leg1_retries += 1;
-                        self.state.leg1_state = OrderState::None;
-                        self.state.leg1_posted_ask = None;
-                        self.state.buildup_detected = true;
-                        info!(retry = self.leg1_retry_count, max = self.max_leg1_retries,
-                            "Leg 1 cancel (0 filled) — retrying with current book prices");
-                    } else {
-                        // True cancel (composite fade, opposite dir, or retries exhausted) — full reset.
-                        debug!(%order_id, "Leg 1 cancel confirmed (0 filled) — resetting Leg 1 state");
-                        self.state.leg1_state = OrderState::None;
-                        self.state.leg1_posted_ask = None;
-                        self.leg1_direction = None;
-                        self.state.buildup_detected = false;
-                        self.state.last_buildup = None;
-                        self.pending_leg1_signal = None;
-                        self.leg1_retry_count = 0;
-                        self.original_signal_ask = None;
-                        // Activate cooldown to prevent re-entry on decaying buildup metrics.
-                        self.in_trade_cooldown = true;
-                        self.last_trade_complete_ms = now_epoch_ms();
-                    }
-                    self.leg1_cancel_retryable = false;
-                }
-            } else if size_matched.is_some() {
-                // Cancel NOT confirmed but query succeeded (filled == 0) — order is still live.
-                // Do NOT reset state or retry. Let sustain re-evaluate on next tick.
-                if matches!(self.state.leg1_state, OrderState::Filled { .. }) {
-                    // User WS fill arrived during cancel — trust it, init deferred Leg 2.
-                    if self.hedge.is_none() {
-                        if let OrderState::Filled { price, size, .. } = &self.state.leg1_state {
-                            let fill_price = *price;
-                            let fill_size = *size;
-                            let now_ms = now_epoch_ms();
-                            info!(%order_id, %fill_price, %fill_size,
-                                "Leg 1 cancel NOT confirmed but filled — deferred Leg 2 init");
-                            self.init_leg2(fill_price, fill_size, now_ms);
-                            self.diag_leg1_fills += 1;
-                            self.live_trade_meta = LiveTradeMeta::default();
-
-                            if let (Some(reporter), Some(signal)) = (
-                                self.reporter.clone(),
-                                self.pending_leg1_signal.clone(),
-                            ) {
-                                let book = signal.book_snapshot.clone()
-                                    .or_else(|| self.state.poly_book.clone())
-                                    .unwrap_or_else(|| OrderBook {
-                                        asset_id: signal.token_id.clone(),
-                                        bids: vec![], asks: vec![],
-                                        timestamp_ms: now_ms,
-                                    });
-                                reporter.send_opportunity_alert(&signal, fill_price, fill_size, &book);
-                                self.live_market_signals += 1;
-                                if signal.bot_contested { self.live_market_walls += 1; }
-                            }
-                        }
-                    }
-                } else {
-                    // Order is still live on CLOB — keep Posted state, sustain will re-evaluate.
-                    warn!(%order_id, "Leg 1 cancel NOT confirmed (0 filled) — order still live, keeping Posted state");
-                }
-                self.leg1_cancel_retryable = false;
-            } else {
-                // Query failed AND was_cancelled=false → defensive fallback.
-                // Keep state as-is, wait for User WS.
-                debug!(%order_id, "Leg 1 cancel: query failed, not cancelled — waiting for User WS");
-            }
-            let now_ms = now_epoch_ms();
-            self.replay_pending_fills(now_ms);
-        }
-    }
-
-    /// Replay buffered TradeStatusUpdate events that didn't match any leg when
-    /// they first arrived. Called after state changes (OrderPosted, CancelResult)
-    /// that may make previously-unmatched events matchable.
-    fn replay_pending_fills(&mut self, now_ms: u64) {
-        if self.pending_fills.is_empty() {
-            return;
-        }
-
-        let fills: Vec<(String, TradeStatus, Option<Decimal>, Option<Decimal>)> = self.pending_fills.drain(..).collect();
-        for (order_id, status, size_matched, original_size) in fills {
-            let is_leg1 = matches!(
-                &self.state.leg1_state,
-                OrderState::Posted { order_id: oid, .. } if *oid == order_id
-            );
-            let is_leg2 = matches!(
-                &self.state.leg2_state,
-                OrderState::Posted { order_id: oid, .. } if *oid == order_id
-            );
-
-            if is_leg1 {
-                info!(%order_id, ?status, "replaying buffered fill for Leg 1");
-                let (price, size) = match &self.state.leg1_state {
-                    OrderState::Posted { price, size, .. } => (*price, *size),
-                    _ => unreachable!(),
-                };
-                match status {
-                    TradeStatus::Matched | TradeStatus::Mined | TradeStatus::Confirmed => {
-                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                            if matched < original {
-                                warn!(%order_id, %matched, %original, "partial fill on Leg 1 (replay) — deferring alert to MINED");
-                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                    leg: "Leg 1", size_matched: matched, original_size: original,
-                                });
-                            }
-                        }
-                        let fill_size = size.round_dp(2);
-                        self.state.leg1_state = OrderState::Filled {
-                            order_id,
-                            price,
-                            size: fill_size,
-                            fill_timestamp_ms: now_ms,
-                        };
-
-                        if self.leg1_cancel_inflight {
-                            info!(fill_size = %fill_size, "replayed Leg 1 fill but cancel in-flight — deferring Leg 2 init");
-                        } else {
-                            self.init_leg2(price, fill_size, now_ms);
-                            self.diag_leg1_fills += 1;
-                            self.live_trade_meta = LiveTradeMeta::default();
-
-                            // Send opportunity alert for replayed Leg 1 fill.
-                            if let (Some(reporter), Some(signal)) = (
-                                self.reporter.clone(),
-                                self.pending_leg1_signal.clone(),
-                            ) {
-                                let book = signal
-                                    .book_snapshot
-                                    .clone()
-                                    .or_else(|| self.state.poly_book.clone())
-                                    .unwrap_or_else(|| OrderBook {
-                                        asset_id: signal.token_id.clone(),
-                                        bids: vec![],
-                                        asks: vec![],
-                                        timestamp_ms: now_ms,
-                                    });
-                                reporter.send_opportunity_alert(&signal, price, size, &book);
-                                self.live_market_signals += 1;
-                                if signal.bot_contested {
-                                    self.live_market_walls += 1;
-                                }
-                            }
-                        }
-                    }
-                    TradeStatus::Failed => {
-                        self.state.leg1_state = OrderState::None;
-                    }
-                    TradeStatus::Canceled => {
-                        if self.leg1_cancel_inflight {
-                            // Cancel in flight — defer cleanup to cancel result handler.
-                            debug!(%order_id, "replayed Leg 1 CANCELED (cancel in flight) — deferring to cancel result");
-                        } else {
-                            warn!(%order_id, "replayed Leg 1 CANCELED unexpectedly — resetting");
-                            self.state.leg1_state = OrderState::None;
-                            self.pending_leg1_signal = None;
-                        }
-                    }
-                    TradeStatus::Retrying => {}
-                }
-            } else if is_leg2 {
-                info!(%order_id, ?status, "replaying buffered fill for Leg 2");
-                let (fill_price, posted_size) = match &self.state.leg2_state {
-                    OrderState::Posted { price, size, .. } => (*price, *size),
-                    _ => unreachable!(),
-                };
-
-                // Prefer actual CLOB fill size over state-derived value.
-                let fill_size = match size_matched {
-                    Some(matched) if matched > Decimal::ZERO => matched.round_dp(2),
-                    _ => posted_size,
-                };
-                // Cap at leg1 size — Leg 2 should never exceed Leg 1.
-                let expected_max = match &self.state.leg1_state {
-                    OrderState::Filled { size, .. } => *size,
-                    _ => fill_size,
-                };
-                let fill_size = fill_size.min(expected_max);
-
-                match status {
-                    TradeStatus::Matched => {
-                        let dust_threshold = Decimal::new(1, 2); // 0.01 shares
-                        // Primary check: CLOB original_size vs size_matched.
-                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                            if matched.round_dp(2) < original.round_dp(2)
-                                && (original - matched) >= dust_threshold
-                            {
-                                info!(%order_id, %matched, %original, "Leg 2 partial fill (replay) — order still resting");
-                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                    leg: "Leg 2", size_matched: matched, original_size: original,
-                                });
-                                continue;
-                            }
-                            // Secondary check: CLOB may report original_size == size_matched
-                            // when balance constrains the order. Compare against our posted_size.
-                            if matched.round_dp(2) < posted_size.round_dp(2)
-                                && (posted_size - matched) >= dust_threshold
-                            {
-                                info!(%order_id, %matched, posted = %posted_size, "Leg 2 partial fill (replay, posted-size check) — order still resting");
-                                self.pending_partial_fills.insert(order_id.clone(), PendingPartialFill {
-                                    leg: "Leg 2", size_matched: matched, original_size: posted_size,
-                                });
-                                continue;
-                            }
-                        } else {
-                            // No size info on MATCHED — wait for MINED/CONFIRMED.
-                            debug!(%order_id, "Leg 2 MATCHED (replay) without size info — waiting for MINED/CONFIRMED");
-                            continue;
-                        }
-                        // Full fill — apply weighted average with any prior Phase 1 partial.
-                        let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
-                            let total_size = p1_size + fill_size;
-                            let weighted_price = if total_size > Decimal::ZERO {
-                                ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
-                            } else {
-                                fill_price
-                            };
-                            (weighted_price.round_dp(4), total_size.round_dp(2))
-                        } else {
-                            (fill_price, fill_size)
-                        };
-                        info!(%order_id, %final_price, %final_size, "Leg 2 fill (replay) — pair complete");
-                        self.state.leg2_state = OrderState::Filled {
-                            order_id,
-                            price: final_price,
-                            size: final_size,
-                            fill_timestamp_ms: now_ms,
-                        };
-                    }
-                    TradeStatus::Mined | TradeStatus::Confirmed => {
-                        // Terminal — size_matched is authoritative.
-                        if let (Some(matched), Some(original)) = (size_matched, original_size) {
-                            let is_partial_clob = matched.round_dp(2) < original.round_dp(2) && matched > Decimal::ZERO;
-                            let is_partial_posted = matched.round_dp(2) < posted_size.round_dp(2)
-                                && (posted_size - matched) >= Decimal::new(1, 2);
-                            if is_partial_clob || is_partial_posted {
-                                let prior_filled = self.leg2_phase1_fill.map(|(_, s)| s).unwrap_or(Decimal::ZERO);
-                                let total_filled = prior_filled + matched.round_dp(2);
-                                let leg1_size = match &self.state.leg1_state {
-                                    OrderState::Filled { size, .. } => *size,
-                                    _ => Decimal::ZERO,
-                                };
-                                let unfilled_remainder = (leg1_size - total_filled).max(Decimal::ZERO).round_dp(2);
-
-                                let min_notional_size = if !fill_price.is_zero() {
-                                    (Decimal::ONE / fill_price).ceil()
-                                } else {
-                                    Decimal::new(5, 0)
-                                };
-                                let remainder_too_small = unfilled_remainder < Decimal::new(5, 0)
-                                    || unfilled_remainder < min_notional_size;
-
-                                if !remainder_too_small {
-                                    warn!(%order_id, %matched, %original, %unfilled_remainder, "Leg 2 terminal partial fill (replay) — resetting for remainder");
-                                    let phase_price = fill_price;
-                                    if let Some((existing_price, existing_size)) = self.leg2_phase1_fill.take() {
-                                        let combined_size = existing_size + matched.round_dp(2);
-                                        let combined_price = if combined_size > Decimal::ZERO {
-                                            ((existing_price * existing_size) + (phase_price * matched.round_dp(2))) / combined_size
-                                        } else {
-                                            phase_price
-                                        };
-                                        self.leg2_phase1_fill = Some((combined_price.round_dp(4), combined_size));
-                                    } else {
-                                        self.leg2_phase1_fill = Some((phase_price, matched.round_dp(2)));
-                                    }
-                                    self.state.leg2_partial_filled = self.leg2_phase1_fill
-                                        .map(|(_, s)| s)
-                                        .unwrap_or(Decimal::ZERO);
-                                    self.leg2_partial_filled = self.state.leg2_partial_filled;
-                                    self.state.leg2_state = OrderState::None;
-                                    continue;
-                                }
-                            }
-                        }
-                        // Full fill (or remainder too small) — apply weighted average.
-                        let (final_price, final_size) = if let Some((p1_price, p1_size)) = self.leg2_phase1_fill.take() {
-                            let total_size = p1_size + fill_size;
-                            let weighted_price = if total_size > Decimal::ZERO {
-                                ((p1_price * p1_size) + (fill_price * fill_size)) / total_size
-                            } else {
-                                fill_price
-                            };
-                            (weighted_price.round_dp(4), total_size.round_dp(2))
-                        } else {
-                            (fill_price, fill_size)
-                        };
-                        info!(%order_id, %final_price, %final_size, status = ?status, "Leg 2 fill (replay) — pair complete");
-                        self.state.leg2_state = OrderState::Filled {
-                            order_id,
-                            price: final_price,
-                            size: final_size,
-                            fill_timestamp_ms: now_ms,
-                        };
-                    }
-                    TradeStatus::Failed => {
-                        self.state.leg2_state = OrderState::None;
-                    }
-                    TradeStatus::Canceled => {
-                        self.state.leg2_state = OrderState::None;
-                        self.prev_leg2_order = None;
-                    }
-                    TradeStatus::Retrying => {}
-                }
-            } else {
-                // Still unmatched after replay — re-buffer.
-                if self.pending_fills.len() < 8 {
-                    self.pending_fills.push_back((order_id, status, size_matched, original_size));
-                }
-            }
-        }
-    }
-
-    /// Record a completed live trade to QuestDB's `executed_trades` table.
-    ///
-    /// Call this when both legs are `Filled` — right before `on_trade_complete()`
-    /// resets state. All required fields are extracted from engine state:
-    /// `leg1_state`, `leg2_state`, `hedge`, `pending_leg1_signal`, `leg1_direction`.
-    pub fn record_live_trade(
-        &self,
-        cold: &mut crate::storage::cold::ColdStorage,
-    ) -> anyhow::Result<()> {
-        let (l1_order_id, l1_price, l1_size, l1_fill_ts) = match &self.state.leg1_state {
-            OrderState::Filled {
+            IngestorEvent::TradeStatusUpdate {
                 order_id,
-                price,
-                size,
-                fill_timestamp_ms,
-            } => (order_id.as_str(), *price, *size, *fill_timestamp_ms),
-            _ => return Ok(()), // not filled — nothing to record
-        };
-        let (l2_order_id, l2_price, l2_size) = match &self.state.leg2_state {
-            OrderState::Filled {
-                order_id,
-                price,
-                size,
+                status,
+                size_matched,
                 ..
-            } => (order_id.as_str(), *price, *size),
-            _ => return Ok(()), // not filled — nothing to record
-        };
-
-        let direction_str = match self.leg1_direction {
-            Some(Direction::Up) => "YES",
-            Some(Direction::Down) => "NO",
-            None => "YES", // fallback — should not happen if both legs filled
-        };
-
-        let pair_cost = l1_price + l2_price;
-        let gross_profit = (Decimal::ONE - pair_cost) * l1_size;
-
-        // Extract hedge metadata (if available).
-        let (
-            expected_pct,
-            profit_tier,
-            hedge_phase,
-            exit_reason,
-            alloc_amount,
-            bot_contested,
-            emergency_submitted,
-            spike_magnitude,
-        ) = match (&self.hedge, &self.pending_leg1_signal) {
-            (Some(h), Some(sig)) => (
-                h.expected_pct,
-                h.tier.label(),
-                h.phase as u8,
-                h.exit_reason,
-                sig.alloc_amount,
-                sig.bot_contested,
-                h.emergency_submitted,
-                h.spike_info.magnitude,
-            ),
-            (Some(h), None) => (
-                h.expected_pct,
-                h.tier.label(),
-                h.phase as u8,
-                h.exit_reason,
-                Decimal::ZERO,
-                false,
-                h.emergency_submitted,
-                h.spike_info.magnitude,
-            ),
-            _ => (
-                Decimal::ZERO,
-                "LOW",
-                0u8,
-                None,
-                Decimal::ZERO,
-                false,
-                false,
-                Decimal::ZERO,
-            ),
-        };
-
-        let leg2_was_taker = exit_reason.is_some();
-        let favorable_taker = exit_reason == Some(ExitReason::FavorableTaker);
-        // In live mode, we can't distinguish maker vs taker fills during emergency chase
-        // (no executor feedback). Conservative: only true if emergency entered but no exit_reason
-        // was set (meaning the maker order filled before FOK deadline).
-        let emergency_maker = emergency_submitted && exit_reason.is_none();
-
-        // Taker fee: CLOB deducts fees automatically; the REST response and User WS
-        // do not return the actual amount charged. Recorded as zero in QuestDB.
-        let taker_fee = Decimal::ZERO;
-        // Leg 1 is always maker (post-only) — estimate rebate. Leg 2 maker rebate if not taker.
-        let leg1_rebate = crate::executor::fill_engine::compute_maker_rebate(l1_price, l1_size);
-        let leg2_rebate = if !leg2_was_taker {
-            crate::executor::fill_engine::compute_maker_rebate(l2_price, l2_size)
-        } else {
-            Decimal::ZERO
-        };
-        let maker_rebate = leg1_rebate + leg2_rebate;
-
-        let net_profit = gross_profit - taker_fee + maker_rebate;
-        let profit_pct = if pair_cost > Decimal::ZERO && l1_size > Decimal::ZERO {
-            net_profit / (pair_cost * l1_size) * Decimal::ONE_HUNDRED
-        } else {
-            Decimal::ZERO
-        };
-
-        cold.record_trade(
-            self.state.active_condition_id.as_deref().unwrap_or(""),
-            direction_str,
-            l1_price,
-            Some(l2_price),
-            l1_size,
-            Some(l2_size),
-            pair_cost,
-            gross_profit,
-            taker_fee,
-            net_profit,
-            profit_pct,
-            expected_pct,
-            profit_tier,
-            alloc_amount,
-            hedge_phase,
-            leg2_was_taker,
-            bot_contested,
-            l1_order_id,
-            Some(l2_order_id),
-            l1_fill_ts,
-            exit_reason,
-            favorable_taker,
-            emergency_maker,
-            spike_magnitude,
-            maker_rebate,
-        )
-    }
-
-    /// Called in live mode when both legs are filled (detected in main engine loop).
-    /// Replicates the trade completion logic from `advance_simulation()`.
-    pub fn on_trade_complete(&mut self) {
-        let now_ms = now_epoch_ms();
-
-        // Extract fill data before clearing state.
-        let l1_data = match &self.state.leg1_state {
-            OrderState::Filled { price, size, fill_timestamp_ms, .. } => {
-                Some((*price, *size, *fill_timestamp_ms))
+            } => {
+                self.on_trade_status_update(&order_id, status, size_matched, now);
             }
-            _ => None,
-        };
-        let l2_data = match &self.state.leg2_state {
-            OrderState::Filled { price, size, .. } => Some((*price, *size)),
-            _ => None,
-        };
 
-        if let (Some((l1_price, l1_size, l1_ts)), Some((l2_price, l2_size))) = (l1_data, l2_data) {
-            let pair_cost = l1_price + l2_price;
-            let net_profit = Decimal::ONE - pair_cost;
-            info!(
-                %l1_price, %l2_price,
-                %pair_cost, %net_profit,
-                "live trade pair complete — resetting for next trade"
-            );
-
-            // Build LiveTradeReport and send Telegram messages if reporter is set.
-            if self.reporter.is_some() {
-                if let Some(trade) =
-                    self.build_live_sim_trade(l1_price, l1_size, l1_ts, l2_price, l2_size, now_ms)
-                {
-                    if let Some(ref reporter) = self.reporter.clone() {
-                        reporter.send_trade_completed(&trade);
-                    }
-                    self.live_market_trades.push(trade.clone());
-                    self.live_session_trades.push(trade);
-                }
-            }
-        }
-
-        self.in_trade_cooldown = true;
-        self.last_trade_complete_ms = now_ms;
-
-        self.state.leg1_state = OrderState::None;
-        self.state.leg2_state = OrderState::None;
-        self.hedge = None;
-        self.leg1_direction = None;
-        self.pending_leg1_signal = None;
-        self.pending_tick_size_cmd = None;
-        self.pending_leg1_cancel = None;
-        self.pending_heartbeat_cancel = None;
-        self.emergency_signal_in_flight = false;
-        self.leg2_command_pending = false;
-        self.prev_leg2_order = None;
-        self.pending_fills.clear();
-        self.state.leg1_posted_ask = None;
-        self.leg1_cancel_inflight = false;
-        self.leg1_retry_count = 0;
-        self.leg1_cancel_retryable = false;
-        self.original_signal_ask = None;
-        // Dual-order tracking: clear IDs on trade reset.
-        self.leg2_phase1_order_id = None;
-        self.leg2_phase2_order_id = None;
-        self.last_leg2_was_phase2_alongside = false;
-        // Leg 2 partial fill tracking: clear on trade completion.
-        self.leg2_partial_filled = Decimal::ZERO;
-        self.leg2_phase1_fill = None;
-        self.state.leg2_partial_filled = Decimal::ZERO;
-        // cumulative_used is NOT reset — capital stays allocated within this market.
-    }
-
-    // ─── Simulation helpers ────────────────────────────────────────────────
-
-    /// Initialize hedge state after a Leg 1 fill.
-    ///
-    /// Reused by both `TradeStatusUpdate` handler (live mode) and
-    /// `advance_simulation()` (simulation mode).
-    fn init_leg2(&mut self, fill_price: Decimal, fill_size: Decimal, now_ms: u64) {
-        if let Some(buildup) = &self.state.last_buildup {
-            let (conf, tier, initial_profit_target) = if let Some(sig) = &self.pending_leg1_signal {
-                (sig.expected_pct, sig.profit_target_tier, sig.profit_target_pct)
-            } else {
-                // Fallback: recompute from buildup (rare path)
-                let t_secs = self.state.time_remaining_ms(now_ms) / 1_000;
-                let yes_mid = self
-                    .state
-                    .poly_yes_book
-                    .as_ref()
-                    .or(self.state.poly_book.as_ref())
-                    .and_then(|b| {
-                        let bid = b.best_bid()?.price;
-                        let ask = b.best_ask()?.price;
-                        Some((bid + ask) / Decimal::TWO)
-                    })
-                    .unwrap_or(Decimal::new(5, 1));
-                let c = compute_expected_repricing(
-                    buildup.composite_score,
-                    Decimal::ZERO,  // min_strength (not used meaningfully with composite)
-                    Decimal::ONE,   // strong_strength
-                    yes_mid,
-                    buildup.direction,
-                    t_secs,
-                    self.leg1.reprice_scale,
-                    self.leg1.time_exponent,
-                    self.leg1.max_time_factor,
-                );
-                let t = ProfitTier::from_expected_reprice(c, self.leg1.reprice_scale);
-                let tick = self.state.tick_size;
-                let target = round_to_tick(c * self.leg1.phase1_target_dampen, tick);
-                (c, t, target)
-            };
-            let direction = self.leg1_direction.unwrap_or(buildup.direction);
-            let tick = self.state.tick_size;
-            let phase1_target_price = round_to_tick(
-                Decimal::ONE - initial_profit_target - fill_price,
-                tick,
-            );
-            let leg1_fee = self.pending_leg1_signal.as_ref()
-                .map(|s| s.leg1_fee)
-                .unwrap_or(Decimal::ZERO);
-            self.hedge = Some(HedgeState::new(
-                now_ms,
-                fill_price,
-                leg1_fee,
-                tier,
-                initial_profit_target,
-                direction,
-                SpikeInfo {
-                    direction,
-                    magnitude: buildup.composite_score,
-                    sustained_ms: 0,
-                    timestamp_ms: buildup.timestamp_ms,
-                    atr_ratio: buildup.signal_atr_ratio,
-                    obi: buildup.obi,
-                },
-                conf,
-                phase1_target_price,
-            ));
-            info!(tier = tier.label(), %fill_price, %fill_size, %phase1_target_price, "leg2 hedge initialised");
-        } else {
-            warn!("Leg 1 filled but no buildup info — hedge not initialised");
-        }
-    }
-
-    /// Advance simulation state: simulate Leg 1 and Leg 2 fills based on
-    /// current orderbook conditions. Test-only — not called in live mode.
-    ///
-    /// Returns confirmed fill signals for the
-    /// executor to record directly. Usually 0 or 1 items per call.
-    #[cfg(test)]
-    pub fn advance_simulation(&mut self) -> Vec<TradeSignal> {
-        let now_ms = now_epoch_ms();
-        let mut signals: Vec<TradeSignal> = Vec::new();
-
-        // ── Leg 1: Posted → Filled ─────────────────────────────────────
-        if let OrderState::Posted {
-            price,
-            size,
-            timestamp_ms,
-            ..
-        } = &self.state.leg1_state
-        {
-            let fill_price = *price;
-            let fill_size = *size;
-
-            let tick = self.state.tick_size;
-            let two_ticks = tick * Decimal::TWO;
-
-            // Leg 1 fill check: maker post-only — fills when ask is within two ticks of
-            // our bid price (ask has crossed or nearly crossed our level).
-            let should_fill = match self.leg1_direction {
-                Some(Direction::Up) => {
-                    let book_opt = self
-                        .state
-                        .poly_yes_book
-                        .as_ref()
-                        .or(self.state.poly_book.as_ref());
-                    match book_opt {
-                        Some(book) => {
-                            let ask = book.best_ask().map(|a| a.price);
-                            // Maker: fills when ask drops to within two ticks of our bid
-                            let maker_valid = ask.is_some_and(|a| a <= fill_price + two_ticks);
-                            let near_ask_depth: Decimal = book
-                                .asks
-                                .iter()
-                                .filter(|lvl| lvl.price <= fill_price + two_ticks)
-                                .map(|lvl| lvl.size)
-                                .sum();
-                            maker_valid && near_ask_depth > Decimal::ZERO
-                        }
-                        None => false,
-                    }
-                }
-                Some(Direction::Down) => match self.state.poly_no_book.as_ref() {
-                    Some(book) => {
-                        let ask = book.best_ask().map(|a| a.price);
-                        // Maker: fills when ask drops to within two ticks of our bid
-                        let maker_valid = ask.is_some_and(|a| a <= fill_price + two_ticks);
-                        let near_ask_depth: Decimal = book
-                            .asks
-                            .iter()
-                            .filter(|lvl| lvl.price <= fill_price + two_ticks)
-                            .map(|lvl| lvl.size)
-                            .sum();
-                        maker_valid && near_ask_depth > Decimal::ZERO
-                    }
-                    None => false,
-                },
-                None => false,
-            };
-
-            if should_fill {
-                self.diag_leg1_fills += 1;
-                info!(
-                    %fill_price, %fill_size,
-                    "advance_simulation: Leg 1 simulated fill (FAK taker at ask)"
-                );
-                if let Some(sig) = self.pending_leg1_signal.take() {
-                    signals.push(sig);
-                }
-                self.state.leg1_state = OrderState::Filled {
-                    order_id: format!("sim-leg1-{}", timestamp_ms),
-                    price: fill_price,
-                    size: fill_size,
-                    fill_timestamp_ms: now_ms,
-                };
-                self.init_leg2(fill_price, fill_size, now_ms);
-            }
-        }
-
-        // ── Leg 2: Posted → Filled ─────────────────────────────────────
-        if let OrderState::Posted { price, size, .. } = &self.state.leg2_state {
-            let posted_price = *price;
-            let posted_size = *size;
-
-            let is_fok = self.hedge.as_ref().is_some_and(|e| e.fok_emitted);
-
-            // Determine fill outcome: (should_fill, is_favorable_taker, fill_price, sim_was_taker).
-            // FOK orders fill immediately at ask (taker). Non-FOK use normal maker fill logic:
-            //   ask < posted_price → favorable taker fill at ask_price
-            //   ask == posted_price → normal maker fill at posted_price
-            //   ask > posted_price or no ask → no fill (order rests)
-            let best_ask = match self.leg1_direction {
-                Some(Direction::Up) => self
-                    .state
-                    .poly_no_book
-                    .as_ref()
-                    .or(self.state.poly_book.as_ref())
-                    .and_then(|b| b.best_ask())
-                    .map(|a| a.price),
-                Some(Direction::Down) => self
-                    .state
-                    .poly_yes_book
-                    .as_ref()
-                    .or(self.state.poly_book.as_ref())
-                    .and_then(|b| b.best_ask())
-                    .map(|a| a.price),
-                None => self
-                    .state
-                    .poly_book
-                    .as_ref()
-                    .and_then(|b| b.best_ask())
-                    .map(|a| a.price),
-            };
-
-            // Dual-order: also check if Phase 1 target price would fill (when in Phase 2).
-            let phase1_fill = if !is_fok {
-                if let Some(hedge) = &self.hedge {
-                    if hedge.phase == HedgePhase::Phase2 {
-                        let p1_price = hedge.phase1_target_price;
-                        match best_ask {
-                            Some(ask) if ask <= p1_price => Some((p1_price, false)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
+            IngestorEvent::HeartbeatStatus { success, latency_ms } => {
+                if success {
+                    self.heartbeat_failures = 0;
+                    self.heartbeat_healthy = true;
+                    self.heartbeat_latency_ms = latency_ms;
                 } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let (should_fill, is_favorable_taker, fill_price, sim_was_taker) = if is_fok {
-                // FOK orders fill immediately at ask (taker).
-                match best_ask {
-                    Some(ask) => (true, false, ask, true),
-                    None => (false, false, posted_price, false),
-                }
-            } else if let Some((p1_fill_price, _)) = phase1_fill {
-                // Phase 1 order fills first (better price for us = lower fill price).
-                // Compare: which fills? Phase 1 fills if ask <= p1_target.
-                // Phase 2 fills if ask <= p2_posted. Pick the one with lower price (better).
-                match best_ask {
-                    Some(ask) if ask < posted_price => {
-                        // Both would fill — Phase 2 is favorable taker (ask < posted).
-                        // Pick Phase 1 if its price is lower (better for us).
-                        if p1_fill_price <= ask {
-                            (true, false, p1_fill_price, false) // Phase 1 maker fill
-                        } else {
-                            (true, true, ask, false) // Phase 2 favorable taker
+                    self.heartbeat_failures += 1;
+                    if self.heartbeat_failures >= self.risk_config.heartbeat_dead_threshold
+                        && self.heartbeat_healthy
+                    {
+                        // Healthy → unhealthy transition: emergency cancel all resting orders
+                        self.heartbeat_healthy = false;
+                        let cancel_actions = self.quoter.cancel_all_actions();
+                        for action in cancel_actions {
+                            if let QuoteAction::Cancel { side, order_id } = action {
+                                self.quoter.on_cancel_sent(side);
+                                self.pending_commands.push(V2ExecutorCommand::CancelOrder {
+                                    side,
+                                    order_id,
+                                });
+                            }
+                        }
+                        info!("heartbeat DEAD — cancelled all resting orders");
+                        if let Some(ref reporter) = self.reporter {
+                            reporter.fire_critical(
+                                "<b>⚠ HEARTBEAT DEAD</b>\nAll resting orders cancelled. \
+                                 Quoting paused until heartbeat recovers."
+                                    .to_string(),
+                            );
                         }
                     }
-                    Some(ask) if ask <= posted_price => {
-                        // Phase 2 would fill at posted, Phase 1 also fills.
-                        if p1_fill_price <= posted_price {
-                            (true, false, p1_fill_price, false) // Phase 1 fills (better price)
-                        } else {
-                            (true, false, posted_price, false) // Phase 2 fills
-                        }
-                    }
-                    _ => {
-                        // Phase 2 wouldn't fill, but Phase 1 does.
-                        (true, false, p1_fill_price, false)
-                    }
                 }
-            } else {
-                match best_ask {
-                    Some(ask) if ask < posted_price => (true, true, ask, false),
-                    Some(ask) if ask <= posted_price => (true, false, posted_price, false),
-                    _ => (false, false, posted_price, false),
-                }
-            };
-
-            let is_emergency = self.hedge.as_ref().is_some_and(|e| e.emergency_submitted);
-
-            if should_fill {
-                if sim_was_taker {
-                    self.diag_leg2_fills_taker += 1;
-                } else {
-                    self.diag_leg2_fills_maker += 1;
-                }
-                if is_emergency {
-                    if sim_was_taker {
-                        self.diag_emg_taker += 1;
-                    } else {
-                        self.diag_emg_maker += 1;
-                    }
-                }
-                info!(
-                    %posted_price, %posted_size, %fill_price, is_emergency, is_favorable_taker, sim_was_taker,
-                    "advance_simulation: Leg 2 simulated fill"
-                );
-                // Build signal BEFORE setting Filled state — hedge is still valid.
-                if let Some(mut sig) =
-                    self.build_sim_leg2_fill_signal(fill_price, posted_size, now_ms)
-                {
-                    if is_favorable_taker {
-                        sig.exit_reason = Some(ExitReason::FavorableTaker);
-                    }
-                    signals.push(sig);
-                }
-                self.state.leg2_state = OrderState::Filled {
-                    order_id: format!("sim-leg2-{}", now_ms),
-                    price: fill_price,
-                    size: posted_size,
-                    fill_timestamp_ms: now_ms,
-                };
-            }
-        }
-
-        // ── Trade completion: both legs Filled → reset for next trade ───
-        let leg1_filled = matches!(self.state.leg1_state, OrderState::Filled { .. });
-        let leg2_filled = matches!(self.state.leg2_state, OrderState::Filled { .. });
-
-        if leg1_filled && leg2_filled {
-            if let (
-                OrderState::Filled {
-                    price: l1_price, ..
-                },
-                OrderState::Filled {
-                    price: l2_price, ..
-                },
-            ) = (&self.state.leg1_state, &self.state.leg2_state)
-            {
-                let pair_cost = *l1_price + *l2_price;
-                let net_profit = Decimal::ONE - pair_cost;
-                info!(
-                    l1_price = %l1_price, l2_price = %l2_price,
-                    %pair_cost, %net_profit,
-                    "advance_simulation: trade pair complete — resetting for next trade"
-                );
             }
 
-            self.state.leg1_state = OrderState::None;
-            self.state.leg2_state = OrderState::None;
-            self.hedge = None;
-            self.leg1_direction = None;
-            // cumulative_used is NOT reset — capital stays allocated within this market.
+            IngestorEvent::WsStatus { .. } => {}
+            IngestorEvent::SpotTrade(_) => {}
+            IngestorEvent::FuturesForceOrder(_) => {}
+            IngestorEvent::PolymarketMarketResolved { .. } => {}
+            IngestorEvent::Shutdown | IngestorEvent::DrainAndRestart
+            | IngestorEvent::PauseTrading | IngestorEvent::ResumeTrading => {}
         }
 
-        signals
+        // Recompute fair value after event processing
+        if self.fair_value.is_warm() && self.state.market_end_timestamp_ms > 0 {
+            self.fair_value.recompute(
+                self.state.market_end_timestamp_ms,
+                self.min_edge,
+                now,
+            );
+        }
+
+        // Phase transition: QUIET → QUOTING
+        if self.phase == MarketPhase::Quiet && now >= self.quiet_until_ms {
+            self.phase = MarketPhase::Quoting;
+            info!("phase transition: QUIET → QUOTING");
+        }
+
+        // Phase transition: QUOTING → CLOSING
+        if self.phase == MarketPhase::Quoting {
+            let remaining = self.state.time_remaining_ms(now);
+            if ClosingManager::should_enter(remaining, self.risk_config.closing_phase_secs) {
+                self.phase = MarketPhase::Closing;
+                self.closing.phase_entered = true;
+                info!(remaining_ms = remaining, "phase transition: QUOTING → CLOSING");
+            }
+        }
     }
 
-    /// Build a Leg 2 fill [`TradeSignal`] for routing to the `SimulationExecutor`.
-    ///
-    /// Uses the current hedge state and hedge book to construct a confirmed fill
-    /// signal. Reads `exit_reason` from hedge state (set on emergency) so the
-    /// executor can categorize the exit correctly.
-    /// Returns `None` if hedge state or hedge token ID is unavailable.
-    fn build_sim_leg2_fill_signal(
-        &self,
-        price: Decimal,
-        size: Decimal,
-        now_ms: u64,
-    ) -> Option<TradeSignal> {
-        let hedge = self.hedge.as_ref()?;
-        let exit_reason = if hedge.emergency_submitted {
-            hedge.exit_reason
+    // ─── Market rotation ────────────────────────────────────────────────
+
+    fn on_market_rotation(
+        &mut self,
+        condition_id: String,
+        yes_token_id: String,
+        no_token_id: String,
+        end_timestamp_ms: u64,
+        tick_size: Decimal,
+        now: u64,
+    ) {
+        // Report on outgoing market
+        if self.state.active_condition_id.is_some() && self.position.total_fills() > 0 {
+            self.send_market_report(now);
+        }
+
+        // Reset state for new market
+        self.state.active_condition_id = Some(condition_id.clone());
+        self.state.active_yes_token_id = Some(yes_token_id.clone());
+        self.state.active_no_token_id = Some(no_token_id.clone());
+        self.state.market_end_timestamp_ms = end_timestamp_ms;
+        self.state.tick_size = tick_size;
+        self.state.poly_yes_book = None;
+        self.state.poly_no_book = None;
+        self.state.poly_book = None;
+
+        self.strike_price = None;
+        self.position.reset();
+        self.quoter.reset();
+        self.closing.reset();
+        self.fair_value.reset(&self.fair_value_config);
+
+        self.last_rebalance_ms = 0;
+        self.pending_rebalance = false;
+        self.pending_fill_messages.clear();
+        self.pending_fill_records.clear();
+
+        self.phase = MarketPhase::Quiet;
+        self.quiet_until_ms = now + self.risk_config.rotation_quiet_ms;
+        self.diag_markets_traded += 1;
+
+        // Forward rotation to executor
+        self.pending_commands.push(V2ExecutorCommand::MarketRotation {
+            condition_id,
+            yes_token_id,
+            no_token_id,
+            tick_size,
+        });
+
+        info!(
+            phase = ?self.phase,
+            quiet_until = self.quiet_until_ms,
+            "market rotation → QUIET"
+        );
+    }
+
+    // ─── Trade status updates (User WS fills) ──────────────────────────
+
+    fn on_trade_status_update(
+        &mut self,
+        order_id: &str,
+        status: TradeStatus,
+        size_matched: Option<Decimal>,
+        now: u64,
+    ) {
+        if !matches!(status, TradeStatus::Matched) {
+            return;
+        }
+        let cumulative = match size_matched {
+            Some(s) if s > Decimal::ZERO => s,
+            _ => return,
+        };
+
+        // Match order_id to a resting order
+        let matched_side = if let Some(ref o) = self.quoter.yes_order {
+            if o.order_id == order_id { Some(MarketSide::Yes) } else { None }
         } else {
             None
-        };
-        let (hedge_token_id, hedge_book) = match self.leg1_direction? {
-            Direction::Up => (
-                self.state.active_no_token_id.as_deref()?.to_string(),
-                self.state
-                    .poly_no_book
-                    .clone()
-                    .or_else(|| self.state.poly_book.clone()),
-            ),
-            Direction::Down => (
-                self.state.active_yes_token_id.as_deref()?.to_string(),
-                self.state
-                    .poly_yes_book
-                    .clone()
-                    .or_else(|| self.state.poly_book.clone()),
-            ),
-        };
-        let signal = make_leg2_signal(
-            &hedge_token_id,
-            self.state.active_condition_id.as_deref().unwrap_or(""),
-            price,
-            size,
-            self.state.binance_price.unwrap_or(Decimal::ZERO),
-            hedge.expected_pct,
-            hedge.tier,
-            hedge.initial_profit_target,
-            hedge.direction,
-            hedge.spike_info,
-            hedge.leg1_fill_price,
-            now_ms,
-            self.state.market_end_timestamp_ms,
-            self.state.tick_size,
-            self.state.atr.unwrap_or(Decimal::ZERO),
-            false,
-            None,
-            hedge_book,
-            exit_reason,
-        );
-        Some(signal)
-    }
+        }.or_else(|| {
+            if let Some(ref o) = self.quoter.no_order {
+                if o.order_id == order_id { Some(MarketSide::No) } else { None }
+            } else {
+                None
+            }
+        });
 
-    // ─── Live mode Telegram reporting ────────────────────────────────────────
-
-    /// Attach a Telegram reporter for live mode reporting.
-    /// Sets `live_session_start_ms` to now so uptime is tracked from bot startup.
-    pub fn set_reporter(&mut self, reporter: TelegramReporter) {
-        self.reporter = Some(reporter);
-        self.live_session_start_ms = now_epoch_ms();
-    }
-
-    /// Send a full market summary via Telegram for the current market.
-    ///
-    /// Called by main.rs just before `MarketRotation` is sent to the executor,
-    /// so counters still reflect the outgoing market.
-    pub fn send_live_market_summary(&self) {
-        let reporter = match &self.reporter {
-            Some(r) => r,
-            None => return,
+        let Some(side) = matched_side else {
+            debug!(order_id, "TradeStatusUpdate: no matching resting order");
+            return;
         };
 
-        let condition_id = match &self.state.active_condition_id {
-            Some(id) => id.as_str(),
-            None => return,
-        };
-
-        let market_end_ms = self.state.market_end_timestamp_ms;
-        let end_secs = market_end_ms / 1_000;
-        let market_duration_secs = 300u64;
-        let start_secs = end_secs.saturating_sub(market_duration_secs);
-        let start_h = (start_secs / 3600) % 24;
-        let start_m = (start_secs % 3600) / 60;
-        let end_h = (end_secs / 3600) % 24;
-        let end_m = (end_secs % 3600) / 60;
-        let period_label = format!(
-            "{:02}:{:02} - {:02}:{:02} UTC",
-            start_h, start_m, end_h, end_m
-        );
-
-        let trades: Vec<LiveTradeReport> = self
-            .live_market_trades
-            .iter()
-            .filter(|t| t.market_id == condition_id)
-            .cloned()
-            .collect();
-
-        let leg1_fills = trades.len() as u32;
-        let trades_hedged = trades.iter().filter(|t| t.leg2.is_some()).count() as u32;
-        let emergency_taker_fills = trades.iter().filter(|t| t.leg2_was_taker).count() as u32;
-        let emergency_maker_fills = trades.iter().filter(|t| t.emergency_maker).count() as u32;
-        let favorable_taker_fills = trades.iter().filter(|t| t.favorable_taker).count() as u32;
-        let favorable_maker_fills = trades.iter().filter(|t| t.favorable_maker).count() as u32;
-
-        let mut allocation_used = Decimal::ZERO;
-        let mut taker_fees_paid = Decimal::ZERO;
-        let mut maker_rebates_earned = Decimal::ZERO;
-        let mut gross_market_pnl = Decimal::ZERO;
-        let mut net_market_pnl = Decimal::ZERO;
-        let mut capital_locked = Decimal::ZERO;
-        for t in &trades {
-            allocation_used += t.alloc_amount;
-            taker_fees_paid += t.taker_fee;
-            maker_rebates_earned += t.maker_rebate;
-            gross_market_pnl += t.gross_profit;
-            net_market_pnl += t.net_profit;
-            capital_locked += t.pair_cost * t.leg1.size;
+        // Dedup: compute delta against previously recorded fills for this order
+        let delta = self.quoter.record_ws_fill(side, cumulative);
+        if delta <= Decimal::ZERO {
+            debug!(order_id, cumulative = %cumulative, "TradeStatusUpdate: duplicate, no new shares");
+            return;
         }
 
-        let summary = MarketSummary {
-            market_id: condition_id.to_owned(),
-            period_label,
-            resolution: "pending".to_owned(),
-            uma_hours_remaining: Some(2),
-            signals_detected: self.live_market_signals,
-            leg1_fills,
-            trades_hedged,
-            total_trades: leg1_fills,
-            walls_outbid: self.live_market_walls,
-            emergency_taker_fills,
-            emergency_maker_fills,
-            favorable_taker_fills,
-            favorable_maker_fills,
-            trades,
-            allocation_used,
-            allocation_cap: self.leg1.max_alloc_per_trade,
-            taker_fees_paid,
-            maker_rebates_earned,
-            gross_market_pnl,
-            net_market_pnl,
-            capital_locked,
-        };
+        let fill_price = self.quoter.order(side).map(|o| o.price).unwrap_or(Decimal::ZERO);
+        let order_size = self.quoter.order(side).map(|o| o.size).unwrap_or(Decimal::ZERO);
+        let was_full = cumulative >= order_size;
 
-        reporter.send_market_summary(&summary);
-    }
+        // Record only the new delta (no maker rebate — too variable to estimate)
+        self.position.record_fill(side, fill_price, delta, now, false, Decimal::ZERO);
+        self.quoter.on_fill(side, was_full);
+        self.push_fill_message(side, fill_price, delta, false);
+        self.push_fill_record(side, fill_price, delta, false, Decimal::ZERO, now);
 
-    /// Send a session summary via Telegram.
-    ///
-    /// Called by main.rs on graceful shutdown in live mode.
-    pub fn send_live_session_summary(&self) {
-        // Persist current market's condition ID if we traded in it.
-        if !self.live_market_trades.is_empty()
-            && let Some(ref cid) = self.state.active_condition_id
-        {
-            crate::control::wallet::append_condition_id_sync(cid);
+        match side {
+            MarketSide::Yes => self.diag_yes_fills += 1,
+            MarketSide::No => self.diag_no_fills += 1,
         }
 
-        let reporter = match &self.reporter {
-            Some(r) => r,
-            None => return,
-        };
+        info!(
+            side = side.label(),
+            price = %fill_price,
+            delta = %delta,
+            cumulative = %cumulative,
+            yes_total = %self.position.yes.total_shares,
+            no_total = %self.position.no.total_shares,
+            paired = %self.position.paired_shares(),
+            "fill recorded (deduped)"
+        );
+    }
 
-        let now_ms = now_epoch_ms();
-        let uptime_secs = now_ms.saturating_sub(self.live_session_start_ms) / 1_000;
+    // ─── Feedback handling ──────────────────────────────────────────────
 
-        let trades = &self.live_session_trades;
-        let total_trades = trades.len() as u32;
-        let leg1_fills = total_trades;
-        let trades_hedged = trades.iter().filter(|t| t.leg2.is_some()).count() as u32;
-        let signals_detected = self.diag_leg1_signals as u32;
-        let unfilled_post_only = (self.diag_leg1_signals as u32).saturating_sub(leg1_fills);
-
-        let mut high_count: u32 = 0;
-        let mut med_count: u32 = 0;
-        let mut low_count: u32 = 0;
-        let mut high_alloc_sum = Decimal::ZERO;
-        let mut med_alloc_sum = Decimal::ZERO;
-        let mut low_alloc_sum = Decimal::ZERO;
-        let mut reprice_sum = Decimal::ZERO;
-        let mut gross_pnl = Decimal::ZERO;
-        let mut taker_fees = Decimal::ZERO;
-        let mut maker_rebates = Decimal::ZERO;
-        let mut profit_pct_sum = Decimal::ZERO;
-        let mut best_pct = Decimal::MIN;
-        let mut best_market = String::new();
-        let mut best_reprice = Decimal::ZERO;
-        let mut worst_pct = Decimal::MAX;
-        let mut worst_market = String::new();
-        let mut worst_reprice = Decimal::ZERO;
-        let mut walls_outbid: u32 = 0;
-        let mut breach_fok: u32 = 0;
-        let mut timeout_fok: u32 = 0;
-        let mut emergency_taker: u32 = 0;
-        let mut emergency_maker: u32 = 0;
-        let mut favorable_taker: u32 = 0;
-        let mut favorable_maker: u32 = 0;
-
-        for t in trades {
-            gross_pnl += t.gross_profit;
-            taker_fees += t.taker_fee;
-            maker_rebates += t.maker_rebate;
-            reprice_sum += t.expected_pct;
-            profit_pct_sum += t.profit_pct;
-            if t.bot_contested { walls_outbid += 1; }
-            if t.leg2_was_taker { emergency_taker += 1; }
-            if t.emergency_maker { emergency_maker += 1; }
-            if t.favorable_taker { favorable_taker += 1; }
-            if t.favorable_maker { favorable_maker += 1; }
-            match t.exit_reason {
-                Some(ExitReason::BreakEvenBreach)
-                | Some(ExitReason::Phase2PriceBreach)
-                | Some(ExitReason::Phase1Breach) => {
-                    breach_fok += 1;
+    pub fn on_feedback(&mut self, fb: V2ExecutorFeedback) {
+        let now = epoch_ms();
+        match fb {
+            V2ExecutorFeedback::OrderPosted {
+                side, order_id, price, size, already_filled,
+            } => {
+                if already_filled {
+                    // Rare for post-only, but handle it
+                    self.position.record_fill(side, price, size, now, false, Decimal::ZERO);
+                    self.quoter.on_order_failed(side); // clear pending state
+                    self.push_fill_message(side, price, size, false);
+                    self.push_fill_record(side, price, size, false, Decimal::ZERO, now);
+                    match side {
+                        MarketSide::Yes => self.diag_yes_fills += 1,
+                        MarketSide::No => self.diag_no_fills += 1,
+                    }
+                } else {
+                    let token_id = match side {
+                        MarketSide::Yes => self.state.active_yes_token_id.clone().unwrap_or_default(),
+                        MarketSide::No => self.state.active_no_token_id.clone().unwrap_or_default(),
+                    };
+                    let fv = match side {
+                        MarketSide::Yes => self.fair_value.yes_fair_value(),
+                        MarketSide::No => self.fair_value.no_fair_value(),
+                    };
+                    self.quoter.on_order_posted(side, ManagedOrder {
+                        side,
+                        order_id,
+                        token_id,
+                        price,
+                        size,
+                        posted_ms: now,
+                        fair_value_at_post: fv,
+                        size_filled: Decimal::ZERO,
+                    });
                 }
-                Some(ExitReason::Phase2Timeout)
-                | Some(ExitReason::MarketExpiry) => timeout_fok += 1,
-                _ => {}
             }
-            match t.profit_target_tier {
-                ProfitTier::High => { high_count += 1; high_alloc_sum += t.alloc_amount; }
-                ProfitTier::Med => { med_count += 1; med_alloc_sum += t.alloc_amount; }
-                ProfitTier::Low => { low_count += 1; low_alloc_sum += t.alloc_amount; }
+
+            V2ExecutorFeedback::OrderFailed { side } => {
+                self.quoter.on_order_failed(side);
             }
-            if t.profit_pct > best_pct {
-                best_pct = t.profit_pct;
-                best_market = t.market_id.clone();
-                best_reprice = t.expected_pct;
+
+            V2ExecutorFeedback::CancelResult {
+                side, size_matched, ..
+            } => {
+                // Dedup: only record the delta not already seen via User WS
+                if let Some(matched) = size_matched {
+                    if matched > Decimal::ZERO {
+                        let already = self.quoter.filled_so_far(side);
+                        let delta = matched - already;
+                        if delta > Decimal::ZERO {
+                            let fill_price = self.quoter.order(side)
+                                .map(|o| o.price)
+                                .unwrap_or(Decimal::ZERO);
+                            self.position.record_fill(side, fill_price, delta, now, false, Decimal::ZERO);
+                            self.push_fill_message(side, fill_price, delta, false);
+                            self.push_fill_record(side, fill_price, delta, false, Decimal::ZERO, now);
+                            match side {
+                                MarketSide::Yes => self.diag_yes_fills += 1,
+                                MarketSide::No => self.diag_no_fills += 1,
+                            }
+                            info!(
+                                side = side.label(),
+                                size_matched = %matched,
+                                already_recorded = %already,
+                                delta = %delta,
+                                "cancel revealed fill — recorded delta"
+                            );
+                        }
+                    }
+                }
+                self.quoter.on_cancel_result(side);
             }
-            if t.profit_pct < worst_pct {
-                worst_pct = t.profit_pct;
-                worst_market = t.market_id.clone();
-                worst_reprice = t.expected_pct;
+
+            V2ExecutorFeedback::ClosingFokResult {
+                side, filled, size_matched, price,
+            } => {
+                if filled && size_matched > Decimal::ZERO {
+                    let fee = compute_taker_fee(price, size_matched);
+                    self.position.record_fill(side, price, size_matched, now, true, fee);
+                    self.push_fill_message(side, price, size_matched, true);
+                    self.push_fill_record(side, price, size_matched, true, fee, now);
+                    self.diag_closing_foks += 1;
+                    info!(
+                        side = side.label(),
+                        price = %price,
+                        size = %size_matched,
+                        attempt = self.closing.attempt_count,
+                        "closing FOK filled"
+                    );
+                }
+                // Allow retry: clear pairing_sent so can_retry() can fire again
+                self.closing.pairing_sent = false;
+            }
+
+            V2ExecutorFeedback::RebalanceResult {
+                side, filled, size_matched, price,
+            } => {
+                if filled && size_matched > Decimal::ZERO {
+                    let fee = compute_taker_fee(price, size_matched);
+                    self.position.record_fill(side, price, size_matched, now, true, fee);
+                    self.push_fill_message(side, price, size_matched, true);
+                    self.push_fill_record(side, price, size_matched, true, fee, now);
+                    info!(
+                        side = side.label(),
+                        price = %price,
+                        size = %size_matched,
+                        "taker rebalance filled"
+                    );
+                }
+                self.pending_rebalance = false;
+            }
+        }
+    }
+
+    // ─── Quote tick (called each iteration) ─────────────────────────────
+
+    pub fn quote_tick(&mut self) -> Vec<V2ExecutorCommand> {
+        if self.phase != MarketPhase::Quoting || self.draining || self.paused {
+            return Vec::new();
+        }
+
+        if !self.fair_value.is_warm() {
+            return Vec::new();
+        }
+
+        let now = epoch_ms();
+
+        // Stale vol data → don't quote
+        if self.fair_value.is_stale(now) {
+            return Vec::new();
+        }
+
+        // Vol tracker not warmed up → don't quote
+        if !self.fair_value.is_vol_warm() {
+            return Vec::new();
+        }
+
+        // Unhealthy heartbeat → don't quote
+        if !self.heartbeat_healthy {
+            return Vec::new();
+        }
+
+        // Polymarket book spread too wide → don't quote either side
+        let spread_ok = |book: &Option<crate::types::market::OrderBook>| -> bool {
+            book.as_ref().map_or(false, |b| {
+                match (b.best_bid(), b.best_ask()) {
+                    (Some(bid), Some(ask)) => {
+                        (ask.price - bid.price).to_f64().unwrap_or(1.0) <= self.risk_config.max_entry_spread
+                    }
+                    _ => false,
+                }
+            })
+        };
+        if !spread_ok(&self.state.poly_yes_book) || !spread_ok(&self.state.poly_no_book) {
+            return Vec::new();
+        }
+
+        // Polymarket book data stale → don't quote
+        let book_fresh = |book: &Option<crate::types::market::OrderBook>| -> bool {
+            book.as_ref().map_or(false, |b| {
+                now.saturating_sub(b.timestamp_ms) <= self.risk_config.stale_book_ms
+            })
+        };
+        if !book_fresh(&self.state.poly_yes_book) || !book_fresh(&self.state.poly_no_book) {
+            return Vec::new();
+        }
+
+        let (yes_token, no_token) = match (
+            self.state.active_yes_token_id.clone(),
+            self.state.active_no_token_id.clone(),
+        ) {
+            (Some(y), Some(n)) => (y, n),
+            _ => return Vec::new(),
+        };
+
+        // ── Bilateral emergency cancel ──
+        // If EITHER side has FV drift >= emergency threshold, cancel BOTH sides
+        let emergency_threshold = self.quoting_config.emergency_requote_threshold;
+        let yes_drift = self.quoter.order(MarketSide::Yes).map(|o| {
+            let fv = self.fair_value.yes_fair_value();
+            (fv - o.fair_value_at_post).abs().to_f64().unwrap_or(0.0)
+        }).unwrap_or(0.0);
+        let no_drift = self.quoter.order(MarketSide::No).map(|o| {
+            let fv = self.fair_value.no_fair_value();
+            (fv - o.fair_value_at_post).abs().to_f64().unwrap_or(0.0)
+        }).unwrap_or(0.0);
+
+        if yes_drift >= emergency_threshold || no_drift >= emergency_threshold {
+            let mut commands = Vec::new();
+            let cancel_actions = self.quoter.cancel_all_actions();
+            for action in cancel_actions {
+                if let QuoteAction::Cancel { side, order_id } = action {
+                    self.quoter.on_cancel_sent(side);
+                    self.diag_requotes += 1;
+                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
+            if !commands.is_empty() {
+                debug!(yes_drift, no_drift, "bilateral emergency cancel triggered");
+                return commands;
             }
         }
 
-        if total_trades == 0 {
-            best_pct = Decimal::ZERO;
-            worst_pct = Decimal::ZERO;
+        // ── Compute edge with scaled inventory skewing ──
+        let base_edge = self.fair_value.edge();
+        let imbalance = self.position.yes.total_shares - self.position.no.total_shares;
+        let abs_imbalance = imbalance.abs();
+        let max_unpaired = self.risk_config.max_unpaired_shares;
+
+        // Scale skew linearly: skew = max_imbalance_skew × (abs(imbalance) / max_unpaired)
+        let skew_ratio = if max_unpaired > Decimal::ZERO {
+            abs_imbalance.to_f64().unwrap_or(0.0) / max_unpaired.to_f64().unwrap_or(1.0)
+        } else {
+            0.0
+        };
+        let skew = Decimal::try_from(
+            self.quoting_config.max_imbalance_skew * skew_ratio.min(1.0)
+        ).unwrap_or(Decimal::ZERO);
+
+        let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
+            // Long YES → tighten NO edge (attract fills), widen YES edge (discourage more)
+            (base_edge + skew, (base_edge - skew).max(Decimal::new(1, 2)))
+        } else if imbalance < Decimal::ZERO {
+            // Long NO → tighten YES edge, widen NO edge
+            ((base_edge - skew).max(Decimal::new(1, 2)), base_edge + skew)
+        } else {
+            (base_edge, base_edge)
+        };
+
+        let tick = self.state.tick_size;
+        let yes_target = round_to_tick(self.fair_value.yes_target_price(yes_edge), tick);
+        let no_target = round_to_tick(self.fair_value.no_target_price(no_edge), tick);
+
+        let yes_fv = self.fair_value.yes_fair_value();
+        let no_fv = self.fair_value.no_fair_value();
+
+        let actions = self.quoter.evaluate_both(
+            yes_target, no_target, yes_fv, no_fv,
+            &yes_token, &no_token,
+            &self.position, &self.quoting_config, &self.risk_config,
+            now,
+        );
+
+        let mut commands = Vec::new();
+        for action in actions {
+            match action {
+                QuoteAction::Post { side, token_id, price, size } => {
+                    self.quoter.mark_post_pending(side);
+                    commands.push(V2ExecutorCommand::PostOrder {
+                        side,
+                        token_id,
+                        price,
+                        size,
+                    });
+                }
+                QuoteAction::Cancel { side, order_id } => {
+                    self.quoter.on_cancel_sent(side);
+                    self.diag_requotes += 1;
+                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
         }
 
-        let net_pnl = gross_pnl - taker_fees + maker_rebates;
-        let avg_expected_pct = if total_trades > 0 {
-            reprice_sum / Decimal::from(total_trades)
-        } else {
-            Decimal::ZERO
-        };
-        let avg_net_profit_pct = if total_trades > 0 {
-            profit_pct_sum / Decimal::from(total_trades)
-        } else {
-            Decimal::ZERO
-        };
-        let win_rate_pct = if total_trades > 0 {
-            let wins = trades.iter().filter(|t| t.net_profit > Decimal::ZERO).count() as u64;
-            Decimal::from(wins) / Decimal::from(total_trades) * Decimal::ONE_HUNDRED
-        } else {
-            Decimal::ZERO
-        };
+        // ── Taker rebalance ──
+        // If imbalance exceeds threshold, actively rebalance by taking the opposite side
+        if abs_imbalance >= self.risk_config.rebalance_threshold
+            && !self.pending_rebalance
+            && now.saturating_sub(self.last_rebalance_ms) >= self.risk_config.min_rebalance_interval_ms
+        {
+            // Determine which side to buy (the lagging one)
+            let (rebal_side, rebal_token, rebal_book) = if imbalance > Decimal::ZERO {
+                // Long YES → buy NO
+                (MarketSide::No, no_token.clone(), &self.state.poly_no_book)
+            } else {
+                // Long NO → buy YES
+                (MarketSide::Yes, yes_token.clone(), &self.state.poly_yes_book)
+            };
 
-        let summary = SessionSummary {
-            uptime_secs,
-            markets_observed: self.diag_markets_rotated as u32,
-            signals_detected,
-            leg1_fills,
-            trades_hedged,
-            total_trades,
-            walls_outbid,
-            breach_fok,
-            timeout_fok,
-            emergency_taker_fills: emergency_taker,
-            emergency_maker_fills: emergency_maker,
-            favorable_taker_fills: favorable_taker,
-            favorable_maker_fills: favorable_maker,
-            high_tier_trades: high_count,
-            high_tier_avg_alloc: if high_count > 0 { high_alloc_sum / Decimal::from(high_count) } else { Decimal::ZERO },
-            med_tier_trades: med_count,
-            med_tier_avg_alloc: if med_count > 0 { med_alloc_sum / Decimal::from(med_count) } else { Decimal::ZERO },
-            low_tier_trades: low_count,
-            low_tier_avg_alloc: if low_count > 0 { low_alloc_sum / Decimal::from(low_count) } else { Decimal::ZERO },
-            avg_expected_pct,
-            gross_pnl,
-            emergency_taker_fees: taker_fees,
-            est_maker_rebates: maker_rebates,
-            net_pnl,
-            win_rate_pct,
-            avg_net_profit_pct,
-            best_trade_pct: best_pct,
-            best_trade_market: best_market,
-            best_trade_reprice: best_reprice,
-            worst_trade_pct: worst_pct,
-            worst_trade_market: worst_market,
-            worst_trade_reprice: worst_reprice,
-            unfilled_signals: unfilled_post_only,
-            unfilled_post_only,
-            unfilled_liquidity: 0,
-            unfilled_spread_wide: 0,
-            capital_locked: Decimal::ZERO,
-            virtual_balance: Decimal::ZERO,
-            starting_balance: Decimal::ZERO,
-        };
+            if let Some(best_ask) = rebal_book.as_ref().and_then(|b| b.best_ask()) {
+                // Check pair cost feasibility
+                let other_avg = match rebal_side {
+                    MarketSide::No => self.position.yes.avg_price(),
+                    MarketSide::Yes => self.position.no.avg_price(),
+                };
+                let pair_cost = other_avg + best_ask.price;
+                let max_rebal_cost = Decimal::try_from(self.risk_config.rebalance_max_pair_cost)
+                    .unwrap_or(Decimal::new(96, 2));
 
-        reporter.send_session_summary(&summary);
+                if pair_cost < max_rebal_cost {
+                    let size = self.risk_config.rebalance_size.min(abs_imbalance);
+                    if size >= Decimal::new(5, 0) {
+                        self.pending_rebalance = true;
+                        self.last_rebalance_ms = now;
+                        commands.push(V2ExecutorCommand::RebalanceTaker {
+                            side: rebal_side,
+                            token_id: rebal_token,
+                            price: best_ask.price,
+                            size,
+                        });
+                        info!(
+                            side = rebal_side.label(),
+                            price = %best_ask.price,
+                            size = %size,
+                            pair_cost = %pair_cost,
+                            "taker rebalance triggered"
+                        );
+                    }
+                }
+            }
+        }
+
+        commands
     }
 
-    /// Build a `LiveTradeReport` from live fill data for Telegram reporting.
-    ///
-    /// Returns `None` if required state (hedge or pending signal) is unavailable.
-    fn build_live_sim_trade(
-        &self,
-        l1_price: Decimal,
-        l1_size: Decimal,
-        l1_ts: u64,
-        l2_price: Decimal,
-        l2_size: Decimal,
-        now_ms: u64,
-    ) -> Option<LiveTradeReport> {
-        use crate::executor::fill_engine::{compute_taker_fee, compute_maker_rebate};
+    // ─── Closing tick (called each iteration) ───────────────────────────
 
-        let hedge = self.hedge.as_ref()?;
-        let signal = self.pending_leg1_signal.as_ref()?;
+    pub fn closing_tick(&mut self) -> Vec<V2ExecutorCommand> {
+        if self.phase != MarketPhase::Closing {
+            return Vec::new();
+        }
 
-        let pair_cost = l1_price + l2_price;
-        let paired_size = l1_size.min(l2_size);
-        let gross_profit = (Decimal::ONE - pair_cost) * paired_size;
-        // Leg 1 is always maker (post-only) — rebate, no taker fee.
-        let leg1_rebate = compute_maker_rebate(l1_price, l1_size);
-        let leg2_taker_fee = if self.live_trade_meta.leg2_was_taker {
-            compute_taker_fee(l2_price, l2_size)
-        } else {
-            Decimal::ZERO
-        };
-        let taker_fee = leg2_taker_fee;
-        // Leg 2 rebate only if maker fill.
-        let leg2_rebate = if self.live_trade_meta.leg2_was_taker {
-            Decimal::ZERO
-        } else {
-            compute_maker_rebate(l2_price, l2_size)
-        };
-        let maker_rebate = leg1_rebate + leg2_rebate;
-        let net_profit = gross_profit - taker_fee + maker_rebate;
-        let total_cost = l1_price * l1_size + l2_price * l2_size;
-        let profit_pct = if total_cost.is_zero() {
-            Decimal::ZERO
-        } else {
-            net_profit / total_cost * Decimal::ONE_HUNDRED
-        };
-        let sizes_differ = l1_size != l2_size;
+        let mut commands = Vec::new();
 
-        let leg1_side = Side::Buy;
-        let leg2_side = leg1_side;
+        // Step 1: Cancel all resting orders
+        if !self.closing.resting_cancelled {
+            let cancel_actions = self.quoter.cancel_all_actions();
+            for action in cancel_actions {
+                if let QuoteAction::Cancel { side, order_id } = action {
+                    self.quoter.on_cancel_sent(side);
+                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
+            self.closing.resting_cancelled = true;
+            if !commands.is_empty() {
+                return commands; // wait for cancel confirmations before pairing
+            }
+        }
 
-        let leg1_fill = FillInfo {
-            side: leg1_side,
-            price: l1_price,
-            size: l1_size,
-            timestamp_ms: l1_ts,
-            was_partial: sizes_differ && l1_size > l2_size,
-            was_taker: false,
-            taker_fee: Decimal::ZERO,
-            maker_rebate: leg1_rebate,
-        };
-        let leg2_fill = FillInfo {
-            side: leg2_side,
-            price: l2_price,
-            size: l2_size,
-            timestamp_ms: now_ms,
-            was_partial: sizes_differ && l2_size > l1_size,
-            was_taker: self.live_trade_meta.leg2_was_taker,
-            taker_fee: leg2_taker_fee,
-            maker_rebate: leg2_rebate,
-        };
+        // Step 2: Wait for all pending operations to resolve
+        if self.quoter.is_pending(MarketSide::Yes) || self.quoter.is_pending(MarketSide::No) {
+            return commands;
+        }
+        if self.closing.pairing_sent {
+            return commands;
+        }
 
-        Some(LiveTradeReport {
-            market_id: signal.condition_id.clone(),
-            direction: hedge.direction,
-            leg1: leg1_fill,
-            leg2: Some(leg2_fill),
-            expected_pct: hedge.expected_pct,
-            profit_target_tier: hedge.tier,
-            alloc_amount: signal.alloc_amount,
-            pair_cost,
-            gross_profit,
-            taker_fee,
-            maker_rebate,
-            net_profit,
-            profit_pct,
-            hedge_phase: hedge.phase as u8,
-            leg2_was_taker: self.live_trade_meta.leg2_was_taker,
-            bot_contested: signal.bot_contested,
-            favorable_taker: self.live_trade_meta.favorable_taker,
-            favorable_maker: self.live_trade_meta.favorable_maker,
-            emergency_maker: self.live_trade_meta.emergency_maker,
-            exit_reason: self.live_trade_meta.exit_reason,
-            spike_magnitude: hedge.spike_info.magnitude,
-            leg1_cancel_race: false,
-            phase1_breach: self.live_trade_meta.phase1_breach,
-            whipsaw_reversal: matches!(self.live_trade_meta.exit_reason, Some(ExitReason::WhipsawReversal)),
-            open_timestamp_ms: l1_ts,
-            close_timestamp_ms: now_ms,
-        })
+        // Step 3: Attempt pairing (multi-attempt with progressive price widening)
+        if self.closing.can_retry() {
+            self.closing.attempt_count += 1;
+
+            let yes_ask = self.state.poly_yes_book.as_ref()
+                .and_then(|b| b.best_ask())
+                .map(|l| l.price);
+            let no_ask = self.state.poly_no_book.as_ref()
+                .and_then(|b| b.best_ask())
+                .map(|l| l.price);
+
+            let (yes_token, no_token) = match (
+                self.state.active_yes_token_id.clone(),
+                self.state.active_no_token_id.clone(),
+            ) {
+                (Some(y), Some(n)) => (y, n),
+                _ => return commands,
+            };
+
+            // Widen max_pair_cost by attempt × retry_price_increment
+            let base_max = Decimal::try_from(self.risk_config.max_closing_pair_cost)
+                .unwrap_or(Decimal::new(97, 2));
+            let widening = Decimal::try_from(
+                self.risk_config.closing_retry_price_increment
+            ).unwrap_or(Decimal::ZERO)
+                * Decimal::from(self.closing.attempt_count.saturating_sub(1));
+            let max_pair_cost = base_max + widening;
+
+            if let Some(pairing) = ClosingManager::compute_pairing(
+                &self.position,
+                &yes_token,
+                &no_token,
+                yes_ask,
+                no_ask,
+                max_pair_cost,
+                self.risk_config.max_capital_per_market,
+            ) {
+                info!(
+                    side = pairing.side.label(),
+                    price = %pairing.price,
+                    size = %pairing.size,
+                    pair_cost = %pairing.expected_pair_cost,
+                    attempt = self.closing.attempt_count,
+                    max_pair_cost = %max_pair_cost,
+                    "closing: FOK pairing"
+                );
+                self.closing.pairing_sent = true;
+                commands.push(V2ExecutorCommand::ClosingFok {
+                    side: pairing.side,
+                    token_id: pairing.token_id,
+                    price: pairing.price,
+                    size: pairing.size,
+                });
+            }
+        }
+
+        commands
     }
 
-    // ─── Drain & Status ───────────────────────────────────────────────────
+    // ─── Drain pending commands ─────────────────────────────────────────
 
-    /// Enter drain mode: block new Leg 1 entries, let Leg 2 continue.
+    pub fn take_pending_commands(&mut self) -> Vec<V2ExecutorCommand> {
+        std::mem::take(&mut self.pending_commands)
+    }
+
+    pub fn take_tick_size_change(&mut self) -> Option<V2ExecutorCommand> {
+        self.pending_tick_change.take()
+    }
+
+    // ─── Control ────────────────────────────────────────────────────────
+
     pub fn set_draining(&mut self) {
         self.draining = true;
     }
 
-    /// Pause trading: block new Leg 1 entries, keep connections alive.
-    pub fn set_paused(&mut self, v: bool) {
-        self.paused = v;
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
-    /// Returns `true` if trading is paused.
-    #[allow(dead_code)] // public API for /status and future use
-    pub fn is_paused(&self) -> bool {
-        self.paused
+    pub fn is_draining(&self) -> bool {
+        self.draining
     }
 
-    /// Reset Leg 1 state to `None` and clear associated tracking fields.
-    pub fn reset_leg1_state(&mut self) {
-        self.state.leg1_state = OrderState::None;
-        self.pending_leg1_signal = None;
-        self.leg1_direction = None;
-        self.state.buildup_detected = false;
-        self.state.last_buildup = None;
-        self.state.leg1_posted_ask = None;
-        self.leg1_cancel_inflight = false;
-        self.leg1_retry_count = 0;
-        self.leg1_cancel_retryable = false;
-        self.original_signal_ask = None;
-        // Leg 2 partial fill tracking: clear on Leg 1 reset.
-        self.leg2_partial_filled = Decimal::ZERO;
-        self.leg2_phase1_fill = None;
-        self.state.leg2_partial_filled = Decimal::ZERO;
-    }
-
-    /// Returns `true` if no position is open (safe to exit immediately).
     pub fn has_no_open_position(&self) -> bool {
-        matches!(self.state.leg1_state, OrderState::None)
-            && matches!(self.state.leg2_state, OrderState::None)
+        !self.quoter.has_resting_orders()
+            && !self.quoter.is_pending(MarketSide::Yes)
+            && !self.quoter.is_pending(MarketSide::No)
     }
 
-    /// Build a status snapshot for the `/status` command.
-    pub fn build_status(&self, mode_str: &str) -> crate::control::types::BotStatus {
-        use crate::control::types::BotStatus;
+    // ─── Diagnostics ────────────────────────────────────────────────────
 
-        let now_ms = now_epoch_ms();
-        let uptime_secs = now_ms.saturating_sub(self.start_ms) / 1_000;
+    pub fn check_diagnostic(&mut self) {
+        let now = epoch_ms();
+        if now.saturating_sub(self.diag_last_ms) < 60_000 {
+            return;
+        }
+        self.diag_last_ms = now;
 
-        let leg1_str = match &self.state.leg1_state {
-            OrderState::None => "None".into(),
-            OrderState::Posted { price, size, .. } => format!("Posted @ ${price} x {size}"),
-            OrderState::Filled { price, size, .. } => format!("Filled @ ${price} x {size}"),
-        };
-        let leg2_str = match &self.state.leg2_state {
-            OrderState::None => "None".into(),
-            OrderState::Posted { price, size, .. } => format!("Posted @ ${price} x {size}"),
-            OrderState::Filled { price, size, .. } => format!("Filled @ ${price} x {size}"),
-        };
+        let paired = self.position.paired_shares();
+        let locked = self.position.locked_profit();
+        let deployed = self.position.total_capital_deployed();
 
-        BotStatus {
-            uptime_secs,
-            mode: mode_str.to_string(),
+        let msg = format!(
+            "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} closing_foks={} | \
+             yes={:.0} no={:.0} paired={:.0} locked=${:.2} deployed=${:.2} | \
+             fv_yes={:.3} fv_no={:.3} edge={:.3} | markets={}",
+            self.phase,
+            self.diag_yes_fills,
+            self.diag_no_fills,
+            self.diag_requotes,
+            self.diag_closing_foks,
+            self.position.yes.total_shares,
+            self.position.no.total_shares,
+            paired,
+            locked,
+            deployed,
+            self.fair_value.yes_fair_value(),
+            self.fair_value.no_fair_value(),
+            self.fair_value.edge(),
+            self.diag_markets_traded,
+        );
+        info!("{msg}");
+        self.pending_telegram_diag = Some(msg);
+
+        // Reset per-interval counters
+        self.diag_yes_fills = 0;
+        self.diag_no_fills = 0;
+        self.diag_requotes = 0;
+        self.diag_closing_foks = 0;
+    }
+
+    pub fn take_pending_telegram_diag(&mut self) -> Option<String> {
+        self.pending_telegram_diag.take()
+    }
+
+    // ─── Fill notifications ─────────────────────────────────────────────
+
+    fn push_fill_message(&mut self, side: MarketSide, price: Decimal, size: Decimal, was_taker: bool) {
+        let tag = if was_taker { "TAKER" } else { "MAKER" };
+        let msg = format!(
+            "{} {} {:.0}@${:.3} | YES:{:.0} NO:{:.0} | paired:{:.0} locked:${:.2}",
+            tag, side.label(), size, price,
+            self.position.yes.total_shares, self.position.no.total_shares,
+            self.position.paired_shares(), self.position.locked_profit(),
+        );
+        self.pending_fill_messages.push(msg);
+    }
+
+    pub fn take_pending_fill_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_fill_messages)
+    }
+
+    fn push_fill_record(&mut self, side: MarketSide, price: Decimal, size: Decimal, was_taker: bool, fee: Decimal, now: u64) {
+        let condition_id = self.state.active_condition_id.clone().unwrap_or_default();
+        self.pending_fill_records.push(FillRecord {
+            condition_id,
+            side: side.label().to_string(),
+            price: price.to_f64().unwrap_or(0.0),
+            size: size.to_f64().unwrap_or(0.0),
+            was_taker,
+            fee: fee.to_f64().unwrap_or(0.0),
+            pair_cost: self.position.avg_pair_cost().to_f64().unwrap_or(0.0),
+            paired: self.position.paired_shares().to_f64().unwrap_or(0.0),
+            locked_profit: self.position.locked_profit().to_f64().unwrap_or(0.0),
+            timestamp_ms: now,
+        });
+    }
+
+    pub fn take_pending_fill_records(&mut self) -> Vec<FillRecord> {
+        std::mem::take(&mut self.pending_fill_records)
+    }
+
+    pub fn take_pending_market_summary(&mut self) -> Option<MarketSummaryRecord> {
+        self.pending_market_summary.take()
+    }
+
+    // ─── Market report / session summary (gated) ────────────────────────
+
+    pub fn take_pending_market_report(&mut self) -> Option<String> {
+        self.pending_market_report.take()
+    }
+
+    pub fn take_pending_session_summary(&mut self) -> Option<String> {
+        self.pending_session_summary.take()
+    }
+
+    // ─── Status ─────────────────────────────────────────────────────────
+
+    pub fn build_status(&self, mode: &str) -> crate::control::types::BotStatus {
+        let now = epoch_ms();
+        let uptime = now.saturating_sub(self.session_start_ms) / 1000;
+
+        crate::control::types::BotStatus {
+            uptime_secs: uptime,
+            mode: mode.to_string(),
             current_market: self.state.active_condition_id.clone(),
-            leg1_state: leg1_str,
-            leg2_state: leg2_str,
-            spikes_received: self.diag_buildups_received,
-            signals_emitted: self.diag_leg1_signals,
-            trades_completed: self.diag_leg2_fills_maker + self.diag_leg2_fills_taker,
-            trades_enabled: true,  // updated by main loop from NotifyFlags
-            summary_enabled: true, // updated by main loop from NotifyFlags
+            phase: format!("{:?}", self.phase),
+            position_summary: format!("YES:{:.0} NO:{:.0}",
+                self.position.yes.total_shares,
+                self.position.no.total_shares),
+            pairing_summary: format!("paired:{:.0} locked:${:.2}",
+                self.position.paired_shares(),
+                self.position.locked_profit()),
+            unpaired_yes: format!("{:.0}", self.position.unpaired_yes()),
+            unpaired_no: format!("{:.0}", self.position.unpaired_no()),
+            markets_traded: self.diag_markets_traded as u64,
+            total_fills: self.position.total_fills() as u64,
+            trades_enabled: !self.paused,
+            summary_enabled: true,
             draining: self.draining,
             paused: self.paused,
-            heartbeat_healthy: self.connectivity.heartbeat_healthy,
-            heartbeat_failures: self.connectivity.consecutive_heartbeat_failures,
-            heartbeat_latency_ms: self.connectivity.last_heartbeat_latency_ms,
+            heartbeat_healthy: self.heartbeat_healthy,
+            heartbeat_failures: self.heartbeat_failures,
+            heartbeat_latency_ms: self.heartbeat_latency_ms,
         }
     }
-}
 
-#[cfg(test)]
-impl Default for StrategyEngine {
-    fn default() -> Self {
-        Self::new(&Config::test_defaults())
+    // ─── Market report ──────────────────────────────────────────────────
+
+    fn send_market_report(&mut self, _now: u64) {
+        let paired = self.position.paired_shares();
+        let locked = self.position.locked_profit();
+        let deployed = self.position.total_capital_deployed();
+        let yes_avg = self.position.yes.avg_price();
+        let no_avg = self.position.no.avg_price();
+
+        let market_id = self.state.active_condition_id.as_deref().unwrap_or("unknown");
+        let short_id = if market_id.len() > 8 {
+            &market_id[market_id.len() - 8..]
+        } else {
+            market_id
+        };
+
+        let text = format!(
+            "<b>Market Complete</b> ...{short_id}\n\n\
+             YES: {yes_shares:.0} shares @ ${yes_avg:.3} avg\n\
+             NO: {no_shares:.0} shares @ ${no_avg:.3} avg\n\n\
+             Paired: {paired:.0} @ ${pair_cost:.3} = ${locked:.2} locked profit\n\
+             Unpaired YES: {up_yes:.0} | Unpaired NO: {up_no:.0}\n\
+             Capital deployed: ${deployed:.2}\n\
+             Taker fees: ${taker:.4}",
+            yes_shares = self.position.yes.total_shares,
+            yes_avg = yes_avg,
+            no_shares = self.position.no.total_shares,
+            no_avg = no_avg,
+            paired = paired,
+            pair_cost = self.position.avg_pair_cost(),
+            locked = locked,
+            up_yes = self.position.unpaired_yes(),
+            up_no = self.position.unpaired_no(),
+            deployed = deployed,
+            taker = self.position.total_taker_fees(),
+        );
+        info!("{text}");
+        self.pending_market_report = Some(text);
+
+        // QuestDB market summary record
+        let condition_id = self.state.active_condition_id.clone().unwrap_or_default();
+        self.pending_market_summary = Some(MarketSummaryRecord {
+            condition_id,
+            yes_shares: self.position.yes.total_shares.to_f64().unwrap_or(0.0),
+            no_shares: self.position.no.total_shares.to_f64().unwrap_or(0.0),
+            yes_avg: yes_avg.to_f64().unwrap_or(0.0),
+            no_avg: no_avg.to_f64().unwrap_or(0.0),
+            paired: paired.to_f64().unwrap_or(0.0),
+            pair_cost: self.position.avg_pair_cost().to_f64().unwrap_or(0.0),
+            locked_profit: locked.to_f64().unwrap_or(0.0),
+            taker_fees: self.position.total_taker_fees().to_f64().unwrap_or(0.0),
+            fill_count: self.position.total_fills() as i64,
+            timestamp_ms: epoch_ms(),
+        });
+    }
+
+    pub fn send_session_summary(&mut self) {
+        let now = epoch_ms();
+        let uptime = now.saturating_sub(self.session_start_ms);
+        let uptime_h = uptime / 3_600_000;
+        let uptime_m = (uptime % 3_600_000) / 60_000;
+
+        let text = format!(
+            "<b>v2 Session Summary</b>\n\n\
+             Uptime: {}h {:02}m\n\
+             Markets traded: {}\n\
+             Total fills: {} (YES: {} | NO: {})\n\
+             Current position — YES: {:.0} NO: {:.0}\n\
+             Paired: {:.0} | Locked profit: ${:.2}",
+            uptime_h, uptime_m,
+            self.diag_markets_traded,
+            self.position.total_fills(),
+            self.position.yes.fill_count,
+            self.position.no.fill_count,
+            self.position.yes.total_shares,
+            self.position.no.total_shares,
+            self.position.paired_shares(),
+            self.position.locked_profit(),
+        );
+        info!("{text}");
+        self.pending_session_summary = Some(text);
     }
 }
-
-
-#[cfg(test)]
-#[path = "tests/strategy_tests.rs"]
-mod tests;

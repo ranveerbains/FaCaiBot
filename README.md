@@ -1,8 +1,8 @@
 # FaCaiBot
 
-Polymarket arbitrage bot for BTC 5-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
+Polymarket market-making bot for BTC 5-minute prediction markets. Uses bilateral accumulation — continuously quoting both YES and NO sides using a Binance-derived fair value model, accumulating matched pairs that pay $1.00 on resolution for less than $1.00 total cost.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [trading_logic/](trading_logic/README.md) for trading logic details.
+See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARCHITECTURE.md](ARCHITECTURE.md) for infrastructure details.
 
 ---
 
@@ -82,17 +82,16 @@ cp config.toml /opt/facaibot/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MODE` | Yes | `live` or `simulation` |
 | `BINANCE_ED25519_API_KEY` | Yes | Ed25519 key for Binance SBE binary streams |
 | `PRIVATE_KEY` | Live only | Hex wallet private key (EIP-712 signing) |
 | `POLYMARKET_API_KEY` | Live only | L2 HMAC API key (UUID) |
 | `POLYMARKET_SECRET` | Live only | L2 HMAC secret |
 | `POLYMARKET_PASSPHRASE` | Live only | L2 HMAC passphrase |
-| `TELEGRAM_BOT_TOKEN` | Sim only | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Sim only | Telegram chat ID |
+| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Yes | Telegram chat ID |
 | `TELEGRAM_ALLOWED_USER_ID` | Optional | Enables Telegram bot control (get from `@userinfobot`) |
 
-**`config.toml`** — all tuning parameters (spike detection, capital, entry guards, erosion). Defaults are production-ready.
+**`config.toml`** — all tuning parameters (fair value model, quoting, risk limits). Defaults are production-ready.
 
 ### Step 5b: Recovery of Stuck Positions (One-Time if Applicable)
 
