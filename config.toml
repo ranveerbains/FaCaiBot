@@ -57,7 +57,7 @@ max_imbalance_skew = 0.02           # max skew at full imbalance (replaces flat 
 max_unpaired_shares = 5
 max_unpaired_usdc = 5
 # Market-wide limits
-max_capital_per_market = 40
+max_capital_per_market = 30
 # Timing
 closing_phase_secs = 45
 rotation_quiet_ms = 5000

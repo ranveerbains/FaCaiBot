@@ -162,6 +162,18 @@ impl V2StrategyEngine {
             heartbeat_dead_threshold: r_toml.heartbeat_dead_threshold,
         };
 
+        info!(
+            max_unpaired_shares = %risk_config.max_unpaired_shares,
+            max_unpaired_usdc = %risk_config.max_unpaired_usdc,
+            max_capital_per_market = %risk_config.max_capital_per_market,
+            rebalance_threshold = %risk_config.rebalance_threshold,
+            rebalance_max_pair_cost = risk_config.rebalance_max_pair_cost,
+            max_closing_pair_cost = risk_config.max_closing_pair_cost,
+            max_order_size = %quoting_config.max_order_size,
+            min_order_size = %quoting_config.min_order_size,
+            "risk config loaded"
+        );
+
         let now = epoch_ms();
         Self {
             min_edge: q_toml.min_edge,
