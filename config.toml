@@ -1,5 +1,5 @@
 [rotation]
-prewarm_lead_secs = 20
+prewarm_lead_secs = 10
 
 [fair_value]
 # Momentum signal weights (futures-derived leading indicators)
@@ -47,15 +47,15 @@ requote_threshold = 0.01
 min_requote_interval_ms = 3500
 emergency_requote_threshold = 0.05  # bypass interval if FV drift >= this
 # Order sizing
-max_order_size = 10
+max_order_size = 15
 min_order_size = 5
 # Inventory skewing — scales linearly with imbalance ratio
 max_imbalance_skew = 0.02           # max skew at full imbalance (replaces flat ±0.01)
 
 [risk_v2]
 # Per-side exposure limits
-max_unpaired_shares = 30
-max_unpaired_usdc = 20
+max_unpaired_shares = 10
+max_unpaired_usdc = 10
 # Market-wide limits
 max_capital_per_market = 50
 # Timing

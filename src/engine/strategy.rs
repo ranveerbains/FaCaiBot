@@ -648,28 +648,23 @@ impl V2StrategyEngine {
             return Vec::new();
         }
 
-        // Polymarket book spread too wide → don't quote either side
-        let spread_ok = |book: &Option<crate::types::market::OrderBook>| -> bool {
-            book.as_ref().map_or(false, |b| {
-                match (b.best_bid(), b.best_ask()) {
+        // Per-side book health: spread OK + data fresh
+        let book_healthy = |book: &Option<crate::types::market::OrderBook>| -> bool {
+            book.as_ref().is_some_and(|b| {
+                let spread_ok = match (b.best_bid(), b.best_ask()) {
                     (Some(bid), Some(ask)) => {
                         (ask.price - bid.price).to_f64().unwrap_or(1.0) <= self.risk_config.max_entry_spread
                     }
                     _ => false,
-                }
+                };
+                let fresh = now.saturating_sub(b.timestamp_ms) <= self.risk_config.stale_book_ms;
+                spread_ok && fresh
             })
         };
-        if !spread_ok(&self.state.poly_yes_book) || !spread_ok(&self.state.poly_no_book) {
-            return Vec::new();
-        }
+        let yes_book_ok = book_healthy(&self.state.poly_yes_book);
+        let no_book_ok = book_healthy(&self.state.poly_no_book);
 
-        // Polymarket book data stale → don't quote
-        let book_fresh = |book: &Option<crate::types::market::OrderBook>| -> bool {
-            book.as_ref().map_or(false, |b| {
-                now.saturating_sub(b.timestamp_ms) <= self.risk_config.stale_book_ms
-            })
-        };
-        if !book_fresh(&self.state.poly_yes_book) || !book_fresh(&self.state.poly_no_book) {
+        if !yes_book_ok && !no_book_ok {
             return Vec::new();
         }
 
@@ -742,12 +737,30 @@ impl V2StrategyEngine {
         let yes_fv = self.fair_value.yes_fair_value();
         let no_fv = self.fair_value.no_fair_value();
 
-        let actions = self.quoter.evaluate_both(
-            yes_target, no_target, yes_fv, no_fv,
-            &yes_token, &no_token,
-            &self.position, &self.quoting_config, &self.risk_config,
-            now,
-        );
+        // Pre-flight: skip sides whose target would cross or meet the CLOB best ask
+        let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+        let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+        let yes_postable = yes_book_ok && yes_best_ask.is_none_or(|ask| yes_target < ask);
+        let no_postable = no_book_ok && no_best_ask.is_none_or(|ask| no_target < ask);
+
+        // Evaluate each side independently (book health + crossing check)
+        let mut actions = Vec::new();
+        if yes_postable
+            && let Some(a) = self.quoter.evaluate_side(
+                MarketSide::Yes, yes_target, yes_fv, &yes_token,
+                &self.position, &self.quoting_config, &self.risk_config, now,
+            )
+        {
+            actions.push(a);
+        }
+        if no_postable
+            && let Some(a) = self.quoter.evaluate_side(
+                MarketSide::No, no_target, no_fv, &no_token,
+                &self.position, &self.quoting_config, &self.risk_config, now,
+            )
+        {
+            actions.push(a);
+        }
 
         let mut commands = Vec::new();
         for action in actions {
@@ -1098,12 +1111,18 @@ impl V2StrategyEngine {
             market_id
         };
 
+        let taker_fees = self.position.total_taker_fees();
+        let unpaired_risk = self.position.unpaired_usdc();
+        let net_worst = locked - taker_fees - unpaired_risk;
+
         let text = format!(
             "<b>Market Complete</b> ...{short_id}\n\n\
              YES: {yes_shares:.0} shares @ ${yes_avg:.3} avg\n\
              NO: {no_shares:.0} shares @ ${no_avg:.3} avg\n\n\
              Paired: {paired:.0} @ ${pair_cost:.3} = ${locked:.2} locked profit\n\
              Unpaired YES: {up_yes:.0} | Unpaired NO: {up_no:.0}\n\
+             Unpaired risk: ${unpaired_risk:.2}\n\
+             Net (worst): ${net_worst:.2}\n\
              Capital deployed: ${deployed:.2}\n\
              Taker fees: ${taker:.4}",
             yes_shares = self.position.yes.total_shares,
@@ -1115,8 +1134,10 @@ impl V2StrategyEngine {
             locked = locked,
             up_yes = self.position.unpaired_yes(),
             up_no = self.position.unpaired_no(),
+            unpaired_risk = unpaired_risk,
+            net_worst = net_worst,
             deployed = deployed,
-            taker = self.position.total_taker_fees(),
+            taker = taker_fees,
         );
         info!("{text}");
         self.pending_market_report = Some(text);

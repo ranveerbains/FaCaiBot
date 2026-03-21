@@ -214,36 +214,6 @@ impl Quoter {
         }
     }
 
-    /// Generate actions for both sides.
-    pub fn evaluate_both(
-        &self,
-        yes_target: Decimal,
-        no_target: Decimal,
-        yes_fv: Decimal,
-        no_fv: Decimal,
-        yes_token_id: &str,
-        no_token_id: &str,
-        position: &BilateralPosition,
-        quoting: &QuotingConfig,
-        risk: &RiskV2Config,
-        now_ms: u64,
-    ) -> Vec<QuoteAction> {
-        let mut actions = Vec::new();
-        if let Some(a) = self.evaluate_side(
-            MarketSide::Yes, yes_target, yes_fv, yes_token_id,
-            position, quoting, risk, now_ms,
-        ) {
-            actions.push(a);
-        }
-        if let Some(a) = self.evaluate_side(
-            MarketSide::No, no_target, no_fv, no_token_id,
-            position, quoting, risk, now_ms,
-        ) {
-            actions.push(a);
-        }
-        actions
-    }
-
     // ── State updates ──
 
     pub fn on_order_posted(&mut self, side: MarketSide, order: ManagedOrder) {
