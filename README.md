@@ -193,8 +193,11 @@ git pull origin v2
 RUSTFLAGS="-C target-cpu=native" cargo build --release  
 sudo systemctl stop facaibot 
 cp target/release/facaibot /opt/facaibot/facaibot
+cp config.toml /opt/facaibot/config.toml                     
 sudo systemctl start facaibot
 ```                       
+
+
 
 ### Switching back to v1 (main)
 

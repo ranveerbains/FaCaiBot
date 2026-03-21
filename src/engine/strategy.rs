@@ -557,6 +557,21 @@ impl V2StrategyEngine {
 
             V2ExecutorFeedback::OrderFailed { side } => {
                 self.quoter.on_order_failed(side);
+                // Invalidate book data for this side — crosses-book means our
+                // local book is stale. Block further posts until a fresh WS
+                // book update arrives.
+                match side {
+                    MarketSide::Yes => {
+                        if let Some(ref mut b) = self.state.poly_yes_book {
+                            b.timestamp_ms = 0;
+                        }
+                    }
+                    MarketSide::No => {
+                        if let Some(ref mut b) = self.state.poly_no_book {
+                            b.timestamp_ms = 0;
+                        }
+                    }
+                }
             }
 
             V2ExecutorFeedback::CancelResult {
