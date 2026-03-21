@@ -72,7 +72,7 @@ src/
 │       └── tests/                 # Extracted test modules (metrics)
 ├── executor/
 │   ├── live.rs                    # LiveExecutor: bilateral maker orders, cancel, closing FOK
-│   ├── fill_engine.rs             # Utility: compute_taker_fee, compute_maker_rebate, round_to_tick
+│   ├── fill_engine.rs             # Utility: compute_taker_fee, round_to_tick
 │   └── tests/                     # Extracted test modules (fill_engine)
 ├── gateway/
 │   ├── binance/

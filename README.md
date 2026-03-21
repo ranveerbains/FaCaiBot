@@ -20,10 +20,10 @@ See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARC
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-34-244-231-11.eu-west-1.compute.amazonaws.com
+ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-34-244-231-11.eu-west-1.compute.amazonaws.com
+ ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
@@ -161,7 +161,44 @@ chronyc tracking
 
 ## Updating
 
-After pushing changes to `main`:
+### v2 branch (manual deploy)
+
+`deploy/deploy.sh` pulls from `main`, so deploy v2 manually:
+
+```bash
+ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
+  ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
+
+sudo systemctl stop facaibot
+cd ~/FaCaiBot
+git fetch origin
+git checkout v2
+git pull origin v2
+
+# Copy config + build
+cp config.toml /opt/facaibot/config.toml
+source $HOME/.cargo/env
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cp target/release/facaibot /opt/facaibot/facaibot
+sudo systemctl start facaibot
+journalctl -u facaibot -f
+```
+
+### Switching back to v1 (main)
+
+```bash
+sudo systemctl stop facaibot
+cd ~/FaCaiBot
+git checkout main
+git pull origin main
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cp target/release/facaibot /opt/facaibot/facaibot
+sudo systemctl start facaibot
+```
+
+### main branch (deploy script)
+
+Once v2 is merged to `main`, use the deploy script:
 
 ```bash
 bash deploy/deploy.sh    # pulls, rebuilds, restarts the service

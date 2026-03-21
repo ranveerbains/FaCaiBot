@@ -16,16 +16,6 @@ impl MarketSide {
     }
 }
 
-/// A single fill record for reporting.
-#[derive(Debug, Clone)]
-pub struct AccFill {
-    pub price: Decimal,
-    pub size: Decimal,
-    pub timestamp_ms: u64,
-    pub was_taker: bool,
-    pub fee: Decimal, // positive = taker fee paid, negative = maker rebate earned
-}
-
 /// Accumulated shares on one side (YES or NO).
 #[derive(Debug, Clone)]
 pub struct SidePosition {
@@ -34,7 +24,6 @@ pub struct SidePosition {
     pub total_rebate: Decimal,    // estimated maker rebates earned
     pub total_taker_fee: Decimal, // taker fees paid
     pub fill_count: u32,
-    pub fills: Vec<AccFill>,
 }
 
 impl SidePosition {
@@ -45,7 +34,6 @@ impl SidePosition {
             total_rebate: Decimal::ZERO,
             total_taker_fee: Decimal::ZERO,
             fill_count: 0,
-            fills: Vec::new(),
         }
     }
 
@@ -58,7 +46,7 @@ impl SidePosition {
         }
     }
 
-    pub fn record_fill(&mut self, price: Decimal, size: Decimal, timestamp_ms: u64, was_taker: bool, fee: Decimal) {
+    pub fn record_fill(&mut self, price: Decimal, size: Decimal, was_taker: bool, fee: Decimal) {
         self.total_shares += size;
         self.total_cost += price * size;
         if was_taker {
@@ -67,13 +55,6 @@ impl SidePosition {
             self.total_rebate += fee.abs(); // maker rebate stored as positive
         }
         self.fill_count += 1;
-        self.fills.push(AccFill {
-            price,
-            size,
-            timestamp_ms,
-            was_taker,
-            fee,
-        });
     }
 
     pub fn reset(&mut self) {
@@ -82,7 +63,6 @@ impl SidePosition {
         self.total_rebate = Decimal::ZERO;
         self.total_taker_fee = Decimal::ZERO;
         self.fill_count = 0;
-        self.fills.clear();
     }
 }
 
@@ -113,11 +93,10 @@ impl BilateralPosition {
         side: MarketSide,
         price: Decimal,
         size: Decimal,
-        timestamp_ms: u64,
         was_taker: bool,
         fee: Decimal,
     ) {
-        self.side_mut(side).record_fill(price, size, timestamp_ms, was_taker, fee);
+        self.side_mut(side).record_fill(price, size, was_taker, fee);
     }
 
     /// Minimum of YES and NO shares — these are fully paired.
@@ -174,11 +153,6 @@ impl BilateralPosition {
         self.yes.total_cost + self.no.total_cost
     }
 
-    /// Total maker rebates earned across both sides.
-    pub fn total_rebates(&self) -> Decimal {
-        self.yes.total_rebate + self.no.total_rebate
-    }
-
     /// Total taker fees paid across both sides.
     pub fn total_taker_fees(&self) -> Decimal {
         self.yes.total_taker_fee + self.no.total_taker_fee
@@ -219,8 +193,8 @@ mod tests {
     #[test]
     fn test_side_position_avg_price() {
         let mut pos = SidePosition::new();
-        pos.record_fill(dec("0.45"), dec("20"), 1000, false, dec("-0.01"));
-        pos.record_fill(dec("0.40"), dec("30"), 2000, false, dec("-0.015"));
+        pos.record_fill(dec("0.45"), dec("20"), false, dec("-0.01"));
+        pos.record_fill(dec("0.40"), dec("30"), false, dec("-0.015"));
         // VWAP = (0.45*20 + 0.40*30) / 50 = (9 + 12) / 50 = 0.42
         assert_eq!(pos.avg_price(), dec("0.42"));
         assert_eq!(pos.total_shares, dec("50"));
@@ -230,8 +204,8 @@ mod tests {
     #[test]
     fn test_bilateral_pairing() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), 1000, false, dec("-0.01"));
-        bp.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("-0.01"));
+        bp.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), false, dec("-0.01"));
+        bp.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("-0.01"));
 
         assert_eq!(bp.paired_shares(), dec("20"));
         assert_eq!(bp.unpaired_yes(), dec("10"));
@@ -251,7 +225,7 @@ mod tests {
     #[test]
     fn test_bilateral_single_side() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.50"), dec("100"), 1000, false, dec("-0.02"));
+        bp.record_fill(MarketSide::Yes, dec("0.50"), dec("100"), false, dec("-0.02"));
         assert_eq!(bp.paired_shares(), Decimal::ZERO);
         assert_eq!(bp.unpaired_yes(), dec("100"));
         assert_eq!(bp.unpaired_no(), Decimal::ZERO);
@@ -260,8 +234,8 @@ mod tests {
     #[test]
     fn test_bilateral_equal_sides() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.43"), dec("50"), 1000, false, dec("0"));
-        bp.record_fill(MarketSide::No, dec("0.47"), dec("50"), 2000, false, dec("0"));
+        bp.record_fill(MarketSide::Yes, dec("0.43"), dec("50"), false, dec("0"));
+        bp.record_fill(MarketSide::No, dec("0.47"), dec("50"), false, dec("0"));
         assert_eq!(bp.paired_shares(), dec("50"));
         assert_eq!(bp.unpaired_yes(), Decimal::ZERO);
         assert_eq!(bp.unpaired_no(), Decimal::ZERO);
@@ -272,8 +246,8 @@ mod tests {
     #[test]
     fn test_capital_deployed() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.45"), dec("20"), 1000, false, dec("0"));
-        bp.record_fill(MarketSide::No, dec("0.50"), dec("10"), 2000, true, dec("0.05"));
+        bp.record_fill(MarketSide::Yes, dec("0.45"), dec("20"), false, dec("0"));
+        bp.record_fill(MarketSide::No, dec("0.50"), dec("10"), true, dec("0.05"));
         // 0.45*20 + 0.50*10 = 9.0 + 5.0 = 14.0
         assert_eq!(bp.total_capital_deployed(), dec("14.0"));
         assert_eq!(bp.total_taker_fees(), dec("0.05"));
@@ -282,8 +256,8 @@ mod tests {
     #[test]
     fn test_unpaired_usdc() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.42"), dec("50"), 1000, false, dec("0"));
-        bp.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        bp.record_fill(MarketSide::Yes, dec("0.42"), dec("50"), false, dec("0"));
+        bp.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
         // Unpaired: 30 YES at avg 0.42 = $12.60
         assert_eq!(bp.unpaired_usdc(), dec("12.60"));
     }
@@ -291,7 +265,7 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.50"), dec("100"), 1000, false, dec("0"));
+        bp.record_fill(MarketSide::Yes, dec("0.50"), dec("100"), false, dec("0"));
         bp.reset();
         assert_eq!(bp.yes.total_shares, Decimal::ZERO);
         assert_eq!(bp.total_fills(), 0);
@@ -300,10 +274,10 @@ mod tests {
     #[test]
     fn test_multiple_fills_same_side() {
         let mut bp = BilateralPosition::new();
-        bp.record_fill(MarketSide::Yes, dec("0.40"), dec("10"), 1000, false, dec("-0.01"));
-        bp.record_fill(MarketSide::Yes, dec("0.44"), dec("10"), 2000, false, dec("-0.01"));
-        bp.record_fill(MarketSide::Yes, dec("0.48"), dec("10"), 3000, false, dec("-0.01"));
-        bp.record_fill(MarketSide::No, dec("0.50"), dec("25"), 4000, false, dec("-0.01"));
+        bp.record_fill(MarketSide::Yes, dec("0.40"), dec("10"), false, dec("-0.01"));
+        bp.record_fill(MarketSide::Yes, dec("0.44"), dec("10"), false, dec("-0.01"));
+        bp.record_fill(MarketSide::Yes, dec("0.48"), dec("10"), false, dec("-0.01"));
+        bp.record_fill(MarketSide::No, dec("0.50"), dec("25"), false, dec("-0.01"));
         // YES avg = (4.0 + 4.4 + 4.8) / 30 = 13.2 / 30 = 0.44
         assert_eq!(bp.yes.avg_price(), dec("0.44"));
         assert_eq!(bp.paired_shares(), dec("25"));

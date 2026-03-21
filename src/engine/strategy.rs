@@ -140,8 +140,6 @@ impl V2StrategyEngine {
             min_requote_interval_ms: q_toml.min_requote_interval_ms,
             max_order_size: Decimal::try_from(q_toml.max_order_size).unwrap_or(Decimal::new(100, 0)),
             min_order_size: Decimal::try_from(q_toml.min_order_size).unwrap_or(Decimal::new(5, 0)),
-            imbalance_edge_tightening: q_toml.imbalance_edge_tightening,
-            imbalance_edge_widening: q_toml.imbalance_edge_widening,
             emergency_requote_threshold: q_toml.emergency_requote_threshold,
             max_imbalance_skew: q_toml.max_imbalance_skew,
         };
@@ -154,7 +152,6 @@ impl V2StrategyEngine {
             closing_phase_secs: r_toml.closing_phase_secs,
             rotation_quiet_ms: r_toml.rotation_quiet_ms,
             max_closing_pair_cost: r_toml.max_closing_pair_cost,
-            max_closing_attempts: r_toml.max_closing_attempts,
             closing_retry_price_increment: r_toml.closing_retry_price_increment,
             rebalance_threshold: Decimal::try_from(r_toml.rebalance_threshold).unwrap_or(Decimal::new(20, 0)),
             rebalance_size: Decimal::try_from(r_toml.rebalance_size).unwrap_or(Decimal::new(10, 0)),
@@ -178,11 +175,7 @@ impl V2StrategyEngine {
             position: BilateralPosition::new(),
             fair_value: FairValueEstimator::new(&fair_value_config),
             quoter: Quoter::new(),
-            closing: ClosingManager::with_config(
-                r_toml.max_closing_attempts,
-                Decimal::try_from(r_toml.closing_retry_price_increment)
-                    .unwrap_or(Decimal::new(1, 2)),
-            ),
+            closing: ClosingManager::with_config(r_toml.max_closing_attempts),
             reporter: None,
             draining: false,
             paused: false,
@@ -215,18 +208,6 @@ impl V2StrategyEngine {
 
     pub fn reporter(&self) -> &Option<TelegramReporter> {
         &self.reporter
-    }
-
-    pub fn state(&self) -> &MarketState {
-        &self.state
-    }
-
-    pub fn phase(&self) -> MarketPhase {
-        self.phase
-    }
-
-    pub fn position(&self) -> &BilateralPosition {
-        &self.position
     }
 
     // ─── Event handling ─────────────────────────────────────────────────
@@ -506,7 +487,7 @@ impl V2StrategyEngine {
         let was_full = cumulative >= order_size;
 
         // Record only the new delta (no maker rebate — too variable to estimate)
-        self.position.record_fill(side, fill_price, delta, now, false, Decimal::ZERO);
+        self.position.record_fill(side, fill_price, delta, false, Decimal::ZERO);
         self.quoter.on_fill(side, was_full);
         self.push_fill_message(side, fill_price, delta, false);
         self.push_fill_record(side, fill_price, delta, false, Decimal::ZERO, now);
@@ -538,7 +519,7 @@ impl V2StrategyEngine {
             } => {
                 if already_filled {
                     // Rare for post-only, but handle it
-                    self.position.record_fill(side, price, size, now, false, Decimal::ZERO);
+                    self.position.record_fill(side, price, size, false, Decimal::ZERO);
                     self.quoter.on_order_failed(side); // clear pending state
                     self.push_fill_message(side, price, size, false);
                     self.push_fill_record(side, price, size, false, Decimal::ZERO, now);
@@ -547,18 +528,12 @@ impl V2StrategyEngine {
                         MarketSide::No => self.diag_no_fills += 1,
                     }
                 } else {
-                    let token_id = match side {
-                        MarketSide::Yes => self.state.active_yes_token_id.clone().unwrap_or_default(),
-                        MarketSide::No => self.state.active_no_token_id.clone().unwrap_or_default(),
-                    };
                     let fv = match side {
                         MarketSide::Yes => self.fair_value.yes_fair_value(),
                         MarketSide::No => self.fair_value.no_fair_value(),
                     };
                     self.quoter.on_order_posted(side, ManagedOrder {
-                        side,
                         order_id,
-                        token_id,
                         price,
                         size,
                         posted_ms: now,
@@ -584,7 +559,7 @@ impl V2StrategyEngine {
                             let fill_price = self.quoter.order(side)
                                 .map(|o| o.price)
                                 .unwrap_or(Decimal::ZERO);
-                            self.position.record_fill(side, fill_price, delta, now, false, Decimal::ZERO);
+                            self.position.record_fill(side, fill_price, delta, false, Decimal::ZERO);
                             self.push_fill_message(side, fill_price, delta, false);
                             self.push_fill_record(side, fill_price, delta, false, Decimal::ZERO, now);
                             match side {
@@ -609,7 +584,7 @@ impl V2StrategyEngine {
             } => {
                 if filled && size_matched > Decimal::ZERO {
                     let fee = compute_taker_fee(price, size_matched);
-                    self.position.record_fill(side, price, size_matched, now, true, fee);
+                    self.position.record_fill(side, price, size_matched, true, fee);
                     self.push_fill_message(side, price, size_matched, true);
                     self.push_fill_record(side, price, size_matched, true, fee, now);
                     self.diag_closing_foks += 1;
@@ -630,7 +605,7 @@ impl V2StrategyEngine {
             } => {
                 if filled && size_matched > Decimal::ZERO {
                     let fee = compute_taker_fee(price, size_matched);
-                    self.position.record_fill(side, price, size_matched, now, true, fee);
+                    self.position.record_fill(side, price, size_matched, true, fee);
                     self.push_fill_message(side, price, size_matched, true);
                     self.push_fill_record(side, price, size_matched, true, fee, now);
                     info!(
@@ -954,10 +929,6 @@ impl V2StrategyEngine {
 
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-    }
-
-    pub fn is_draining(&self) -> bool {
-        self.draining
     }
 
     pub fn has_no_open_position(&self) -> bool {

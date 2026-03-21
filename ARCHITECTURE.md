@@ -171,7 +171,6 @@ The `PolymarketGateway` wraps the `polymarket-client-sdk`:
 
 Utility functions:
 - `compute_taker_fee(price, size)`: CLOB taker fee formula `C × 0.25 × (p(1-p))²`
-- `compute_maker_rebate(price, size)`: Estimated 20% of taker fee equivalent
 - `round_to_tick(price, tick_size)`: Floor price to tick grid
 
 ## 6. Control Layer

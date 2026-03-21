@@ -11,9 +11,7 @@ use crate::engine::position::{BilateralPosition, MarketSide};
 /// State of a resting order managed by the quoter.
 #[derive(Debug, Clone)]
 pub struct ManagedOrder {
-    pub side: MarketSide,
     pub order_id: String,
-    pub token_id: String,
     pub price: Decimal,
     pub size: Decimal,
     pub posted_ms: u64,
@@ -40,13 +38,12 @@ pub enum QuoteAction {
 /// Config for the quoter (from config.toml [quoting]).
 #[derive(Debug, Clone)]
 pub struct QuotingConfig {
+    #[allow(dead_code)]
     pub min_edge: f64,
     pub requote_threshold: f64,
     pub min_requote_interval_ms: u64,
     pub max_order_size: Decimal,
     pub min_order_size: Decimal,
-    pub imbalance_edge_tightening: f64,
-    pub imbalance_edge_widening: f64,
     pub emergency_requote_threshold: f64,
     pub max_imbalance_skew: f64,
 }
@@ -59,8 +56,6 @@ impl Default for QuotingConfig {
             min_requote_interval_ms: 2000,
             max_order_size: Decimal::new(100, 0),
             min_order_size: Decimal::new(5, 0),
-            imbalance_edge_tightening: 0.01,
-            imbalance_edge_widening: 0.01,
             emergency_requote_threshold: 0.05,
             max_imbalance_skew: 0.02,
         }
@@ -76,7 +71,6 @@ pub struct RiskV2Config {
     pub closing_phase_secs: u64,
     pub rotation_quiet_ms: u64,
     pub max_closing_pair_cost: f64,
-    pub max_closing_attempts: u32,
     pub closing_retry_price_increment: f64,
     pub rebalance_threshold: Decimal,
     pub rebalance_size: Decimal,
@@ -96,7 +90,6 @@ impl Default for RiskV2Config {
             closing_phase_secs: 45,
             rotation_quiet_ms: 5000,
             max_closing_pair_cost: 0.97,
-            max_closing_attempts: 3,
             closing_retry_price_increment: 0.01,
             rebalance_threshold: Decimal::new(20, 0),
             rebalance_size: Decimal::new(10, 0),
@@ -450,7 +443,7 @@ mod tests {
         let quoter = Quoter::new();
         let mut position = BilateralPosition::new();
         // Deploy max capital
-        position.record_fill(MarketSide::Yes, dec("0.50"), dec("200"), 500, false, dec("0"));
+        position.record_fill(MarketSide::Yes, dec("0.50"), dec("200"), false, dec("0"));
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
@@ -465,7 +458,7 @@ mod tests {
         let quoter = Quoter::new();
         let mut position = BilateralPosition::new();
         // 50 YES, 0 NO → 50 unpaired YES (at limit)
-        position.record_fill(MarketSide::Yes, dec("0.40"), dec("50"), 500, false, dec("0"));
+        position.record_fill(MarketSide::Yes, dec("0.40"), dec("50"), false, dec("0"));
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
@@ -479,9 +472,7 @@ mod tests {
     fn test_requote_on_fv_drift() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "order1".into(),
-            token_id: "yes_token".into(),
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,
@@ -504,9 +495,7 @@ mod tests {
     fn test_hold_when_fv_stable() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "order1".into(),
-            token_id: "yes_token".into(),
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,
@@ -529,9 +518,7 @@ mod tests {
     fn test_cancel_all() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "y1".into(),
-            token_id: "yt".into(),
             price: dec("0.42"),
             size: dec("10"),
             posted_ms: 1000,
@@ -539,9 +526,7 @@ mod tests {
             size_filled: Decimal::ZERO,
         });
         quoter.on_order_posted(MarketSide::No, ManagedOrder {
-            side: MarketSide::No,
             order_id: "n1".into(),
-            token_id: "nt".into(),
             price: dec("0.48"),
             size: dec("10"),
             posted_ms: 1000,
@@ -558,8 +543,8 @@ mod tests {
         let quoter = Quoter::new();
         let mut position = BilateralPosition::new();
         // Deploy $90 of $100 max
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("100"), 500, false, dec("0"));
-        position.record_fill(MarketSide::No, dec("0.45"), dec("100"), 500, false, dec("0"));
+        position.record_fill(MarketSide::Yes, dec("0.45"), dec("100"), false, dec("0"));
+        position.record_fill(MarketSide::No, dec("0.45"), dec("100"), false, dec("0"));
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
@@ -586,9 +571,7 @@ mod tests {
     fn test_record_ws_fill_delta() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "o1".into(),
-            token_id: "yt".into(),
             price: dec("0.42"),
             size: dec("100"),
             posted_ms: 1000,
@@ -613,9 +596,7 @@ mod tests {
     fn test_filled_so_far() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::No, ManagedOrder {
-            side: MarketSide::No,
             order_id: "o2".into(),
-            token_id: "nt".into(),
             price: dec("0.55"),
             size: dec("80"),
             posted_ms: 1000,
@@ -632,9 +613,7 @@ mod tests {
     fn test_emergency_requote_bypasses_interval() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "o1".into(),
-            token_id: "yt".into(),
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,
@@ -657,9 +636,7 @@ mod tests {
     fn test_normal_requote_respects_interval() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            side: MarketSide::Yes,
             order_id: "o1".into(),
-            token_id: "yt".into(),
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,

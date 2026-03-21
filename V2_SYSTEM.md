@@ -417,7 +417,7 @@ Trades notify: on | Summary notify: on
 | `engine/closing.rs` | `ClosingManager`: end-of-market cancel + FOK pairing logic |
 | `engine/buildup/metrics.rs` | Metric trackers: CVD, OBI velocity, basis delta, realized vol |
 | `executor/live.rs` | `LiveExecutor`: CLOB order placement, cancel, FOK, SDK caching |
-| `executor/fill_engine.rs` | `compute_taker_fee`, `compute_maker_rebate`, `round_to_tick` |
+| `executor/fill_engine.rs` | `compute_taker_fee`, `round_to_tick` |
 | `types/market.rs` | `IngestorEvent`, `MarketState`, `OrderBook`, Binance structs |
 | `types/order.rs` | `V2ExecutorCommand`, `V2ExecutorFeedback`, `OrderRequest` |
 | `config.rs` | `Config`, `BotConfig`, TOML sub-configs, `.env` loading |

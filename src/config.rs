@@ -103,8 +103,6 @@ pub struct QuotingTomlConfig {
     pub min_requote_interval_ms: u64,
     pub max_order_size: f64,
     pub min_order_size: f64,
-    pub imbalance_edge_tightening: f64,
-    pub imbalance_edge_widening: f64,
     pub emergency_requote_threshold: f64,
     pub max_imbalance_skew: f64,
 }
@@ -117,8 +115,6 @@ impl Default for QuotingTomlConfig {
             min_requote_interval_ms: 2000,
             max_order_size: 100.0,
             min_order_size: 5.0,
-            imbalance_edge_tightening: 0.01,
-            imbalance_edge_widening: 0.01,
             emergency_requote_threshold: 0.05,
             max_imbalance_skew: 0.02,
         }
@@ -286,27 +282,4 @@ impl Config {
         Ok(config)
     }
 
-    #[cfg(test)]
-    pub fn test_defaults() -> Self {
-        let bot = BotConfig::default();
-        let max_capital_per_market = Decimal::try_from(bot.risk_v2.max_capital_per_market).unwrap();
-        let stale_event_threshold_ms = bot.risk_v2.binance_stale_event_ms;
-        Self {
-            polymarket_api_key: String::new(),
-            polymarket_secret: String::new(),
-            polymarket_passphrase: String::new(),
-            private_key: String::new(),
-            questdb_url: "127.0.0.1:9009".into(),
-            questdb_http_url: "http://127.0.0.1:9000".into(),
-            binance_sbe_ws_url: "wss://stream-sbe.binance.com:9443".into(),
-            binance_ed25519_api_key: "test-key".into(),
-            binance_futures_ws_url: "wss://fstream.binance.com".into(),
-            telegram_bot_token: "test-token".into(),
-            telegram_chat_id: "test-chat".into(),
-            telegram_allowed_user_id: None,
-            bot,
-            max_capital_per_market,
-            stale_event_threshold_ms,
-        }
-    }
 }

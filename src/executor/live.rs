@@ -231,8 +231,6 @@ impl LiveExecutor {
         info!(side = side.label(), %order_id, %was_cancelled, ?size_matched, "cancel result");
         let _ = self.feedback_tx.try_send(V2ExecutorFeedback::CancelResult {
             side,
-            order_id: order_id.to_string(),
-            was_cancelled,
             size_matched,
         });
     }

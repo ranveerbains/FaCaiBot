@@ -51,8 +51,6 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "quoting.min_requote_interval_ms", min: 0.0, max: 10000.0 },
     ParamSpec { name: "quoting.max_order_size", min: 1.0, max: 100000.0 },
     ParamSpec { name: "quoting.min_order_size", min: 0.01, max: 1000.0 },
-    ParamSpec { name: "quoting.imbalance_edge_tightening", min: 0.0, max: 0.10 },
-    ParamSpec { name: "quoting.imbalance_edge_widening", min: 0.0, max: 0.10 },
     ParamSpec { name: "quoting.emergency_requote_threshold", min: 0.01, max: 0.20 },
     ParamSpec { name: "quoting.max_imbalance_skew", min: 0.0, max: 0.10 },
     // risk_v2

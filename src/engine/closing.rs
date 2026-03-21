@@ -24,7 +24,6 @@ pub struct ClosingManager {
     pub attempt_count: u32,
     pub pairing_sent: bool,
     max_attempts: u32,
-    retry_price_increment: Decimal,
 }
 
 impl ClosingManager {
@@ -35,18 +34,16 @@ impl ClosingManager {
             attempt_count: 0,
             pairing_sent: false,
             max_attempts: 3,
-            retry_price_increment: Decimal::new(1, 2), // 0.01
         }
     }
 
-    pub fn with_config(max_attempts: u32, retry_price_increment: Decimal) -> Self {
+    pub fn with_config(max_attempts: u32) -> Self {
         Self {
             phase_entered: false,
             resting_cancelled: false,
             attempt_count: 0,
             pairing_sent: false,
             max_attempts,
-            retry_price_increment,
         }
     }
 
@@ -185,8 +182,8 @@ mod tests {
     #[test]
     fn test_pairing_need_no() {
         let mut pos = BilateralPosition::new();
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
             &pos, "yt", "nt",
@@ -202,8 +199,8 @@ mod tests {
     #[test]
     fn test_pairing_need_yes() {
         let mut pos = BilateralPosition::new();
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("10"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("10"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
             &pos, "yt", "nt",
@@ -219,8 +216,8 @@ mod tests {
     #[test]
     fn test_pairing_too_expensive() {
         let mut pos = BilateralPosition::new();
-        pos.record_fill(MarketSide::Yes, dec("0.55"), dec("30"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.55"), dec("30"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         // pair_cost = 0.55 + 0.49 = 1.04 > 0.97
         let action = ClosingManager::compute_pairing(
@@ -234,8 +231,8 @@ mod tests {
     #[test]
     fn test_pairing_balanced() {
         let mut pos = BilateralPosition::new();
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("20"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("20"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
             &pos, "yt", "nt",
@@ -248,8 +245,8 @@ mod tests {
     #[test]
     fn test_pairing_no_book() {
         let mut pos = BilateralPosition::new();
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("30"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
             &pos, "yt", "nt",
@@ -263,8 +260,8 @@ mod tests {
     fn test_pairing_deficit_below_minimum() {
         let mut pos = BilateralPosition::new();
         // 23 YES, 20 NO → deficit = 3 (below min 5)
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("23"), 1000, false, dec("0"));
-        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), 2000, false, dec("0"));
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("23"), false, dec("0"));
+        pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
             &pos, "yt", "nt",
@@ -286,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_can_retry() {
-        let mut cm = ClosingManager::with_config(3, dec("0.01"));
+        let mut cm = ClosingManager::with_config(3);
         assert!(cm.can_retry()); // 0 < 3
         cm.attempt_count = 1;
         assert!(cm.can_retry()); // 1 < 3
@@ -298,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_can_retry_blocked_while_sent() {
-        let mut cm = ClosingManager::with_config(3, dec("0.01"));
+        let mut cm = ClosingManager::with_config(3);
         cm.pairing_sent = true;
         assert!(!cm.can_retry()); // blocked while FOK in-flight
     }

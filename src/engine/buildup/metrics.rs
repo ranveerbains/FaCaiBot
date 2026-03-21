@@ -125,6 +125,7 @@ impl CvdAccelTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
+    #[allow(dead_code)]
     pub fn raw(&self) -> f64 {
         self.accel
     }
@@ -192,6 +193,7 @@ impl ObiVelocityTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
+    #[allow(dead_code)]
     pub fn raw(&self) -> f64 {
         self.obi_delta_ema
     }
@@ -279,6 +281,7 @@ impl BasisDeltaTracker {
         self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
     }
 
+    #[allow(dead_code)]
     pub fn raw(&self) -> f64 {
         self.basis_delta_ema
     }
@@ -382,11 +385,6 @@ impl RealizedVolTracker {
     pub fn is_fresh(&self, now_ms: u64) -> bool {
         self.last_update_ms > 0
             && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
-    }
-
-    /// Number of samples collected so far.
-    pub fn sample_count(&self) -> usize {
-        self.count
     }
 
     /// Whether the tracker has enough samples for valid vol computation.

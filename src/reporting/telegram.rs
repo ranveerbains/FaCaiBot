@@ -30,8 +30,6 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
-use crate::control::types::NotifyFlags;
-
 // ─── TelegramReporter ────────────────────────────────────────────────────────
 
 /// Sends pre-formatted messages to a Telegram bot via raw HTTPS POST to the
@@ -52,8 +50,6 @@ struct ReporterInner {
     tls_connector: TlsConnector,
     /// Epoch ms of the last dispatched message. Rate limiting: 5s minimum interval.
     last_send_ms: AtomicU64,
-    /// Optional notification flags (shared with command listener).
-    notify_flags: Option<Arc<NotifyFlags>>,
     /// Tracked sent message IDs for periodic cleanup (bounded to last 200).
     sent_messages: Mutex<VecDeque<i64>>,
 }
@@ -75,41 +71,8 @@ impl TelegramReporter {
                 chat_id,
                 tls_connector,
                 last_send_ms: AtomicU64::new(0),
-                notify_flags: None,
                 sent_messages: Mutex::new(VecDeque::new()),
             }),
-        }
-    }
-
-    /// Builder: attach notification flags for command-driven gating.
-    /// Must be called immediately after `new()` before cloning.
-    pub fn with_notify_flags(self, flags: Arc<NotifyFlags>) -> Self {
-        // Re-create inner with flags set. Safe because we just constructed it.
-        match Arc::try_unwrap(self.inner) {
-            Ok(old) => Self {
-                inner: Arc::new(ReporterInner {
-                    bot_token: old.bot_token,
-                    chat_id: old.chat_id,
-                    tls_connector: old.tls_connector,
-                    last_send_ms: old.last_send_ms,
-                    notify_flags: Some(flags),
-                    sent_messages: old.sent_messages,
-                }),
-            },
-            Err(arc) => {
-                // Fallback: should never happen if called right after new().
-                // Clone the fields we need.
-                Self {
-                    inner: Arc::new(ReporterInner {
-                        bot_token: arc.bot_token.clone(),
-                        chat_id: arc.chat_id.clone(),
-                        tls_connector: arc.tls_connector.clone(),
-                        last_send_ms: AtomicU64::new(arc.last_send_ms.load(Ordering::Relaxed)),
-                        notify_flags: Some(flags),
-                        sent_messages: Mutex::new(VecDeque::new()),
-                    }),
-                }
-            }
         }
     }
 

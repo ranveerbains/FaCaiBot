@@ -133,18 +133,17 @@ pub struct FuturesBookTicker {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FuturesForceOrder {
     pub side: String,
-    #[allow(dead_code)]
     pub price: Decimal,
     pub quantity: Decimal,
-    #[allow(dead_code)]
     pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SpotTrade {
-    #[allow(dead_code)]
     pub price: Decimal,
     pub quantity: Decimal,
     pub is_buyer_maker: bool,
@@ -210,38 +209,50 @@ pub enum IngestorEvent {
     PolymarketBook(OrderBook),
     PolymarketPriceChange {
         asset_id: String,
+        #[allow(dead_code)]
         price: Decimal,
+        #[allow(dead_code)]
         size: Decimal,
+        #[allow(dead_code)]
         side: crate::types::order::Side,
+        #[allow(dead_code)]
         best_bid: Decimal,
+        #[allow(dead_code)]
         best_ask: Decimal,
     },
     PolymarketBestBidAsk {
         asset_id: String,
+        #[allow(dead_code)]
         best_bid: Decimal,
+        #[allow(dead_code)]
         best_ask: Decimal,
     },
     PolymarketTickSizeChange {
+        #[allow(dead_code)]
         asset_id: String,
+        #[allow(dead_code)]
         old_tick_size: Decimal,
         new_tick_size: Decimal,
     },
     PolymarketMarketResolved {
+        #[allow(dead_code)]
         market: String,
+        #[allow(dead_code)]
         winning_asset_id: String,
     },
     TradeStatusUpdate {
         order_id: String,
         status: TradeStatus,
         size_matched: Option<Decimal>,
+        #[allow(dead_code)]
         original_size: Option<Decimal>,
     },
     BinanceTick(BinanceTick),
     BinanceDepth(BinanceDepth),
     FuturesAggTrade(FuturesAggTrade),
     FuturesBookTicker(FuturesBookTicker),
-    FuturesForceOrder(FuturesForceOrder),
-    SpotTrade(SpotTrade),
+    FuturesForceOrder(#[allow(dead_code)] FuturesForceOrder),
+    SpotTrade(#[allow(dead_code)] SpotTrade),
     MarketRotation {
         condition_id: String,
         yes_token_id: String,
@@ -250,7 +261,12 @@ pub enum IngestorEvent {
         tick_size: Decimal,
     },
     HeartbeatStatus { success: bool, latency_ms: u64 },
-    WsStatus { source: DataSource, connected: bool },
+    WsStatus {
+        #[allow(dead_code)]
+        source: DataSource,
+        #[allow(dead_code)]
+        connected: bool,
+    },
     Shutdown,
     DrainAndRestart,
     PauseTrading,

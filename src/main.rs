@@ -167,8 +167,7 @@ async fn async_main() -> Result<()> {
     let live_reporter_for_engine = TelegramReporter::new(
         config.telegram_bot_token.clone(),
         config.telegram_chat_id.clone(),
-    )
-    .with_notify_flags(Arc::clone(&notify_flags));
+    );
     live_reporter_for_engine.spawn_cleanup_task();
 
     let listener_reporter = live_reporter_for_engine.clone();
@@ -403,7 +402,6 @@ async fn async_main() -> Result<()> {
 
     // ── Layer 3: V2 Executor ──
     let executor_config = config.clone();
-    let executor_notify_flags = Arc::clone(&notify_flags);
     let executor_handle = tokio::spawn(async move {
         info!("starting v2 executor");
 
@@ -411,8 +409,7 @@ async fn async_main() -> Result<()> {
         let reporter = TelegramReporter::new(
             executor_config.telegram_bot_token.clone(),
             executor_config.telegram_chat_id.clone(),
-        )
-        .with_notify_flags(Arc::clone(&executor_notify_flags));
+        );
         reporter.spawn_cleanup_task();
 
         let live_executor = LiveExecutor::new(poly, feedback_tx, reporter);
