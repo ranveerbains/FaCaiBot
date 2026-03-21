@@ -368,13 +368,13 @@ impl V2StrategyEngine {
         }
 
         // Phase transition: QUIET → QUOTING
-        if self.phase == MarketPhase::Quiet && now >= self.quiet_until_ms {
+        if self.phase == MarketPhase::Quiet && now >= self.quiet_until_ms && !self.paused {
             self.phase = MarketPhase::Quoting;
             info!("phase transition: QUIET → QUOTING");
         }
 
         // Phase transition: QUOTING → CLOSING
-        if self.phase == MarketPhase::Quoting {
+        if self.phase == MarketPhase::Quoting && !self.paused {
             let remaining = self.state.time_remaining_ms(now);
             if ClosingManager::should_enter(remaining, self.risk_config.closing_phase_secs) {
                 self.phase = MarketPhase::Closing;
@@ -823,7 +823,7 @@ impl V2StrategyEngine {
     // ─── Closing tick (called each iteration) ───────────────────────────
 
     pub fn closing_tick(&mut self) -> Vec<V2ExecutorCommand> {
-        if self.phase != MarketPhase::Closing {
+        if self.phase != MarketPhase::Closing || self.paused {
             return Vec::new();
         }
 
@@ -927,8 +927,25 @@ impl V2StrategyEngine {
         self.draining = true;
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
+    pub fn set_paused(&mut self, paused: bool) -> Vec<V2ExecutorCommand> {
         self.paused = paused;
+        if paused {
+            // Cancel all resting orders immediately
+            let mut commands = Vec::new();
+            let cancel_actions = self.quoter.cancel_all_actions();
+            for action in cancel_actions {
+                if let QuoteAction::Cancel { side, order_id } = action {
+                    self.quoter.on_cancel_sent(side);
+                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
+            if !commands.is_empty() {
+                info!("paused: cancelling {} resting order(s)", commands.len());
+            }
+            commands
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn has_no_open_position(&self) -> bool {

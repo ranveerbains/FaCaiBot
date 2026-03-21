@@ -233,12 +233,17 @@ async fn async_main() -> Result<()> {
                     continue;
                 }
                 IngestorEvent::PauseTrading => {
-                    engine.set_paused(true);
+                    let cancel_cmds = engine.set_paused(true);
+                    for cmd in cancel_cmds {
+                        if let Err(e) = executor_tx.send(cmd) {
+                            error!(error = %e, "failed to send pause cancel command");
+                        }
+                    }
                     info!("trading PAUSED");
                     continue;
                 }
                 IngestorEvent::ResumeTrading => {
-                    engine.set_paused(false);
+                    let _ = engine.set_paused(false);
                     info!("trading RESUMED");
                     continue;
                 }
