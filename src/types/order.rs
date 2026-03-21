@@ -148,6 +148,7 @@ pub enum V2ExecutorFeedback {
     /// Cancel result with authoritative fill size.
     CancelResult {
         side: MarketSide,
+        order_id: String,
         size_matched: Option<Decimal>,
     },
     /// Closing FOK result.

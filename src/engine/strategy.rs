@@ -548,32 +548,31 @@ impl V2StrategyEngine {
             }
 
             V2ExecutorFeedback::CancelResult {
-                side, size_matched, ..
+                side, order_id, size_matched,
             } => {
-                // Dedup: only record the delta not already seen via User WS
-                if let Some(matched) = size_matched {
-                    if matched > Decimal::ZERO {
-                        let already = self.quoter.filled_so_far(side);
-                        let delta = matched - already;
-                        if delta > Decimal::ZERO {
-                            let fill_price = self.quoter.order(side)
-                                .map(|o| o.price)
-                                .unwrap_or(Decimal::ZERO);
-                            self.position.record_fill(side, fill_price, delta, false, Decimal::ZERO);
-                            self.push_fill_message(side, fill_price, delta, false);
-                            self.push_fill_record(side, fill_price, delta, false, Decimal::ZERO, now);
-                            match side {
-                                MarketSide::Yes => self.diag_yes_fills += 1,
-                                MarketSide::No => self.diag_no_fills += 1,
-                            }
-                            info!(
-                                side = side.label(),
-                                size_matched = %matched,
-                                already_recorded = %already,
-                                delta = %delta,
-                                "cancel revealed fill — recorded delta"
-                            );
+                // Dedup: only record the delta not already seen via User WS.
+                // Uses order_id to match even if the order was already cleared by a full WS fill.
+                if let Some(matched) = size_matched
+                    && matched > Decimal::ZERO
+                    && let Some((price, already_filled)) = self.quoter.lookup_order_for_cancel(side, &order_id)
+                {
+                    let delta = matched - already_filled;
+                    if delta > Decimal::ZERO {
+                        self.position.record_fill(side, price, delta, false, Decimal::ZERO);
+                        self.push_fill_message(side, price, delta, false);
+                        self.push_fill_record(side, price, delta, false, Decimal::ZERO, now);
+                        match side {
+                            MarketSide::Yes => self.diag_yes_fills += 1,
+                            MarketSide::No => self.diag_no_fills += 1,
                         }
+                        info!(
+                            side = side.label(),
+                            %order_id,
+                            size_matched = %matched,
+                            already_recorded = %already_filled,
+                            delta = %delta,
+                            "cancel revealed fill — recorded delta"
+                        );
                     }
                 }
                 self.quoter.on_cancel_result(side);

@@ -184,6 +184,18 @@ sudo systemctl start facaibot
 journalctl -u facaibot -f
 ```
 
+to deploy once u update the code pushed
+```bash 
+cd /home/ec2-user/FaCaiBot            
+git fetch origin                             
+git checkout v2                       
+git pull origin v2     
+RUSTFLAGS="-C target-cpu=native" cargo build --release  
+sudo systemctl stop facaibot 
+cp target/release/facaibot /opt/facaibot/facaibot
+sudo systemctl start facaibot
+```                       
+
 ### Switching back to v1 (main)
 
 ```bash

@@ -102,6 +102,17 @@ impl Default for RiskV2Config {
     }
 }
 
+// ─── Cleared order (for CancelResult dedup) ─────────────────────────────────
+
+/// Snapshot of an order that was cleared (full fill or cancel result),
+/// retained so a late-arriving `CancelResult` can still dedup correctly.
+#[derive(Debug, Clone)]
+struct ClearedOrder {
+    order_id: String,
+    price: Decimal,
+    size_filled: Decimal,
+}
+
 // ─── Quoter ─────────────────────────────────────────────────────────────────
 
 /// Manages resting orders on both sides (YES and NO).
@@ -114,6 +125,9 @@ pub struct Quoter {
     no_pending_cancel: bool,
     yes_pending_post: bool,
     no_pending_post: bool,
+    /// Last cleared order per side — for CancelResult dedup when order is already gone.
+    yes_last_cleared: Option<ClearedOrder>,
+    no_last_cleared: Option<ClearedOrder>,
 }
 
 impl Quoter {
@@ -127,6 +141,8 @@ impl Quoter {
             no_pending_cancel: false,
             yes_pending_post: false,
             no_pending_post: false,
+            yes_last_cleared: None,
+            no_last_cleared: None,
         }
     }
 
@@ -252,10 +268,24 @@ impl Quoter {
     pub fn on_cancel_result(&mut self, side: MarketSide) {
         match side {
             MarketSide::Yes => {
+                if let Some(ref o) = self.yes_order {
+                    self.yes_last_cleared = Some(ClearedOrder {
+                        order_id: o.order_id.clone(),
+                        price: o.price,
+                        size_filled: o.size_filled,
+                    });
+                }
                 self.yes_order = None;
                 self.yes_pending_cancel = false;
             }
             MarketSide::No => {
+                if let Some(ref o) = self.no_order {
+                    self.no_last_cleared = Some(ClearedOrder {
+                        order_id: o.order_id.clone(),
+                        price: o.price,
+                        size_filled: o.size_filled,
+                    });
+                }
                 self.no_order = None;
                 self.no_pending_cancel = false;
             }
@@ -265,8 +295,26 @@ impl Quoter {
     pub fn on_fill(&mut self, side: MarketSide, was_full: bool) {
         if was_full {
             match side {
-                MarketSide::Yes => self.yes_order = None,
-                MarketSide::No => self.no_order = None,
+                MarketSide::Yes => {
+                    if let Some(ref o) = self.yes_order {
+                        self.yes_last_cleared = Some(ClearedOrder {
+                            order_id: o.order_id.clone(),
+                            price: o.price,
+                            size_filled: o.size_filled,
+                        });
+                    }
+                    self.yes_order = None;
+                }
+                MarketSide::No => {
+                    if let Some(ref o) = self.no_order {
+                        self.no_last_cleared = Some(ClearedOrder {
+                            order_id: o.order_id.clone(),
+                            price: o.price,
+                            size_filled: o.size_filled,
+                        });
+                    }
+                    self.no_order = None;
+                }
             }
         }
     }
@@ -322,6 +370,27 @@ impl Quoter {
         actions
     }
 
+    /// Look up an order by side + order_id for CancelResult dedup.
+    /// Checks the current resting order first, then the last cleared order.
+    /// Returns `(price, size_filled)` if found.
+    pub fn lookup_order_for_cancel(&self, side: MarketSide, order_id: &str) -> Option<(Decimal, Decimal)> {
+        if let Some(o) = self.order(side)
+            && o.order_id == order_id
+        {
+            return Some((o.price, o.size_filled));
+        }
+        let cleared = match side {
+            MarketSide::Yes => &self.yes_last_cleared,
+            MarketSide::No => &self.no_last_cleared,
+        };
+        if let Some(c) = cleared
+            && c.order_id == order_id
+        {
+            return Some((c.price, c.size_filled));
+        }
+        None
+    }
+
     pub fn reset(&mut self) {
         self.yes_order = None;
         self.no_order = None;
@@ -331,6 +400,8 @@ impl Quoter {
         self.no_pending_cancel = false;
         self.yes_pending_post = false;
         self.no_pending_post = false;
+        self.yes_last_cleared = None;
+        self.no_last_cleared = None;
     }
 
     // ── Accessors ──
