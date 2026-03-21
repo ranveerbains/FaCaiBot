@@ -142,6 +142,7 @@ For each side, the quoter checks guards in order:
 2. **Unpaired limit**: Skip if `unpaired_shares(side) >= max_unpaired_shares`
 3. **USDC exposure**: Skip if `unpaired_usdc >= max_unpaired_usdc` and this side is contributing
 4. **Capital limit**: Skip if `total_capital_deployed >= max_capital_per_market`
+5. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
 
 ### Size Computation
 
@@ -230,19 +231,19 @@ Fills are detected via two channels:
 
 2. **Executor Feedback**: When the executor posts, cancels, or sends a FOK, the result includes fill information:
    - `OrderPosted { already_filled }` — rare for post-only but handled
-   - `CancelResult { size_matched }` — reveals fills that occurred before the cancel
+   - `CancelResult { order_id, size_matched }` — reveals fills that occurred before the cancel
    - `ClosingFokResult { filled, size_matched }` — closing phase taker fills
 
 Each fill records: side, price, size, timestamp, was_taker flag, and fee (maker rebate or taker fee).
 
 ### Fill Deduplication
 
-User WS and CancelResult can both report the same fills (e.g., shares filled during a cancel round-trip). To prevent double-counting, each `ManagedOrder` tracks `size_filled` — the cumulative filled size already recorded in the position.
+User WS and CancelResult can both report the same fills (e.g., shares filled during a cancel round-trip). To prevent double-counting, each `ManagedOrder` tracks `size_filled` — the cumulative filled size already recorded in the position. Additionally, the quoter retains a `ClearedOrder` snapshot per side (`last_cleared`) so that late-arriving CancelResults can still dedup after a full WS fill has cleared the order.
 
-- **User WS path**: Calls `quoter.record_ws_fill(side, cumulative_matched)` which computes `delta = cumulative - size_filled`, updates the tracker, and returns the delta. Only the delta is recorded in the position.
-- **CancelResult path**: Computes `delta = size_matched - quoter.filled_so_far(side)`. Only records if delta > 0.
+- **User WS path**: Calls `quoter.record_ws_fill(side, cumulative_matched)` which computes `delta = cumulative - size_filled`, updates the tracker, and returns the delta. Only the delta is recorded in the position. On full fill, `on_fill(was_full=true)` clears the order but saves its `(order_id, price, size_filled)` to `last_cleared`.
+- **CancelResult path**: Uses `quoter.lookup_order_for_cancel(side, order_id)` to find the order by ID — checking the current resting order first, then `last_cleared`. Computes `delta = size_matched - already_filled`. Only records if delta > 0. If the order_id is not found (stale), the CancelResult is silently ignored.
 
-This ensures fills are counted exactly once regardless of which path arrives first or if both arrive. Correct fill tracking is a prerequisite for accurate repost sizing after a cancel-requote cycle.
+This ensures fills are counted exactly once regardless of which path arrives first, if both arrive, or if the WS fill clears the order before the CancelResult. Correct fill tracking is a prerequisite for accurate repost sizing after a cancel-requote cycle.
 
 ## 8. Market Rotation
 

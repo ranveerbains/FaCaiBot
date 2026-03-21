@@ -138,7 +138,7 @@ Before modifying any function or struct, **trace its callers and consumers**:
 After implementing, verify in this order:
 
 1. **`cargo build`** — Catch type errors, missing imports, signature mismatches. Fix all errors before proceeding.
-2. **`cargo test`** — Run the full test suite (125 tests). If tests fail, fix them before touching docs. Tests cover fair value model, quoting guards, position pairing, closing logic, fill engine utilities, and metric trackers.
+2. **`cargo test`** — Run the full test suite (138 tests). If tests fail, fix them before touching docs. Tests cover fair value model, quoting guards, position pairing, closing logic, fill engine utilities, and metric trackers.
 3. **`cargo clippy`** — Fix warnings. Common ones: collapsible if-statements, derivable impls, too many function arguments.
 4. **Manual trace** — For behavioral changes, mentally walk through a complete market lifecycle (rotation → quiet → quoting → closing) to verify no state leaks or missed transitions. Use `V2_SYSTEM.md` §9 as reference.
 

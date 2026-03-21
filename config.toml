@@ -1,5 +1,5 @@
 [rotation]
-prewarm_lead_secs = 10
+prewarm_lead_secs = 20
 
 [fair_value]
 # Momentum signal weights (futures-derived leading indicators)
@@ -47,7 +47,7 @@ requote_threshold = 0.01
 min_requote_interval_ms = 3500
 emergency_requote_threshold = 0.05  # bypass interval if FV drift >= this
 # Order sizing
-max_order_size = 10
+max_order_size = 5
 min_order_size = 5
 # Inventory skewing — scales linearly with imbalance ratio
 max_imbalance_skew = 0.02           # max skew at full imbalance (replaces flat ±0.01)
@@ -57,7 +57,7 @@ max_imbalance_skew = 0.02           # max skew at full imbalance (replaces flat 
 max_unpaired_shares = 5
 max_unpaired_usdc = 5
 # Market-wide limits
-max_capital_per_market = 50
+max_capital_per_market = 40
 # Timing
 closing_phase_secs = 45
 rotation_quiet_ms = 5000
@@ -66,10 +66,10 @@ max_closing_pair_cost = 0.97
 max_closing_attempts = 3             # multi-attempt FOK (was 1 one-shot)
 closing_retry_price_increment = 0.01 # accept 1 tick worse per retry
 # Taker rebalance (active imbalance correction)
-rebalance_threshold = 20             # shares imbalance to trigger taker rebalance
+rebalance_threshold = 10            # shares imbalance to trigger taker rebalance
 rebalance_size = 10                  # shares per rebalance order
 rebalance_max_pair_cost = 0.96       # max pair cost for rebalance (tighter than closing)
-min_rebalance_interval_ms = 10000    # 10s cooldown between rebalances
+min_rebalance_interval_ms = 5000    # 10s cooldown between rebalances
 # Data quality
 stale_book_ms = 850
 max_entry_spread = 0.04

@@ -157,6 +157,7 @@ impl LiveExecutor {
 
         let tick_size = Decimal::new(1, 2); // default; SDK uses cached tick size
         let rounded_price = round_to_tick(price, tick_size);
+        let size = size.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
         let order = OrderRequest::post_only_gtc(
             token_id.to_string(),

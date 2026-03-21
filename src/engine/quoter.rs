@@ -175,6 +175,19 @@ impl Quoter {
             return None;
         }
 
+        // Pair-cost feasibility guard: don't post if filling at target_price
+        // would push the running pair cost above $1.00
+        let other_avg = match side {
+            MarketSide::Yes => position.no.avg_price(),
+            MarketSide::No => position.yes.avg_price(),
+        };
+        if other_avg > Decimal::ZERO {
+            let projected_pair_cost = other_avg + target_price;
+            if projected_pair_cost >= Decimal::ONE {
+                return None;
+            }
+        }
+
         // ── Size computation ──
         let remaining_capital = risk.max_capital_per_market - position.total_capital_deployed();
         if remaining_capital <= Decimal::ZERO || target_price <= Decimal::ZERO {
@@ -335,11 +348,6 @@ impl Quoter {
             }
             None => Decimal::ZERO,
         }
-    }
-
-    /// Return how much has already been recorded as filled for the current order on this side.
-    pub fn filled_so_far(&self, side: MarketSide) -> Decimal {
-        self.order(side).map(|o| o.size_filled).unwrap_or(Decimal::ZERO)
     }
 
     pub fn mark_post_pending(&mut self, side: MarketSide) {
@@ -634,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filled_so_far() {
+    fn test_lookup_order_for_cancel_current() {
         let mut quoter = Quoter::new();
         quoter.on_order_posted(MarketSide::No, ManagedOrder {
             order_id: "o2".into(),
@@ -645,9 +653,41 @@ mod tests {
             size_filled: Decimal::ZERO,
         });
 
-        assert_eq!(quoter.filled_so_far(MarketSide::No), dec("0"));
+        // Finds current resting order
+        let result = quoter.lookup_order_for_cancel(MarketSide::No, "o2");
+        assert_eq!(result, Some((dec("0.55"), dec("0"))));
+
+        // After partial fill, returns updated size_filled
         quoter.record_ws_fill(MarketSide::No, dec("25"));
-        assert_eq!(quoter.filled_so_far(MarketSide::No), dec("25"));
+        let result = quoter.lookup_order_for_cancel(MarketSide::No, "o2");
+        assert_eq!(result, Some((dec("0.55"), dec("25"))));
+
+        // Wrong order_id returns None
+        assert!(quoter.lookup_order_for_cancel(MarketSide::No, "wrong").is_none());
+    }
+
+    #[test]
+    fn test_lookup_order_for_cancel_after_full_fill() {
+        let mut quoter = Quoter::new();
+        quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
+            order_id: "o3".into(),
+            price: dec("0.63"),
+            size: dec("10"),
+            posted_ms: 1000,
+            fair_value_at_post: dec("0.60"),
+            size_filled: Decimal::ZERO,
+        });
+
+        // Full WS fill clears order but saves to last_cleared
+        quoter.record_ws_fill(MarketSide::Yes, dec("10"));
+        quoter.on_fill(MarketSide::Yes, true);
+
+        // Current order is gone
+        assert!(quoter.order(MarketSide::Yes).is_none());
+
+        // But lookup still finds it via last_cleared
+        let result = quoter.lookup_order_for_cancel(MarketSide::Yes, "o3");
+        assert_eq!(result, Some((dec("0.63"), dec("10"))));
     }
 
     #[test]
@@ -671,6 +711,52 @@ mod tests {
             &position, &qc, &rc, 1500,
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
+    }
+
+    #[test]
+    fn test_pair_cost_guard_blocks_expensive_pair() {
+        let quoter = Quoter::new();
+        let mut position = BilateralPosition::new();
+        // NO fills at avg $0.60
+        position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
+        let (qc, rc) = default_configs();
+
+        // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
+        let action = quoter.evaluate_side(
+            MarketSide::Yes, dec("0.45"), dec("0.50"), "yes_token",
+            &position, &qc, &rc, 1000,
+        );
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_pair_cost_guard_allows_cheap_pair() {
+        let quoter = Quoter::new();
+        let mut position = BilateralPosition::new();
+        // NO fills at avg $0.60
+        position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
+        let (qc, rc) = default_configs();
+
+        // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
+        let action = quoter.evaluate_side(
+            MarketSide::Yes, dec("0.39"), dec("0.45"), "yes_token",
+            &position, &qc, &rc, 1000,
+        );
+        assert!(matches!(action, Some(QuoteAction::Post { .. })));
+    }
+
+    #[test]
+    fn test_pair_cost_guard_skipped_no_opposite_fills() {
+        let quoter = Quoter::new();
+        let position = BilateralPosition::new();
+        let (qc, rc) = default_configs();
+
+        // No opposite fills → guard skipped → normal post
+        let action = quoter.evaluate_side(
+            MarketSide::Yes, dec("0.85"), dec("0.90"), "yes_token",
+            &position, &qc, &rc, 1000,
+        );
+        assert!(matches!(action, Some(QuoteAction::Post { .. })));
     }
 
     #[test]

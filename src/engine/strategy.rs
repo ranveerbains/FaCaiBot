@@ -981,7 +981,7 @@ impl V2StrategyEngine {
 
         let msg = format!(
             "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} closing_foks={} | \
-             yes={:.0} no={:.0} paired={:.0} locked=${:.2} deployed=${:.2} | \
+             yes={:.2} no={:.2} paired={:.2} locked=${:.2} deployed=${:.2} | \
              fv_yes={:.3} fv_no={:.3} edge={:.3} | markets={}",
             self.phase,
             self.diag_yes_fills,
@@ -1017,7 +1017,7 @@ impl V2StrategyEngine {
     fn push_fill_message(&mut self, side: MarketSide, price: Decimal, size: Decimal, was_taker: bool) {
         let tag = if was_taker { "TAKER" } else { "MAKER" };
         let msg = format!(
-            "{} {} {:.0}@${:.3} | YES:{:.0} NO:{:.0} | paired:{:.0} locked:${:.2}",
+            "{} {} {:.2}@${:.3} | YES:{:.2} NO:{:.2} | paired:{:.2} locked:${:.2}",
             tag, side.label(), size, price,
             self.position.yes.total_shares, self.position.no.total_shares,
             self.position.paired_shares(), self.position.locked_profit(),
@@ -1074,14 +1074,14 @@ impl V2StrategyEngine {
             mode: mode.to_string(),
             current_market: self.state.active_condition_id.clone(),
             phase: format!("{:?}", self.phase),
-            position_summary: format!("YES:{:.0} NO:{:.0}",
+            position_summary: format!("YES:{:.2} NO:{:.2}",
                 self.position.yes.total_shares,
                 self.position.no.total_shares),
-            pairing_summary: format!("paired:{:.0} locked:${:.2}",
+            pairing_summary: format!("paired:{:.2} locked:${:.2}",
                 self.position.paired_shares(),
                 self.position.locked_profit()),
-            unpaired_yes: format!("{:.0}", self.position.unpaired_yes()),
-            unpaired_no: format!("{:.0}", self.position.unpaired_no()),
+            unpaired_yes: format!("{:.2}", self.position.unpaired_yes()),
+            unpaired_no: format!("{:.2}", self.position.unpaired_no()),
             markets_traded: self.diag_markets_traded as u64,
             total_fills: self.position.total_fills() as u64,
             trades_enabled: !self.paused,
@@ -1116,10 +1116,10 @@ impl V2StrategyEngine {
 
         let text = format!(
             "<b>Market Complete</b> ...{short_id}\n\n\
-             YES: {yes_shares:.0} shares @ ${yes_avg:.3} avg\n\
-             NO: {no_shares:.0} shares @ ${no_avg:.3} avg\n\n\
-             Paired: {paired:.0} @ ${pair_cost:.3} = ${locked:.2} locked profit\n\
-             Unpaired YES: {up_yes:.0} | Unpaired NO: {up_no:.0}\n\
+             YES: {yes_shares:.2} shares @ ${yes_avg:.3} avg\n\
+             NO: {no_shares:.2} shares @ ${no_avg:.3} avg\n\n\
+             Paired: {paired:.2} @ ${pair_cost:.3} = ${locked:.2} locked profit\n\
+             Unpaired YES: {up_yes:.2} | Unpaired NO: {up_no:.2}\n\
              Unpaired risk: ${unpaired_risk:.2}\n\
              Net (worst): ${net_worst:.2}\n\
              Capital deployed: ${deployed:.2}\n\
@@ -1169,8 +1169,8 @@ impl V2StrategyEngine {
              Uptime: {}h {:02}m\n\
              Markets traded: {}\n\
              Total fills: {} (YES: {} | NO: {})\n\
-             Current position — YES: {:.0} NO: {:.0}\n\
-             Paired: {:.0} | Locked profit: ${:.2}",
+             Current position — YES: {:.2} NO: {:.2}\n\
+             Paired: {:.2} | Locked profit: ${:.2}",
             uptime_h, uptime_m,
             self.diag_markets_traded,
             self.position.total_fills(),
