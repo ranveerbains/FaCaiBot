@@ -143,6 +143,7 @@ For each side, the quoter checks guards in order:
 3. **USDC exposure**: Skip if `unpaired_usdc >= max_unpaired_usdc` and this side is contributing
 4. **Capital limit**: Skip if `total_capital_deployed >= max_capital_per_market`
 5. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
+6. **Dead-zone guard**: If the opposite side has **no** fills yet (`other_avg == 0`) but the bot already holds unpaired shares on this side, check whether `opposite_fair_value + target_price >= $1.00`. If so, quoting is blocked — the current fair value implies no path to a profitable pair on the other side, so accumulating more unpaired shares is pointless. This prevents "dead-zone" drift where one side fills but the opposite side's fair value makes pairing impossible.
 
 ### Size Computation
 
@@ -180,10 +181,10 @@ Before evaluating quotes, if **either** side has fair value drift `≥ emergency
 
 ### Taker Rebalance
 
-If passive skewing is insufficient and the imbalance exceeds `rebalance_threshold` (default: 20 shares), the engine sends a taker FOK on the lagging side:
+If passive skewing is insufficient and the imbalance exceeds `rebalance_threshold` (default: 15 shares), the engine sends a taker FOK on the lagging side:
 
 - **Cooldown**: Minimum `min_rebalance_interval_ms` (10s) between rebalance attempts
-- **Pair cost guard**: `other_side_avg + best_ask < rebalance_max_pair_cost` (0.96, tighter than closing's 0.97)
+- **Pair cost guard**: `other_side_avg + best_ask < rebalance_max_pair_cost` (0.96)
 - **Size**: `min(rebalance_size, abs_imbalance)`, minimum 5 shares
 - **Only during QUOTING phase** — not triggered during CLOSING
 
@@ -199,13 +200,14 @@ If neither condition is met, the order holds.
 
 ## 6. Closing Phase
 
-In the last `closing_phase_secs` (default: 45s) of a market:
+In the last `closing_phase_secs` (default: 15s) of a market:
 
 1. **Cancel all** resting orders on both sides
 2. **Wait** for all pending operations (cancels, fills) to resolve
 3. **Compute pairing**: Identify the lagging side and the deficit
-4. **Guard checks**: Skip FOK if deficit < 5 shares or if `ask_price × deficit < $1.00` (CLOB notional minimum)
-5. **FOK order**: If `avg_pair_cost_with_taker < max_closing_pair_cost`, send a Fill-or-Kill taker order on the lagging side to pair up remaining shares
+4. **Guard checks**: Skip FOK if deficit < 3 shares
+5. **Notional floor**: If `ask_price × deficit < $1.00` (CLOB notional minimum), instead of skipping the FOK, the closing manager increases the size to `ceil(1 / price)` to meet the $1 minimum. The extra shares beyond the original deficit are cheap insurance — they cost fractions of a cent each and may pair with future fills
+6. **FOK order**: If `avg_pair_cost_with_taker < max_closing_pair_cost`, send a Fill-or-Kill taker order on the lagging side to pair up remaining shares
 
 ### Multi-Attempt FOK
 
@@ -215,9 +217,9 @@ Up to `max_closing_attempts` (default: 3) FOK attempts are made. Each retry prog
 max_pair_cost_for_attempt = max_closing_pair_cost + (attempt - 1) × closing_retry_price_increment
 ```
 
-- Attempt 1: max_pair_cost = 0.97
-- Attempt 2: max_pair_cost = 0.98
-- Attempt 3: max_pair_cost = 0.99
+- Attempt 1: max_pair_cost = 0.95
+- Attempt 2: max_pair_cost = 0.96
+- Attempt 3: max_pair_cost = 0.97
 
 After each FOK result (success or failure), `pairing_sent` is cleared to allow the next retry. The `attempt_count` is incremented before each attempt, and `can_retry()` returns false once `attempt_count >= max_attempts`.
 
@@ -271,7 +273,7 @@ When the Gamma API discovers a new market:
 | **IDLE** | Boot (no market yet) | No quoting, waiting for first rotation |
 | **QUIET** | MarketRotation received | Wait for books to populate, set strike price |
 | **QUOTING** | `now >= quiet_until_ms` | Evaluate and post/requote on both sides. Blocked by: stale vol data, vol tracker not warm, unhealthy heartbeat, fair value estimator not warm, wide Polymarket spread (`> max_entry_spread` on either book), stale Polymarket book (`> stale_book_ms` since last update). Also: bilateral emergency cancel if either side drifts `≥ emergency_requote_threshold`, taker rebalance if imbalance `≥ rebalance_threshold` |
-| **CLOSING** | `time_remaining <= closing_phase_secs × 1000` | Cancel all → wait → multi-attempt FOK pair (up to `max_closing_attempts`, progressively wider price tolerance) |
+| **CLOSING** | `time_remaining <= closing_phase_secs × 1000` | Cancel all → wait → multi-attempt FOK pair (up to `max_closing_attempts`, progressively wider price tolerance). Notional floor: if `price × deficit < $1`, size is bumped to `ceil(1/price)` |
 
 All phases revert to QUIET on the next MarketRotation.
 
@@ -332,17 +334,17 @@ All phases revert to QUIET on the next MarketRotation.
 | `max_unpaired_shares` | 30 | Maximum unpaired shares per side (lowered from 50 to reduce directional exposure) |
 | `max_unpaired_usdc` | 25 | Maximum USDC exposure on unpaired shares |
 | `max_capital_per_market` | 100 | Total USDC deployed across both sides per market |
-| `closing_phase_secs` | 45 | Seconds before expiry to enter closing phase (extended from 30 for multi-attempt FOK) |
-| `rotation_quiet_ms` | 5000 | Quiet period after market rotation (ms) |
-| `max_closing_pair_cost` | 0.97 | Base maximum pair cost for closing FOK (widened per retry) |
+| `closing_phase_secs` | 15 | Seconds before expiry to enter closing phase |
+| `rotation_quiet_ms` | 8000 | Quiet period after market rotation (ms) |
+| `max_closing_pair_cost` | 0.95 | Base maximum pair cost for closing FOK (widened per retry) |
 | `max_closing_attempts` | 3 | Number of FOK pairing attempts during closing |
 | `closing_retry_price_increment` | 0.01 | How much to widen max_pair_cost per retry |
-| `rebalance_threshold` | 20 | Shares imbalance to trigger taker rebalance during QUOTING |
+| `rebalance_threshold` | 15 | Shares imbalance to trigger taker rebalance during QUOTING |
 | `rebalance_size` | 10 | Shares per rebalance FOK order |
 | `rebalance_max_pair_cost` | 0.96 | Max pair cost for rebalance (tighter than closing) |
 | `min_rebalance_interval_ms` | 10000 | Cooldown between rebalance attempts (10s) |
 | `stale_book_ms` | 850 | Polymarket book staleness threshold — blocks quoting if either book is older than this |
-| `max_entry_spread` | 0.04 | Maximum Polymarket book spread — blocks both sides if either book spread exceeds this |
+| `max_entry_spread` | 0.08 | Maximum Polymarket book spread — blocks both sides if either book spread exceeds this |
 | `heartbeat_dead_threshold` | 5 | Consecutive heartbeat failures before unhealthy. On transition, all resting orders auto-cancelled + Telegram alert |
 | `binance_stale_event_ms` | 150 | Binance event staleness threshold |
 
@@ -380,11 +382,14 @@ Three tables, all written via ILP over TCP:
 **`v2_fills`** — Individual fill events (flushed immediately):
 - `condition_id` (symbol), `side` (symbol), `price`, `size`, `was_taker`, `fee`
 - Running totals: `pair_cost`, `paired`, `locked_profit`
+- Model snapshot: `fair_value_yes` (f64), `strike` (f64)
 - `timestamp` (designated ts)
 
 **`v2_market_summaries`** — End-of-market summaries (flushed immediately):
 - `condition_id` (symbol), `yes_shares`, `no_shares`, `yes_avg`, `no_avg`
 - `paired`, `pair_cost`, `locked_profit`, `taker_fees`, `fill_count`
+- Model context: `strike` (f64), `final_fv_yes` (f64)
+- Unpaired breakdown: `unpaired_yes` (f64), `unpaired_no` (f64), `rebalance_count` (i64)
 - `timestamp` (designated ts)
 
 Fill records and market summaries are produced alongside fill notifications and market reports in the engine, then drained and written in the main loop.

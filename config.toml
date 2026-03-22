@@ -8,15 +8,15 @@ momentum_weight_cvd = 0.05
 momentum_weight_obi = 0.05
 max_momentum_adj = 0.08
 # Edge scaling
-vol_edge_scale = 0.5
-time_edge_scale = 0.02
+vol_edge_scale = 0.05
+time_edge_scale = 0.01
 baseline_vol = 0.00003
 # Realized vol tracker
 vol_ring_capacity = 600          # ~30s lookback at 20 ticks/sec
 vol_session_capacity = 6000      # full 5-min session
 vol_freshness_ms = 500           # stale if no update in 500ms
 vol_min_warmup = 10              # minimum samples before valid vol
-vol_default = 0.00003            # default vol before warmup
+vol_default = 0.00001            # default vol before warmup (1/3 baseline for reasonable starting edge)
 vol_ticks_per_sec = 20.0         # BinanceTick cadence
 # Model params
 tail_compression_factor = 0.85   # compress z-score to fatten tails
@@ -50,7 +50,7 @@ emergency_requote_threshold = 0.05  # bypass interval if FV drift >= this
 max_order_size = 10
 min_order_size = 5
 # Inventory skewing — scales linearly with imbalance ratio
-max_imbalance_skew = 0.04           # max skew at full imbalance (replaces flat ±0.01)
+max_imbalance_skew = 0.06           # max skew at full imbalance — 12c spread between sides at max imbalance
 
 [risk_v2]
 # Per-side exposure limits
@@ -59,19 +59,19 @@ max_unpaired_usdc = 20
 # Market-wide limits
 max_capital_per_market = 50
 # Timing
-closing_phase_secs = 45
-rotation_quiet_ms = 5000
+closing_phase_secs = 25
+rotation_quiet_ms = 10000
 # Closing phase
 max_closing_pair_cost = 0.97
 max_closing_attempts = 3             # multi-attempt FOK (was 1 one-shot)
 closing_retry_price_increment = 0.01 # accept 1 tick worse per retry
 # Taker rebalance (active imbalance correction)
-rebalance_threshold = 9            # shares imbalance to trigger taker rebalance
+rebalance_threshold = 6             # shares imbalance to trigger taker rebalance
 rebalance_size = 5                   # shares per rebalance order
 rebalance_max_pair_cost = 0.96       # max pair cost for rebalance (tighter than closing)
 min_rebalance_interval_ms = 2500    # s cooldown between rebalances
 # Data quality
 stale_book_ms = 850
-max_entry_spread = 0.06
+max_entry_spread = 0.08
 heartbeat_dead_threshold = 5
 binance_stale_event_ms = 150

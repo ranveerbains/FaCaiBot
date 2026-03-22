@@ -80,7 +80,7 @@ impl ClosingManager {
             return None; // already balanced
         }
 
-        let min_deficit = Decimal::new(5, 0);
+        let min_deficit = Decimal::new(3, 0);
 
         if yes_shares > no_shares {
             // Need more NO shares
@@ -89,10 +89,13 @@ impl ClosingManager {
                 return None;
             }
             let no_ask = no_best_ask?;
-            // $1 notional minimum
-            if no_ask * deficit < Decimal::new(1, 0) {
+            // Ensure $1 notional minimum — increase size if needed rather than skipping
+            let deficit = if no_ask > Decimal::ZERO {
+                let min_notional_size = (Decimal::ONE / no_ask).ceil();
+                deficit.max(min_notional_size)
+            } else {
                 return None;
-            }
+            };
             let pair_cost = position.yes.avg_price() + no_ask;
             if pair_cost >= max_pair_cost {
                 return None; // too expensive
@@ -120,10 +123,13 @@ impl ClosingManager {
                 return None;
             }
             let yes_ask = yes_best_ask?;
-            // $1 notional minimum
-            if yes_ask * deficit < Decimal::new(1, 0) {
+            // Ensure $1 notional minimum — increase size if needed rather than skipping
+            let deficit = if yes_ask > Decimal::ZERO {
+                let min_notional_size = (Decimal::ONE / yes_ask).ceil();
+                deficit.max(min_notional_size)
+            } else {
                 return None;
-            }
+            };
             let pair_cost = yes_ask + position.no.avg_price();
             if pair_cost >= max_pair_cost {
                 return None;
@@ -259,8 +265,8 @@ mod tests {
     #[test]
     fn test_pairing_deficit_below_minimum() {
         let mut pos = BilateralPosition::new();
-        // 23 YES, 20 NO → deficit = 3 (below min 5)
-        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("23"), false, dec("0"));
+        // 22 YES, 20 NO → deficit = 2 (below min 3)
+        pos.record_fill(MarketSide::Yes, dec("0.42"), dec("22"), false, dec("0"));
         pos.record_fill(MarketSide::No, dec("0.48"), dec("20"), false, dec("0"));
 
         let action = ClosingManager::compute_pairing(
@@ -268,7 +274,7 @@ mod tests {
             Some(dec("0.43")), Some(dec("0.49")),
             dec("0.97"), dec("100"),
         );
-        assert!(action.is_none(), "deficit of 3 should be below min 5");
+        assert!(action.is_none(), "deficit of 2 should be below min 3");
     }
 
     #[test]

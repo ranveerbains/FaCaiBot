@@ -157,6 +157,7 @@ impl Quoter {
         quoting: &QuotingConfig,
         risk: &RiskV2Config,
         now_ms: u64,
+        opposite_fair_value: Decimal,
     ) -> Option<QuoteAction> {
         // ── Guards ──
         if self.is_pending(side) {
@@ -184,6 +185,16 @@ impl Quoter {
         if other_avg > Decimal::ZERO {
             let projected_pair_cost = other_avg + target_price;
             if projected_pair_cost >= Decimal::ONE {
+                return None;
+            }
+        }
+
+        // Dead-zone guard: if we have unpaired shares on THIS side but no fills
+        // on the opposite side, use opposite fair value as a proxy for pairing cost.
+        // If even at fair value the pair cost is >= $1.00, stop accumulating.
+        if other_avg == Decimal::ZERO && position.unpaired(side) > Decimal::ZERO {
+            let projected = opposite_fair_value + target_price;
+            if projected >= Decimal::ONE {
                 return None;
             }
         }
@@ -468,7 +479,7 @@ mod tests {
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
     }
@@ -482,7 +493,7 @@ mod tests {
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(action.is_none());
     }
@@ -497,7 +508,7 @@ mod tests {
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(action.is_none());
     }
@@ -512,7 +523,7 @@ mod tests {
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(action.is_none());
     }
@@ -535,7 +546,7 @@ mod tests {
         // Fair value shifted by 0.02 (> threshold 0.01), 3s elapsed (> 2s min)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
-            &position, &qc, &rc, 7000,
+            &position, &qc, &rc, 7000, dec("0.50"),
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
     }
@@ -558,7 +569,7 @@ mod tests {
         // Fair value barely moved (0.005 < threshold 0.01)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.425"), dec("0.455"), "yes_token",
-            &position, &qc, &rc, 7000,
+            &position, &qc, &rc, 7000, dec("0.50"),
         );
         assert!(action.is_none());
     }
@@ -598,7 +609,7 @@ mod tests {
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.45"), dec("0.48"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         // Remaining capital = 100 - 90 = 10. At 0.45, that's ~22 shares.
         // But max_order_size is 100 and min is 5, so should post with capped size.
@@ -708,7 +719,7 @@ mod tests {
         // FV drift 0.06 (>= emergency 0.05), only 500ms elapsed (< min_requote 2000ms)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.48"), dec("0.51"), "yes_token",
-            &position, &qc, &rc, 1500,
+            &position, &qc, &rc, 1500, dec("0.50"),
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
     }
@@ -724,7 +735,7 @@ mod tests {
         // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.45"), dec("0.50"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(action.is_none());
     }
@@ -740,7 +751,7 @@ mod tests {
         // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.39"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
     }
@@ -754,7 +765,7 @@ mod tests {
         // No opposite fills → guard skipped → normal post
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.85"), dec("0.90"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc, &rc, 1000, dec("0.50"),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
     }
@@ -777,7 +788,7 @@ mod tests {
         // FV drift 0.02 (>= threshold 0.01, < emergency 0.05), only 500ms elapsed
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
-            &position, &qc, &rc, 1500,
+            &position, &qc, &rc, 1500, dec("0.50"),
         );
         assert!(action.is_none());
     }

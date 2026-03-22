@@ -74,6 +74,7 @@ pub struct V2StrategyEngine {
     // ── Rebalance state ──
     last_rebalance_ms: u64,
     pending_rebalance: bool,
+    diag_rebalances: u32,
 
     // ── Pending commands ──
     pending_commands: Vec<V2ExecutorCommand>,
@@ -203,6 +204,7 @@ impl V2StrategyEngine {
             diag_markets_traded: 0,
             last_rebalance_ms: 0,
             pending_rebalance: false,
+            diag_rebalances: 0,
             pending_commands: Vec::new(),
             pending_tick_change: None,
             pending_telegram_diag: None,
@@ -430,6 +432,7 @@ impl V2StrategyEngine {
 
         self.last_rebalance_ms = 0;
         self.pending_rebalance = false;
+        self.diag_rebalances = 0;
         self.pending_fill_messages.clear();
         self.pending_fill_records.clear();
 
@@ -774,7 +777,7 @@ impl V2StrategyEngine {
         if yes_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                &self.position, &self.quoting_config, &self.risk_config, now,
+                &self.position, &self.quoting_config, &self.risk_config, now, no_fv,
             )
         {
             actions.push(a);
@@ -782,7 +785,7 @@ impl V2StrategyEngine {
         if no_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::No, no_target, no_fv, &no_token,
-                &self.position, &self.quoting_config, &self.risk_config, now,
+                &self.position, &self.quoting_config, &self.risk_config, now, yes_fv,
             )
         {
             actions.push(a);
@@ -838,6 +841,7 @@ impl V2StrategyEngine {
                     if size >= Decimal::new(5, 0) {
                         self.pending_rebalance = true;
                         self.last_rebalance_ms = now;
+                        self.diag_rebalances += 1;
                         commands.push(V2ExecutorCommand::RebalanceTaker {
                             side: rebal_side,
                             token_id: rebal_token,
@@ -1068,6 +1072,8 @@ impl V2StrategyEngine {
             pair_cost: self.position.avg_pair_cost().to_f64().unwrap_or(0.0),
             paired: self.position.paired_shares().to_f64().unwrap_or(0.0),
             locked_profit: self.position.locked_profit().to_f64().unwrap_or(0.0),
+            fair_value_yes: self.fair_value.yes_fair_value().to_f64().unwrap_or(0.0),
+            strike: self.strike_price.and_then(|s| s.to_f64()).unwrap_or(0.0),
             timestamp_ms: now,
         });
     }
@@ -1181,6 +1187,11 @@ impl V2StrategyEngine {
             locked_profit: locked.to_f64().unwrap_or(0.0),
             taker_fees: self.position.total_taker_fees().to_f64().unwrap_or(0.0),
             fill_count: self.position.total_fills() as i64,
+            strike: self.strike_price.and_then(|s| s.to_f64()).unwrap_or(0.0),
+            final_fv_yes: self.fair_value.yes_fair_value().to_f64().unwrap_or(0.0),
+            unpaired_yes: self.position.unpaired_yes().to_f64().unwrap_or(0.0),
+            unpaired_no: self.position.unpaired_no().to_f64().unwrap_or(0.0),
+            rebalance_count: self.diag_rebalances as i64,
             timestamp_ms: epoch_ms(),
         });
     }

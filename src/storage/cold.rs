@@ -139,6 +139,8 @@ impl ColdStorage {
             .column_f64("pair_cost", record.pair_cost)?
             .column_f64("paired", record.paired)?
             .column_f64("locked_profit", record.locked_profit)?
+            .column_f64("fair_value_yes", record.fair_value_yes)?
+            .column_f64("strike", record.strike)?
             .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
 
         self.sender
@@ -163,6 +165,11 @@ impl ColdStorage {
             .column_f64("locked_profit", record.locked_profit)?
             .column_f64("taker_fees", record.taker_fees)?
             .column_i64("fill_count", record.fill_count)?
+            .column_f64("strike", record.strike)?
+            .column_f64("final_fv_yes", record.final_fv_yes)?
+            .column_f64("unpaired_yes", record.unpaired_yes)?
+            .column_f64("unpaired_no", record.unpaired_no)?
+            .column_i64("rebalance_count", record.rebalance_count)?
             .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
 
         self.sender
@@ -205,6 +212,8 @@ pub struct FillRecord {
     pub pair_cost: f64,
     pub paired: f64,
     pub locked_profit: f64,
+    pub fair_value_yes: f64,
+    pub strike: f64,
     pub timestamp_ms: u64,
 }
 
@@ -220,6 +229,11 @@ pub struct MarketSummaryRecord {
     pub locked_profit: f64,
     pub taker_fees: f64,
     pub fill_count: i64,
+    pub strike: f64,
+    pub final_fv_yes: f64,
+    pub unpaired_yes: f64,
+    pub unpaired_no: f64,
+    pub rebalance_count: i64,
     pub timestamp_ms: u64,
 }
 
