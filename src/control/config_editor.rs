@@ -52,7 +52,9 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "quoting.max_order_size", min: 1.0, max: 100000.0 },
     ParamSpec { name: "quoting.min_order_size", min: 0.01, max: 1000.0 },
     ParamSpec { name: "quoting.emergency_requote_threshold", min: 0.01, max: 0.20 },
-    ParamSpec { name: "quoting.max_imbalance_skew", min: 0.0, max: 0.10 },
+    ParamSpec { name: "quoting.max_imbalance_skew", min: 0.0, max: 0.20 },
+    ParamSpec { name: "quoting.max_one_sided_shares", min: 1.0, max: 100.0 },
+    ParamSpec { name: "quoting.max_fair_value_extremity", min: 0.50, max: 0.98 },
     // risk_v2
     ParamSpec { name: "risk_v2.max_unpaired_shares", min: 0.0, max: 100000.0 },
     ParamSpec { name: "risk_v2.max_unpaired_usdc", min: 0.0, max: 100000.0 },

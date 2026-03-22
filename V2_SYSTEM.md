@@ -131,8 +131,9 @@ Before evaluating either side, these conditions must ALL be met — otherwise bo
 2. **Vol data fresh**: Short-window vol tracker must have been updated within `vol_freshness_ms`
 3. **Vol tracker warm**: Vol tracker must have `≥ vol_min_warmup` samples (belts-and-suspenders — Binance data will almost always warm it during the 5s quiet period, but blocks quoting if data lags)
 4. **Heartbeat healthy**: Fewer than `heartbeat_dead_threshold` consecutive heartbeat failures. On healthy→unhealthy transition, all resting orders are automatically cancelled and a Telegram critical alert is sent
-4. **Polymarket spread**: Neither YES nor NO book spread exceeds `max_entry_spread`
-5. **Polymarket book fresh**: Both YES and NO books must have been updated within `stale_book_ms`
+5. **Polymarket spread**: Neither YES nor NO book spread exceeds `max_entry_spread`
+6. **Polymarket book fresh**: Both YES and NO books must have been updated within `stale_book_ms`
+7. **FV extremity guard**: If YES fair value exceeds `max_fair_value_extremity` (default: 0.85) or is below `1 - max_fair_value_extremity` (0.15), skip quoting entirely. At extreme fair values, the cheap side cannot fill at any profitable price, making pairing structurally impossible. This is the deepest protection against one-sided accumulation
 
 ### Per-Side Evaluation
 
@@ -142,8 +143,9 @@ For each side, the quoter checks guards in order:
 2. **Unpaired limit**: Skip if `unpaired_shares(side) >= max_unpaired_shares`
 3. **USDC exposure**: Skip if `unpaired_usdc >= max_unpaired_usdc` and this side is contributing
 4. **Capital limit**: Skip if `total_capital_deployed >= max_capital_per_market`
-5. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
-6. **Dead-zone guard**: If the opposite side has **no** fills yet (`other_avg == 0`) but the bot already holds unpaired shares on this side, check whether `opposite_fair_value + target_price >= $1.00`. If so, quoting is blocked — the current fair value implies no path to a profitable pair on the other side, so accumulating more unpaired shares is pointless. This prevents "dead-zone" drift where one side fills but the opposite side's fair value makes pairing impossible.
+5. **One-sided accumulation guard**: If the opposite side has **zero fills** (`other_shares == 0`), skip if `unpaired(side) >= max_one_sided_shares` (default: 5). Caps exposure when pairing is impossible — prevents turning bilateral market-making into a naked directional bet
+6. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
+7. **Book-aware pair-cost check**: If the bot has unpaired shares on this side, check pairing viability using actual book data. If `opposite_best_ask` is `None` and there are no opposite fills (`other_avg == 0`), block (no pairing path exists). If `opposite_best_ask + target_price >= $1.00`, block (next pair unprofitable at current book prices).
 
 ### Size Computation
 
@@ -326,6 +328,8 @@ All phases revert to QUIET on the next MarketRotation.
 | `max_order_size` | 100 | Maximum shares per order |
 | `min_order_size` | 5 | Minimum shares per order (below this, skip posting) |
 | `max_imbalance_skew` | 0.02 | Maximum edge skew at full imbalance (linearly scaled). Replaces flat `imbalance_edge_tightening`/`widening` |
+| `max_one_sided_shares` | 5 | Hard cap on unpaired shares when opposite side has zero fills. Prevents one-sided accumulation turning into naked directional bets |
+| `max_fair_value_extremity` | 0.85 | Don't quote when either side's FV exceeds this (or is below 1 - this). At extremes, the cheap side can't fill, making pairing impossible |
 
 ### `[risk_v2]` — Risk Limits
 

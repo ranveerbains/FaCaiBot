@@ -15,7 +15,7 @@ use crate::engine::quoter::{ManagedOrder, QuoteAction, Quoter, QuotingConfig, Ri
 use crate::executor::fill_engine::{compute_taker_fee, round_to_tick};
 use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::{FillRecord, MarketSummaryRecord};
-use crate::types::market::{IngestorEvent, MarketState, TradeStatus};
+use crate::types::market::{IngestorEvent, MarketState, PriceLevel, TradeStatus};
 use crate::types::order::{V2ExecutorCommand, V2ExecutorFeedback};
 use crate::utils::time::epoch_ms;
 
@@ -143,6 +143,9 @@ impl V2StrategyEngine {
             min_order_size: Decimal::try_from(q_toml.min_order_size).unwrap_or(Decimal::new(5, 0)),
             emergency_requote_threshold: q_toml.emergency_requote_threshold,
             max_imbalance_skew: q_toml.max_imbalance_skew,
+            max_one_sided_shares: Decimal::try_from(q_toml.max_one_sided_shares)
+                .unwrap_or(Decimal::new(5, 0)),
+            max_fair_value_extremity: q_toml.max_fair_value_extremity,
         };
 
         let r_toml = &config.bot.risk_v2;
@@ -297,9 +300,31 @@ impl V2StrategyEngine {
                 self.state.last_update_ms = now;
             }
 
-            IngestorEvent::PolymarketPriceChange { asset_id, .. } |
-            IngestorEvent::PolymarketBestBidAsk { asset_id, .. } => {
-                let _ = asset_id;
+            IngestorEvent::PolymarketBestBidAsk { asset_id, best_bid, best_ask } => {
+                let book_ref = if Some(&asset_id) == self.state.active_yes_token_id.as_ref() {
+                    self.state.poly_yes_book.as_mut()
+                } else if Some(&asset_id) == self.state.active_no_token_id.as_ref() {
+                    self.state.poly_no_book.as_mut()
+                } else {
+                    None
+                };
+                if let Some(book) = book_ref {
+                    book.bids = if best_bid > Decimal::ZERO {
+                        vec![PriceLevel { price: best_bid, size: Decimal::ONE }]
+                    } else {
+                        vec![]
+                    };
+                    book.asks = if best_ask > Decimal::ZERO {
+                        vec![PriceLevel { price: best_ask, size: Decimal::ONE }]
+                    } else {
+                        vec![]
+                    };
+                    book.timestamp_ms = now;
+                }
+                self.state.last_update_ms = now;
+            }
+
+            IngestorEvent::PolymarketPriceChange { .. } => {
                 self.state.last_update_ms = now;
             }
 
@@ -697,6 +722,16 @@ impl V2StrategyEngine {
             return Vec::new();
         }
 
+        // FV extremity guard: don't quote when fair value is too extreme
+        // (the cheap side cannot fill, making pairing structurally impossible)
+        let yes_fv_check = self.fair_value.yes_fair_value();
+        let max_extreme = Decimal::try_from(self.quoting_config.max_fair_value_extremity)
+            .unwrap_or(Decimal::new(85, 2));
+        let min_extreme = Decimal::ONE - max_extreme;
+        if yes_fv_check > max_extreme || yes_fv_check < min_extreme {
+            return Vec::new();
+        }
+
         let (yes_token, no_token) = match (
             self.state.active_yes_token_id.clone(),
             self.state.active_no_token_id.clone(),
@@ -777,7 +812,8 @@ impl V2StrategyEngine {
         if yes_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                &self.position, &self.quoting_config, &self.risk_config, now, no_fv,
+                &self.position, &self.quoting_config, &self.risk_config, now,
+                no_best_ask,
             )
         {
             actions.push(a);
@@ -785,7 +821,8 @@ impl V2StrategyEngine {
         if no_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::No, no_target, no_fv, &no_token,
-                &self.position, &self.quoting_config, &self.risk_config, now, yes_fv,
+                &self.position, &self.quoting_config, &self.risk_config, now,
+                yes_best_ask,
             )
         {
             actions.push(a);

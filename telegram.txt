@@ -1,0 +1,211 @@
+[22/3/26 7:45 PM] r b: /balance
+[22/3/26 7:45 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $388.028881
+POL: 151.9048
+[22/3/26 7:46 PM] facaibot: Trading paused. Use /resume to restart.
+[22/3/26 7:46 PM] r b: /stop
+[22/3/26 7:49 PM] facaibot: Trading resumed.
+[22/3/26 7:49 PM] r b: /resume
+[22/3/26 7:51 PM] facaibot: MAKER YES 10.00@$0.540 | YES:10.00 NO:0.00 | paired:0.00 locked:$0.00
+[22/3/26 7:51 PM] facaibot: TAKER NO 5.00@$0.410 | YES:10.00 NO:5.00 | paired:5.00 locked:$0.25
+[22/3/26 7:52 PM] facaibot: MAKER YES 10.00@$0.100 | YES:20.00 NO:5.00 | paired:5.00 locked:$1.35
+[22/3/26 7:53 PM] r b: /polybalance
+[22/3/26 7:53 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $8.32
+[22/3/26 7:54 PM] facaibot: TAKER NO 5.00@$0.630 | YES:20.00 NO:10.00 | paired:10.00 locked:$1.60
+[22/3/26 7:54 PM] facaibot: MAKER NO 10.00@$0.530 | YES:20.00 NO:20.00 | paired:20.00 locked:$3.10
+[22/3/26 7:54 PM] facaibot: MAKER YES 10.00@$0.460 | YES:30.00 NO:20.00 | paired:20.00 locked:$2.16
+[22/3/26 7:54 PM] facaibot: TAKER NO 5.00@$0.550 | YES:30.00 NO:25.00 | paired:25.00 locked:$2.58
+[22/3/26 7:54 PM] facaibot: TAKER NO 5.00@$0.520 | YES:30.00 NO:30.00 | paired:30.00 locked:$3.15
+[22/3/26 7:54 PM] facaibot: Market Complete ...cbe3b7dd
+
+YES: 30.00 shares @ $0.366 avg
+NO: 30.00 shares @ $0.528 avg
+
+Paired: 30.00 @ $0.895 = $3.15 locked profit
+Unpaired YES: 0.00 | Unpaired NO: 0.00
+Unpaired risk: $0.00
+Net (worst): $2.99
+Capital deployed: $26.85
+Taker fees: $0.1553
+[22/3/26 7:55 PM] facaibot: Auto-redeem: Redemption complete: 0 redeemed, 1 skipped
+
+Errors:
+- 0x3cfe...b7dd: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+[22/3/26 7:56 PM] r b: /redeem
+[22/3/26 7:57 PM] facaibot: Redemption complete: 1 redeemed, 0 skipped
+[22/3/26 7:57 PM] r b: /balance
+[22/3/26 7:57 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $387.078882
+POL: 151.8882
+[22/3/26 7:57 PM] r b: /balance
+[22/3/26 7:57 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $387.078882
+POL: 151.8882
+[22/3/26 7:57 PM] facaibot: MAKER NO 10.00@$0.910 | YES:0.00 NO:10.00 | paired:0.00 locked:$0.00
+[22/3/26 7:58 PM] facaibot: TAKER YES 25.00@$0.040 | YES:25.00 NO:10.00 | paired:10.00 locked:$0.50
+[22/3/26 7:58 PM] facaibot: MAKER NO 10.00@$0.950 | YES:25.00 NO:20.00 | paired:20.00 locked:$0.60
+[22/3/26 7:58 PM] facaibot: MAKER NO 10.00@$0.940 | YES:25.00 NO:30.00 | paired:25.00 locked:$0.66
+[22/3/26 7:59 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $27.57
+[22/3/26 7:59 PM] r b: /polybalance
+[22/3/26 7:59 PM] facaibot: TAKER YES 100.00@$0.010 | YES:125.00 NO:30.00 | paired:30.00 locked:$1.52
+[22/3/26 7:59 PM] r b: /polybalance
+[22/3/26 7:59 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $35.22
+[22/3/26 7:59 PM] facaibot: Market Complete ...bda29939
+
+YES: 125.00 shares @ $0.016 avg
+NO: 30.00 shares @ $0.933 avg
+
+Paired: 30.00 @ $0.949 = $1.52 locked profit
+Unpaired YES: 95.00 | Unpaired NO: 0.00
+Unpaired risk: $1.52
+Net (worst): $-0.00
+Capital deployed: $30.00
+Taker fees: $0.0003
+[22/3/26 8:01 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $387.078882
+POL: 151.8322
+[22/3/26 8:01 PM] facaibot: Redemption complete: 1 redeemed, 0 skipped
+[22/3/26 8:02 PM] facaibot: MAKER YES 10.00@$0.920 | YES:10.00 NO:0.00 | paired:0.00 locked:$0.00
+[22/3/26 8:02 PM] facaibot: MAKER YES 10.00@$0.890 | YES:20.00 NO:0.00 | paired:0.00 locked:$0.00
+[22/3/26 8:04 PM] facaibot: Market Complete ...634f659c
+
+YES: 20.00 shares @ $0.905 avg
+NO: 0.00 shares @ $0.000 avg
+
+Paired: 0.00 @ $0.905 = $0.00 locked profit
+Unpaired YES: 20.00 | Unpaired NO: 0.00
+Unpaired risk: $18.10
+Net (worst): $-18.10
+Capital deployed: $18.10
+Taker fees: $0.0000
+[22/3/26 8:05 PM] r b: /polybalance
+[22/3/26 8:05 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 1
+Market value: $17.20
+[22/3/26 8:05 PM] r b: /polybalance
+[22/3/26 8:05 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 1
+Market value: $17.20
+[22/3/26 8:05 PM] r b: /balance
+[22/3/26 8:05 PM] facaibot: Redemption complete: 1 redeemed, 0 skipped
+[22/3/26 8:06 PM] r b: /balance
+[22/3/26 8:06 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $368.978882
+POL: 151.7783
+[22/3/26 8:09 PM] facaibot: MAKER YES 10.00@$0.930 | YES:10.00 NO:0.00 | paired:0.00 locked:$0.00
+[22/3/26 8:09 PM] facaibot: TAKER NO 50.00@$0.020 | YES:10.00 NO:50.00 | paired:10.00 locked:$0.50
+[22/3/26 8:09 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 1
+Market value: $6.85
+[22/3/26 8:09 PM] r b: /polybalance
+[22/3/26 8:09 PM] r b: /balance
+[22/3/26 8:09 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $358.678882
+POL: 151.7783
+[22/3/26 8:09 PM] facaibot: Market Complete ...b8ec37d5
+
+YES: 10.00 shares @ $0.930 avg
+NO: 50.00 shares @ $0.020 avg
+
+Paired: 10.00 @ $0.950 = $0.50 locked profit
+Unpaired YES: 0.00 | Unpaired NO: 40.00
+Unpaired risk: $0.80
+Net (worst): $-0.30
+Capital deployed: $10.30
+Taker fees: $0.0000
+[22/3/26 8:10 PM] r b: /polybalance
+[22/3/26 8:10 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $22.60
+[22/3/26 8:10 PM] facaibot: MAKER NO 10.00@$0.430 | YES:0.00 NO:10.00 | paired:0.00 locked:$0.00
+[22/3/26 8:10 PM] facaibot: MAKER YES 5.00@$0.520 | YES:5.00 NO:10.00 | paired:5.00 locked:$0.25
+[22/3/26 8:10 PM] facaibot: MAKER YES 5.00@$0.520 | YES:10.00 NO:10.00 | paired:10.00 locked:$0.50
+[22/3/26 8:10 PM] r b: /redeem
+[22/3/26 8:10 PM] facaibot: Redemption complete: 0 redeemed, 2 skipped
+
+Errors:
+- 0x00bc...1f48: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+- 0xd3e9...37d5: receipt timed out
+[22/3/26 8:11 PM] r b: /redeem
+[22/3/26 8:11 PM] facaibot: Auto-redeem: Redemption complete: 1 redeemed, 1 skipped
+
+Errors:
+- 0x00bc...1f48: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+[22/3/26 8:11 PM] r b: /balance
+[22/3/26 8:11 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $359.178882
+POL: 151.7395
+[22/3/26 8:11 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $10.00
+[22/3/26 8:11 PM] r b: /polybalance
+[22/3/26 8:11 PM] facaibot: MAKER YES 7.44@$0.550 | YES:17.44 NO:10.00 | paired:10.00 locked:$0.37
+[22/3/26 8:11 PM] facaibot: MAKER YES 2.55@$0.550 | YES:19.99 NO:10.00 | paired:10.00 locked:$0.35
+[22/3/26 8:11 PM] r b: /polybalance
+[22/3/26 8:11 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $16.95
+[22/3/26 8:11 PM] facaibot: MAKER NO 10.00@$0.460 | YES:19.99 NO:20.00 | paired:19.99 locked:$0.39
+[22/3/26 8:12 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $20.00
+[22/3/26 8:12 PM] r b: /polybalance
+[22/3/26 8:12 PM] r b: /polybalance
+[22/3/26 8:12 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $20.00
+[22/3/26 8:12 PM] facaibot: MAKER YES 10.00@$0.540 | YES:29.99 NO:20.00 | paired:20.00 locked:$0.36
+[22/3/26 8:12 PM] facaibot: TAKER NO 5.00@$0.420 | YES:29.99 NO:25.00 | paired:25.00 locked:$0.58
+[22/3/26 8:12 PM] facaibot: MAKER NO 10.00@$0.460 | YES:29.99 NO:35.00 | paired:29.99 locked:$0.52
+[22/3/26 8:14 PM] facaibot: MAKER NO 10.00@$0.170 | YES:29.99 NO:45.00 | paired:29.99 locked:$2.36
+[22/3/26 8:14 PM] r b: /polybalance
+[22/3/26 8:14 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $37.72
+[22/3/26 8:14 PM] facaibot: TAKER YES 5.00@$0.570 | YES:34.99 NO:45.00 | paired:34.99 locked:$2.59
+[22/3/26 8:14 PM] r b: /balance
+[22/3/26 8:14 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $335.281939
+POL: 151.7395
+[22/3/26 8:14 PM] facaibot: TAKER YES 10.00@$0.510 | YES:44.99 NO:45.00 | paired:44.99 locked:$3.64
+[22/3/26 8:14 PM] r b: /polybalance
+[22/3/26 8:14 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $45.18
+[22/3/26 8:14 PM] r b: /balance
+[22/3/26 8:14 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $327.331939
+POL: 151.7395
+[22/3/26 8:14 PM] facaibot: Market Complete ...f15e1f48
+
+YES: 44.99 shares @ $0.534 avg
+NO: 45.00 shares @ $0.384 avg
+
+Paired: 44.99 @ $0.918 = $3.64 locked profit
+Unpaired YES: 0.00 | Unpaired NO: 0.00
+Unpaired risk: $0.00
+Net (worst): $3.49
+Capital deployed: $41.34
+Taker fees: $0.1535
+[22/3/26 8:15 PM] facaibot: MAKER YES 10.00@$0.530 | YES:10.00 NO:0.00 | paired:0.00 locked:$0.00
+[22/3/26 8:15 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+USDC.e: $327.331939
+POL: 151.7395
+[22/3/26 8:15 PM] r b: /balance
+[22/3/26 8:15 PM] facaibot: MAKER NO 10.00@$0.310 | YES:10.00 NO:10.00 | paired:10.00 locked:$1.60
+[22/3/26 8:15 PM] facaibot: MAKER YES 10.00@$0.580 | YES:20.00 NO:10.00 | paired:10.00 locked:$1.35
+[22/3/26 8:16 PM] facaibot: Auto-redeem: Redemption complete: 1 redeemed, 1 skipped
+
+Errors:
+- 0x8e8a...a195: server returned an error response: error code 3: execution reverted: result for condition not received yet, data: "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000025726573756c7420666f7220636f6e646974696f6e206e6f7420726563656976656420796574000000000000000000000000000000000000000000000000000000"
+[22/3/26 8:16 PM] r b: /polybalance
+[22/3/26 8:16 PM] facaibot: Wallet: 0x0a3a574856fBf301C4Eb67d41cCB1ba08F4b3C85
+Positions: 2
+Market value: $15.15
+[22/3/26 8:16 PM] r b: /balance

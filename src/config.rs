@@ -105,6 +105,8 @@ pub struct QuotingTomlConfig {
     pub min_order_size: f64,
     pub emergency_requote_threshold: f64,
     pub max_imbalance_skew: f64,
+    pub max_one_sided_shares: f64,
+    pub max_fair_value_extremity: f64,
 }
 
 impl Default for QuotingTomlConfig {
@@ -117,6 +119,8 @@ impl Default for QuotingTomlConfig {
             min_order_size: 5.0,
             emergency_requote_threshold: 0.05,
             max_imbalance_skew: 0.02,
+            max_one_sided_shares: 5.0,
+            max_fair_value_extremity: 0.85,
         }
     }
 }

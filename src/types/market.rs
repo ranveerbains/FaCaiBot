@@ -222,9 +222,7 @@ pub enum IngestorEvent {
     },
     PolymarketBestBidAsk {
         asset_id: String,
-        #[allow(dead_code)]
         best_bid: Decimal,
-        #[allow(dead_code)]
         best_ask: Decimal,
     },
     PolymarketTickSizeChange {

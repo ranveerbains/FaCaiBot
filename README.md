@@ -20,10 +20,10 @@ See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARC
 chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
 
 ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
+ec2-user@ec2-34-244-199-252.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
+ ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-34-244-199-252.eu-west-1.compute.amazonaws.com
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
