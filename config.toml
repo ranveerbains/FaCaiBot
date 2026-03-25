@@ -47,7 +47,7 @@ requote_threshold = 0.01
 # Order sizing
 max_order_size = 15
 min_order_size = 5
-max_fair_value_extremity = 0.75      # don't quote when either FV > this (pairing infeasible)
+max_fair_value_extremity = 0.78      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
 # Timing
