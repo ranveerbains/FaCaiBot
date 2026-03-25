@@ -54,7 +54,7 @@ max_fair_value_extremity = 0.75      # don't quote when either FV > this (pairin
 rotation_quiet_ms = 10000
 # Taker rebalance (active imbalance correction)
 rebalance_threshold = 4.99             # shares imbalance to trigger taker rebalance
-rebalance_size = 15                   # shares per rebalance order
+rebalance_size = 30                   # shares per rebalance order
 rebalance_max_pair_cost = 0.98      # max pair cost for rebalance (only rebalance when profitable)
 # Data quality
 stale_book_ms = 850

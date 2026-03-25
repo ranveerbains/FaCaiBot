@@ -105,21 +105,22 @@ pub fn max_total_shares(max_size: Decimal, min_size: Decimal) -> Decimal {
     total
 }
 
-/// Compute dynamic order size based on paired shares.
+/// Compute dynamic order size based on per-side accumulated shares.
 ///
-/// Halves the order size at each pairing milestone (floored at `min_size`).
+/// Halves the order size at each accumulation milestone (floored at `min_size`).
+/// Each side tracks independently — heavy side reduces faster.
 ///
-/// Example with max=10, min=5:
-/// - 0..9 paired → 10 (batch 1)
-/// - 10..14 paired → 5 (batch 2)
-/// - 15+ paired → 5 (batch 3)
-pub fn dynamic_order_size(max_size: Decimal, min_size: Decimal, paired: Decimal) -> Decimal {
+/// Example with max=15, min=5:
+/// - 0..14 shares on this side → 15 (batch 1)
+/// - 15..22.4 → 7.5 (batch 2)
+/// - 22.5+ → 5 (batch 3)
+pub fn dynamic_order_size(max_size: Decimal, min_size: Decimal, side_shares: Decimal) -> Decimal {
     let two = Decimal::TWO;
     let mut size = max_size;
     let mut threshold = Decimal::ZERO;
     for _ in 0..3 {
         threshold += size;
-        if paired < threshold {
+        if side_shares < threshold {
             return size;
         }
         size = (size / two).max(min_size);
@@ -217,7 +218,7 @@ impl Quoter {
         let dynamic_max = dynamic_order_size(
             quoting.max_order_size,
             quoting.min_order_size,
-            position.paired_shares(),
+            side_shares,
         );
 
         if target_price <= Decimal::ZERO {
