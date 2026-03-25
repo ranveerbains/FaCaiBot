@@ -52,7 +52,7 @@ min_order_size = 5
 # Inventory skewing — scales linearly with imbalance ratio
 max_imbalance_skew = 0.12            # max skew at full imbalance — steeper to halt heavy side
 max_one_sided_shares = 10             # hard cap before opposite side fills
-max_fair_value_extremity = 0.80      # don't quote when either FV > this (pairing infeasible)
+max_fair_value_extremity = 0.75      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
 # Per-side exposure limits
@@ -61,17 +61,17 @@ max_unpaired_usdc = 100
 # Market-wide limits
 max_capital_per_market = 30
 # Timing
-closing_phase_secs = 30
+closing_phase_secs = 45
 rotation_quiet_ms = 10000
 # Closing phase
 max_closing_pair_cost = 0.97
 max_closing_attempts = 3             # multi-attempt FOK (was 1 one-shot)
 closing_retry_price_increment = 0.01 # accept 1 tick worse per retry
 # Taker rebalance (active imbalance correction)
-rebalance_threshold = 5             # shares imbalance to trigger taker rebalance
-rebalance_size = 5                   # shares per rebalance order
-rebalance_max_pair_cost = 0.95      # max pair cost for rebalance (only rebalance when profitable)
-min_rebalance_interval_ms = 2500    # fast response to imbalance (profitability guarded by rebalance_max_pair_cost)
+rebalance_threshold = 4.99             # shares imbalance to trigger taker rebalance
+rebalance_size = 10                   # shares per rebalance order
+rebalance_max_pair_cost = 0.97      # max pair cost for rebalance (only rebalance when profitable)
+min_rebalance_interval_ms = 1000    # fast response to imbalance (profitability guarded by rebalance_max_pair_cost)
 # Data quality
 stale_book_ms = 850
 max_entry_spread = 0.08
