@@ -974,10 +974,18 @@ impl V2StrategyEngine {
         let dyn_max = 0.50 + (config_max - 0.50) * (1.0 - self.last_rebalance_risk);
 
         let buildup = self.buildup_score(now);
+        let yes_ask = self.state.poly_yes_book.as_ref()
+            .and_then(|b| b.best_ask())
+            .map(|l| format!("{:.3}", l.price))
+            .unwrap_or_else(|| "-".to_string());
+        let no_ask = self.state.poly_no_book.as_ref()
+            .and_then(|b| b.best_ask())
+            .map(|l| format!("{:.3}", l.price))
+            .unwrap_or_else(|| "-".to_string());
         let msg = format!(
             "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} darkens={} | \
              yes={:.2} no={:.2} paired={:.2} locked=${:.2} deployed=${:.2} | \
-             fv_yes={:.3} fv_no={:.3} edge={:.3} risk={:.2} dyn_max={:.2} buildup={:.3}{} | markets={}",
+             fv_yes={:.3} fv_no={:.3} ask_yes={} ask_no={} edge={:.3} risk={:.2} dyn_max={:.2} buildup={:.3}{} | markets={}",
             self.phase,
             self.diag_yes_fills,
             self.diag_no_fills,
@@ -990,6 +998,8 @@ impl V2StrategyEngine {
             deployed,
             self.fair_value.yes_fair_value(),
             self.fair_value.no_fair_value(),
+            yes_ask,
+            no_ask,
             self.fair_value.edge(),
             self.last_rebalance_risk,
             dyn_max,

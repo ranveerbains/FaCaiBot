@@ -24,7 +24,7 @@ Example:
   Locked profit = (1.00 - 0.90) × 50 = $5.00
 ```
 
-**Edge enforcement**: The quoting system targets prices at `fair_value - edge` on each side. With a $0.03 edge per side, the theoretical pair cost is `(fv - 0.03) + ((1 - fv) - 0.03) = 0.94`, yielding $0.06 per paired share.
+**Edge enforcement**: The quoting system targets prices at `CLOB_ask - edge` on each side, anchored to the live market. With a $0.03 edge per side, the theoretical pair cost is `(ask_yes - 0.03) + (ask_no - 0.03) = ask_yes + ask_no - 0.06`. When the two asks sum to ~$1.00, the pair cost is ~$0.94, yielding $0.06 per paired share.
 
 **Unpaired risk**: Shares that don't have a matching opposite-side share carry directional risk — they're worth $1.00 or $0.00 at resolution. Risk limits cap unpaired exposure.
 
@@ -165,12 +165,14 @@ If `dynamic_order_size` returns None (pairing cap reached), skip posting. If siz
 ### Target Price
 
 ```
-target_price = round_to_tick(fair_value - edge, tick_size)
+target_price = round_to_tick(CLOB_best_ask - edge, tick_size)
 ```
+
+The target price is anchored to the live CLOB ask, not fair value. The FV model feeds into the **edge** calculation (via momentum adjustment and adaptive sizing), but the posting price itself tracks the market.
 
 ### Zero-Edge Rebalance Posting
 
-When the position is imbalanced, the **lagging side** (the side with fewer shares) posts its maker order with **zero edge** instead of the normal `min_edge`. This makes the lagging side's bid ~3 cents closer to the ask (since `min_edge` is typically 0.03), attracting fills to rebalance the position passively.
+When the position is imbalanced, the **lagging side** (the side with fewer shares) posts its maker order with **zero edge** instead of the normal `base_edge`. Since the target is `ask - edge`, zero edge means posting at the ask itself, attracting fills to rebalance the position passively.
 
 - **Long YES** (more YES than NO): NO side posts with edge = 0, YES side uses normal `base_edge`
 - **Long NO** (more NO than YES): YES side posts with edge = 0, NO side uses normal `base_edge`
@@ -186,7 +188,7 @@ If zero-edge posting is insufficient and the imbalance exceeds `rebalance_thresh
 
 ### Requoting
 
-A resting order is cancelled and replaced when fair value has drifted by `≥ requote_threshold` since the order was posted. The cancel→confirm→repost cycle (~1.2s round-trip) is the natural throttle — no artificial interval. Both sides independently handle requotes, so fast BTC moves are handled reactively on each side.
+A resting order is cancelled and replaced when the CLOB ask has drifted by `≥ requote_threshold` since the order was posted. The cancel→confirm→repost cycle (~1.2s round-trip) is the natural throttle — no artificial interval. Both sides independently handle requotes, so fast market moves are handled reactively on each side.
 
 ## 6. Fill Detection
 
@@ -318,7 +320,7 @@ Three notification categories, each gated by a `/trades`, `/summary`, or `/diag`
 | Fill notifications | `trades_enabled` | Per fill, non-critical | `MAKER YES 10@$0.470 \| YES:30 NO:20 \| paired:20 locked:$2.00` |
 | Market reports | `summary_enabled` | Per market rotation, critical | Full market summary (shares, pairing, locked profit, fees) |
 | Session summary | `summary_enabled` | On shutdown/restart, critical | Uptime, markets traded, total fills, final position |
-| Diagnostics | `diagnostics_enabled` | Every 60s, non-critical | Phase, fills, position, fair value, edge |
+| Diagnostics | `diagnostics_enabled` | Every 60s, non-critical | Phase, fills, position, fair value, CLOB asks, edge |
 
 **Fill message format**: `{MAKER|TAKER} {YES|NO} {size}@${price} | YES:{total} NO:{total} | paired:{n} locked:${amt}`
 
