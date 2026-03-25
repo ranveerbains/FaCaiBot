@@ -144,6 +144,8 @@ pub struct RiskV2TomlConfig {
     pub max_entry_spread: f64,
     pub heartbeat_dead_threshold: u32,
     pub binance_stale_event_ms: u64,
+    pub buildup_enter_threshold: f64,
+    pub buildup_exit_threshold: f64,
 }
 
 impl Default for RiskV2TomlConfig {
@@ -165,6 +167,8 @@ impl Default for RiskV2TomlConfig {
             max_entry_spread: 0.04,
             heartbeat_dead_threshold: 5,
             binance_stale_event_ms: 150,
+            buildup_enter_threshold: 0.40,
+            buildup_exit_threshold: 0.25,
         }
     }
 }

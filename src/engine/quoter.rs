@@ -83,6 +83,8 @@ pub struct RiskV2Config {
     pub stale_book_ms: u64,
     pub max_entry_spread: f64,
     pub heartbeat_dead_threshold: u32,
+    pub buildup_enter_threshold: f64,
+    pub buildup_exit_threshold: f64,
 }
 
 impl Default for RiskV2Config {
@@ -102,6 +104,8 @@ impl Default for RiskV2Config {
             stale_book_ms: 850,
             max_entry_spread: 0.04,
             heartbeat_dead_threshold: 5,
+            buildup_enter_threshold: 0.40,
+            buildup_exit_threshold: 0.25,
         }
     }
 }

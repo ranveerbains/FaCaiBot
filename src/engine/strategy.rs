@@ -71,6 +71,10 @@ pub struct V2StrategyEngine {
     diag_closing_foks: u32,
     diag_markets_traded: u32,
 
+    // ── Buildup guard ──
+    buildup_guard_active: bool,
+    diag_buildup_darkens: u32,
+
     // ── Rebalance state ──
     last_rebalance_ms: u64,
     pending_rebalance: bool,
@@ -164,6 +168,8 @@ impl V2StrategyEngine {
             stale_book_ms: r_toml.stale_book_ms,
             max_entry_spread: r_toml.max_entry_spread,
             heartbeat_dead_threshold: r_toml.heartbeat_dead_threshold,
+            buildup_enter_threshold: r_toml.buildup_enter_threshold,
+            buildup_exit_threshold: r_toml.buildup_exit_threshold,
         };
 
         info!(
@@ -205,6 +211,8 @@ impl V2StrategyEngine {
             diag_requotes: 0,
             diag_closing_foks: 0,
             diag_markets_traded: 0,
+            buildup_guard_active: false,
+            diag_buildup_darkens: 0,
             last_rebalance_ms: 0,
             pending_rebalance: false,
             diag_rebalances: 0,
@@ -455,6 +463,8 @@ impl V2StrategyEngine {
         self.closing.reset();
         self.fair_value.reset(&self.fair_value_config);
 
+        self.buildup_guard_active = false;
+        self.diag_buildup_darkens = 0;
         self.last_rebalance_ms = 0;
         self.pending_rebalance = false;
         self.diag_rebalances = 0;
@@ -537,6 +547,7 @@ impl V2StrategyEngine {
             MarketSide::No => self.diag_no_fills += 1,
         }
 
+        let bs = self.buildup_score(now);
         info!(
             side = side.label(),
             price = %fill_price,
@@ -545,6 +556,7 @@ impl V2StrategyEngine {
             yes_total = %self.position.yes.total_shares,
             no_total = %self.position.no.total_shares,
             paired = %self.position.paired_shares(),
+            buildup = format!("{bs:.3}"),
             "fill recorded (deduped)"
         );
     }
@@ -729,6 +741,18 @@ impl V2StrategyEngine {
             .unwrap_or(Decimal::new(85, 2));
         let min_extreme = Decimal::ONE - max_extreme;
         if yes_fv_check > max_extreme || yes_fv_check < min_extreme {
+            return Vec::new();
+        }
+
+        // ── Buildup guard — go dark during genuine BTC moves ──
+        if self.check_buildup_guard(now) {
+            let cancel_actions = self.quoter.cancel_all_actions();
+            for action in cancel_actions {
+                if let QuoteAction::Cancel { side, order_id } = action {
+                    self.quoter.on_cancel_sent(side);
+                    self.pending_commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
             return Vec::new();
         }
 
@@ -1047,15 +1071,17 @@ impl V2StrategyEngine {
         let locked = self.position.locked_profit();
         let deployed = self.position.total_capital_deployed();
 
+        let buildup = self.buildup_score(now);
         let msg = format!(
-            "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} closing_foks={} | \
+            "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} closing_foks={} darkens={} | \
              yes={:.2} no={:.2} paired={:.2} locked=${:.2} deployed=${:.2} | \
-             fv_yes={:.3} fv_no={:.3} edge={:.3} | markets={}",
+             fv_yes={:.3} fv_no={:.3} edge={:.3} buildup={:.3}{} | markets={}",
             self.phase,
             self.diag_yes_fills,
             self.diag_no_fills,
             self.diag_requotes,
             self.diag_closing_foks,
+            self.diag_buildup_darkens,
             self.position.yes.total_shares,
             self.position.no.total_shares,
             paired,
@@ -1064,6 +1090,8 @@ impl V2StrategyEngine {
             self.fair_value.yes_fair_value(),
             self.fair_value.no_fair_value(),
             self.fair_value.edge(),
+            buildup,
+            if self.buildup_guard_active { " DARK" } else { "" },
             self.diag_markets_traded,
         );
         info!("{msg}");
@@ -1258,5 +1286,102 @@ impl V2StrategyEngine {
         );
         info!("{text}");
         self.pending_session_summary = Some(text);
+    }
+
+    // ─── Buildup guard ─────────────────────────────────────────────────
+
+    /// Check if Binance signals indicate a genuine directional move.
+    /// Uses v1-inspired pipeline: direction consensus → causal ordering → weighted composite.
+    /// Returns true if the guard is active (should go dark).
+    fn check_buildup_guard(&mut self, now_ms: u64) -> bool {
+        use crate::types::market::Direction;
+
+        let (cvd_norm, cvd_dir) = self.fair_value.cvd_signal(now_ms);
+        let (obi_norm, obi_dir) = self.fair_value.obi_signal(now_ms);
+        let (basis_norm, basis_dir) = self.fair_value.basis_signal(now_ms);
+
+        // 1. Direction consensus — all non-zero signals must agree. Any dissenter → veto.
+        let mut up = 0u32;
+        let mut down = 0u32;
+        for &(norm, dir) in &[(cvd_norm, cvd_dir), (obi_norm, obi_dir), (basis_norm, basis_dir)] {
+            if norm > 0.0 {
+                match dir {
+                    Some(Direction::Up) => up += 1,
+                    Some(Direction::Down) => down += 1,
+                    None => {}
+                }
+            }
+        }
+        let has_consensus = (up > 0 && down == 0) || (down > 0 && up == 0);
+
+        // 2. Causal ordering — at least 1 futures-derived signal (CVD or basis) must be non-zero
+        let has_leading = cvd_norm > 0.0 || basis_norm > 0.0;
+
+        // 3. Weighted composite (veto if no consensus or no leading signal)
+        let score = if has_consensus && has_leading {
+            0.40 * cvd_norm + 0.30 * basis_norm + 0.30 * obi_norm
+        } else {
+            0.0
+        };
+
+        // 4. Hysteresis
+        let was_active = self.buildup_guard_active;
+        let threshold = if was_active {
+            self.risk_config.buildup_exit_threshold
+        } else {
+            self.risk_config.buildup_enter_threshold
+        };
+
+        if !was_active && score >= threshold {
+            self.buildup_guard_active = true;
+            self.diag_buildup_darkens += 1;
+            let dir_label = if up >= down { "UP" } else { "DOWN" };
+            info!(
+                score = format!("{score:.3}"),
+                direction = dir_label,
+                cvd = format!("{cvd_norm:.2}"),
+                obi = format!("{obi_norm:.2}"),
+                basis = format!("{basis_norm:.2}"),
+                "buildup guard ACTIVE — going dark"
+            );
+        } else if was_active && score < threshold {
+            self.buildup_guard_active = false;
+            info!(
+                score = format!("{score:.3}"),
+                cvd = format!("{cvd_norm:.2}"),
+                obi = format!("{obi_norm:.2}"),
+                basis = format!("{basis_norm:.2}"),
+                "buildup guard CLEARED — resuming"
+            );
+        }
+
+        self.buildup_guard_active
+    }
+
+    /// Current buildup composite score (read-only, no side effects).
+    fn buildup_score(&self, now_ms: u64) -> f64 {
+        use crate::types::market::Direction;
+        let (cvd_norm, cvd_dir) = self.fair_value.cvd_signal(now_ms);
+        let (obi_norm, obi_dir) = self.fair_value.obi_signal(now_ms);
+        let (basis_norm, basis_dir) = self.fair_value.basis_signal(now_ms);
+
+        let mut up = 0u32;
+        let mut down = 0u32;
+        for &(norm, dir) in &[(cvd_norm, cvd_dir), (obi_norm, obi_dir), (basis_norm, basis_dir)] {
+            if norm > 0.0 {
+                match dir {
+                    Some(Direction::Up) => up += 1,
+                    Some(Direction::Down) => down += 1,
+                    None => {}
+                }
+            }
+        }
+        let has_consensus = (up > 0 && down == 0) || (down > 0 && up == 0);
+        let has_leading = cvd_norm > 0.0 || basis_norm > 0.0;
+        if has_consensus && has_leading {
+            0.40 * cvd_norm + 0.30 * basis_norm + 0.30 * obi_norm
+        } else {
+            0.0
+        }
     }
 }

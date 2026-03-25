@@ -52,14 +52,14 @@ min_order_size = 5
 # Inventory skewing — scales linearly with imbalance ratio
 max_imbalance_skew = 0.12            # max skew at full imbalance — steeper to halt heavy side
 max_one_sided_shares = 10             # hard cap before opposite side fills
-max_fair_value_extremity = 0.85      # don't quote when either FV > this (pairing infeasible)
+max_fair_value_extremity = 0.80      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
 # Per-side exposure limits
-max_unpaired_shares = 20
+max_unpaired_shares = 15
 max_unpaired_usdc = 100
 # Market-wide limits
-max_capital_per_market = 50
+max_capital_per_market = 30
 # Timing
 closing_phase_secs = 30
 rotation_quiet_ms = 10000
@@ -77,3 +77,6 @@ stale_book_ms = 850
 max_entry_spread = 0.08
 heartbeat_dead_threshold = 5
 binance_stale_event_ms = 150
+# Buildup guard — weighted composite score with direction consensus + causal ordering
+buildup_enter_threshold = 0.35   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
+buildup_exit_threshold = 0.1    # resume when score drops below this

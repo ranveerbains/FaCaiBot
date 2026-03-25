@@ -355,6 +355,23 @@ impl FairValueEstimator {
     pub fn reset(&mut self, config: &FairValueConfig) {
         *self = Self::new(config);
     }
+
+    // ── Signal getters for buildup guard ──
+
+    /// CVD acceleration: (normalized [0,1], direction).
+    pub fn cvd_signal(&self, now_ms: u64) -> (f64, Option<crate::types::market::Direction>) {
+        (self.cvd_tracker.normalized(now_ms), self.cvd_tracker.direction())
+    }
+
+    /// OBI velocity: (normalized [0,1], direction).
+    pub fn obi_signal(&self, now_ms: u64) -> (f64, Option<crate::types::market::Direction>) {
+        (self.obi_tracker.normalized(now_ms), self.obi_tracker.direction())
+    }
+
+    /// Basis delta: (normalized [0,1], direction).
+    pub fn basis_signal(&self, now_ms: u64) -> (f64, Option<crate::types::market::Direction>) {
+        (self.basis_tracker.normalized(now_ms), self.basis_tracker.direction())
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

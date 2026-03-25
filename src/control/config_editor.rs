@@ -72,6 +72,8 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "risk_v2.max_entry_spread", min: 0.005, max: 0.20 },
     ParamSpec { name: "risk_v2.heartbeat_dead_threshold", min: 2.0, max: 20.0 },
     ParamSpec { name: "risk_v2.binance_stale_event_ms", min: 10.0, max: 1000.0 },
+    ParamSpec { name: "risk_v2.buildup_enter_threshold", min: 0.1, max: 1.0 },
+    ParamSpec { name: "risk_v2.buildup_exit_threshold", min: 0.05, max: 1.0 },
 ];
 
 /// Validate a parameter name against the allowlist and check value range.
