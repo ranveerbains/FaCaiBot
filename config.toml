@@ -41,7 +41,7 @@ obi_saturation = 0.2
 
 [quoting]
 # Edge (minimum profit margin per share)
-min_edge = 0.03
+min_edge = 0.045
 # Requoting
 requote_threshold = 0.01
 # Order sizing
