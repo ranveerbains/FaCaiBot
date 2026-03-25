@@ -329,10 +329,12 @@ impl FairValueEstimator {
         Decimal::try_from(self.no_fair_value).unwrap_or(Decimal::new(50, 2))
     }
 
+    #[allow(dead_code)]
     pub fn yes_target_price(&self, edge: Decimal) -> Decimal {
         (self.yes_fair_value() - edge).max(Decimal::new(1, 2))
     }
 
+    #[allow(dead_code)]
     pub fn no_target_price(&self, edge: Decimal) -> Decimal {
         (self.no_fair_value() - edge).max(Decimal::new(1, 2))
     }

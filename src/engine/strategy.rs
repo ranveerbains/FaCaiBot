@@ -556,16 +556,13 @@ impl V2StrategyEngine {
                         MarketSide::No => self.diag_no_fills += 1,
                     }
                 } else {
-                    let fv = match side {
-                        MarketSide::Yes => self.fair_value.yes_fair_value(),
-                        MarketSide::No => self.fair_value.no_fair_value(),
-                    };
+                    let ask = self.quoter.pending_ask(side).unwrap_or(Decimal::ZERO);
                     self.quoter.on_order_posted(side, ManagedOrder {
                         order_id,
                         price,
                         size,
                         posted_ms: now,
-                        fair_value_at_post: fv,
+                        ask_at_post: ask,
                         size_filled: Decimal::ZERO,
                     });
                 }
@@ -761,32 +758,44 @@ impl V2StrategyEngine {
         // ── Maker quoting (suppressed during buildup dark) ──
         let mut commands = Vec::new();
         if !buildup_dark {
+            // Extract CLOB best asks (anchor for bid pricing)
+            let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+            let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+
+            // Edge computation: lagging side drops min_edge, keeps vol/time risk cushion
             let base_edge = self.fair_value.edge();
+            let min_edge_dec = Decimal::try_from(self.min_edge).unwrap_or(Decimal::ZERO);
+            let computed_edge = (base_edge - min_edge_dec).max(Decimal::ZERO);
             let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
-                // Long YES → NO is lagging, post NO without edge to attract fills
-                (base_edge, Decimal::ZERO)
+                // Long YES → NO is lagging (drop min_edge only)
+                (base_edge, computed_edge)
             } else if imbalance < Decimal::ZERO {
-                // Long NO → YES is lagging, post YES without edge to attract fills
-                (Decimal::ZERO, base_edge)
+                // Long NO → YES is lagging (drop min_edge only)
+                (computed_edge, base_edge)
             } else {
                 (base_edge, base_edge)
             };
 
+            // Target price = CLOB ask - edge (anchored to live market)
             let tick = self.state.tick_size;
-            let yes_target = round_to_tick(self.fair_value.yes_target_price(yes_edge), tick);
-            let no_target = round_to_tick(self.fair_value.no_target_price(no_edge), tick);
+            let yes_target = match yes_best_ask {
+                Some(ask) => round_to_tick(ask - yes_edge, tick),
+                None => Decimal::ZERO,
+            };
+            let no_target = match no_best_ask {
+                Some(ask) => round_to_tick(ask - no_edge, tick),
+                None => Decimal::ZERO,
+            };
 
-            let yes_fv = self.fair_value.yes_fair_value();
-            let no_fv = self.fair_value.no_fair_value();
-
-            // Pre-flight: skip sides whose target would cross or meet the CLOB best ask,
-            // and enforce dynamic posting zone bounds
-            let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-            let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+            // Pre-flight: skip sides with no ask, non-positive target, or outside posting zone
             let yes_postable = yes_book_ok
+                && yes_best_ask.is_some()
+                && yes_target > Decimal::ZERO
                 && yes_target >= min_extreme && yes_target <= max_extreme
                 && yes_best_ask.is_none_or(|ask| yes_target < ask);
             let no_postable = no_book_ok
+                && no_best_ask.is_some()
+                && no_target > Decimal::ZERO
                 && no_target >= min_extreme && no_target <= max_extreme
                 && no_best_ask.is_none_or(|ask| no_target < ask);
 
@@ -816,18 +825,16 @@ impl V2StrategyEngine {
             let mut actions = Vec::new();
             if yes_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::Yes, yes_target, yes_fv, &yes_token,
+                    MarketSide::Yes, yes_target, yes_best_ask.unwrap_or(Decimal::ZERO), &yes_token,
                     &self.position, &self.quoting_config, &self.risk_config,
-                    no_best_ask,
                 )
             {
                 actions.push(a);
             }
             if no_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::No, no_target, no_fv, &no_token,
+                    MarketSide::No, no_target, no_best_ask.unwrap_or(Decimal::ZERO), &no_token,
                     &self.position, &self.quoting_config, &self.risk_config,
-                    yes_best_ask,
                 )
             {
                 actions.push(a);
@@ -836,7 +843,11 @@ impl V2StrategyEngine {
             for action in actions {
                 match action {
                     QuoteAction::Post { side, token_id, price, size } => {
-                        self.quoter.mark_post_pending(side);
+                        let ask = match side {
+                            MarketSide::Yes => yes_best_ask.unwrap_or(Decimal::ZERO),
+                            MarketSide::No => no_best_ask.unwrap_or(Decimal::ZERO),
+                        };
+                        self.quoter.mark_post_pending(side, ask);
                         commands.push(V2ExecutorCommand::PostOrder {
                             side,
                             token_id,

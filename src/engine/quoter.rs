@@ -16,7 +16,7 @@ pub struct ManagedOrder {
     pub size: Decimal,
     #[allow(dead_code)]
     pub posted_ms: u64,
-    pub fair_value_at_post: Decimal,
+    pub ask_at_post: Decimal,
     /// Cumulative filled size tracked for dedup (WS + CancelResult may both report fills).
     pub size_filled: Decimal,
 }
@@ -151,6 +151,9 @@ pub struct Quoter {
     no_pending_cancel: bool,
     yes_pending_post: bool,
     no_pending_post: bool,
+    /// Ask price at the time a post was initiated (for ask_at_post on ManagedOrder).
+    yes_pending_ask: Option<Decimal>,
+    no_pending_ask: Option<Decimal>,
     /// Last cleared order per side — for CancelResult dedup when order is already gone.
     yes_last_cleared: Option<ClearedOrder>,
     no_last_cleared: Option<ClearedOrder>,
@@ -165,6 +168,8 @@ impl Quoter {
             no_pending_cancel: false,
             yes_pending_post: false,
             no_pending_post: false,
+            yes_pending_ask: None,
+            no_pending_ask: None,
             yes_last_cleared: None,
             no_last_cleared: None,
         }
@@ -175,12 +180,11 @@ impl Quoter {
         &self,
         side: MarketSide,
         target_price: Decimal,
-        fair_value: Decimal,
+        ask_price: Decimal,
         token_id: &str,
         position: &BilateralPosition,
         quoting: &QuotingConfig,
         risk: &RiskV2Config,
-        opposite_best_ask: Option<Decimal>,
     ) -> Option<QuoteAction> {
         // ── Guards ──
         if self.is_pending(side) {
@@ -198,27 +202,6 @@ impl Quoter {
         };
         if side_shares >= total_cap {
             return None;
-        }
-        // Pair-cost feasibility guard: don't post if filling at target_price
-        // would push the running pair cost above $1.00
-        let other_avg = match side {
-            MarketSide::Yes => position.no.avg_price(),
-            MarketSide::No => position.yes.avg_price(),
-        };
-        if other_avg > Decimal::ZERO {
-            let projected_pair_cost = other_avg + target_price;
-            if projected_pair_cost >= Decimal::ONE {
-                return None;
-            }
-        }
-
-        // Book-aware pair-cost check: block if pairing is impossible or unprofitable
-        if position.unpaired(side) > Decimal::ZERO {
-            match opposite_best_ask {
-                None if other_avg == Decimal::ZERO => return None, // No fills + no book = no pairing path
-                Some(opp_ask) if opp_ask + target_price >= Decimal::ONE => return None,
-                _ => {}
-            }
         }
 
         // ── Size computation ──
@@ -260,9 +243,9 @@ impl Quoter {
             }
             Some(existing) => {
                 // Check if requote needed
-                let fv_drift = (fair_value - existing.fair_value_at_post).abs();
-                let fv_drift_f64 = fv_drift.to_string().parse::<f64>().unwrap_or(0.0);
-                if fv_drift_f64 >= quoting.requote_threshold {
+                let ask_drift = (ask_price - existing.ask_at_post).abs();
+                let ask_drift_f64 = ask_drift.to_string().parse::<f64>().unwrap_or(0.0);
+                if ask_drift_f64 >= quoting.requote_threshold {
                     // Cancel existing, then repost (cancel first, post on confirmation)
                     Some(QuoteAction::Cancel {
                         side,
@@ -380,10 +363,23 @@ impl Quoter {
         }
     }
 
-    pub fn mark_post_pending(&mut self, side: MarketSide) {
+    pub fn mark_post_pending(&mut self, side: MarketSide, ask: Decimal) {
         match side {
-            MarketSide::Yes => self.yes_pending_post = true,
-            MarketSide::No => self.no_pending_post = true,
+            MarketSide::Yes => {
+                self.yes_pending_post = true;
+                self.yes_pending_ask = Some(ask);
+            }
+            MarketSide::No => {
+                self.no_pending_post = true;
+                self.no_pending_ask = Some(ask);
+            }
+        }
+    }
+
+    pub fn pending_ask(&self, side: MarketSide) -> Option<Decimal> {
+        match side {
+            MarketSide::Yes => self.yes_pending_ask,
+            MarketSide::No => self.no_pending_ask,
         }
     }
 
@@ -452,6 +448,8 @@ impl Quoter {
         self.no_pending_cancel = false;
         self.yes_pending_post = false;
         self.no_pending_post = false;
+        self.yes_pending_ask = None;
+        self.no_pending_ask = None;
         self.yes_last_cleared = None;
         self.no_last_cleared = None;
     }
@@ -551,7 +549,6 @@ mod tests {
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
             &position, &qc, &rc,
-            Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
     }
@@ -559,14 +556,13 @@ mod tests {
     #[test]
     fn test_no_post_when_pending() {
         let mut quoter = Quoter::new();
-        quoter.mark_post_pending(MarketSide::Yes);
+        quoter.mark_post_pending(MarketSide::Yes, dec("0.50"));
         let position = BilateralPosition::new();
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
             &position, &qc, &rc,
-            Some(dec("0.50")),
         );
         assert!(action.is_none());
     }
@@ -582,7 +578,6 @@ mod tests {
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
             &position, &qc, &rc,
-            Some(dec("0.50")),
         );
         assert!(action.is_none());
     }
@@ -595,7 +590,7 @@ mod tests {
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
+            ask_at_post: dec("0.45"),
             size_filled: Decimal::ZERO,
         });
 
@@ -606,7 +601,6 @@ mod tests {
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
             &position, &qc, &rc,
-            Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
     }
@@ -619,7 +613,7 @@ mod tests {
             price: dec("0.42"),
             size: dec("50"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
+            ask_at_post: dec("0.45"),
             size_filled: Decimal::ZERO,
         });
 
@@ -630,7 +624,6 @@ mod tests {
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.425"), dec("0.455"), "yes_token",
             &position, &qc, &rc,
-            Some(dec("0.50")),
         );
         assert!(action.is_none());
     }
@@ -643,7 +636,7 @@ mod tests {
             price: dec("0.42"),
             size: dec("10"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
+            ask_at_post: dec("0.45"),
             size_filled: Decimal::ZERO,
         });
         quoter.on_order_posted(MarketSide::No, ManagedOrder {
@@ -651,7 +644,7 @@ mod tests {
             price: dec("0.48"),
             size: dec("10"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.55"),
+            ask_at_post: dec("0.55"),
             size_filled: Decimal::ZERO,
         });
 
@@ -662,7 +655,7 @@ mod tests {
     #[test]
     fn test_reset_clears_all() {
         let mut quoter = Quoter::new();
-        quoter.mark_post_pending(MarketSide::Yes);
+        quoter.mark_post_pending(MarketSide::Yes, dec("0.50"));
         quoter.on_cancel_sent(MarketSide::No);
         quoter.reset();
         assert!(!quoter.is_pending(MarketSide::Yes));
@@ -678,7 +671,7 @@ mod tests {
             price: dec("0.42"),
             size: dec("100"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
+            ask_at_post: dec("0.45"),
             size_filled: Decimal::ZERO,
         });
 
@@ -703,7 +696,7 @@ mod tests {
             price: dec("0.55"),
             size: dec("80"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.52"),
+            ask_at_post: dec("0.52"),
             size_filled: Decimal::ZERO,
         });
 
@@ -728,7 +721,7 @@ mod tests {
             price: dec("0.63"),
             size: dec("10"),
             posted_ms: 1000,
-            fair_value_at_post: dec("0.60"),
+            ask_at_post: dec("0.60"),
             size_filled: Decimal::ZERO,
         });
 
@@ -744,102 +737,4 @@ mod tests {
         assert_eq!(result, Some((dec("0.63"), dec("10"))));
     }
 
-    #[test]
-    fn test_pair_cost_guard_blocks_expensive_pair() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // NO fills at avg $0.60
-        position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.45"), dec("0.50"), "yes_token",
-            &position, &qc, &rc,
-            Some(dec("0.50")),
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_pair_cost_guard_allows_cheap_pair() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // NO fills at avg $0.60
-        position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.39"), dec("0.45"), "yes_token",
-            &position, &qc, &rc,
-            Some(dec("0.50")),
-        );
-        assert!(matches!(action, Some(QuoteAction::Post { .. })));
-    }
-
-    #[test]
-    fn test_pair_cost_guard_skipped_no_opposite_fills() {
-        let quoter = Quoter::new();
-        let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
-
-        // No opposite fills → guard skipped → normal post
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.85"), dec("0.90"), "yes_token",
-            &position, &qc, &rc,
-            Some(dec("0.50")),
-        );
-        assert!(matches!(action, Some(QuoteAction::Post { .. })));
-    }
-
-    #[test]
-    fn test_book_cost_blocks_no_opposite_book() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 3 YES, 0 NO → has unpaired shares, opposite_best_ask = None
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc,
-            None, // No opposite book liquidity
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_book_cost_blocks_expensive_opposite() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 3 YES, 0 NO → unpaired shares, opposite ask too expensive
-        position.record_fill(MarketSide::Yes, dec("0.70"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        // target=0.70, opposite_best_ask=0.35 → 0.70 + 0.35 = 1.05 >= 1.00 → blocked
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.70"), dec("0.75"), "yes_token",
-            &position, &qc, &rc,
-            Some(dec("0.35")),
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_book_cost_blocks_when_book_expensive() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 3 YES, 0 NO → has unpaired, book price makes next pair unprofitable
-        position.record_fill(MarketSide::Yes, dec("0.60"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        // target=0.60, opposite_best_ask=0.45 → marginal cost = 0.60 + 0.45 = 1.05 >= 1.00
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.60"), dec("0.65"), "yes_token",
-            &position, &qc, &rc,
-            Some(dec("0.45")),
-        );
-        assert!(action.is_none());
-    }
 }
