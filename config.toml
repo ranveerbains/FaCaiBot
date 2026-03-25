@@ -50,6 +50,8 @@ min_order_size = 5
 max_fair_value_extremity = 0.78      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
+# Per-side exposure limits
+max_unpaired_shares = 10
 # Timing
 rotation_quiet_ms = 10000
 # Taker rebalance (active imbalance correction)

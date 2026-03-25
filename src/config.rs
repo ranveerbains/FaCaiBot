@@ -119,6 +119,7 @@ impl Default for QuotingTomlConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RiskV2TomlConfig {
+    pub max_unpaired_shares: f64,
     pub rotation_quiet_ms: u64,
     pub rebalance_threshold: f64,
     pub rebalance_size: f64,
@@ -133,6 +134,7 @@ pub struct RiskV2TomlConfig {
 impl Default for RiskV2TomlConfig {
     fn default() -> Self {
         Self {
+            max_unpaired_shares: 10.0,
             rotation_quiet_ms: 5000,
             rebalance_threshold: 20.0,
             rebalance_size: 10.0,

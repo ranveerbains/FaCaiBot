@@ -149,6 +149,7 @@ impl V2StrategyEngine {
 
         let r_toml = &config.bot.risk_v2;
         let risk_config = RiskV2Config {
+            max_unpaired_shares: Decimal::try_from(r_toml.max_unpaired_shares).unwrap_or(Decimal::new(10, 0)),
             rotation_quiet_ms: r_toml.rotation_quiet_ms,
             rebalance_threshold: Decimal::try_from(r_toml.rebalance_threshold).unwrap_or(Decimal::new(20, 0)),
             rebalance_size: Decimal::try_from(r_toml.rebalance_size).unwrap_or(Decimal::new(10, 0)),
@@ -813,7 +814,7 @@ impl V2StrategyEngine {
         if yes_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                &self.position, &self.quoting_config,
+                &self.position, &self.quoting_config, &self.risk_config,
                 no_best_ask,
             )
         {
@@ -822,7 +823,7 @@ impl V2StrategyEngine {
         if no_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::No, no_target, no_fv, &no_token,
-                &self.position, &self.quoting_config,
+                &self.position, &self.quoting_config, &self.risk_config,
                 yes_best_ask,
             )
         {

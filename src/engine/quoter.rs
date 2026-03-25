@@ -62,6 +62,7 @@ impl Default for QuotingConfig {
 /// Risk limits for v2 (from config.toml [risk_v2]).
 #[derive(Debug, Clone)]
 pub struct RiskV2Config {
+    pub max_unpaired_shares: Decimal,
     pub rotation_quiet_ms: u64,
     pub rebalance_threshold: Decimal,
     pub rebalance_size: Decimal,
@@ -75,6 +76,7 @@ pub struct RiskV2Config {
 impl Default for RiskV2Config {
     fn default() -> Self {
         Self {
+            max_unpaired_shares: Decimal::new(10, 0),
             rotation_quiet_ms: 5000,
             rebalance_threshold: Decimal::new(20, 0),
             rebalance_size: Decimal::new(10, 0),
@@ -177,10 +179,15 @@ impl Quoter {
         token_id: &str,
         position: &BilateralPosition,
         quoting: &QuotingConfig,
+        risk: &RiskV2Config,
         opposite_best_ask: Option<Decimal>,
     ) -> Option<QuoteAction> {
         // ── Guards ──
         if self.is_pending(side) {
+            return None;
+        }
+        // Unpaired shares guard: prevent one-sided accumulation
+        if position.unpaired(side) >= risk.max_unpaired_shares {
             return None;
         }
         // Total shares cap: stop maker orders when either side hits the precalculated limit
@@ -487,8 +494,8 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn default_config() -> QuotingConfig {
-        QuotingConfig::default()
+    fn default_configs() -> (QuotingConfig, RiskV2Config) {
+        (QuotingConfig::default(), RiskV2Config::default())
     }
 
     // ── dynamic_order_size tests ──
@@ -539,11 +546,11 @@ mod tests {
     fn test_post_when_no_resting() {
         let quoter = Quoter::new();
         let position = BilateralPosition::new();
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -554,11 +561,11 @@ mod tests {
         let mut quoter = Quoter::new();
         quoter.mark_post_pending(MarketSide::Yes);
         let position = BilateralPosition::new();
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -570,11 +577,11 @@ mod tests {
         let mut position = BilateralPosition::new();
         // Deploy max capital
         position.record_fill(MarketSide::Yes, dec("0.50"), dec("200"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -593,12 +600,12 @@ mod tests {
         });
 
         let position = BilateralPosition::new();
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // Fair value shifted by 0.02 (> threshold 0.01), 3s elapsed (> 2s min)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
@@ -617,12 +624,12 @@ mod tests {
         });
 
         let position = BilateralPosition::new();
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // Fair value barely moved (0.005 < threshold 0.01)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.425"), dec("0.455"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -743,12 +750,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // NO fills at avg $0.60
         position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.45"), dec("0.50"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -760,12 +767,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // NO fills at avg $0.60
         position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.39"), dec("0.45"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -775,12 +782,12 @@ mod tests {
     fn test_pair_cost_guard_skipped_no_opposite_fills() {
         let quoter = Quoter::new();
         let position = BilateralPosition::new();
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // No opposite fills → guard skipped → normal post
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.85"), dec("0.90"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -792,11 +799,11 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → has unpaired shares, opposite_best_ask = None
         position.record_fill(MarketSide::Yes, dec("0.45"), dec("3"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             None, // No opposite book liquidity
         );
         assert!(action.is_none());
@@ -808,12 +815,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → unpaired shares, opposite ask too expensive
         position.record_fill(MarketSide::Yes, dec("0.70"), dec("3"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // target=0.70, opposite_best_ask=0.35 → 0.70 + 0.35 = 1.05 >= 1.00 → blocked
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.70"), dec("0.75"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.35")),
         );
         assert!(action.is_none());
@@ -825,12 +832,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → has unpaired, book price makes next pair unprofitable
         position.record_fill(MarketSide::Yes, dec("0.60"), dec("3"), false, dec("0"));
-        let qc = default_config();
+        let (qc, rc) = default_configs();
 
         // target=0.60, opposite_best_ask=0.45 → marginal cost = 0.60 + 0.45 = 1.05 >= 1.00
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.60"), dec("0.65"), "yes_token",
-            &position, &qc,
+            &position, &qc, &rc,
             Some(dec("0.45")),
         );
         assert!(action.is_none());

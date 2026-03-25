@@ -52,6 +52,7 @@ const ALLOWED_PARAMS: &[ParamSpec] = &[
     ParamSpec { name: "quoting.min_order_size", min: 0.01, max: 1000.0 },
     ParamSpec { name: "quoting.max_fair_value_extremity", min: 0.50, max: 0.98 },
     // risk_v2
+    ParamSpec { name: "risk_v2.max_unpaired_shares", min: 1.0, max: 100.0 },
     ParamSpec { name: "risk_v2.rotation_quiet_ms", min: 0.0, max: 120000.0 },
     ParamSpec { name: "risk_v2.rebalance_threshold", min: 1.0, max: 1000.0 },
     ParamSpec { name: "risk_v2.rebalance_size", min: 1.0, max: 1000.0 },
