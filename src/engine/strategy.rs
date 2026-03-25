@@ -735,7 +735,9 @@ impl V2StrategyEngine {
         }
 
         // ── Buildup guard — go dark during genuine BTC moves ──
-        if self.check_buildup_guard(now) {
+        // Cancels maker orders but does NOT suppress taker rebalance (risk-reducing).
+        let buildup_dark = self.check_buildup_guard(now);
+        if buildup_dark {
             let cancel_actions = self.quoter.cancel_all_actions();
             for action in cancel_actions {
                 if let QuoteAction::Cancel { side, order_id } = action {
@@ -743,7 +745,6 @@ impl V2StrategyEngine {
                     self.pending_commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
                 }
             }
-            return Vec::new();
         }
 
         let (yes_token, no_token) = match (
@@ -754,103 +755,105 @@ impl V2StrategyEngine {
             _ => return Vec::new(),
         };
 
-        // ── Compute edge with zero-edge rebalance posting ──
-        let base_edge = self.fair_value.edge();
         let imbalance = self.position.yes.total_shares - self.position.no.total_shares;
         let abs_imbalance = imbalance.abs();
 
-        let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
-            // Long YES → NO is lagging, post NO without edge to attract fills
-            (base_edge, Decimal::ZERO)
-        } else if imbalance < Decimal::ZERO {
-            // Long NO → YES is lagging, post YES without edge to attract fills
-            (Decimal::ZERO, base_edge)
-        } else {
-            (base_edge, base_edge)
-        };
-
-        let tick = self.state.tick_size;
-        let yes_target = round_to_tick(self.fair_value.yes_target_price(yes_edge), tick);
-        let no_target = round_to_tick(self.fair_value.no_target_price(no_edge), tick);
-
-        let yes_fv = self.fair_value.yes_fair_value();
-        let no_fv = self.fair_value.no_fair_value();
-
-        // Pre-flight: skip sides whose target would cross or meet the CLOB best ask,
-        // and enforce dynamic posting zone bounds
-        let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-        let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-        let yes_postable = yes_book_ok
-            && yes_target >= min_extreme && yes_target <= max_extreme
-            && yes_best_ask.is_none_or(|ask| yes_target < ask);
-        let no_postable = no_book_ok
-            && no_target >= min_extreme && no_target <= max_extreme
-            && no_best_ask.is_none_or(|ask| no_target < ask);
-
-        // Cancel resting orders that are now outside the dynamic posting zone
-        {
-            let mut zone_cancels = Vec::new();
-            if !yes_postable
-                && let Some(QuoteAction::Cancel { side, order_id }) =
-                    self.quoter.cancel_side_action(MarketSide::Yes)
-            {
-                self.quoter.on_cancel_sent(side);
-                zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
-            }
-            if !no_postable
-                && let Some(QuoteAction::Cancel { side, order_id }) =
-                    self.quoter.cancel_side_action(MarketSide::No)
-            {
-                self.quoter.on_cancel_sent(side);
-                zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
-            }
-            if !zone_cancels.is_empty() {
-                return zone_cancels;
-            }
-        }
-
-        // Evaluate each side independently (book health + crossing check)
-        let mut actions = Vec::new();
-        if yes_postable
-            && let Some(a) = self.quoter.evaluate_side(
-                MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                &self.position, &self.quoting_config, &self.risk_config,
-                no_best_ask,
-            )
-        {
-            actions.push(a);
-        }
-        if no_postable
-            && let Some(a) = self.quoter.evaluate_side(
-                MarketSide::No, no_target, no_fv, &no_token,
-                &self.position, &self.quoting_config, &self.risk_config,
-                yes_best_ask,
-            )
-        {
-            actions.push(a);
-        }
-
+        // ── Maker quoting (suppressed during buildup dark) ──
         let mut commands = Vec::new();
-        for action in actions {
-            match action {
-                QuoteAction::Post { side, token_id, price, size } => {
-                    self.quoter.mark_post_pending(side);
-                    commands.push(V2ExecutorCommand::PostOrder {
-                        side,
-                        token_id,
-                        price,
-                        size,
-                    });
-                }
-                QuoteAction::Cancel { side, order_id } => {
+        if !buildup_dark {
+            let base_edge = self.fair_value.edge();
+            let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
+                // Long YES → NO is lagging, post NO without edge to attract fills
+                (base_edge, Decimal::ZERO)
+            } else if imbalance < Decimal::ZERO {
+                // Long NO → YES is lagging, post YES without edge to attract fills
+                (Decimal::ZERO, base_edge)
+            } else {
+                (base_edge, base_edge)
+            };
+
+            let tick = self.state.tick_size;
+            let yes_target = round_to_tick(self.fair_value.yes_target_price(yes_edge), tick);
+            let no_target = round_to_tick(self.fair_value.no_target_price(no_edge), tick);
+
+            let yes_fv = self.fair_value.yes_fair_value();
+            let no_fv = self.fair_value.no_fair_value();
+
+            // Pre-flight: skip sides whose target would cross or meet the CLOB best ask,
+            // and enforce dynamic posting zone bounds
+            let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+            let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+            let yes_postable = yes_book_ok
+                && yes_target >= min_extreme && yes_target <= max_extreme
+                && yes_best_ask.is_none_or(|ask| yes_target < ask);
+            let no_postable = no_book_ok
+                && no_target >= min_extreme && no_target <= max_extreme
+                && no_best_ask.is_none_or(|ask| no_target < ask);
+
+            // Cancel resting orders that are now outside the dynamic posting zone
+            {
+                let mut zone_cancels = Vec::new();
+                if !yes_postable
+                    && let Some(QuoteAction::Cancel { side, order_id }) =
+                        self.quoter.cancel_side_action(MarketSide::Yes)
+                {
                     self.quoter.on_cancel_sent(side);
-                    self.diag_requotes += 1;
-                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                    zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+                if !no_postable
+                    && let Some(QuoteAction::Cancel { side, order_id }) =
+                        self.quoter.cancel_side_action(MarketSide::No)
+                {
+                    self.quoter.on_cancel_sent(side);
+                    zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+                if !zone_cancels.is_empty() {
+                    return zone_cancels;
+                }
+            }
+
+            // Evaluate each side independently (book health + crossing check)
+            let mut actions = Vec::new();
+            if yes_postable
+                && let Some(a) = self.quoter.evaluate_side(
+                    MarketSide::Yes, yes_target, yes_fv, &yes_token,
+                    &self.position, &self.quoting_config, &self.risk_config,
+                    no_best_ask,
+                )
+            {
+                actions.push(a);
+            }
+            if no_postable
+                && let Some(a) = self.quoter.evaluate_side(
+                    MarketSide::No, no_target, no_fv, &no_token,
+                    &self.position, &self.quoting_config, &self.risk_config,
+                    yes_best_ask,
+                )
+            {
+                actions.push(a);
+            }
+
+            for action in actions {
+                match action {
+                    QuoteAction::Post { side, token_id, price, size } => {
+                        self.quoter.mark_post_pending(side);
+                        commands.push(V2ExecutorCommand::PostOrder {
+                            side,
+                            token_id,
+                            price,
+                            size,
+                        });
+                    }
+                    QuoteAction::Cancel { side, order_id } => {
+                        self.quoter.on_cancel_sent(side);
+                        self.diag_requotes += 1;
+                        commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                    }
                 }
             }
         }
 
-        // ── Taker rebalance ──
+        // ── Taker rebalance (always runs — risk-reducing, not suppressed by buildup) ──
         // If imbalance exceeds threshold, actively rebalance by taking the opposite side
         if abs_imbalance >= self.risk_config.rebalance_threshold
             && !self.pending_rebalance

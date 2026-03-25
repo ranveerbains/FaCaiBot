@@ -178,7 +178,7 @@ When the position is imbalanced, the **lagging side** (the side with fewer share
 
 ### Taker Rebalance
 
-If zero-edge posting is insufficient and the imbalance exceeds `rebalance_threshold`, the engine sends a taker FOK on the lagging side. Rebalance attempts are sequential — each FOK is sent, the engine waits for the result, and immediately retries if the price is still favorable:
+If zero-edge posting is insufficient and the imbalance exceeds `rebalance_threshold`, the engine sends a taker FOK on the lagging side. The taker rebalance is a risk-reducing action and runs even when the buildup guard is active (dark mode) — only maker quoting is suppressed during buildup. Rebalance attempts are sequential — each FOK is sent, the engine waits for the result, and immediately retries if the price is still favorable:
 
 - **Pair cost guard**: `other_side_avg + best_ask < rebalance_max_pair_cost` (0.97)
 - **Size**: `min(rebalance_size, abs_imbalance)`, minimum 5 shares
@@ -235,7 +235,7 @@ When the Gamma API discovers a new market:
 |-------|----------------|----------|
 | **IDLE** | Boot (no market yet) | No quoting, waiting for first rotation |
 | **QUIET** | MarketRotation received | Wait for books to populate, set strike price |
-| **QUOTING** | `now >= quiet_until_ms` | Evaluate and post/requote on both sides. Blocked by: stale vol data, vol tracker not warm, unhealthy heartbeat, fair value estimator not warm, wide Polymarket spread (`> max_entry_spread` on either book), stale Polymarket book (`> stale_book_ms` since last update). Also: taker rebalance if imbalance `≥ rebalance_threshold` |
+| **QUOTING** | `now >= quiet_until_ms` | Evaluate and post/requote on both sides. Blocked by: stale vol data, vol tracker not warm, unhealthy heartbeat, fair value estimator not warm, wide Polymarket spread (`> max_entry_spread` on either book), stale Polymarket book (`> stale_book_ms` since last update). Buildup guard cancels makers and suppresses new maker posts, but taker rebalance still fires if imbalance `≥ rebalance_threshold` |
 
 All phases revert to QUIET on the next MarketRotation. The bot quotes continuously until market rotation — there is no closing phase.
 
