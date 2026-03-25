@@ -681,37 +681,8 @@ impl V2StrategyEngine {
             return Vec::new();
         }
 
-        // FV extremity guard: don't quote when fair value is too extreme
-        // (the cheap side cannot fill, making pairing structurally impossible)
-        let yes_fv_check = self.fair_value.yes_fair_value();
-        let max_extreme = Decimal::try_from(self.quoting_config.max_fair_value_extremity)
-            .unwrap_or(Decimal::new(85, 2));
-        let min_extreme = Decimal::ONE - max_extreme;
-        if yes_fv_check > max_extreme || yes_fv_check < min_extreme {
-            return Vec::new();
-        }
-
-        // ── Buildup guard — go dark during genuine BTC moves ──
-        if self.check_buildup_guard(now) {
-            let cancel_actions = self.quoter.cancel_all_actions();
-            for action in cancel_actions {
-                if let QuoteAction::Cancel { side, order_id } = action {
-                    self.quoter.on_cancel_sent(side);
-                    self.pending_commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
-                }
-            }
-            return Vec::new();
-        }
-
-        let (yes_token, no_token) = match (
-            self.state.active_yes_token_id.clone(),
-            self.state.active_no_token_id.clone(),
-        ) {
-            (Some(y), Some(n)) => (y, n),
-            _ => return Vec::new(),
-        };
-
         // ── Dynamic max post price (risk-adjusted) ──
+        // Computed always (even when FV is extreme) so diagnostics stay accurate.
         // Narrows the posting zone from config value toward $0.50 based on:
         // 1. FV conviction (how one-sided the probability is)
         // 2. Time pressure (how close to market end)
@@ -755,6 +726,32 @@ impl V2StrategyEngine {
         let max_extreme = Decimal::try_from(dynamic_max)
             .unwrap_or(Decimal::new(78, 2));
         let min_extreme = Decimal::ONE - max_extreme;
+
+        // FV extremity guard: don't quote when fair value is outside dynamic posting zone
+        let yes_fv_check = self.fair_value.yes_fair_value();
+        if yes_fv_check > max_extreme || yes_fv_check < min_extreme {
+            return Vec::new();
+        }
+
+        // ── Buildup guard — go dark during genuine BTC moves ──
+        if self.check_buildup_guard(now) {
+            let cancel_actions = self.quoter.cancel_all_actions();
+            for action in cancel_actions {
+                if let QuoteAction::Cancel { side, order_id } = action {
+                    self.quoter.on_cancel_sent(side);
+                    self.pending_commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
+            return Vec::new();
+        }
+
+        let (yes_token, no_token) = match (
+            self.state.active_yes_token_id.clone(),
+            self.state.active_no_token_id.clone(),
+        ) {
+            (Some(y), Some(n)) => (y, n),
+            _ => return Vec::new(),
+        };
 
         // ── Compute edge with zero-edge rebalance posting ──
         let base_edge = self.fair_value.edge();
