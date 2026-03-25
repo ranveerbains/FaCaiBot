@@ -63,5 +63,5 @@ stale_book_ms = 850
 heartbeat_dead_threshold = 5
 binance_stale_event_ms = 150
 # Buildup guard — weighted composite score with direction consensus + causal ordering
-buildup_go_dark_threshold = 0.4   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
+buildup_go_dark_threshold = 0.35   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
 buildup_go_live_threshold = 0.1    # resume when score drops below this
