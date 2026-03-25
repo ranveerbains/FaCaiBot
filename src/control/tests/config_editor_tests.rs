@@ -29,15 +29,15 @@ fn test_update_config_file() {
     let path = dir.join("config_test.toml");
     std::fs::write(
         &path,
-        "[risk_v2]\nmax_capital_per_market = 100\nclosing_phase_secs = 30\n",
+        "[risk_v2]\nrebalance_threshold = 100\nstale_book_ms = 30\n",
     )
     .unwrap();
 
-    update_config_file(&path, "risk_v2.max_capital_per_market", 200.0).unwrap();
+    update_config_file(&path, "risk_v2.rebalance_threshold", 200.0).unwrap();
 
     let contents = std::fs::read_to_string(&path).unwrap();
-    assert!(contents.contains("max_capital_per_market = 200"));
-    assert!(contents.contains("closing_phase_secs = 30"));
+    assert!(contents.contains("rebalance_threshold = 200"));
+    assert!(contents.contains("stale_book_ms = 30"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -49,16 +49,16 @@ fn test_update_preserves_comments() {
     let path = dir.join("config_comments.toml");
     std::fs::write(
         &path,
-        "[risk_v2]\nmax_capital_per_market = 100  # Max capital\nclosing_phase_secs = 30\n",
+        "[risk_v2]\nrebalance_threshold = 100  # Threshold\nstale_book_ms = 30\n",
     )
     .unwrap();
 
-    update_config_file(&path, "risk_v2.max_capital_per_market", 200.0).unwrap();
+    update_config_file(&path, "risk_v2.rebalance_threshold", 200.0).unwrap();
 
     let contents = std::fs::read_to_string(&path).unwrap();
-    assert!(contents.contains("max_capital_per_market = 200"));
-    assert!(contents.contains("# Max capital"));
-    assert!(contents.contains("closing_phase_secs = 30"));
+    assert!(contents.contains("rebalance_threshold = 200"));
+    assert!(contents.contains("# Threshold"));
+    assert!(contents.contains("stale_book_ms = 30"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -70,13 +70,13 @@ fn test_read_config_section() {
     let path = dir.join("config_read.toml");
     std::fs::write(
         &path,
-        "[quoting]\nmin_edge = 0.03\n\n[risk_v2]\nmax_capital_per_market = 100\n",
+        "[quoting]\nmin_edge = 0.03\n\n[risk_v2]\nrebalance_threshold = 100\n",
     )
     .unwrap();
 
     let section = read_config_section(&path, "quoting").unwrap();
     assert!(section.contains("min_edge"));
-    assert!(!section.contains("max_capital_per_market"));
+    assert!(!section.contains("rebalance_threshold"));
 
     let all = read_config_all(&path).unwrap();
     assert!(all.contains("quoting"));

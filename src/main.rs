@@ -71,10 +71,7 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let config = Config::load()?;
-    info!(
-        max_capital = %config.max_capital_per_market,
-        "FaCaiBot v2 starting"
-    );
+    info!("FaCaiBot v2 starting");
 
     // ── Channels ──
     let (ingestor_tx, ingestor_rx): (Sender<IngestorEvent>, Receiver<IngestorEvent>) =
@@ -211,7 +208,7 @@ async fn async_main() -> Result<()> {
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
                         reason: "shutdown".into(),
-                        position_info: "Waiting for closing phase to complete".into(),
+                        position_info: "Waiting for market rotation".into(),
                     });
                     continue;
                 }
@@ -228,7 +225,7 @@ async fn async_main() -> Result<()> {
                     }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
                         reason: "config change".into(),
-                        position_info: "Waiting for closing phase to complete".into(),
+                        position_info: "Waiting for market rotation".into(),
                     });
                     continue;
                 }
@@ -289,14 +286,6 @@ async fn async_main() -> Result<()> {
             for cmd in engine.quote_tick() {
                 if let Err(e) = executor_tx.send(cmd) {
                     error!(error = %e, "failed to send quote command");
-                    break;
-                }
-            }
-
-            // 6. Closing phase
-            for cmd in engine.closing_tick() {
-                if let Err(e) = executor_tx.send(cmd) {
-                    error!(error = %e, "failed to send closing command");
                     break;
                 }
             }
@@ -373,6 +362,15 @@ async fn async_main() -> Result<()> {
                 if let Some(ref mut c) = cold {
                     if let Err(e) = c.record_market_summary(&summary) {
                         debug!(error = %e, "failed to record market summary to QuestDB");
+                    }
+                }
+            }
+
+            // 12. QuestDB risk score records
+            for record in engine.take_pending_risk_records() {
+                if let Some(ref mut c) = cold {
+                    if let Err(e) = c.record_risk_score(&record) {
+                        debug!(error = %e, "failed to record risk score to QuestDB");
                     }
                 }
             }

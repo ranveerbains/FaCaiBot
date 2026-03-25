@@ -44,39 +44,22 @@ obi_saturation = 0.2
 min_edge = 0.03
 # Requoting
 requote_threshold = 0.01
-min_requote_interval_ms = 3500
-emergency_requote_threshold = 0.05  # bypass interval if FV drift >= this
 # Order sizing
-max_order_size = 10
+max_order_size = 15
 min_order_size = 5
-# Inventory skewing — scales linearly with imbalance ratio
-max_imbalance_skew = 0.12            # max skew at full imbalance — steeper to halt heavy side
-max_one_sided_shares = 10             # hard cap before opposite side fills
 max_fair_value_extremity = 0.75      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
-# Per-side exposure limits
-max_unpaired_shares = 15
-max_unpaired_usdc = 100
-# Market-wide limits
-max_capital_per_market = 30
 # Timing
-closing_phase_secs = 45
 rotation_quiet_ms = 10000
-# Closing phase
-max_closing_pair_cost = 0.97
-max_closing_attempts = 3             # multi-attempt FOK (was 1 one-shot)
-closing_retry_price_increment = 0.01 # accept 1 tick worse per retry
 # Taker rebalance (active imbalance correction)
 rebalance_threshold = 4.99             # shares imbalance to trigger taker rebalance
-rebalance_size = 10                   # shares per rebalance order
-rebalance_max_pair_cost = 0.97      # max pair cost for rebalance (only rebalance when profitable)
-min_rebalance_interval_ms = 1000    # fast response to imbalance (profitability guarded by rebalance_max_pair_cost)
+rebalance_size = 15                   # shares per rebalance order
+rebalance_max_pair_cost = 0.98      # max pair cost for rebalance (only rebalance when profitable)
 # Data quality
 stale_book_ms = 850
-max_entry_spread = 0.08
 heartbeat_dead_threshold = 5
 binance_stale_event_ms = 150
 # Buildup guard — weighted composite score with direction consensus + causal ordering
-buildup_enter_threshold = 0.35   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
-buildup_exit_threshold = 0.1    # resume when score drops below this
+buildup_go_dark_threshold = 0.4   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
+buildup_go_live_threshold = 0.1    # resume when score drops below this

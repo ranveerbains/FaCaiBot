@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::info;
 
@@ -100,12 +99,8 @@ impl Default for FairValueTomlConfig {
 pub struct QuotingTomlConfig {
     pub min_edge: f64,
     pub requote_threshold: f64,
-    pub min_requote_interval_ms: u64,
     pub max_order_size: f64,
     pub min_order_size: f64,
-    pub emergency_requote_threshold: f64,
-    pub max_imbalance_skew: f64,
-    pub max_one_sided_shares: f64,
     pub max_fair_value_extremity: f64,
 }
 
@@ -114,12 +109,8 @@ impl Default for QuotingTomlConfig {
         Self {
             min_edge: 0.04,
             requote_threshold: 0.01,
-            min_requote_interval_ms: 2000,
             max_order_size: 100.0,
             min_order_size: 5.0,
-            emergency_requote_threshold: 0.05,
-            max_imbalance_skew: 0.02,
-            max_one_sided_shares: 5.0,
             max_fair_value_extremity: 0.85,
         }
     }
@@ -128,47 +119,29 @@ impl Default for QuotingTomlConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RiskV2TomlConfig {
-    pub max_unpaired_shares: f64,
-    pub max_unpaired_usdc: f64,
-    pub max_capital_per_market: f64,
-    pub closing_phase_secs: u64,
     pub rotation_quiet_ms: u64,
-    pub max_closing_pair_cost: f64,
-    pub max_closing_attempts: u32,
-    pub closing_retry_price_increment: f64,
     pub rebalance_threshold: f64,
     pub rebalance_size: f64,
     pub rebalance_max_pair_cost: f64,
-    pub min_rebalance_interval_ms: u64,
     pub stale_book_ms: u64,
-    pub max_entry_spread: f64,
     pub heartbeat_dead_threshold: u32,
     pub binance_stale_event_ms: u64,
-    pub buildup_enter_threshold: f64,
-    pub buildup_exit_threshold: f64,
+    pub buildup_go_dark_threshold: f64,
+    pub buildup_go_live_threshold: f64,
 }
 
 impl Default for RiskV2TomlConfig {
     fn default() -> Self {
         Self {
-            max_unpaired_shares: 30.0,
-            max_unpaired_usdc: 25.0,
-            max_capital_per_market: 100.0,
-            closing_phase_secs: 45,
             rotation_quiet_ms: 5000,
-            max_closing_pair_cost: 0.97,
-            max_closing_attempts: 3,
-            closing_retry_price_increment: 0.01,
             rebalance_threshold: 20.0,
             rebalance_size: 10.0,
             rebalance_max_pair_cost: 0.96,
-            min_rebalance_interval_ms: 10000,
             stale_book_ms: 850,
-            max_entry_spread: 0.04,
             heartbeat_dead_threshold: 5,
             binance_stale_event_ms: 150,
-            buildup_enter_threshold: 0.40,
-            buildup_exit_threshold: 0.25,
+            buildup_go_dark_threshold: 0.40,
+            buildup_go_live_threshold: 0.25,
         }
     }
 }
@@ -222,8 +195,7 @@ pub struct Config {
     // ── Tuning (from config.toml) ──
     pub bot: BotConfig,
 
-    // ── Derived Decimal values ──
-    pub max_capital_per_market: Decimal,
+    // ── Derived values ──
     pub stale_event_threshold_ms: u64,
 }
 
@@ -259,8 +231,6 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<i64>().ok());
 
-        let max_capital_per_market = Decimal::try_from(bot.risk_v2.max_capital_per_market)
-            .context("risk_v2.max_capital_per_market: invalid decimal")?;
         let stale_event_threshold_ms = bot.risk_v2.binance_stale_event_ms;
 
         let config = Self {
@@ -280,13 +250,9 @@ impl Config {
             telegram_chat_id,
             telegram_allowed_user_id,
             bot,
-            max_capital_per_market,
             stale_event_threshold_ms,
         };
 
-        if config.max_capital_per_market <= Decimal::ZERO {
-            anyhow::bail!("risk_v2.max_capital_per_market must be positive");
-        }
         Ok(config)
     }
 

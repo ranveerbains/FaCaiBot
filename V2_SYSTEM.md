@@ -40,7 +40,7 @@ Ingestor (gateway/)          Engine (engine/)              Executor (executor/)
 ├─ Binance Futures JSON WS   │  ├─ FairValueEstimator      │  ├─ Post maker orders
 ├─ Polymarket Market WS      │  ├─ Quoter                  │  ├─ Cancel orders
 ├─ Polymarket User WS        │  ├─ BilateralPosition       │  ├─ Closing FOK
-├─ Gamma API (rotation)      │  └─ ClosingManager          │  └─ QuestDB analytics
+├─ Gamma API (rotation)      │                              │  └─ QuestDB analytics
 └─ Heartbeat POST            └─ 3 metric + 2 vol trackers  └─ Telegram reports
 ```
 
@@ -141,22 +141,26 @@ For each side, the quoter checks guards in order:
 
 1. **Pending operation**: Skip if a post or cancel is in-flight for this side
 2. **Unpaired limit**: Skip if `unpaired_shares(side) >= max_unpaired_shares`
-3. **USDC exposure**: Skip if `unpaired_usdc >= max_unpaired_usdc` and this side is contributing
-4. **Capital limit**: Skip if `total_capital_deployed >= max_capital_per_market`
-5. **One-sided accumulation guard**: If the opposite side has **zero fills** (`other_shares == 0`), skip if `unpaired(side) >= max_one_sided_shares` (default: 5). Caps exposure when pairing is impossible — prevents turning bilateral market-making into a naked directional bet
-6. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
-7. **Book-aware pair-cost check**: If the bot has unpaired shares on this side, check pairing viability using actual book data. If `opposite_best_ask` is `None` and there are no opposite fills (`other_avg == 0`), block (no pairing path exists). If `opposite_best_ask + target_price >= $1.00`, block (next pair unprofitable at current book prices).
+3. **Pair-cost feasibility**: If the opposite side has fills (`other_avg > 0`), skip if `other_avg + target_price >= $1.00`. Prevents posting orders that would create unprofitable pairs (pair cost ≥ $1.00). Skipped when the opposite side has no fills yet (early market, guard inactive).
+4. **Book-aware pair-cost check**: If the bot has unpaired shares on this side, check pairing viability using actual book data. If `opposite_best_ask` is `None` and there are no opposite fills (`other_avg == 0`), block (no pairing path exists). If `opposite_best_ask + target_price >= $1.00`, block (next pair unprofitable at current book prices).
+5. **Dynamic sizing cap**: If `dynamic_order_size()` returns `None` (3 batches completed), stop trading this market.
 
-### Size Computation
+### Size Computation (Dynamic)
 
+Order size decreases as paired shares accumulate, halving at each pairing milestone:
+- **Batch 1**: `max_order_size` (10) — trades until 10 shares paired
+- **Batch 2**: `max(10/2, min_order_size)` = 5 — trades until 15 paired
+- **Batch 3**: `max(5/2, min_order_size)` = 5 — trades until 20 paired
+- **4th batch trigger**: **stop trading this market entirely**
+
+The dynamic size is then further constrained:
 ```
-remaining_capital = max_capital_per_market - total_capital_deployed
-max_by_capital    = remaining_capital / target_price
-max_by_imbalance  = max_unpaired_shares - unpaired(side)
-size              = min(max_order_size, max_by_capital, max_by_imbalance)
+dynamic_max      = dynamic_order_size(max_order_size, min_order_size, paired_shares)
+max_by_imbalance = max_unpaired_shares - unpaired(side)
+size             = min(dynamic_max, max_by_imbalance)
 ```
 
-If size < `min_order_size` (default: 5 shares), skip posting. Additionally, if `target_price × size < $1.00` (CLOB notional minimum), skip posting.
+If `dynamic_order_size` returns None (pairing cap reached), skip posting. If size < `min_order_size` (default: 5 shares), skip posting. If `target_price × size < $1.00` (CLOB notional minimum), skip posting.
 
 ### Target Price
 
@@ -164,70 +168,27 @@ If size < `min_order_size` (default: 5 shares), skip posting. Additionally, if `
 target_price = round_to_tick(fair_value - edge, tick_size)
 ```
 
-### Inventory Skewing (Scaled)
+### Zero-Edge Rebalance Posting
 
-When the position is imbalanced (more shares on one side), the edge is adjusted **linearly with imbalance severity**:
+When the position is imbalanced, the **lagging side** (the side with fewer shares) posts its maker order with **zero edge** instead of the normal `min_edge`. This makes the lagging side's bid ~3 cents closer to the ask (since `min_edge` is typically 0.03), attracting fills to rebalance the position passively.
 
-```
-skew = max_imbalance_skew × (abs(imbalance) / max_unpaired_shares)
-```
-
-- **Long YES** (more YES than NO): Tighten NO edge by `skew` (attract NO fills), widen YES edge by `skew` (slow YES fills)
-- **Long NO** (more NO than YES): Tighten YES edge by `skew`, widen NO edge by `skew`
-
-At 5/30 imbalance: skew = 0.02 × 0.17 = 0.003. At 25/30 imbalance: skew = 0.02 × 0.83 = 0.017.
-
-### Bilateral Emergency Cancel
-
-Before evaluating quotes, if **either** side has fair value drift `≥ emergency_requote_threshold` since its order was posted, **both** sides are cancelled immediately. This prevents the second side from accumulating adverse fills during a fast BTC move.
+- **Long YES** (more YES than NO): NO side posts with edge = 0, YES side uses normal `base_edge`
+- **Long NO** (more NO than YES): YES side posts with edge = 0, NO side uses normal `base_edge`
+- **Balanced**: Both sides use `base_edge`
 
 ### Taker Rebalance
 
-If passive skewing is insufficient and the imbalance exceeds `rebalance_threshold` (default: 15 shares), the engine sends a taker FOK on the lagging side:
+If zero-edge posting is insufficient and the imbalance exceeds `rebalance_threshold`, the engine sends a taker FOK on the lagging side. Rebalance attempts are sequential — each FOK is sent, the engine waits for the result, and immediately retries if the price is still favorable:
 
-- **Cooldown**: Minimum `min_rebalance_interval_ms` (10s) between rebalance attempts
-- **Pair cost guard**: `other_side_avg + best_ask < rebalance_max_pair_cost` (0.96)
+- **Pair cost guard**: `other_side_avg + best_ask < rebalance_max_pair_cost` (0.97)
 - **Size**: `min(rebalance_size, abs_imbalance)`, minimum 5 shares
-- **Only during QUOTING phase** — not triggered during CLOSING
+- **Sequential**: No interval between attempts — the natural throttle is waiting for the FOK result. If cancelled or partially filled, the next `quote_tick` iteration re-triggers if conditions are still met
 
 ### Requoting
 
-A resting order is cancelled and replaced when:
-1. Fair value has drifted by `≥ requote_threshold` since the order was posted
-2. At least `min_requote_interval_ms` has elapsed since last post
+A resting order is cancelled and replaced when fair value has drifted by `≥ requote_threshold` since the order was posted. The cancel→confirm→repost cycle (~1.2s round-trip) is the natural throttle — no artificial interval. Both sides independently handle requotes, so fast BTC moves are handled reactively on each side.
 
-**Emergency requote**: If fair value drifts by `≥ emergency_requote_threshold` (default: $0.05), the minimum interval is bypassed — the cancel fires immediately. This prevents stale quotes during fast BTC moves.
-
-If neither condition is met, the order holds.
-
-## 6. Closing Phase
-
-In the last `closing_phase_secs` (default: 15s) of a market:
-
-1. **Cancel all** resting orders on both sides
-2. **Wait** for all pending operations (cancels, fills) to resolve
-3. **Compute pairing**: Identify the lagging side and the deficit
-4. **Guard checks**: Skip FOK if deficit < 3 shares
-5. **Notional floor**: If `ask_price × deficit < $1.00` (CLOB notional minimum), instead of skipping the FOK, the closing manager increases the size to `ceil(1 / price)` to meet the $1 minimum. The extra shares beyond the original deficit are cheap insurance — they cost fractions of a cent each and may pair with future fills
-6. **FOK order**: If `avg_pair_cost_with_taker < max_closing_pair_cost`, send a Fill-or-Kill taker order on the lagging side to pair up remaining shares
-
-### Multi-Attempt FOK
-
-Up to `max_closing_attempts` (default: 3) FOK attempts are made. Each retry progressively widens the acceptable pair cost:
-
-```
-max_pair_cost_for_attempt = max_closing_pair_cost + (attempt - 1) × closing_retry_price_increment
-```
-
-- Attempt 1: max_pair_cost = 0.95
-- Attempt 2: max_pair_cost = 0.96
-- Attempt 3: max_pair_cost = 0.97
-
-After each FOK result (success or failure), `pairing_sent` is cleared to allow the next retry. The `attempt_count` is incremented before each attempt, and `can_retry()` returns false once `attempt_count >= max_attempts`.
-
-The FOK uses `clob_safe_fok_size()` to ensure `price × size` has ≤2 decimal places (CLOB constraint).
-
-## 7. Fill Detection
+## 6. Fill Detection
 
 Fills are detected via two channels:
 
@@ -236,7 +197,7 @@ Fills are detected via two channels:
 2. **Executor Feedback**: When the executor posts, cancels, or sends a FOK, the result includes fill information:
    - `OrderPosted { already_filled }` — rare for post-only but handled
    - `CancelResult { order_id, size_matched }` — reveals fills that occurred before the cancel
-   - `ClosingFokResult { filled, size_matched }` — closing phase taker fills
+   - `RebalanceResult { filled, size_matched }` — rebalance taker fills
 
 Each fill records: side, price, size, timestamp, was_taker flag, and fee (maker rebate or taker fee).
 
@@ -249,24 +210,24 @@ User WS and CancelResult can both report the same fills (e.g., shares filled dur
 
 This ensures fills are counted exactly once regardless of which path arrives first, if both arrive, or if the WS fill clears the order before the CancelResult. Correct fill tracking is a prerequisite for accurate repost sizing after a cancel-requote cycle.
 
-## 8. Market Rotation
+## 7. Market Rotation
 
 When the Gamma API discovers a new market:
 
 1. **Report** the outgoing market (if any fills occurred): Telegram message with shares, pairing, locked profit, rebates
-2. **Reset** all state: position, quoter, closing manager, fair value estimator
+2. **Reset** all state: position, quoter, fair value estimator
 3. **Forward** `MarketRotation` command to executor (resets its SDK caches)
 4. **Enter QUIET phase**: Wait `rotation_quiet_ms` before quoting (lets books populate and strike price settle)
 5. **Strike snapshot**: Median of first `strike_warmup_count` (default: 5) Binance ticks after rotation — this is the reference price for the fair value model
 
-## 9. State Machine
+## 8. State Machine
 
 ```
                     MarketRotation
     ┌─────────────────────┐
     │                     ▼
-  IDLE ──────────── ▶ QUIET ──────────── ▶ QUOTING ──────────── ▶ CLOSING
-                     (wait quiet_ms)      (post maker orders)    (cancel + FOK pair)
+  IDLE ──────────── ▶ QUIET ──────────── ▶ QUOTING
+                     (wait quiet_ms)      (post maker orders)
                                           ◄─── requote loop ──►
 ```
 
@@ -274,12 +235,11 @@ When the Gamma API discovers a new market:
 |-------|----------------|----------|
 | **IDLE** | Boot (no market yet) | No quoting, waiting for first rotation |
 | **QUIET** | MarketRotation received | Wait for books to populate, set strike price |
-| **QUOTING** | `now >= quiet_until_ms` | Evaluate and post/requote on both sides. Blocked by: stale vol data, vol tracker not warm, unhealthy heartbeat, fair value estimator not warm, wide Polymarket spread (`> max_entry_spread` on either book), stale Polymarket book (`> stale_book_ms` since last update). Also: bilateral emergency cancel if either side drifts `≥ emergency_requote_threshold`, taker rebalance if imbalance `≥ rebalance_threshold` |
-| **CLOSING** | `time_remaining <= closing_phase_secs × 1000` | Cancel all → wait → multi-attempt FOK pair (up to `max_closing_attempts`, progressively wider price tolerance). Notional floor: if `price × deficit < $1`, size is bumped to `ceil(1/price)` |
+| **QUOTING** | `now >= quiet_until_ms` | Evaluate and post/requote on both sides. Blocked by: stale vol data, vol tracker not warm, unhealthy heartbeat, fair value estimator not warm, wide Polymarket spread (`> max_entry_spread` on either book), stale Polymarket book (`> stale_book_ms` since last update). Also: taker rebalance if imbalance `≥ rebalance_threshold` |
 
-All phases revert to QUIET on the next MarketRotation.
+All phases revert to QUIET on the next MarketRotation. The bot quotes continuously until market rotation — there is no closing phase.
 
-## 10. Config Reference
+## 9. Config Reference
 
 ### `[fair_value]` — Fair Value Model
 
@@ -322,13 +282,9 @@ All phases revert to QUIET on the next MarketRotation.
 | Param | Default | Description |
 |-------|---------|-------------|
 | `min_edge` | 0.04 | Minimum profit margin per share ($0.04 = 4 cents). Raised from 0.03 to account for 1.4s latency |
-| `requote_threshold` | 0.01 | Fair value drift that triggers a requote |
-| `min_requote_interval_ms` | 2000 | Minimum time between requotes per side |
-| `emergency_requote_threshold` | 0.05 | FV drift that bypasses min_requote_interval_ms; also triggers bilateral emergency cancel |
+| `requote_threshold` | 0.01 | Fair value drift that triggers a requote (cancel then repost) |
 | `max_order_size` | 100 | Maximum shares per order |
 | `min_order_size` | 5 | Minimum shares per order (below this, skip posting) |
-| `max_imbalance_skew` | 0.02 | Maximum edge skew at full imbalance (linearly scaled). Replaces flat `imbalance_edge_tightening`/`widening` |
-| `max_one_sided_shares` | 5 | Hard cap on unpaired shares when opposite side has zero fills. Prevents one-sided accumulation turning into naked directional bets |
 | `max_fair_value_extremity` | 0.85 | Don't quote when either side's FV exceeds this (or is below 1 - this). At extremes, the cheap side can't fill, making pairing impossible |
 
 ### `[risk_v2]` — Risk Limits
@@ -336,17 +292,10 @@ All phases revert to QUIET on the next MarketRotation.
 | Param | Default | Description |
 |-------|---------|-------------|
 | `max_unpaired_shares` | 30 | Maximum unpaired shares per side (lowered from 50 to reduce directional exposure) |
-| `max_unpaired_usdc` | 25 | Maximum USDC exposure on unpaired shares |
-| `max_capital_per_market` | 100 | Total USDC deployed across both sides per market |
-| `closing_phase_secs` | 15 | Seconds before expiry to enter closing phase |
 | `rotation_quiet_ms` | 8000 | Quiet period after market rotation (ms) |
-| `max_closing_pair_cost` | 0.95 | Base maximum pair cost for closing FOK (widened per retry) |
-| `max_closing_attempts` | 3 | Number of FOK pairing attempts during closing |
-| `closing_retry_price_increment` | 0.01 | How much to widen max_pair_cost per retry |
-| `rebalance_threshold` | 15 | Shares imbalance to trigger taker rebalance during QUOTING |
+| `rebalance_threshold` | 15 | Shares imbalance to trigger taker rebalance |
 | `rebalance_size` | 10 | Shares per rebalance FOK order |
-| `rebalance_max_pair_cost` | 0.96 | Max pair cost for rebalance (tighter than closing) |
-| `min_rebalance_interval_ms` | 10000 | Cooldown between rebalance attempts (10s) |
+| `rebalance_max_pair_cost` | 0.97 | Max pair cost for rebalance (only rebalance when profitable) |
 | `stale_book_ms` | 850 | Polymarket book staleness threshold — blocks quoting if either book is older than this |
 | `max_entry_spread` | 0.08 | Maximum Polymarket book spread — blocks both sides if either book spread exceeds this |
 | `heartbeat_dead_threshold` | 5 | Consecutive heartbeat failures before unhealthy. On transition, all resting orders auto-cancelled + Telegram alert |
@@ -358,9 +307,9 @@ All phases revert to QUIET on the next MarketRotation.
 |-------|---------|-------------|
 | `prewarm_lead_secs` | 20 | Seconds before market end to start searching for next market |
 
-## 11. Operational Layer (Telegram + QuestDB)
+## 10. Operational Layer (Telegram + QuestDB)
 
-### 11.1 Telegram Notifications
+### 10.1 Telegram Notifications
 
 Three notification categories, each gated by a `/trades`, `/summary`, or `/diag` toggle:
 
@@ -377,7 +326,7 @@ All notifications are stored as pending messages in the engine and dispatched in
 
 Messages are always logged via `info!()` regardless of toggle state.
 
-### 11.2 QuestDB Analytics
+### 10.2 QuestDB Analytics
 
 Three tables, all written via ILP over TCP:
 
@@ -416,15 +365,14 @@ Markets: 5 | Fills: 47
 Trades notify: on | Summary notify: on
 ```
 
-## 12. Source File Map
+## 11. Source File Map
 
 | File | Purpose |
 |------|---------|
-| `engine/strategy.rs` | `V2StrategyEngine`: event routing, state machine, quote/closing ticks |
+| `engine/strategy.rs` | `V2StrategyEngine`: event routing, state machine, quote ticks |
 | `engine/fair_value.rs` | `FairValueEstimator`: BTC probability model, momentum adjustment, edge sizing |
 | `engine/quoter.rs` | `Quoter`: per-side order management, requoting, inventory skewing |
 | `engine/position.rs` | `BilateralPosition`: share tracking, pairing math, PnL computation |
-| `engine/closing.rs` | `ClosingManager`: end-of-market cancel + FOK pairing logic |
 | `engine/buildup/metrics.rs` | Metric trackers: CVD, OBI velocity, basis delta, realized vol |
 | `executor/live.rs` | `LiveExecutor`: CLOB order placement, cancel, FOK, SDK caching |
 | `executor/fill_engine.rs` | `compute_taker_fee`, `round_to_tick` |

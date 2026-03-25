@@ -50,7 +50,7 @@ Ingestor (gateway/) ──▶ Engine (engine/) ──▶ Executor (executor/)
   Binance Spot SBE WS       FairValueEstimator       CLOB API (post/cancel/FOK)
   Binance Futures JSON WS   Quoter (both sides)      Telegram reports
   Polymarket WS             BilateralPosition         QuestDB analytics
-  Gamma API (REST)          ClosingManager
+  Gamma API (REST)
 ```
 
 Full details in `V2_SYSTEM.md` and `ARCHITECTURE.md`.
@@ -62,16 +62,15 @@ src/
 ├── main.rs                        # Entry point: jemalloc, tokio runtime (2 workers), channel wiring
 ├── config.rs                      # Hybrid config: config.toml (tuning) + .env (secrets)
 ├── engine/
-│   ├── strategy.rs                # V2StrategyEngine: event routing, state machine (IDLE→QUIET→QUOTING→CLOSING)
+│   ├── strategy.rs                # V2StrategyEngine: event routing, state machine (IDLE→QUIET→QUOTING)
 │   ├── fair_value.rs              # FairValueEstimator: BTC probability model, momentum, edge sizing
 │   ├── quoter.rs                  # Quoter: per-side order management, requoting, inventory skewing
 │   ├── position.rs                # BilateralPosition: share tracking, pairing math, PnL
-│   ├── closing.rs                 # ClosingManager: end-of-market cancel + FOK pairing
 │   └── buildup/
 │       ├── metrics.rs             # 4 metric trackers (CVD, OBI velocity, basis delta, realized volatility)
 │       └── tests/                 # Extracted test modules (metrics)
 ├── executor/
-│   ├── live.rs                    # LiveExecutor: bilateral maker orders, cancel, closing FOK
+│   ├── live.rs                    # LiveExecutor: bilateral maker orders, cancel, rebalance taker
 │   ├── fill_engine.rs             # Utility: compute_taker_fee, round_to_tick
 │   └── tests/                     # Extracted test modules (fill_engine)
 ├── gateway/
@@ -116,9 +115,9 @@ When making any code change, work through these layers top-down. Each layer can 
 
 2. **Config second** (`config.rs`, `config.toml`): If the change needs new tunable params — add the config struct fields, TOML section, and defaults. Add to `config_editor.rs` allowlist if it should be `/set`-able.
 
-3. **Core logic third** (`engine/fair_value.rs`, `engine/quoter.rs`, `engine/position.rs`, `engine/closing.rs`, `engine/buildup/metrics.rs`): Pure computation. These files should never touch IO or external state. Implement the logic using types from step 1 and config from step 2.
+3. **Core logic third** (`engine/fair_value.rs`, `engine/quoter.rs`, `engine/position.rs`, `engine/buildup/metrics.rs`): Pure computation. These files should never touch IO or external state. Implement the logic using types from step 1 and config from step 2.
 
-4. **State management fourth** (`engine/strategy.rs`): Wire the new logic into the event loop. This is where state transitions happen. Key entry points: `on_event()`, `on_feedback()`, `quote_tick()`, `closing_tick()`, `on_market_rotation()`, `on_trade_status_update()`.
+4. **State management fourth** (`engine/strategy.rs`): Wire the new logic into the event loop. This is where state transitions happen. Key entry points: `on_event()`, `on_feedback()`, `quote_tick()`, `on_market_rotation()`, `on_trade_status_update()`.
 
 5. **Executor fifth** (`executor/live.rs`): If the change affects CLOB interaction — order placement, cancellation, or feedback. Must match the `V2ExecutorCommand`/`V2ExecutorFeedback` types from step 1.
 
@@ -131,16 +130,16 @@ Before modifying any function or struct, **trace its callers and consumers**:
 - **Grep for the function/field name** across the codebase before changing its signature or semantics. A field on `V2ExecutorCommand` is used in `strategy.rs`, `live.rs`, `cold.rs`, and `telegram.rs` — miss one and it silently breaks.
 - **Check both directions**: who produces this data (upstream) and who consumes it (downstream). The channel boundary (`engine → executor`) is a common blind spot — a type change in `order.rs` affects both sides.
 - **strategy.rs is the hub**: Almost every behavioral change touches this file. If you think your change doesn't need strategy.rs edits, double-check — it probably does.
-- **State reset completeness**: New fields must be cleared in `on_market_rotation()` (which resets position, quoter, closing, and fair value). Missing a reset causes state leaks between markets.
+- **State reset completeness**: New fields must be cleared in `on_market_rotation()` (which resets position, quoter, and fair value). Missing a reset causes state leaks between markets.
 
 ### Iterative Verification
 
 After implementing, verify in this order:
 
 1. **`cargo build`** — Catch type errors, missing imports, signature mismatches. Fix all errors before proceeding.
-2. **`cargo test`** — Run the full test suite (138 tests). If tests fail, fix them before touching docs. Tests cover fair value model, quoting guards, position pairing, closing logic, fill engine utilities, and metric trackers.
+2. **`cargo test`** — Run the full test suite (136 tests). If tests fail, fix them before touching docs. Tests cover fair value model, quoting guards, position pairing, fill engine utilities, and metric trackers.
 3. **`cargo clippy`** — Fix warnings. Common ones: collapsible if-statements, derivable impls, too many function arguments.
-4. **Manual trace** — For behavioral changes, mentally walk through a complete market lifecycle (rotation → quiet → quoting → closing) to verify no state leaks or missed transitions. Use `V2_SYSTEM.md` §9 as reference.
+4. **Manual trace** — For behavioral changes, mentally walk through a complete market lifecycle (rotation → quiet → quoting) to verify no state leaks or missed transitions. Use `V2_SYSTEM.md` §8 as reference.
 
 ### When to Use Subagents
 
@@ -152,10 +151,9 @@ After implementing, verify in this order:
 ### Common Pitfalls
 
 - **Pending operation guards**: The quoter tracks pending posts/cancels per side. Issuing a new command while one is in-flight causes race conditions. Always check `is_pending()` before posting or cancelling.
-- **State reset on rotation**: `on_market_rotation()` resets position, quoter, closing, and fair value. New fields must be cleared here. Missing a reset causes stale state to leak into the next market.
+- **State reset on rotation**: `on_market_rotation()` resets position, quoter, and fair value. New fields must be cleared here. Missing a reset causes stale state to leak into the next market.
 - **Channel ordering**: Feedback is drained BEFORE `on_event()` in the main loop. This ensures fill data is processed before new quoting decisions.
-- **CLOB constraints**: `price × size` must have ≤2 decimal places for FOK orders. Use `clob_safe_fok_size()` for closing FOKs. Maker rebate is an estimate (20% of taker fee). Post-only orders can be rejected if price crosses book.
-- **Closing phase timing**: The closing FOK is a one-shot attempt. If the first attempt fails or is too expensive (`pair_cost >= max_closing_pair_cost`), unpaired shares ride to resolution.
+- **CLOB constraints**: `price × size` must have ≤2 decimal places for FOK orders. Use `clob_safe_fok_size()` for rebalance FOKs. Maker rebate is an estimate (20% of taker fee). Post-only orders can be rejected if price crosses book.
 
 ## Code Conventions (Cross-Cutting Rules)
 
@@ -164,7 +162,7 @@ These are codebase-wide rules that apply regardless of which module you're worki
 - **Decimal arithmetic**: All pricing uses `rust_decimal::Decimal` — never f32/f64 for prices or sizes
 - **Centralized timestamps**: All `epoch_ms()` calls use `crate::utils::time::epoch_ms` — no duplicates
 - **Channel-based data flow**: crossbeam bounded(8192) SPSC between layers — no `Arc<Mutex>`. Reverse `V2ExecutorFeedback` channel for CLOB order IDs
-- **Module purity**: `fair_value.rs`, `quoter.rs`, `position.rs`, `closing.rs` are pure computation — `strategy.rs` is the only file that mutates state and coordinates
+- **Module purity**: `fair_value.rs`, `quoter.rs`, `position.rs` are pure computation — `strategy.rs` is the only file that mutates state and coordinates
 - **Hybrid config**: `config.toml` for tuning params (serde + `#[serde(default)]`), `.env` for secrets only. Override path with `CONFIG_FILE` env var
 - **jemalloc**: Global allocator via `tikv-jemallocator`, conditional on `cfg(not(target_env = "msvc"))`
 - **Tokio runtime**: Manual 2-worker multi-thread, pinned cores 1-2. Core 0 reserved for ingestor. Engine on `spawn_blocking` (off worker pool)
@@ -178,19 +176,18 @@ These are codebase-wide rules that apply regardless of which module you're worki
 | **Fair value model, momentum, edge** | `V2_SYSTEM.md` §4 | `engine/fair_value.rs`, `engine/buildup/metrics.rs` |
 | **Quoting logic, inventory skewing** | `V2_SYSTEM.md` §5 | `engine/quoter.rs`, `engine/strategy.rs` |
 | **Position tracking, pairing, PnL** | `V2_SYSTEM.md` §2-3 | `engine/position.rs` |
-| **Closing phase, FOK pairing** | `V2_SYSTEM.md` §6 | `engine/closing.rs`, `engine/strategy.rs` |
-| **Fill detection, order matching** | `V2_SYSTEM.md` §7 | `engine/strategy.rs`, `gateway/polymarket/user_ws.rs` |
-| **Market rotation, state reset** | `V2_SYSTEM.md` §8 | `gateway/polymarket/rotation.rs`, `engine/strategy.rs` |
-| **State machine, phase transitions** | `V2_SYSTEM.md` §9 | `engine/strategy.rs` |
+| **Fill detection, order matching** | `V2_SYSTEM.md` §6 | `engine/strategy.rs`, `gateway/polymarket/user_ws.rs` |
+| **Market rotation, state reset** | `V2_SYSTEM.md` §7 | `gateway/polymarket/rotation.rs`, `engine/strategy.rs` |
+| **State machine, phase transitions** | `V2_SYSTEM.md` §8 | `engine/strategy.rs` |
 | **Metric trackers (CVD, OBI, etc.)** | `V2_SYSTEM.md` §4 | `engine/buildup/metrics.rs` |
 | **Binance data feeds (spot SBE)** | `ARCHITECTURE.md` (Ingestor section) | `gateway/binance/ws.rs` |
 | **Binance futures feeds** | `ARCHITECTURE.md` (Ingestor section) | `gateway/binance/futures_ws.rs` |
 | **Polymarket WS / REST / SDK** | `ARCHITECTURE.md` (Executor section) | `gateway/polymarket/rest.rs`, `user_ws.rs`, `market_ws.rs` |
 | **Telegram commands, bot control** | `ARCHITECTURE.md` (Control section) | `control/listener.rs`, `control/handlers.rs` |
-| **Telegram notifications, /status** | `V2_SYSTEM.md` §11 | `engine/strategy.rs`, `control/types.rs`, `control/handlers.rs` |
+| **Telegram notifications, /status** | `V2_SYSTEM.md` §10 | `engine/strategy.rs`, `control/types.rs`, `control/handlers.rs` |
 | **Wallet, redemption, /redeem** | `ARCHITECTURE.md` (Control section) | `control/wallet.rs` |
-| **QuestDB, analytics, retention** | `V2_SYSTEM.md` §11, `ARCHITECTURE.md` (Storage) | `storage/cold.rs` |
-| **Config params, /set command** | `V2_SYSTEM.md` §10, `config.toml` | `config.rs`, `control/config_editor.rs` |
+| **QuestDB, analytics, retention** | `V2_SYSTEM.md` §10, `ARCHITECTURE.md` (Storage) | `storage/cold.rs` |
+| **Config params, /set command** | `V2_SYSTEM.md` §9, `config.toml` | `config.rs`, `control/config_editor.rs` |
 | **Deployment, systemd, AWS** | `README.md`, `ARCHITECTURE.md` (Deployment section) | `deploy/` scripts |
 | **Refactoring plan** | `REFACTORING.md` | (varies by item) |
 
@@ -200,7 +197,7 @@ After **every** change, update docs in this order. Skip files that aren't affect
 
 1. **`CLAUDE.md`** — Only if: source file tree changed, new cross-cutting convention added, or task routing table needs updating. Do NOT add domain-specific definitions here.
 
-2. **`V2_SYSTEM.md`** — Update the relevant section for any behavioral change: fair value model (§4), quoting logic (§5), closing phase (§6), fill detection (§7), market rotation (§8), state machine (§9), config (§10), operational layer (§11).
+2. **`V2_SYSTEM.md`** — Update the relevant section for any behavioral change: fair value model (§4), quoting logic (§5), fill detection (§6), market rotation (§7), state machine (§8), config (§9), operational layer (§10).
 
 3. **`ARCHITECTURE.md`** — Only if: system design, layer boundaries, data flow, infrastructure, or deployment changed.
 

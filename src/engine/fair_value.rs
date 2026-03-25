@@ -128,6 +128,7 @@ pub struct FairValueEstimator {
     no_fair_value: f64,
     edge: f64,
     last_update_ms: u64,
+    last_momentum: f64,
     // Vol trackers
     vol_tracker: RealizedVolTracker,
     session_vol_tracker: RealizedVolTracker,
@@ -183,6 +184,7 @@ impl FairValueEstimator {
             no_fair_value: 0.5,
             edge: 0.05,
             last_update_ms: 0,
+            last_momentum: 0.0,
             vol_tracker,
             session_vol_tracker,
             basis_tracker,
@@ -280,6 +282,7 @@ impl FairValueEstimator {
             self.config.max_momentum_adj,
         );
 
+        self.last_momentum = momentum_clamped;
         self.yes_fair_value = (base_fv + momentum_clamped).clamp(0.02, 0.98);
         self.no_fair_value = 1.0 - self.yes_fair_value;
 
@@ -336,6 +339,10 @@ impl FairValueEstimator {
 
     pub fn edge(&self) -> Decimal {
         Decimal::try_from(self.edge).unwrap_or(Decimal::new(5, 2))
+    }
+
+    pub fn last_momentum(&self) -> f64 {
+        self.last_momentum
     }
 
     pub fn strike_price(&self) -> Decimal {

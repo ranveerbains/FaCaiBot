@@ -45,6 +45,7 @@ pub struct OrderBook {
 }
 
 impl OrderBook {
+    #[allow(dead_code)]
     pub fn best_bid(&self) -> Option<&PriceLevel> {
         self.bids.first()
     }
@@ -191,9 +192,6 @@ impl MarketState {
         }
     }
 
-    pub fn time_remaining_ms(&self, now_ms: u64) -> u64 {
-        self.market_end_timestamp_ms.saturating_sub(now_ms)
-    }
 }
 
 impl Default for MarketState {

@@ -178,7 +178,31 @@ impl ColdStorage {
         Ok(())
     }
 
-    // ─── 4. Explicit Flush ──────────────────────────────────────────────────────
+    // ─── 4. v2_risk_scores ─────────────────────────────────────────────────────
+
+    /// Record a risk score snapshot to `v2_risk_scores`. Flushed immediately.
+    pub fn record_risk_score(&mut self, record: &RiskScoreRecord) -> Result<()> {
+        self.buffer
+            .table("v2_risk_scores")?
+            .symbol("condition_id", &record.condition_id)?
+            .column_f64("rebalance_risk", record.rebalance_risk)?
+            .column_f64("dynamic_max_post", record.dynamic_max_post)?
+            .column_f64("conviction", record.conviction)?
+            .column_f64("time_pressure", record.time_pressure)?
+            .column_f64("momentum_alignment", record.momentum_alignment)?
+            .column_f64("fv_yes", record.fv_yes)?
+            .column_f64("yes_shares", record.yes_shares)?
+            .column_f64("no_shares", record.no_shares)?
+            .column_f64("paired", record.paired)?
+            .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
+
+        self.sender
+            .flush(&mut self.buffer)
+            .context("QuestDB flush (v2_risk_scores) failed")?;
+        Ok(())
+    }
+
+    // ─── 5. Explicit Flush ──────────────────────────────────────────────────────
 
     /// Flush any remaining buffered `binance_ticks` data.
     ///
@@ -234,6 +258,21 @@ pub struct MarketSummaryRecord {
     pub unpaired_yes: f64,
     pub unpaired_no: f64,
     pub rebalance_count: i64,
+    pub timestamp_ms: u64,
+}
+
+/// Dynamic risk score snapshot for QuestDB recording (every 5s during quoting).
+pub struct RiskScoreRecord {
+    pub condition_id: String,
+    pub rebalance_risk: f64,
+    pub dynamic_max_post: f64,
+    pub conviction: f64,
+    pub time_pressure: f64,
+    pub momentum_alignment: f64,
+    pub fv_yes: f64,
+    pub yes_shares: f64,
+    pub no_shares: f64,
+    pub paired: f64,
     pub timestamp_ms: u64,
 }
 

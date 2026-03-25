@@ -1,6 +1,6 @@
 //! V2 Strategy Engine — bilateral accumulation.
 //!
-//! State machine: IDLE → QUIET → QUOTING → CLOSING
+//! State machine: IDLE → QUIET → QUOTING
 //! Accumulates YES and NO shares independently, pairs at resolution.
 
 use rust_decimal::Decimal;
@@ -8,13 +8,12 @@ use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, info};
 
 use crate::config::Config;
-use crate::engine::closing::ClosingManager;
 use crate::engine::fair_value::{FairValueConfig, FairValueEstimator};
 use crate::engine::position::{BilateralPosition, MarketSide};
 use crate::engine::quoter::{ManagedOrder, QuoteAction, Quoter, QuotingConfig, RiskV2Config};
 use crate::executor::fill_engine::{compute_taker_fee, round_to_tick};
 use crate::reporting::telegram::TelegramReporter;
-use crate::storage::cold::{FillRecord, MarketSummaryRecord};
+use crate::storage::cold::{FillRecord, MarketSummaryRecord, RiskScoreRecord};
 use crate::types::market::{IngestorEvent, MarketState, PriceLevel, TradeStatus};
 use crate::types::order::{V2ExecutorCommand, V2ExecutorFeedback};
 use crate::utils::time::epoch_ms;
@@ -26,7 +25,6 @@ pub enum MarketPhase {
     Idle,
     Quiet,
     Quoting,
-    Closing,
 }
 
 // ─── V2 Strategy Engine ─────────────────────────────────────────────────────
@@ -48,7 +46,6 @@ pub struct V2StrategyEngine {
     position: BilateralPosition,
     fair_value: FairValueEstimator,
     quoter: Quoter,
-    closing: ClosingManager,
 
     // ── Reporting ──
     reporter: Option<TelegramReporter>,
@@ -68,7 +65,6 @@ pub struct V2StrategyEngine {
     diag_yes_fills: u32,
     diag_no_fills: u32,
     diag_requotes: u32,
-    diag_closing_foks: u32,
     diag_markets_traded: u32,
 
     // ── Buildup guard ──
@@ -76,9 +72,11 @@ pub struct V2StrategyEngine {
     diag_buildup_darkens: u32,
 
     // ── Rebalance state ──
-    last_rebalance_ms: u64,
     pending_rebalance: bool,
     diag_rebalances: u32,
+
+    // ── Dynamic risk score (for 60s diagnostic) ──
+    last_rebalance_risk: f64,
 
     // ── Pending commands ──
     pending_commands: Vec<V2ExecutorCommand>,
@@ -99,6 +97,8 @@ pub struct V2StrategyEngine {
     // ── QuestDB records (Task 5 & 6) ──
     pending_fill_records: Vec<FillRecord>,
     pending_market_summary: Option<MarketSummaryRecord>,
+    pending_risk_records: Vec<RiskScoreRecord>,
+    last_risk_record_ms: u64,
 }
 
 impl V2StrategyEngine {
@@ -142,43 +142,26 @@ impl V2StrategyEngine {
         let quoting_config = QuotingConfig {
             min_edge: q_toml.min_edge,
             requote_threshold: q_toml.requote_threshold,
-            min_requote_interval_ms: q_toml.min_requote_interval_ms,
             max_order_size: Decimal::try_from(q_toml.max_order_size).unwrap_or(Decimal::new(100, 0)),
             min_order_size: Decimal::try_from(q_toml.min_order_size).unwrap_or(Decimal::new(5, 0)),
-            emergency_requote_threshold: q_toml.emergency_requote_threshold,
-            max_imbalance_skew: q_toml.max_imbalance_skew,
-            max_one_sided_shares: Decimal::try_from(q_toml.max_one_sided_shares)
-                .unwrap_or(Decimal::new(5, 0)),
             max_fair_value_extremity: q_toml.max_fair_value_extremity,
         };
 
         let r_toml = &config.bot.risk_v2;
         let risk_config = RiskV2Config {
-            max_unpaired_shares: Decimal::try_from(r_toml.max_unpaired_shares).unwrap_or(Decimal::new(30, 0)),
-            max_unpaired_usdc: Decimal::try_from(r_toml.max_unpaired_usdc).unwrap_or(Decimal::new(25, 0)),
-            max_capital_per_market: Decimal::try_from(r_toml.max_capital_per_market).unwrap_or(Decimal::new(100, 0)),
-            closing_phase_secs: r_toml.closing_phase_secs,
             rotation_quiet_ms: r_toml.rotation_quiet_ms,
-            max_closing_pair_cost: r_toml.max_closing_pair_cost,
-            closing_retry_price_increment: r_toml.closing_retry_price_increment,
             rebalance_threshold: Decimal::try_from(r_toml.rebalance_threshold).unwrap_or(Decimal::new(20, 0)),
             rebalance_size: Decimal::try_from(r_toml.rebalance_size).unwrap_or(Decimal::new(10, 0)),
             rebalance_max_pair_cost: r_toml.rebalance_max_pair_cost,
-            min_rebalance_interval_ms: r_toml.min_rebalance_interval_ms,
             stale_book_ms: r_toml.stale_book_ms,
-            max_entry_spread: r_toml.max_entry_spread,
             heartbeat_dead_threshold: r_toml.heartbeat_dead_threshold,
-            buildup_enter_threshold: r_toml.buildup_enter_threshold,
-            buildup_exit_threshold: r_toml.buildup_exit_threshold,
+            buildup_go_dark_threshold: r_toml.buildup_go_dark_threshold,
+            buildup_go_live_threshold: r_toml.buildup_go_live_threshold,
         };
 
         info!(
-            max_unpaired_shares = %risk_config.max_unpaired_shares,
-            max_unpaired_usdc = %risk_config.max_unpaired_usdc,
-            max_capital_per_market = %risk_config.max_capital_per_market,
             rebalance_threshold = %risk_config.rebalance_threshold,
             rebalance_max_pair_cost = risk_config.rebalance_max_pair_cost,
-            max_closing_pair_cost = risk_config.max_closing_pair_cost,
             max_order_size = %quoting_config.max_order_size,
             min_order_size = %quoting_config.min_order_size,
             "risk config loaded"
@@ -197,7 +180,6 @@ impl V2StrategyEngine {
             position: BilateralPosition::new(),
             fair_value: FairValueEstimator::new(&fair_value_config),
             quoter: Quoter::new(),
-            closing: ClosingManager::with_config(r_toml.max_closing_attempts),
             reporter: None,
             draining: false,
             paused: false,
@@ -209,13 +191,12 @@ impl V2StrategyEngine {
             diag_yes_fills: 0,
             diag_no_fills: 0,
             diag_requotes: 0,
-            diag_closing_foks: 0,
             diag_markets_traded: 0,
             buildup_guard_active: false,
             diag_buildup_darkens: 0,
-            last_rebalance_ms: 0,
             pending_rebalance: false,
             diag_rebalances: 0,
+            last_rebalance_risk: 0.0,
             pending_commands: Vec::new(),
             pending_tick_change: None,
             pending_telegram_diag: None,
@@ -224,6 +205,8 @@ impl V2StrategyEngine {
             pending_session_summary: None,
             pending_fill_records: Vec::new(),
             pending_market_summary: None,
+            pending_risk_records: Vec::new(),
+            last_risk_record_ms: 0,
         }
     }
 
@@ -420,15 +403,6 @@ impl V2StrategyEngine {
             info!("phase transition: QUIET → QUOTING");
         }
 
-        // Phase transition: QUOTING → CLOSING
-        if self.phase == MarketPhase::Quoting && !self.paused {
-            let remaining = self.state.time_remaining_ms(now);
-            if ClosingManager::should_enter(remaining, self.risk_config.closing_phase_secs) {
-                self.phase = MarketPhase::Closing;
-                self.closing.phase_entered = true;
-                info!(remaining_ms = remaining, "phase transition: QUOTING → CLOSING");
-            }
-        }
     }
 
     // ─── Market rotation ────────────────────────────────────────────────
@@ -460,16 +434,17 @@ impl V2StrategyEngine {
         self.strike_price = None;
         self.position.reset();
         self.quoter.reset();
-        self.closing.reset();
         self.fair_value.reset(&self.fair_value_config);
 
         self.buildup_guard_active = false;
         self.diag_buildup_darkens = 0;
-        self.last_rebalance_ms = 0;
         self.pending_rebalance = false;
         self.diag_rebalances = 0;
+        self.last_rebalance_risk = 0.0;
+        self.last_risk_record_ms = 0;
         self.pending_fill_messages.clear();
         self.pending_fill_records.clear();
+        self.pending_risk_records.clear();
 
         self.phase = MarketPhase::Quiet;
         self.quiet_until_ms = now + self.risk_config.rotation_quiet_ms;
@@ -645,27 +620,6 @@ impl V2StrategyEngine {
                 self.quoter.on_cancel_result(side);
             }
 
-            V2ExecutorFeedback::ClosingFokResult {
-                side, filled, size_matched, price,
-            } => {
-                if filled && size_matched > Decimal::ZERO {
-                    let fee = compute_taker_fee(price, size_matched);
-                    self.position.record_fill(side, price, size_matched, true, fee);
-                    self.push_fill_message(side, price, size_matched, true);
-                    self.push_fill_record(side, price, size_matched, true, fee, now);
-                    self.diag_closing_foks += 1;
-                    info!(
-                        side = side.label(),
-                        price = %price,
-                        size = %size_matched,
-                        attempt = self.closing.attempt_count,
-                        "closing FOK filled"
-                    );
-                }
-                // Allow retry: clear pairing_sent so can_retry() can fire again
-                self.closing.pairing_sent = false;
-            }
-
             V2ExecutorFeedback::RebalanceResult {
                 side, filled, size_matched, price,
             } => {
@@ -714,17 +668,10 @@ impl V2StrategyEngine {
             return Vec::new();
         }
 
-        // Per-side book health: spread OK + data fresh
+        // Per-side book health: data fresh
         let book_healthy = |book: &Option<crate::types::market::OrderBook>| -> bool {
             book.as_ref().is_some_and(|b| {
-                let spread_ok = match (b.best_bid(), b.best_ask()) {
-                    (Some(bid), Some(ask)) => {
-                        (ask.price - bid.price).to_f64().unwrap_or(1.0) <= self.risk_config.max_entry_spread
-                    }
-                    _ => false,
-                };
-                let fresh = now.saturating_sub(b.timestamp_ms) <= self.risk_config.stale_book_ms;
-                spread_ok && fresh
+                now.saturating_sub(b.timestamp_ms) <= self.risk_config.stale_book_ms
             })
         };
         let yes_book_ok = book_healthy(&self.state.poly_yes_book);
@@ -764,56 +711,62 @@ impl V2StrategyEngine {
             _ => return Vec::new(),
         };
 
-        // ── Bilateral emergency cancel ──
-        // If EITHER side has FV drift >= emergency threshold, cancel BOTH sides
-        let emergency_threshold = self.quoting_config.emergency_requote_threshold;
-        let yes_drift = self.quoter.order(MarketSide::Yes).map(|o| {
-            let fv = self.fair_value.yes_fair_value();
-            (fv - o.fair_value_at_post).abs().to_f64().unwrap_or(0.0)
-        }).unwrap_or(0.0);
-        let no_drift = self.quoter.order(MarketSide::No).map(|o| {
-            let fv = self.fair_value.no_fair_value();
-            (fv - o.fair_value_at_post).abs().to_f64().unwrap_or(0.0)
-        }).unwrap_or(0.0);
+        // ── Dynamic max post price (risk-adjusted) ──
+        // Narrows the posting zone from config value toward $0.50 based on:
+        // 1. FV conviction (how one-sided the probability is)
+        // 2. Time pressure (how close to market end)
+        // 3. Binance momentum alignment (confirming vs opposing the FV direction)
+        let fv_yes_f64 = self.fair_value.yes_fair_value()
+            .to_f64().unwrap_or(0.5);
+        let conviction = (fv_yes_f64 - 0.5).abs() * 2.0;
 
-        if yes_drift >= emergency_threshold || no_drift >= emergency_threshold {
-            let mut commands = Vec::new();
-            let cancel_actions = self.quoter.cancel_all_actions();
-            for action in cancel_actions {
-                if let QuoteAction::Cancel { side, order_id } = action {
-                    self.quoter.on_cancel_sent(side);
-                    self.diag_requotes += 1;
-                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
-                }
-            }
-            if !commands.is_empty() {
-                debug!(yes_drift, no_drift, "bilateral emergency cancel triggered");
-                return commands;
-            }
+        let time_remaining_ms = self.state.market_end_timestamp_ms.saturating_sub(now);
+        let time_pressure = 1.0 - (time_remaining_ms as f64 / 300_000.0).clamp(0.0, 1.0);
+
+        let momentum = self.fair_value.last_momentum();
+        let fv_direction = if fv_yes_f64 >= 0.5 { 1.0 } else { -1.0 };
+        let max_mom = self.fair_value_config.max_momentum_adj.max(0.001);
+        let raw_alignment = (momentum * fv_direction / max_mom).clamp(-1.0, 1.0);
+
+        let rebalance_risk = compute_rebalance_risk(conviction, time_pressure, raw_alignment);
+        self.last_rebalance_risk = rebalance_risk;
+
+        let config_max = self.quoting_config.max_fair_value_extremity;
+        let dynamic_max = compute_dynamic_max_post(config_max, rebalance_risk);
+
+        // Record risk score to QuestDB every 5 seconds
+        if now.saturating_sub(self.last_risk_record_ms) >= 5_000 {
+            self.last_risk_record_ms = now;
+            self.pending_risk_records.push(RiskScoreRecord {
+                condition_id: self.state.active_condition_id.clone().unwrap_or_default(),
+                rebalance_risk,
+                dynamic_max_post: dynamic_max,
+                conviction,
+                time_pressure,
+                momentum_alignment: raw_alignment,
+                fv_yes: fv_yes_f64,
+                yes_shares: self.position.yes.total_shares.to_f64().unwrap_or(0.0),
+                no_shares: self.position.no.total_shares.to_f64().unwrap_or(0.0),
+                paired: self.position.paired_shares().to_f64().unwrap_or(0.0),
+                timestamp_ms: now,
+            });
         }
 
-        // ── Compute edge with scaled inventory skewing ──
+        let max_extreme = Decimal::try_from(dynamic_max)
+            .unwrap_or(Decimal::new(78, 2));
+        let min_extreme = Decimal::ONE - max_extreme;
+
+        // ── Compute edge with zero-edge rebalance posting ──
         let base_edge = self.fair_value.edge();
         let imbalance = self.position.yes.total_shares - self.position.no.total_shares;
         let abs_imbalance = imbalance.abs();
-        let max_unpaired = self.risk_config.max_unpaired_shares;
-
-        // Scale skew linearly: skew = max_imbalance_skew × (abs(imbalance) / max_unpaired)
-        let skew_ratio = if max_unpaired > Decimal::ZERO {
-            abs_imbalance.to_f64().unwrap_or(0.0) / max_unpaired.to_f64().unwrap_or(1.0)
-        } else {
-            0.0
-        };
-        let skew = Decimal::try_from(
-            self.quoting_config.max_imbalance_skew * skew_ratio.min(1.0)
-        ).unwrap_or(Decimal::ZERO);
 
         let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
-            // Long YES → tighten NO edge (attract fills), widen YES edge (discourage more)
-            (base_edge + skew, (base_edge - skew).max(Decimal::new(1, 2)))
+            // Long YES → NO is lagging, post NO without edge to attract fills
+            (base_edge, Decimal::ZERO)
         } else if imbalance < Decimal::ZERO {
-            // Long NO → tighten YES edge, widen NO edge
-            ((base_edge - skew).max(Decimal::new(1, 2)), base_edge + skew)
+            // Long NO → YES is lagging, post YES without edge to attract fills
+            (Decimal::ZERO, base_edge)
         } else {
             (base_edge, base_edge)
         };
@@ -825,18 +778,45 @@ impl V2StrategyEngine {
         let yes_fv = self.fair_value.yes_fair_value();
         let no_fv = self.fair_value.no_fair_value();
 
-        // Pre-flight: skip sides whose target would cross or meet the CLOB best ask
+        // Pre-flight: skip sides whose target would cross or meet the CLOB best ask,
+        // and enforce dynamic posting zone bounds
         let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
         let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-        let yes_postable = yes_book_ok && yes_best_ask.is_none_or(|ask| yes_target < ask);
-        let no_postable = no_book_ok && no_best_ask.is_none_or(|ask| no_target < ask);
+        let yes_postable = yes_book_ok
+            && yes_target >= min_extreme && yes_target <= max_extreme
+            && yes_best_ask.is_none_or(|ask| yes_target < ask);
+        let no_postable = no_book_ok
+            && no_target >= min_extreme && no_target <= max_extreme
+            && no_best_ask.is_none_or(|ask| no_target < ask);
+
+        // Cancel resting orders that are now outside the dynamic posting zone
+        {
+            let mut zone_cancels = Vec::new();
+            if !yes_postable
+                && let Some(QuoteAction::Cancel { side, order_id }) =
+                    self.quoter.cancel_side_action(MarketSide::Yes)
+            {
+                self.quoter.on_cancel_sent(side);
+                zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
+            }
+            if !no_postable
+                && let Some(QuoteAction::Cancel { side, order_id }) =
+                    self.quoter.cancel_side_action(MarketSide::No)
+            {
+                self.quoter.on_cancel_sent(side);
+                zone_cancels.push(V2ExecutorCommand::CancelOrder { side, order_id });
+            }
+            if !zone_cancels.is_empty() {
+                return zone_cancels;
+            }
+        }
 
         // Evaluate each side independently (book health + crossing check)
         let mut actions = Vec::new();
         if yes_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                &self.position, &self.quoting_config, &self.risk_config, now,
+                &self.position, &self.quoting_config,
                 no_best_ask,
             )
         {
@@ -845,7 +825,7 @@ impl V2StrategyEngine {
         if no_postable
             && let Some(a) = self.quoter.evaluate_side(
                 MarketSide::No, no_target, no_fv, &no_token,
-                &self.position, &self.quoting_config, &self.risk_config, now,
+                &self.position, &self.quoting_config,
                 yes_best_ask,
             )
         {
@@ -876,7 +856,6 @@ impl V2StrategyEngine {
         // If imbalance exceeds threshold, actively rebalance by taking the opposite side
         if abs_imbalance >= self.risk_config.rebalance_threshold
             && !self.pending_rebalance
-            && now.saturating_sub(self.last_rebalance_ms) >= self.risk_config.min_rebalance_interval_ms
         {
             // Determine which side to buy (the lagging one)
             let (rebal_side, rebal_token, rebal_book) = if imbalance > Decimal::ZERO {
@@ -897,11 +876,10 @@ impl V2StrategyEngine {
                 let max_rebal_cost = Decimal::try_from(self.risk_config.rebalance_max_pair_cost)
                     .unwrap_or(Decimal::new(96, 2));
 
-                if pair_cost < max_rebal_cost {
+                if pair_cost <= max_rebal_cost {
                     let size = self.risk_config.rebalance_size.min(abs_imbalance);
                     if size >= Decimal::new(5, 0) {
                         self.pending_rebalance = true;
-                        self.last_rebalance_ms = now;
                         self.diag_rebalances += 1;
                         commands.push(V2ExecutorCommand::RebalanceTaker {
                             side: rebal_side,
@@ -918,97 +896,6 @@ impl V2StrategyEngine {
                         );
                     }
                 }
-            }
-        }
-
-        commands
-    }
-
-    // ─── Closing tick (called each iteration) ───────────────────────────
-
-    pub fn closing_tick(&mut self) -> Vec<V2ExecutorCommand> {
-        if self.phase != MarketPhase::Closing || self.paused {
-            return Vec::new();
-        }
-
-        let mut commands = Vec::new();
-
-        // Step 1: Cancel all resting orders
-        if !self.closing.resting_cancelled {
-            let cancel_actions = self.quoter.cancel_all_actions();
-            for action in cancel_actions {
-                if let QuoteAction::Cancel { side, order_id } = action {
-                    self.quoter.on_cancel_sent(side);
-                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
-                }
-            }
-            self.closing.resting_cancelled = true;
-            if !commands.is_empty() {
-                return commands; // wait for cancel confirmations before pairing
-            }
-        }
-
-        // Step 2: Wait for all pending operations to resolve
-        if self.quoter.is_pending(MarketSide::Yes) || self.quoter.is_pending(MarketSide::No) {
-            return commands;
-        }
-        if self.closing.pairing_sent {
-            return commands;
-        }
-
-        // Step 3: Attempt pairing (multi-attempt with progressive price widening)
-        if self.closing.can_retry() {
-            self.closing.attempt_count += 1;
-
-            let yes_ask = self.state.poly_yes_book.as_ref()
-                .and_then(|b| b.best_ask())
-                .map(|l| l.price);
-            let no_ask = self.state.poly_no_book.as_ref()
-                .and_then(|b| b.best_ask())
-                .map(|l| l.price);
-
-            let (yes_token, no_token) = match (
-                self.state.active_yes_token_id.clone(),
-                self.state.active_no_token_id.clone(),
-            ) {
-                (Some(y), Some(n)) => (y, n),
-                _ => return commands,
-            };
-
-            // Widen max_pair_cost by attempt × retry_price_increment
-            let base_max = Decimal::try_from(self.risk_config.max_closing_pair_cost)
-                .unwrap_or(Decimal::new(97, 2));
-            let widening = Decimal::try_from(
-                self.risk_config.closing_retry_price_increment
-            ).unwrap_or(Decimal::ZERO)
-                * Decimal::from(self.closing.attempt_count.saturating_sub(1));
-            let max_pair_cost = base_max + widening;
-
-            if let Some(pairing) = ClosingManager::compute_pairing(
-                &self.position,
-                &yes_token,
-                &no_token,
-                yes_ask,
-                no_ask,
-                max_pair_cost,
-                self.risk_config.max_capital_per_market,
-            ) {
-                info!(
-                    side = pairing.side.label(),
-                    price = %pairing.price,
-                    size = %pairing.size,
-                    pair_cost = %pairing.expected_pair_cost,
-                    attempt = self.closing.attempt_count,
-                    max_pair_cost = %max_pair_cost,
-                    "closing: FOK pairing"
-                );
-                self.closing.pairing_sent = true;
-                commands.push(V2ExecutorCommand::ClosingFok {
-                    side: pairing.side,
-                    token_id: pairing.token_id,
-                    price: pairing.price,
-                    size: pairing.size,
-                });
             }
         }
 
@@ -1071,16 +958,18 @@ impl V2StrategyEngine {
         let locked = self.position.locked_profit();
         let deployed = self.position.total_capital_deployed();
 
+        let config_max = self.quoting_config.max_fair_value_extremity;
+        let dyn_max = 0.50 + (config_max - 0.50) * (1.0 - self.last_rebalance_risk);
+
         let buildup = self.buildup_score(now);
         let msg = format!(
-            "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} closing_foks={} darkens={} | \
+            "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} darkens={} | \
              yes={:.2} no={:.2} paired={:.2} locked=${:.2} deployed=${:.2} | \
-             fv_yes={:.3} fv_no={:.3} edge={:.3} buildup={:.3}{} | markets={}",
+             fv_yes={:.3} fv_no={:.3} edge={:.3} risk={:.2} dyn_max={:.2} buildup={:.3}{} | markets={}",
             self.phase,
             self.diag_yes_fills,
             self.diag_no_fills,
             self.diag_requotes,
-            self.diag_closing_foks,
             self.diag_buildup_darkens,
             self.position.yes.total_shares,
             self.position.no.total_shares,
@@ -1090,6 +979,8 @@ impl V2StrategyEngine {
             self.fair_value.yes_fair_value(),
             self.fair_value.no_fair_value(),
             self.fair_value.edge(),
+            self.last_rebalance_risk,
+            dyn_max,
             buildup,
             if self.buildup_guard_active { " DARK" } else { "" },
             self.diag_markets_traded,
@@ -1101,7 +992,6 @@ impl V2StrategyEngine {
         self.diag_yes_fills = 0;
         self.diag_no_fills = 0;
         self.diag_requotes = 0;
-        self.diag_closing_foks = 0;
     }
 
     pub fn take_pending_telegram_diag(&mut self) -> Option<String> {
@@ -1149,6 +1039,10 @@ impl V2StrategyEngine {
 
     pub fn take_pending_market_summary(&mut self) -> Option<MarketSummaryRecord> {
         self.pending_market_summary.take()
+    }
+
+    pub fn take_pending_risk_records(&mut self) -> Vec<RiskScoreRecord> {
+        std::mem::take(&mut self.pending_risk_records)
     }
 
     // ─── Market report / session summary (gated) ────────────────────────
@@ -1327,9 +1221,9 @@ impl V2StrategyEngine {
         // 4. Hysteresis
         let was_active = self.buildup_guard_active;
         let threshold = if was_active {
-            self.risk_config.buildup_exit_threshold
+            self.risk_config.buildup_go_live_threshold
         } else {
-            self.risk_config.buildup_enter_threshold
+            self.risk_config.buildup_go_dark_threshold
         };
 
         if !was_active && score >= threshold {
@@ -1384,4 +1278,17 @@ impl V2StrategyEngine {
             0.0
         }
     }
+}
+
+// ─── Pure helpers (extracted for testability) ───────────────────────────────
+
+/// Compute the rebalance risk score from conviction, time pressure, and momentum alignment.
+/// Returns a value in [0.0, 1.0].
+fn compute_rebalance_risk(conviction: f64, time_pressure: f64, alignment: f64) -> f64 {
+    (conviction * (0.3 + 0.7 * time_pressure) * (1.0 + 0.5 * alignment)).clamp(0.0, 1.0)
+}
+
+/// Compute the dynamic max post price given the config max and the risk score.
+fn compute_dynamic_max_post(config_max: f64, risk: f64) -> f64 {
+    0.50 + (config_max - 0.50) * (1.0 - risk)
 }

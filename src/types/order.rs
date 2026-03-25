@@ -99,13 +99,6 @@ pub enum V2ExecutorCommand {
         side: MarketSide,
         order_id: String,
     },
-    /// CLOSING phase: aggressive FOK to pair position.
-    ClosingFok {
-        side: MarketSide,
-        token_id: String,
-        price: Decimal,
-        size: Decimal,
-    },
     /// Taker rebalance order to correct inventory imbalance.
     RebalanceTaker {
         side: MarketSide,
@@ -150,13 +143,6 @@ pub enum V2ExecutorFeedback {
         side: MarketSide,
         order_id: String,
         size_matched: Option<Decimal>,
-    },
-    /// Closing FOK result.
-    ClosingFokResult {
-        side: MarketSide,
-        filled: bool,
-        size_matched: Decimal,
-        price: Decimal,
     },
     /// Taker rebalance result.
     RebalanceResult {

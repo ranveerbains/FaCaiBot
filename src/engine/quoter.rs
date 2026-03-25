@@ -14,6 +14,7 @@ pub struct ManagedOrder {
     pub order_id: String,
     pub price: Decimal,
     pub size: Decimal,
+    #[allow(dead_code)]
     pub posted_ms: u64,
     pub fair_value_at_post: Decimal,
     /// Cumulative filled size tracked for dedup (WS + CancelResult may both report fills).
@@ -41,12 +42,8 @@ pub struct QuotingConfig {
     #[allow(dead_code)]
     pub min_edge: f64,
     pub requote_threshold: f64,
-    pub min_requote_interval_ms: u64,
     pub max_order_size: Decimal,
     pub min_order_size: Decimal,
-    pub emergency_requote_threshold: f64,
-    pub max_imbalance_skew: f64,
-    pub max_one_sided_shares: Decimal,
     pub max_fair_value_extremity: f64,
 }
 
@@ -55,12 +52,8 @@ impl Default for QuotingConfig {
         Self {
             min_edge: 0.04,
             requote_threshold: 0.01,
-            min_requote_interval_ms: 2000,
             max_order_size: Decimal::new(100, 0),
             min_order_size: Decimal::new(5, 0),
-            emergency_requote_threshold: 0.05,
-            max_imbalance_skew: 0.02,
-            max_one_sided_shares: Decimal::new(5, 0),
             max_fair_value_extremity: 0.85,
         }
     }
@@ -69,45 +62,69 @@ impl Default for QuotingConfig {
 /// Risk limits for v2 (from config.toml [risk_v2]).
 #[derive(Debug, Clone)]
 pub struct RiskV2Config {
-    pub max_unpaired_shares: Decimal,
-    pub max_unpaired_usdc: Decimal,
-    pub max_capital_per_market: Decimal,
-    pub closing_phase_secs: u64,
     pub rotation_quiet_ms: u64,
-    pub max_closing_pair_cost: f64,
-    pub closing_retry_price_increment: f64,
     pub rebalance_threshold: Decimal,
     pub rebalance_size: Decimal,
     pub rebalance_max_pair_cost: f64,
-    pub min_rebalance_interval_ms: u64,
     pub stale_book_ms: u64,
-    pub max_entry_spread: f64,
     pub heartbeat_dead_threshold: u32,
-    pub buildup_enter_threshold: f64,
-    pub buildup_exit_threshold: f64,
+    pub buildup_go_dark_threshold: f64,
+    pub buildup_go_live_threshold: f64,
 }
 
 impl Default for RiskV2Config {
     fn default() -> Self {
         Self {
-            max_unpaired_shares: Decimal::new(30, 0),
-            max_unpaired_usdc: Decimal::new(25, 0),
-            max_capital_per_market: Decimal::new(100, 0),
-            closing_phase_secs: 45,
             rotation_quiet_ms: 5000,
-            max_closing_pair_cost: 0.97,
-            closing_retry_price_increment: 0.01,
             rebalance_threshold: Decimal::new(20, 0),
             rebalance_size: Decimal::new(10, 0),
             rebalance_max_pair_cost: 0.96,
-            min_rebalance_interval_ms: 10000,
             stale_book_ms: 850,
-            max_entry_spread: 0.04,
             heartbeat_dead_threshold: 5,
-            buildup_enter_threshold: 0.40,
-            buildup_exit_threshold: 0.25,
+            buildup_go_dark_threshold: 0.40,
+            buildup_go_live_threshold: 0.25,
         }
     }
+}
+
+// ─── Dynamic order sizing ────────────────────────────────────────────────────
+
+/// Precalculate the maximum total shares per side (sum of all batch sizes).
+/// After this many shares on either side, maker orders stop.
+///
+/// Example with max=20, min=5: 20 + 10 + 5 = 35
+/// Example with max=10, min=5: 10 + 5 + 5 = 20
+pub fn max_total_shares(max_size: Decimal, min_size: Decimal) -> Decimal {
+    let two = Decimal::TWO;
+    let mut size = max_size;
+    let mut total = Decimal::ZERO;
+    for _ in 0..3 {
+        total += size;
+        size = (size / two).max(min_size);
+    }
+    total
+}
+
+/// Compute dynamic order size based on paired shares.
+///
+/// Halves the order size at each pairing milestone (floored at `min_size`).
+///
+/// Example with max=10, min=5:
+/// - 0..9 paired → 10 (batch 1)
+/// - 10..14 paired → 5 (batch 2)
+/// - 15+ paired → 5 (batch 3)
+pub fn dynamic_order_size(max_size: Decimal, min_size: Decimal, paired: Decimal) -> Decimal {
+    let two = Decimal::TWO;
+    let mut size = max_size;
+    let mut threshold = Decimal::ZERO;
+    for _ in 0..3 {
+        threshold += size;
+        if paired < threshold {
+            return size;
+        }
+        size = (size / two).max(min_size);
+    }
+    min_size
 }
 
 // ─── Cleared order (for CancelResult dedup) ─────────────────────────────────
@@ -127,8 +144,6 @@ struct ClearedOrder {
 pub struct Quoter {
     pub yes_order: Option<ManagedOrder>,
     pub no_order: Option<ManagedOrder>,
-    yes_last_post_ms: u64,
-    no_last_post_ms: u64,
     yes_pending_cancel: bool,
     no_pending_cancel: bool,
     yes_pending_post: bool,
@@ -143,8 +158,6 @@ impl Quoter {
         Self {
             yes_order: None,
             no_order: None,
-            yes_last_post_ms: 0,
-            no_last_post_ms: 0,
             yes_pending_cancel: false,
             no_pending_cancel: false,
             yes_pending_post: false,
@@ -163,38 +176,21 @@ impl Quoter {
         token_id: &str,
         position: &BilateralPosition,
         quoting: &QuotingConfig,
-        risk: &RiskV2Config,
-        now_ms: u64,
         opposite_best_ask: Option<Decimal>,
     ) -> Option<QuoteAction> {
         // ── Guards ──
         if self.is_pending(side) {
             return None;
         }
-        if position.unpaired(side) >= risk.max_unpaired_shares {
-            return None;
-        }
-        if position.unpaired_usdc() >= risk.max_unpaired_usdc {
-            // Only block if this side is the one causing the imbalance
-            if position.unpaired(side) > Decimal::ZERO {
-                return None;
-            }
-        }
-        if position.total_capital_deployed() >= risk.max_capital_per_market {
-            return None;
-        }
-
-        // One-sided accumulation guard: tight limit when opposite has zero fills
-        let other_shares = match side {
-            MarketSide::Yes => position.no.total_shares,
-            MarketSide::No => position.yes.total_shares,
+        // Total shares cap: stop maker orders when either side hits the precalculated limit
+        let total_cap = max_total_shares(quoting.max_order_size, quoting.min_order_size);
+        let side_shares = match side {
+            MarketSide::Yes => position.yes.total_shares,
+            MarketSide::No => position.no.total_shares,
         };
-        if other_shares == Decimal::ZERO
-            && position.unpaired(side) >= quoting.max_one_sided_shares
-        {
+        if side_shares >= total_cap {
             return None;
         }
-
         // Pair-cost feasibility guard: don't post if filling at target_price
         // would push the running pair cost above $1.00
         let other_avg = match side {
@@ -218,15 +214,19 @@ impl Quoter {
         }
 
         // ── Size computation ──
-        let remaining_capital = risk.max_capital_per_market - position.total_capital_deployed();
-        if remaining_capital <= Decimal::ZERO || target_price <= Decimal::ZERO {
+        let dynamic_max = dynamic_order_size(
+            quoting.max_order_size,
+            quoting.min_order_size,
+            position.paired_shares(),
+        );
+
+        if target_price <= Decimal::ZERO {
             return None;
         }
-        let max_by_capital = remaining_capital / target_price;
-        let max_by_imbalance = risk.max_unpaired_shares - position.unpaired(side);
-        let size = quoting.max_order_size
-            .min(max_by_capital)
-            .min(max_by_imbalance)
+        // Cap size so we don't exceed total_cap on this side
+        let remaining = total_cap - side_shares;
+        let size = dynamic_max
+            .min(remaining)
             .max(Decimal::ZERO);
 
         if size < quoting.min_order_size {
@@ -254,12 +254,7 @@ impl Quoter {
                 // Check if requote needed
                 let fv_drift = (fair_value - existing.fair_value_at_post).abs();
                 let fv_drift_f64 = fv_drift.to_string().parse::<f64>().unwrap_or(0.0);
-                let elapsed = now_ms.saturating_sub(self.last_post_ms(side));
-
-                let is_emergency = fv_drift_f64 >= quoting.emergency_requote_threshold;
-                if fv_drift_f64 >= quoting.requote_threshold
-                    && (elapsed >= quoting.min_requote_interval_ms || is_emergency)
-                {
+                if fv_drift_f64 >= quoting.requote_threshold {
                     // Cancel existing, then repost (cancel first, post on confirmation)
                     Some(QuoteAction::Cancel {
                         side,
@@ -277,12 +272,10 @@ impl Quoter {
     pub fn on_order_posted(&mut self, side: MarketSide, order: ManagedOrder) {
         match side {
             MarketSide::Yes => {
-                self.yes_last_post_ms = order.posted_ms;
                 self.yes_order = Some(order);
                 self.yes_pending_post = false;
             }
             MarketSide::No => {
-                self.no_last_post_ms = order.posted_ms;
                 self.no_order = Some(order);
                 self.no_pending_post = false;
             }
@@ -407,6 +400,22 @@ impl Quoter {
         actions
     }
 
+    /// Generate a cancel action for a specific side, if it has a resting order
+    /// and no pending cancel already in flight.
+    pub fn cancel_side_action(&self, side: MarketSide) -> Option<QuoteAction> {
+        let (order, pending) = match side {
+            MarketSide::Yes => (&self.yes_order, self.yes_pending_cancel),
+            MarketSide::No => (&self.no_order, self.no_pending_cancel),
+        };
+        if pending {
+            return None;
+        }
+        order.as_ref().map(|o| QuoteAction::Cancel {
+            side,
+            order_id: o.order_id.clone(),
+        })
+    }
+
     /// Look up an order by side + order_id for CancelResult dedup.
     /// Checks the current resting order first, then the last cleared order.
     /// Returns `(price, size_filled)` if found.
@@ -431,8 +440,6 @@ impl Quoter {
     pub fn reset(&mut self) {
         self.yes_order = None;
         self.no_order = None;
-        self.yes_last_post_ms = 0;
-        self.no_last_post_ms = 0;
         self.yes_pending_cancel = false;
         self.no_pending_cancel = false;
         self.yes_pending_post = false;
@@ -461,12 +468,6 @@ impl Quoter {
         }
     }
 
-    fn last_post_ms(&self, side: MarketSide) -> u64 {
-        match side {
-            MarketSide::Yes => self.yes_last_post_ms,
-            MarketSide::No => self.no_last_post_ms,
-        }
-    }
 }
 
 impl Default for Quoter {
@@ -485,19 +486,63 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn default_configs() -> (QuotingConfig, RiskV2Config) {
-        (QuotingConfig::default(), RiskV2Config::default())
+    fn default_config() -> QuotingConfig {
+        QuotingConfig::default()
+    }
+
+    // ── dynamic_order_size tests ──
+
+    #[test]
+    fn test_dynamic_size_batch1() {
+        // max=10, min=5: 0..9 paired → 10
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("0")), dec("10"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("9")), dec("10"));
+    }
+
+    #[test]
+    fn test_dynamic_size_batch2() {
+        // max=10, min=5: 10..14 paired → 5 (halved, floored at min)
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("10")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("14")), dec("5"));
+    }
+
+    #[test]
+    fn test_dynamic_size_batch3() {
+        // max=10, min=5: 15+ paired → 5 (stays at min)
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("15")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("100")), dec("5"));
+    }
+
+    #[test]
+    fn test_dynamic_size_larger_max() {
+        // max=20, min=5: batch1=20 (0..19), batch2=10 (20..29), batch3=5 (30+)
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("0")), dec("20"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("19")), dec("20"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("20")), dec("10"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("29")), dec("10"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("30")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("100")), dec("5"));
+    }
+
+    #[test]
+    fn test_max_total_shares() {
+        // max=10, min=5: 10 + 5 + 5 = 20
+        assert_eq!(max_total_shares(dec("10"), dec("5")), dec("20"));
+        // max=20, min=5: 20 + 10 + 5 = 35
+        assert_eq!(max_total_shares(dec("20"), dec("5")), dec("35"));
+        // max=40, min=5: 40 + 20 + 10 = 70
+        assert_eq!(max_total_shares(dec("40"), dec("5")), dec("70"));
     }
 
     #[test]
     fn test_post_when_no_resting() {
         let quoter = Quoter::new();
         let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -508,11 +553,11 @@ mod tests {
         let mut quoter = Quoter::new();
         quoter.mark_post_pending(MarketSide::Yes);
         let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -524,27 +569,11 @@ mod tests {
         let mut position = BilateralPosition::new();
         // Deploy max capital
         position.record_fill(MarketSide::Yes, dec("0.50"), dec("200"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
-            Some(dec("0.50")),
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_no_post_when_unpaired_limit() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 50 YES, 0 NO → 50 unpaired YES (at limit)
-        position.record_fill(MarketSide::Yes, dec("0.40"), dec("50"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -563,12 +592,12 @@ mod tests {
         });
 
         let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // Fair value shifted by 0.02 (> threshold 0.01), 3s elapsed (> 2s min)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
-            &position, &qc, &rc, 7000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
@@ -587,12 +616,12 @@ mod tests {
         });
 
         let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // Fair value barely moved (0.005 < threshold 0.01)
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.425"), dec("0.455"), "yes_token",
-            &position, &qc, &rc, 7000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -620,25 +649,6 @@ mod tests {
 
         let actions = quoter.cancel_all_actions();
         assert_eq!(actions.len(), 2);
-    }
-
-    #[test]
-    fn test_size_capped_by_remaining_capital() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // Deploy $90 of $100 max
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("100"), false, dec("0"));
-        position.record_fill(MarketSide::No, dec("0.45"), dec("100"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.45"), dec("0.48"), "yes_token",
-            &position, &qc, &rc, 1000,
-            Some(dec("0.50")),
-        );
-        // Remaining capital = 100 - 90 = 10. At 0.45, that's ~22 shares.
-        // But max_order_size is 100 and min is 5, so should post with capped size.
-        assert!(matches!(action, Some(QuoteAction::Post { size, .. }) if size >= dec("5")));
     }
 
     #[test]
@@ -727,41 +737,17 @@ mod tests {
     }
 
     #[test]
-    fn test_emergency_requote_bypasses_interval() {
-        let mut quoter = Quoter::new();
-        quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            order_id: "o1".into(),
-            price: dec("0.42"),
-            size: dec("50"),
-            posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
-            size_filled: Decimal::ZERO,
-        });
-
-        let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
-
-        // FV drift 0.06 (>= emergency 0.05), only 500ms elapsed (< min_requote 2000ms)
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.48"), dec("0.51"), "yes_token",
-            &position, &qc, &rc, 1500,
-            Some(dec("0.50")),
-        );
-        assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
-    }
-
-    #[test]
     fn test_pair_cost_guard_blocks_expensive_pair() {
         let quoter = Quoter::new();
         let mut position = BilateralPosition::new();
         // NO fills at avg $0.60
         position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.45"), dec("0.50"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(action.is_none());
@@ -773,12 +759,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // NO fills at avg $0.60
         position.record_fill(MarketSide::No, dec("0.60"), dec("10"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.39"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -788,85 +774,12 @@ mod tests {
     fn test_pair_cost_guard_skipped_no_opposite_fills() {
         let quoter = Quoter::new();
         let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // No opposite fills → guard skipped → normal post
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.85"), dec("0.90"), "yes_token",
-            &position, &qc, &rc, 1000,
-            Some(dec("0.50")),
-        );
-        assert!(matches!(action, Some(QuoteAction::Post { .. })));
-    }
-
-    #[test]
-    fn test_normal_requote_respects_interval() {
-        let mut quoter = Quoter::new();
-        quoter.on_order_posted(MarketSide::Yes, ManagedOrder {
-            order_id: "o1".into(),
-            price: dec("0.42"),
-            size: dec("50"),
-            posted_ms: 1000,
-            fair_value_at_post: dec("0.45"),
-            size_filled: Decimal::ZERO,
-        });
-
-        let position = BilateralPosition::new();
-        let (qc, rc) = default_configs();
-
-        // FV drift 0.02 (>= threshold 0.01, < emergency 0.05), only 500ms elapsed
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.44"), dec("0.47"), "yes_token",
-            &position, &qc, &rc, 1500,
-            Some(dec("0.50")),
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_one_sided_guard_blocks_at_limit() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 5 YES, 0 NO → one-sided limit reached (default max_one_sided_shares = 5)
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("5"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
-            Some(dec("0.50")),
-        );
-        assert!(action.is_none());
-    }
-
-    #[test]
-    fn test_one_sided_guard_allows_below_limit() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 4 YES, 0 NO → below one-sided limit
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("4"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
-            Some(dec("0.50")),
-        );
-        assert!(matches!(action, Some(QuoteAction::Post { .. })));
-    }
-
-    #[test]
-    fn test_one_sided_guard_inactive_with_opposite_fills() {
-        let quoter = Quoter::new();
-        let mut position = BilateralPosition::new();
-        // 10 YES, 5 NO → opposite has fills, one-sided guard should not trigger
-        position.record_fill(MarketSide::Yes, dec("0.45"), dec("10"), false, dec("0"));
-        position.record_fill(MarketSide::No, dec("0.50"), dec("5"), false, dec("0"));
-        let (qc, rc) = default_configs();
-
-        let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.50")),
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -878,11 +791,11 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → has unpaired shares, opposite_best_ask = None
         position.record_fill(MarketSide::Yes, dec("0.45"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.42"), dec("0.45"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             None, // No opposite book liquidity
         );
         assert!(action.is_none());
@@ -894,12 +807,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → unpaired shares, opposite ask too expensive
         position.record_fill(MarketSide::Yes, dec("0.70"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // target=0.70, opposite_best_ask=0.35 → 0.70 + 0.35 = 1.05 >= 1.00 → blocked
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.70"), dec("0.75"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.35")),
         );
         assert!(action.is_none());
@@ -911,12 +824,12 @@ mod tests {
         let mut position = BilateralPosition::new();
         // 3 YES, 0 NO → has unpaired, book price makes next pair unprofitable
         position.record_fill(MarketSide::Yes, dec("0.60"), dec("3"), false, dec("0"));
-        let (qc, rc) = default_configs();
+        let qc = default_config();
 
         // target=0.60, opposite_best_ask=0.45 → marginal cost = 0.60 + 0.45 = 1.05 >= 1.00
         let action = quoter.evaluate_side(
             MarketSide::Yes, dec("0.60"), dec("0.65"), "yes_token",
-            &position, &qc, &rc, 1000,
+            &position, &qc,
             Some(dec("0.45")),
         );
         assert!(action.is_none());

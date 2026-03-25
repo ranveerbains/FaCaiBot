@@ -115,9 +115,6 @@ impl LiveExecutor {
                 V2ExecutorCommand::CancelOrder { side, order_id } => {
                     self.handle_cancel(side, &order_id).await;
                 }
-                V2ExecutorCommand::ClosingFok { side, token_id, price, size } => {
-                    self.handle_closing_fok(side, &token_id, price, size).await;
-                }
                 V2ExecutorCommand::RebalanceTaker { side, token_id, price, size } => {
                     self.handle_rebalance_taker(side, &token_id, price, size).await;
                 }
@@ -235,73 +232,6 @@ impl LiveExecutor {
             order_id: order_id.to_string(),
             size_matched,
         });
-    }
-
-    // ─── Closing FOK ────────────────────────────────────────────────────
-
-    async fn handle_closing_fok(
-        &mut self,
-        side: MarketSide,
-        token_id: &str,
-        price: Decimal,
-        size: Decimal,
-    ) {
-        if !self.caches_warm {
-            warn!(side = side.label(), "closing FOK REJECTED — caches not warm");
-            let _ = self.feedback_tx.try_send(V2ExecutorFeedback::ClosingFokResult {
-                side, filled: false, size_matched: Decimal::ZERO, price,
-            });
-            return;
-        }
-
-        let safe_size = clob_safe_fok_size(price, size);
-        if safe_size.is_zero() {
-            warn!(side = side.label(), %price, %size, "closing FOK: no valid CLOB-safe size");
-            let _ = self.feedback_tx.try_send(V2ExecutorFeedback::ClosingFokResult {
-                side, filled: false, size_matched: Decimal::ZERO, price,
-            });
-            return;
-        }
-
-        let order = OrderRequest::emergency_fok(
-            token_id.to_string(),
-            Side::Buy,
-            price,
-            safe_size,
-        );
-
-        info!(
-            side = side.label(),
-            token = %token_id,
-            price = %price,
-            size = %safe_size,
-            "closing FOK"
-        );
-
-        match self.poly.place_order(&order).await {
-            Ok(resp) => {
-                let filled = resp.status == OrderStatus::Filled;
-                let matched = resp.size_matched.min(safe_size);
-                info!(
-                    side = side.label(),
-                    filled,
-                    size_matched = %matched,
-                    "closing FOK result"
-                );
-                let _ = self.feedback_tx.try_send(V2ExecutorFeedback::ClosingFokResult {
-                    side,
-                    filled,
-                    size_matched: matched,
-                    price,
-                });
-            }
-            Err(e) => {
-                error!(side = side.label(), error = %e, "closing FOK FAILED");
-                let _ = self.feedback_tx.try_send(V2ExecutorFeedback::ClosingFokResult {
-                    side, filled: false, size_matched: Decimal::ZERO, price,
-                });
-            }
-        }
     }
 
     // ─── Rebalance taker ──────────────────────────────────────────────
