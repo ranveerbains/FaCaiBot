@@ -20,7 +20,7 @@ vol_default = 0.00001            # default vol before warmup (1/3 baseline for r
 vol_ticks_per_sec = 20.0         # BinanceTick cadence
 # Model params
 vol_floor = 0.00002              # minimum per-tick vol — prevents overconfidence during calm periods
-tail_compression_factor = 0.45   # compress z-score to fatten tails (lower = fatter tails, more uncertain)
+tail_compression_factor = 0.60   # compress z-score to fatten tails (lower = fatter tails, more uncertain)
 stale_data_edge_penalty = 0.01   # extra edge per stale momentum feed
 regime_spike_threshold = 2.0     # short_vol / session_vol ratio trigger
 regime_spike_penalty = 0.01      # extra edge during regime spike

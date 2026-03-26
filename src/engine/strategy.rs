@@ -913,6 +913,13 @@ impl V2StrategyEngine {
                 if pair_cost <= max_rebal_cost {
                     let size = self.risk_config.rebalance_size.min(abs_imbalance);
                     if size >= Decimal::new(5, 0) {
+                        // Cancel resting maker on rebalance side to prevent double-fill
+                        if let Some(QuoteAction::Cancel { side, order_id }) =
+                            self.quoter.cancel_side_action(rebal_side)
+                        {
+                            self.quoter.on_cancel_sent(side);
+                            commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                        }
                         self.pending_rebalance = true;
                         self.diag_rebalances += 1;
                         commands.push(V2ExecutorCommand::RebalanceTaker {
