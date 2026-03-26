@@ -376,9 +376,10 @@ impl RealizedVolTracker {
     }
 
     /// Volatility scaled to remaining time: σ_tick × √(ticks_per_sec × remaining_secs).
-    pub fn scaled_vol(&self, remaining_secs: f64) -> f64 {
+    /// `vol_floor` sets a minimum per-tick vol to prevent overconfidence during calm periods.
+    pub fn scaled_vol(&self, remaining_secs: f64, vol_floor: f64) -> f64 {
         let ticks_remaining = self.ticks_per_sec * remaining_secs;
-        self.realized_vol() * ticks_remaining.max(1.0).sqrt()
+        self.realized_vol().max(vol_floor) * ticks_remaining.max(1.0).sqrt()
     }
 
     /// Whether the tracker has been updated recently.

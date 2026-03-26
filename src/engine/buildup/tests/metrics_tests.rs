@@ -172,8 +172,8 @@ fn test_realized_vol_time_scaling() {
         let price = 100_000.0 + (i as f64 * 10.0);
         tracker.update(price, i * 50);
     }
-    let vol_200s = tracker.scaled_vol(200.0);
-    let vol_100s = tracker.scaled_vol(100.0);
+    let vol_200s = tracker.scaled_vol(200.0, 0.0);
+    let vol_100s = tracker.scaled_vol(100.0, 0.0);
     // More time remaining → higher scaled vol
     assert!(vol_200s > vol_100s, "200s vol ({vol_200s}) should exceed 100s vol ({vol_100s})");
     // Scaling should be sqrt(2) ratio

@@ -381,11 +381,10 @@ impl FairValueEstimator {
 
         // ── Base model: corrected binary option ──
         let displacement = (self.current_btc / self.strike_price).ln();
-        // Use vol floor to prevent overconfidence during calm periods.
-        // BTC can easily move $200 in 5 min — the model must reflect that.
-        let realized = self.vol_tracker.realized_vol().max(self.config.vol_floor);
-        let ticks_remaining = self.config.vol_ticks_per_sec * time_remaining_s;
-        let sigma_remaining = (realized * ticks_remaining.max(1.0).sqrt()).max(0.0001);
+        // Vol floor prevents overconfidence during calm periods
+        let sigma_remaining = self.vol_tracker
+            .scaled_vol(time_remaining_s, self.config.vol_floor)
+            .max(0.0001);
         let d = displacement / sigma_remaining;
         let d_adjusted = d * self.config.tail_compression_factor;
         let base_fv = phi(d_adjusted);
