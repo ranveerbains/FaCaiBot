@@ -83,21 +83,41 @@ The strike price is set from the median of the first `strike_warmup_count` (defa
 
 ### Momentum Adjustment
 
-Three Binance metrics shift the fair value based on real-time order flow:
+Eight signals shift the fair value — three velocity/acceleration signals (rate-of-change) plus five level/flow signals (persistent state):
 
-| Metric | Source | What it measures |
-|--------|--------|-----------------|
-| **Basis Delta** | Futures @bookTicker + Spot mid | Rate of change of futures-spot premium. Rising basis → futures leading up |
-| **CVD Acceleration** | Futures @aggTrade | Fast EMA - slow EMA of signed trade volume. Accelerating buys → bullish |
-| **OBI Velocity** | Spot @depth20 | Rate of change of order book imbalance. Accelerating bid-heavy → bullish |
+**Velocity signals** (short-lived, capture market acceleration):
 
-Each metric produces a normalized [0,1] score with a directional sign. Weights are reduced relative to v1 — the corrected base model does the heavy lifting. The weighted sum is clamped to `±max_momentum_adj` (default: ±0.08) and added to the base fair value:
+| Metric | Source | What it measures | Weight |
+|--------|--------|-----------------|--------|
+| **Basis Delta** | Futures @bookTicker + Spot mid | Rate of change of futures-spot premium | 0.10 |
+| **CVD Acceleration** | Futures @aggTrade | Fast - slow EMA of signed trade volume | 0.05 |
+| **OBI Velocity** | Spot @depth20 | Rate of change of order book imbalance | 0.05 |
+
+**Level signals** (persistent, capture absolute state):
+
+| Metric | Source | What it measures | Weight |
+|--------|--------|-----------------|--------|
+| **CVD Level** | Futures @aggTrade | Long-EMA of signed volume (persistent flow direction) | 0.04 |
+| **OBI Level** | Spot @depth20 | EMA of raw OBI value (book state) | 0.03 |
+| **Basis Level** | Futures BBO + Spot mid | EMA of absolute basis in bps (persistent premium) | 0.05 |
+| **Spot CVD** | Spot @trade | Fast/slow EMA acceleration of spot trade flow | 0.04 |
+| **Liquidation** | Futures @forceOrder | Net liquidation pressure (buy vs sell liquidations) | 0.03 |
+
+Level trackers use longer EMA half-lives (1.5-3s) than velocity trackers (200-500ms) to capture persistent market state.
+
+Momentum is applied in **log-odds space** rather than probability space for mathematically correct Bayesian updates. This makes momentum more impactful near P=0.50 and naturally conservative at extremes:
 
 ```
-momentum = w_basis(0.10) × basis_signed + w_cvd(0.05) × cvd_signed + w_obi(0.05) × obi_signed
-yes_fv = clamp(base_fv + momentum, 0.02, 0.98)
+raw_momentum = Σ(weight_i × normalized_i × direction_i)    # all 8 signals
+momentum = clamp(raw_momentum × time_decay_factor, ±max_momentum_adj)
+
+# Log-odds application (default):
+logit_adj = logit(base_fv) + momentum
+yes_fv = sigmoid(logit_adj)                 # clamped [0.02, 0.98]
 no_fv  = 1.0 - yes_fv
 ```
+
+**Time-adaptive decay**: All momentum is scaled by `time_remaining / 300s`. Early in the market, momentum matters (trends develop). Late in the market, displacement dominates and momentum is noise.
 
 ### Edge Sizing
 
@@ -117,7 +137,7 @@ edge = min_edge
 - **Vol-adaptive**: Higher realized vol → wider edge (more risk per share). Capped at 2× baseline.
 - **Time-adaptive**: `sqrt(time_fraction)` — wider early, tighter late. Uses sqrt for convex decay.
 - **Regime spike penalty**: Added when `short_vol / session_vol > regime_spike_threshold` (default: 2.0). Detects sudden vol regime changes.
-- **Stale feed penalty**: Each stale momentum tracker (basis, CVD, OBI) adds `stale_data_edge_penalty` to the edge. Models uncertainty from missing data.
+- **Stale feed penalty**: Each stale momentum tracker (basis, CVD, OBI, CVD level, OBI level, basis level, spot CVD) adds `stale_data_edge_penalty` to the edge. Liquidation tracker excluded (sparse by nature).
 
 ## 5. Quoting Logic
 
@@ -165,18 +185,14 @@ If `dynamic_order_size` returns None (pairing cap reached), skip posting. If siz
 ### Target Price
 
 ```
-target_price = round_to_tick(CLOB_best_ask - edge, tick_size)
+target_price = round_to_tick(fair_value - edge, tick_size)
 ```
 
-The target price is anchored to the live CLOB ask, not fair value. The FV model feeds into the **edge** calculation (via momentum adjustment and adaptive sizing), but the posting price itself tracks the market.
+The target price is anchored to the FV model's output. The model produces YES and NO fair values from Binance data (displacement + 8 momentum signals in log-odds space), and the edge is subtracted to provide a profit margin. The CLOB ask is only used for crossing checks (never bid >= ask).
 
-### Zero-Edge Rebalance Posting
+### Inventory Edge
 
-When the position is imbalanced, the **lagging side** (the side with fewer shares) posts its maker order with **zero edge** instead of the normal `base_edge`. Since the target is `ask - edge`, zero edge means posting at the ask itself, attracting fills to rebalance the position passively.
-
-- **Long YES** (more YES than NO): NO side posts with edge = 0, YES side uses normal `base_edge`
-- **Long NO** (more NO than YES): YES side posts with edge = 0, NO side uses normal `base_edge`
-- **Balanced**: Both sides use `base_edge`
+Both sides (leading and lagging) use the same `base_edge`. No inventory skewing via edge — rebalancing happens via taker FOK orders when imbalance exceeds the threshold.
 
 ### Taker Rebalance
 
@@ -188,7 +204,7 @@ If zero-edge posting is insufficient and the imbalance exceeds `rebalance_thresh
 
 ### Requoting
 
-A resting order is cancelled and replaced when the CLOB ask has drifted by `≥ requote_threshold` since the order was posted. The cancel→confirm→repost cycle (~1.2s round-trip) is the natural throttle — no artificial interval. Both sides independently handle requotes, so fast market moves are handled reactively on each side.
+A resting order is cancelled and replaced when the fair value has drifted by `≥ requote_threshold` since the order was posted. The cancel→confirm→repost cycle (~1.2s round-trip) is the natural throttle — no artificial interval. Both sides independently handle requotes, so fast market moves are handled reactively on each side.
 
 ## 6. Fill Detection
 

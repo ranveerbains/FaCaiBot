@@ -134,7 +134,6 @@ pub struct FuturesBookTicker {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FuturesForceOrder {
     pub side: String,
     pub price: Decimal,
@@ -143,7 +142,6 @@ pub struct FuturesForceOrder {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SpotTrade {
     pub price: Decimal,
     pub quantity: Decimal,
@@ -247,8 +245,8 @@ pub enum IngestorEvent {
     BinanceDepth(BinanceDepth),
     FuturesAggTrade(FuturesAggTrade),
     FuturesBookTicker(FuturesBookTicker),
-    FuturesForceOrder(#[allow(dead_code)] FuturesForceOrder),
-    SpotTrade(#[allow(dead_code)] SpotTrade),
+    FuturesForceOrder(FuturesForceOrder),
+    SpotTrade(SpotTrade),
     MarketRotation {
         condition_id: String,
         yes_token_id: String,

@@ -7,7 +7,9 @@
 use rust_decimal::Decimal;
 
 use crate::engine::buildup::metrics::{
-    BasisDeltaTracker, CvdAccelTracker, ObiVelocityTracker, RealizedVolTracker,
+    BasisDeltaTracker, BasisLevelTracker, CvdAccelTracker, CvdLevelTracker,
+    LiquidationTracker, ObiLevelTracker, ObiVelocityTracker, RealizedVolTracker,
+    SpotCvdTracker,
 };
 
 // ─── Normal CDF approximation ───────────────────────────────────────────────
@@ -26,6 +28,16 @@ fn phi(x: f64) -> f64 {
     let t = 1.0 / (1.0 + p * ax);
     let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
     0.5 * (1.0 + sign * y)
+}
+
+/// Logistic sigmoid: 1 / (1 + exp(-x))
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Logit (log-odds): ln(p / (1 - p)). Caller must ensure 0 < p < 1.
+fn logit(p: f64) -> f64 {
+    (p / (1.0 - p)).ln()
 }
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -69,6 +81,34 @@ pub struct FairValueConfig {
     pub obi_freshness_ms: u64,
     pub obi_min: f64,
     pub obi_saturation: f64,
+    // Level-based signal weights
+    pub momentum_weight_cvd_level: f64,
+    pub momentum_weight_obi_level: f64,
+    pub momentum_weight_basis_level: f64,
+    pub momentum_weight_spot_cvd: f64,
+    pub momentum_weight_liquidation: f64,
+    // Level tracker params
+    pub cvd_level_halflife_ms: f64,
+    pub cvd_level_freshness_ms: u64,
+    pub cvd_level_saturation: f64,
+    pub obi_level_halflife_ms: f64,
+    pub obi_level_freshness_ms: u64,
+    pub obi_level_saturation: f64,
+    pub basis_level_halflife_ms: f64,
+    pub basis_level_freshness_ms: u64,
+    pub basis_level_saturation: f64,
+    // Spot CVD tracker
+    pub spot_cvd_fast_halflife_ms: f64,
+    pub spot_cvd_slow_halflife_ms: f64,
+    pub spot_cvd_freshness_ms: u64,
+    pub spot_cvd_saturation: f64,
+    // Liquidation tracker
+    pub liquidation_halflife_ms: f64,
+    pub liquidation_freshness_ms: u64,
+    pub liquidation_saturation: f64,
+    // Momentum mode
+    pub use_logit_momentum: bool,
+    pub momentum_time_decay: bool,
 }
 
 impl Default for FairValueConfig {
@@ -105,6 +145,34 @@ impl Default for FairValueConfig {
             obi_freshness_ms: 120,
             obi_min: 0.0,
             obi_saturation: 0.2,
+            // Level-based signal weights
+            momentum_weight_cvd_level: 0.04,
+            momentum_weight_obi_level: 0.03,
+            momentum_weight_basis_level: 0.05,
+            momentum_weight_spot_cvd: 0.04,
+            momentum_weight_liquidation: 0.03,
+            // Level tracker params
+            cvd_level_halflife_ms: 3000.0,
+            cvd_level_freshness_ms: 500,
+            cvd_level_saturation: 5.0,
+            obi_level_halflife_ms: 1500.0,
+            obi_level_freshness_ms: 300,
+            obi_level_saturation: 0.3,
+            basis_level_halflife_ms: 2000.0,
+            basis_level_freshness_ms: 500,
+            basis_level_saturation: 3.0,
+            // Spot CVD tracker
+            spot_cvd_fast_halflife_ms: 300.0,
+            spot_cvd_slow_halflife_ms: 800.0,
+            spot_cvd_freshness_ms: 300,
+            spot_cvd_saturation: 0.6,
+            // Liquidation tracker
+            liquidation_halflife_ms: 1000.0,
+            liquidation_freshness_ms: 3000,
+            liquidation_saturation: 10.0,
+            // Momentum mode
+            use_logit_momentum: true,
+            momentum_time_decay: true,
         }
     }
 }
@@ -132,10 +200,17 @@ pub struct FairValueEstimator {
     // Vol trackers
     vol_tracker: RealizedVolTracker,
     session_vol_tracker: RealizedVolTracker,
-    // Momentum trackers
+    // Momentum trackers (velocity)
     basis_tracker: BasisDeltaTracker,
     cvd_tracker: CvdAccelTracker,
     obi_tracker: ObiVelocityTracker,
+    // Level trackers
+    cvd_level_tracker: CvdLevelTracker,
+    obi_level_tracker: ObiLevelTracker,
+    basis_level_tracker: BasisLevelTracker,
+    // Additional signal trackers
+    spot_cvd_tracker: SpotCvdTracker,
+    liquidation_tracker: LiquidationTracker,
     // Strike warmup buffer
     strike_warmup_buffer: Vec<f64>,
 }
@@ -175,6 +250,32 @@ impl FairValueEstimator {
             config.obi_min,
             config.obi_saturation,
         );
+        let cvd_level_tracker = CvdLevelTracker::new(
+            config.cvd_level_halflife_ms,
+            config.cvd_level_freshness_ms,
+            config.cvd_level_saturation,
+        );
+        let obi_level_tracker = ObiLevelTracker::new(
+            config.obi_level_halflife_ms,
+            config.obi_level_freshness_ms,
+            config.obi_level_saturation,
+        );
+        let basis_level_tracker = BasisLevelTracker::new(
+            config.basis_level_halflife_ms,
+            config.basis_level_freshness_ms,
+            config.basis_level_saturation,
+        );
+        let spot_cvd_tracker = SpotCvdTracker::new(
+            config.spot_cvd_fast_halflife_ms,
+            config.spot_cvd_slow_halflife_ms,
+            config.spot_cvd_freshness_ms,
+            config.spot_cvd_saturation,
+        );
+        let liquidation_tracker = LiquidationTracker::new(
+            config.liquidation_halflife_ms,
+            config.liquidation_freshness_ms,
+            config.liquidation_saturation,
+        );
 
         Self {
             config: config.clone(),
@@ -190,6 +291,11 @@ impl FairValueEstimator {
             basis_tracker,
             cvd_tracker,
             obi_tracker,
+            cvd_level_tracker,
+            obi_level_tracker,
+            basis_level_tracker,
+            spot_cvd_tracker,
+            liquidation_tracker,
             strike_warmup_buffer: Vec::with_capacity(config.strike_warmup_count),
         }
     }
@@ -223,24 +329,38 @@ impl FairValueEstimator {
         self.session_vol_tracker.update(price, now_ms);
     }
 
-    /// Update spot mid for basis tracker.
+    /// Update spot mid for basis trackers (delta + level).
     pub fn update_spot_mid(&mut self, mid: f64, now_ms: u64) {
         self.basis_tracker.update_spot_mid(mid, now_ms);
+        self.basis_level_tracker.update_spot_mid(mid, now_ms);
     }
 
-    /// Update futures mid (from FuturesBookTicker).
+    /// Update futures mid (from FuturesBookTicker). Feeds both basis trackers.
     pub fn update_futures_mid(&mut self, bid: f64, ask: f64, now_ms: u64) {
         self.basis_tracker.update_futures_mid(bid, ask, now_ms);
+        self.basis_level_tracker.update_futures_mid(bid, ask, now_ms);
     }
 
-    /// Update CVD (from FuturesAggTrade).
+    /// Update spot CVD (from SpotTrade).
+    pub fn update_spot_cvd(&mut self, quantity: f64, is_buyer_maker: bool, now_ms: u64) {
+        self.spot_cvd_tracker.update(quantity, is_buyer_maker, now_ms);
+    }
+
+    /// Update liquidation pressure (from FuturesForceOrder).
+    pub fn update_liquidation(&mut self, side: &str, quantity: f64, now_ms: u64) {
+        self.liquidation_tracker.update(side, quantity, now_ms);
+    }
+
+    /// Update CVD (from FuturesAggTrade). Feeds both accel and level trackers.
     pub fn update_cvd(&mut self, quantity: f64, is_buyer_maker: bool, now_ms: u64) {
         self.cvd_tracker.update(quantity, is_buyer_maker, now_ms);
+        self.cvd_level_tracker.update(quantity, is_buyer_maker, now_ms);
     }
 
-    /// Update OBI velocity (from BinanceDepth).
+    /// Update OBI (from BinanceDepth). Feeds both velocity and level trackers.
     pub fn update_obi(&mut self, obi: f64, now_ms: u64) {
         self.obi_tracker.update(obi, now_ms);
+        self.obi_level_tracker.update(obi, now_ms);
     }
 
     /// Whether vol data is too stale to quote safely.
@@ -264,26 +384,58 @@ impl FairValueEstimator {
         let d_adjusted = d * self.config.tail_compression_factor;
         let base_fv = phi(d_adjusted);
 
-        // ── Momentum adjustment ──
-        let basis_norm = self.basis_tracker.normalized(now_ms);
-        let cvd_norm = self.cvd_tracker.normalized(now_ms);
-        let obi_norm = self.obi_tracker.normalized(now_ms);
+        // ── Momentum adjustment (all 8 signals) ──
+        let dir = |d: Option<crate::types::market::Direction>| -> f64 {
+            match d {
+                Some(crate::types::market::Direction::Up) => 1.0,
+                Some(crate::types::market::Direction::Down) => -1.0,
+                None => 0.0,
+            }
+        };
 
-        let basis_signed = basis_norm * direction_sign(&self.basis_tracker);
-        let cvd_signed = cvd_norm * direction_sign_cvd(&self.cvd_tracker);
-        let obi_signed = obi_norm * direction_sign_obi(&self.obi_tracker);
+        // Velocity signals (existing)
+        let basis_signed = self.basis_tracker.normalized(now_ms) * dir(self.basis_tracker.direction());
+        let cvd_signed = self.cvd_tracker.normalized(now_ms) * dir(self.cvd_tracker.direction());
+        let obi_signed = self.obi_tracker.normalized(now_ms) * dir(self.obi_tracker.direction());
+        // Level signals (new)
+        let cvd_level_signed = self.cvd_level_tracker.normalized(now_ms) * dir(self.cvd_level_tracker.direction());
+        let obi_level_signed = self.obi_level_tracker.normalized(now_ms) * dir(self.obi_level_tracker.direction());
+        let basis_level_signed = self.basis_level_tracker.normalized(now_ms) * dir(self.basis_level_tracker.direction());
+        // Additional signals (new)
+        let spot_cvd_signed = self.spot_cvd_tracker.normalized(now_ms) * dir(self.spot_cvd_tracker.direction());
+        let liq_signed = self.liquidation_tracker.normalized(now_ms) * dir(self.liquidation_tracker.direction());
 
-        let momentum = self.config.momentum_weight_basis * basis_signed
+        // Time-adaptive momentum: momentum matters more early, less near expiry
+        let momentum_time_factor = if self.config.momentum_time_decay {
+            time_fraction // already = (time_remaining_s / 300.0).clamp(0, 1)
+        } else {
+            1.0
+        };
+
+        let raw_momentum = self.config.momentum_weight_basis * basis_signed
             + self.config.momentum_weight_cvd * cvd_signed
-            + self.config.momentum_weight_obi * obi_signed;
+            + self.config.momentum_weight_obi * obi_signed
+            + self.config.momentum_weight_cvd_level * cvd_level_signed
+            + self.config.momentum_weight_obi_level * obi_level_signed
+            + self.config.momentum_weight_basis_level * basis_level_signed
+            + self.config.momentum_weight_spot_cvd * spot_cvd_signed
+            + self.config.momentum_weight_liquidation * liq_signed;
 
-        let momentum_clamped = momentum.clamp(
+        let momentum_clamped = (raw_momentum * momentum_time_factor).clamp(
             -self.config.max_momentum_adj,
             self.config.max_momentum_adj,
         );
 
         self.last_momentum = momentum_clamped;
-        self.yes_fair_value = (base_fv + momentum_clamped).clamp(0.02, 0.98);
+
+        // Apply momentum: log-odds space (correct for probability updates) or additive fallback
+        if self.config.use_logit_momentum {
+            let base_clamped = base_fv.clamp(0.02, 0.98);
+            let logit_adj = logit(base_clamped) + momentum_clamped;
+            self.yes_fair_value = sigmoid(logit_adj).clamp(0.02, 0.98);
+        } else {
+            self.yes_fair_value = (base_fv + momentum_clamped).clamp(0.02, 0.98);
+        }
         self.no_fair_value = 1.0 - self.yes_fair_value;
 
         // ── Edge sizing ──
@@ -302,17 +454,15 @@ impl FairValueEstimator {
             edge += self.config.regime_spike_penalty;
         }
 
-        // Stale momentum feed penalties
+        // Stale momentum feed penalties (exclude liquidation — sparse by nature)
         let mut stale_count = 0u32;
-        if !self.basis_tracker.is_fresh(now_ms) {
-            stale_count += 1;
-        }
-        if !self.cvd_tracker.is_fresh(now_ms) {
-            stale_count += 1;
-        }
-        if !self.obi_tracker.is_fresh(now_ms) {
-            stale_count += 1;
-        }
+        if !self.basis_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.cvd_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.obi_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.cvd_level_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.obi_level_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.basis_level_tracker.is_fresh(now_ms) { stale_count += 1; }
+        if !self.spot_cvd_tracker.is_fresh(now_ms) { stale_count += 1; }
         edge += stale_count as f64 * self.config.stale_data_edge_penalty;
 
         self.edge = edge;
@@ -329,12 +479,10 @@ impl FairValueEstimator {
         Decimal::try_from(self.no_fair_value).unwrap_or(Decimal::new(50, 2))
     }
 
-    #[allow(dead_code)]
     pub fn yes_target_price(&self, edge: Decimal) -> Decimal {
         (self.yes_fair_value() - edge).max(Decimal::new(1, 2))
     }
 
-    #[allow(dead_code)]
     pub fn no_target_price(&self, edge: Decimal) -> Decimal {
         (self.no_fair_value() - edge).max(Decimal::new(1, 2))
     }
@@ -384,30 +532,6 @@ impl FairValueEstimator {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn direction_sign(tracker: &BasisDeltaTracker) -> f64 {
-    match tracker.direction() {
-        Some(crate::types::market::Direction::Up) => 1.0,
-        Some(crate::types::market::Direction::Down) => -1.0,
-        None => 0.0,
-    }
-}
-
-fn direction_sign_cvd(tracker: &CvdAccelTracker) -> f64 {
-    match tracker.direction() {
-        Some(crate::types::market::Direction::Up) => 1.0,
-        Some(crate::types::market::Direction::Down) => -1.0,
-        None => 0.0,
-    }
-}
-
-fn direction_sign_obi(tracker: &ObiVelocityTracker) -> f64 {
-    match tracker.direction() {
-        Some(crate::types::market::Direction::Up) => 1.0,
-        Some(crate::types::market::Direction::Down) => -1.0,
-        None => 0.0,
-    }
-}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -618,5 +742,48 @@ mod tests {
         assert_eq!(fv.strike_price, 0.0);
         assert!(!fv.is_warm());
         assert!(fv.strike_warmup_buffer.is_empty());
+    }
+
+    // ── Sigmoid/Logit tests ──
+
+    #[test]
+    fn test_sigmoid_at_zero() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_sigmoid_large_positive() {
+        assert!(sigmoid(10.0) > 0.999);
+    }
+
+    #[test]
+    fn test_sigmoid_large_negative() {
+        assert!(sigmoid(-10.0) < 0.001);
+    }
+
+    #[test]
+    fn test_logit_inverse() {
+        let p = 0.3;
+        let recovered = sigmoid(logit(p));
+        assert!((recovered - p).abs() < 1e-10, "sigmoid(logit({p})) should = {p}, got {recovered}");
+    }
+
+    #[test]
+    fn test_logit_symmetry() {
+        let l1 = logit(0.3);
+        let l2 = logit(0.7);
+        assert!((l1 + l2).abs() < 1e-10, "logit(0.3) + logit(0.7) should = 0");
+    }
+
+    #[test]
+    fn test_logit_momentum_smaller_at_extremes() {
+        // Same logit shift should produce smaller probability change at P=0.90 vs P=0.50
+        let shift = 0.15;
+        let delta_at_50 = sigmoid(logit(0.50) + shift) - 0.50;
+        let delta_at_90 = sigmoid(logit(0.90) + shift) - 0.90;
+        assert!(
+            delta_at_50.abs() > delta_at_90.abs(),
+            "logit momentum should have less effect at extremes: delta@0.50={delta_at_50:.4}, delta@0.90={delta_at_90:.4}"
+        );
     }
 }

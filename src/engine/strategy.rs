@@ -136,6 +136,34 @@ impl V2StrategyEngine {
             obi_freshness_ms: fv_toml.obi_freshness_ms,
             obi_min: fv_toml.obi_min,
             obi_saturation: fv_toml.obi_saturation,
+            // Level-based signal weights
+            momentum_weight_cvd_level: fv_toml.momentum_weight_cvd_level,
+            momentum_weight_obi_level: fv_toml.momentum_weight_obi_level,
+            momentum_weight_basis_level: fv_toml.momentum_weight_basis_level,
+            momentum_weight_spot_cvd: fv_toml.momentum_weight_spot_cvd,
+            momentum_weight_liquidation: fv_toml.momentum_weight_liquidation,
+            // Level tracker params
+            cvd_level_halflife_ms: fv_toml.cvd_level_halflife_ms,
+            cvd_level_freshness_ms: fv_toml.cvd_level_freshness_ms,
+            cvd_level_saturation: fv_toml.cvd_level_saturation,
+            obi_level_halflife_ms: fv_toml.obi_level_halflife_ms,
+            obi_level_freshness_ms: fv_toml.obi_level_freshness_ms,
+            obi_level_saturation: fv_toml.obi_level_saturation,
+            basis_level_halflife_ms: fv_toml.basis_level_halflife_ms,
+            basis_level_freshness_ms: fv_toml.basis_level_freshness_ms,
+            basis_level_saturation: fv_toml.basis_level_saturation,
+            // Spot CVD tracker
+            spot_cvd_fast_halflife_ms: fv_toml.spot_cvd_fast_halflife_ms,
+            spot_cvd_slow_halflife_ms: fv_toml.spot_cvd_slow_halflife_ms,
+            spot_cvd_freshness_ms: fv_toml.spot_cvd_freshness_ms,
+            spot_cvd_saturation: fv_toml.spot_cvd_saturation,
+            // Liquidation tracker
+            liquidation_halflife_ms: fv_toml.liquidation_halflife_ms,
+            liquidation_freshness_ms: fv_toml.liquidation_freshness_ms,
+            liquidation_saturation: fv_toml.liquidation_saturation,
+            // Momentum mode
+            use_logit_momentum: fv_toml.use_logit_momentum,
+            momentum_time_decay: fv_toml.momentum_time_decay,
         };
 
         let q_toml = &config.bot.quoting;
@@ -382,8 +410,14 @@ impl V2StrategyEngine {
             }
 
             IngestorEvent::WsStatus { .. } => {}
-            IngestorEvent::SpotTrade(_) => {}
-            IngestorEvent::FuturesForceOrder(_) => {}
+            IngestorEvent::SpotTrade(trade) => {
+                let qty = trade.quantity.to_f64().unwrap_or(0.0);
+                self.fair_value.update_spot_cvd(qty, trade.is_buyer_maker, now);
+            }
+            IngestorEvent::FuturesForceOrder(order) => {
+                let qty = order.quantity.to_f64().unwrap_or(0.0);
+                self.fair_value.update_liquidation(&order.side, qty, now);
+            }
             IngestorEvent::PolymarketMarketResolved { .. } => {}
             IngestorEvent::Shutdown | IngestorEvent::DrainAndRestart
             | IngestorEvent::PauseTrading | IngestorEvent::ResumeTrading => {}
@@ -556,13 +590,16 @@ impl V2StrategyEngine {
                         MarketSide::No => self.diag_no_fills += 1,
                     }
                 } else {
-                    let ask = self.quoter.pending_ask(side).unwrap_or(Decimal::ZERO);
+                    let fv = match side {
+                        MarketSide::Yes => self.fair_value.yes_fair_value(),
+                        MarketSide::No => self.fair_value.no_fair_value(),
+                    };
                     self.quoter.on_order_posted(side, ManagedOrder {
                         order_id,
                         price,
                         size,
                         posted_ms: now,
-                        ask_at_post: ask,
+                        fair_value_at_post: fv,
                         size_filled: Decimal::ZERO,
                     });
                 }
@@ -758,44 +795,32 @@ impl V2StrategyEngine {
         // ── Maker quoting (suppressed during buildup dark) ──
         let mut commands = Vec::new();
         if !buildup_dark {
-            // Extract CLOB best asks (anchor for bid pricing)
-            let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-            let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
-
-            // Edge computation: lagging side drops min_edge, keeps vol/time risk cushion
             let base_edge = self.fair_value.edge();
-            let min_edge_dec = Decimal::try_from(self.min_edge).unwrap_or(Decimal::ZERO);
-            let computed_edge = (base_edge - min_edge_dec).max(Decimal::ZERO);
             let (yes_edge, no_edge) = if imbalance > Decimal::ZERO {
-                // Long YES → NO is lagging (drop min_edge only)
-                (base_edge, computed_edge)
+                // Long YES → NO is lagging, same edge both sides (min_edge=0)
+                (base_edge, base_edge)
             } else if imbalance < Decimal::ZERO {
-                // Long NO → YES is lagging (drop min_edge only)
-                (computed_edge, base_edge)
+                // Long NO → YES is lagging, same edge both sides (min_edge=0)
+                (base_edge, base_edge)
             } else {
                 (base_edge, base_edge)
             };
 
-            // Target price = CLOB ask - edge (anchored to live market)
             let tick = self.state.tick_size;
-            let yes_target = match yes_best_ask {
-                Some(ask) => round_to_tick(ask - yes_edge, tick),
-                None => Decimal::ZERO,
-            };
-            let no_target = match no_best_ask {
-                Some(ask) => round_to_tick(ask - no_edge, tick),
-                None => Decimal::ZERO,
-            };
+            let yes_target = round_to_tick(self.fair_value.yes_target_price(yes_edge), tick);
+            let no_target = round_to_tick(self.fair_value.no_target_price(no_edge), tick);
 
-            // Pre-flight: skip sides with no ask, non-positive target, or outside posting zone
+            let yes_fv = self.fair_value.yes_fair_value();
+            let no_fv = self.fair_value.no_fair_value();
+
+            // Pre-flight: skip sides whose target would cross or meet the CLOB best ask,
+            // and enforce dynamic posting zone bounds
+            let yes_best_ask = self.state.poly_yes_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
+            let no_best_ask = self.state.poly_no_book.as_ref().and_then(|b| b.best_ask()).map(|l| l.price);
             let yes_postable = yes_book_ok
-                && yes_best_ask.is_some()
-                && yes_target > Decimal::ZERO
                 && yes_target >= min_extreme && yes_target <= max_extreme
                 && yes_best_ask.is_none_or(|ask| yes_target < ask);
             let no_postable = no_book_ok
-                && no_best_ask.is_some()
-                && no_target > Decimal::ZERO
                 && no_target >= min_extreme && no_target <= max_extreme
                 && no_best_ask.is_none_or(|ask| no_target < ask);
 
@@ -825,7 +850,7 @@ impl V2StrategyEngine {
             let mut actions = Vec::new();
             if yes_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::Yes, yes_target, yes_best_ask.unwrap_or(Decimal::ZERO), &yes_token,
+                    MarketSide::Yes, yes_target, yes_fv, &yes_token,
                     &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
@@ -833,7 +858,7 @@ impl V2StrategyEngine {
             }
             if no_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::No, no_target, no_best_ask.unwrap_or(Decimal::ZERO), &no_token,
+                    MarketSide::No, no_target, no_fv, &no_token,
                     &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
@@ -843,11 +868,7 @@ impl V2StrategyEngine {
             for action in actions {
                 match action {
                     QuoteAction::Post { side, token_id, price, size } => {
-                        let ask = match side {
-                            MarketSide::Yes => yes_best_ask.unwrap_or(Decimal::ZERO),
-                            MarketSide::No => no_best_ask.unwrap_or(Decimal::ZERO),
-                        };
-                        self.quoter.mark_post_pending(side, ask);
+                        self.quoter.mark_post_pending(side);
                         commands.push(V2ExecutorCommand::PostOrder {
                             side,
                             token_id,
@@ -982,10 +1003,18 @@ impl V2StrategyEngine {
             .and_then(|b| b.best_ask())
             .map(|l| format!("{:.3}", l.price))
             .unwrap_or_else(|| "-".to_string());
+        let yes_bid = self.state.poly_yes_book.as_ref()
+            .and_then(|b| b.best_bid())
+            .map(|l| format!("{:.3}", l.price))
+            .unwrap_or_else(|| "-".to_string());
+        let no_bid = self.state.poly_no_book.as_ref()
+            .and_then(|b| b.best_bid())
+            .map(|l| format!("{:.3}", l.price))
+            .unwrap_or_else(|| "-".to_string());
         let msg = format!(
             "v2 60s | phase={:?} | yes_fills={} no_fills={} requotes={} darkens={} | \
              yes={:.2} no={:.2} paired={:.2} locked=${:.2} deployed=${:.2} | \
-             fv_yes={:.3} fv_no={:.3} ask_yes={} ask_no={} edge={:.3} risk={:.2} dyn_max={:.2} buildup={:.3}{} | markets={}",
+             fv_yes={:.3} fv_no={:.3} book_yes={}/{} book_no={}/{} edge={:.3} risk={:.2} dyn_max={:.2} buildup={:.3}{} | markets={}",
             self.phase,
             self.diag_yes_fills,
             self.diag_no_fills,
@@ -998,8 +1027,8 @@ impl V2StrategyEngine {
             deployed,
             self.fair_value.yes_fair_value(),
             self.fair_value.no_fair_value(),
-            yes_ask,
-            no_ask,
+            yes_bid, yes_ask,
+            no_bid, no_ask,
             self.fair_value.edge(),
             self.last_rebalance_risk,
             dyn_max,

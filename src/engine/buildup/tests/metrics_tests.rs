@@ -205,3 +205,130 @@ fn test_realized_vol_ring_buffer_eviction() {
     assert!(vol.is_finite(), "vol should be finite after eviction");
     assert!(vol > 0.0, "vol should be positive with price movement");
 }
+
+// ── CVD Level Tracker ───────────────────────────────────────────────
+
+#[test]
+fn test_cvd_level_accumulates_buying() {
+    let mut tracker = CvdLevelTracker::new(3000.0, 500, 5.0);
+    for i in 0..20 {
+        tracker.update(1.0, false, i * 10); // buyer aggressor
+    }
+    assert!(tracker.raw() > 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Up));
+    assert!(tracker.normalized(200) > 0.0);
+}
+
+#[test]
+fn test_cvd_level_accumulates_selling() {
+    let mut tracker = CvdLevelTracker::new(3000.0, 500, 5.0);
+    for i in 0..20 {
+        tracker.update(1.0, true, i * 10); // seller aggressor
+    }
+    assert!(tracker.raw() < 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Down));
+}
+
+#[test]
+fn test_cvd_level_staleness() {
+    let mut tracker = CvdLevelTracker::new(3000.0, 500, 5.0);
+    for i in 0..20 {
+        tracker.update(1.0, false, i * 10);
+    }
+    assert!(tracker.is_fresh(300));
+    assert!(!tracker.is_fresh(1000));
+    assert_eq!(tracker.normalized(1000), 0.0);
+}
+
+// ── OBI Level Tracker ───────────────────────────────────────────────
+
+#[test]
+fn test_obi_level_bid_heavy() {
+    let mut tracker = ObiLevelTracker::new(1500.0, 300, 0.3);
+    for i in 0..10 {
+        tracker.update(0.4, i * 50); // bid-heavy OBI
+    }
+    assert!(tracker.raw() > 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Up));
+    assert!(tracker.normalized(500) > 0.0);
+}
+
+#[test]
+fn test_obi_level_ask_heavy() {
+    let mut tracker = ObiLevelTracker::new(1500.0, 300, 0.3);
+    for i in 0..10 {
+        tracker.update(-0.3, i * 50); // ask-heavy OBI
+    }
+    assert!(tracker.raw() < 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Down));
+}
+
+// ── Basis Level Tracker ─────────────────────────────────────────────
+
+#[test]
+fn test_basis_level_futures_premium() {
+    let mut tracker = BasisLevelTracker::new(2000.0, 500, 3.0);
+    tracker.update_spot_mid(50000.0, 100);
+    tracker.update_futures_mid(50005.0, 50015.0, 100); // +1 bps premium
+    assert!(tracker.raw() > 0.0, "futures premium should be positive, got {}", tracker.raw());
+    assert_eq!(tracker.direction(), Some(Direction::Up));
+}
+
+#[test]
+fn test_basis_level_futures_discount() {
+    let mut tracker = BasisLevelTracker::new(2000.0, 500, 3.0);
+    tracker.update_spot_mid(50000.0, 100);
+    tracker.update_futures_mid(49985.0, 49995.0, 100); // discount
+    assert!(tracker.raw() < 0.0, "futures discount should be negative, got {}", tracker.raw());
+    assert_eq!(tracker.direction(), Some(Direction::Down));
+}
+
+// ── Spot CVD Tracker ────────────────────────────────────────────────
+
+#[test]
+fn test_spot_cvd_bullish_acceleration() {
+    let mut tracker = SpotCvdTracker::new(300.0, 800.0, 300, 0.6);
+    for i in 0..30 {
+        tracker.update((i + 1) as f64, false, i * 10);
+    }
+    assert!(tracker.raw() > 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Up));
+    assert!(tracker.normalized(300) > 0.0);
+}
+
+#[test]
+fn test_spot_cvd_bearish_acceleration() {
+    let mut tracker = SpotCvdTracker::new(300.0, 800.0, 300, 0.6);
+    for i in 0..30 {
+        tracker.update((i + 1) as f64, true, i * 10);
+    }
+    assert!(tracker.raw() < 0.0);
+    assert_eq!(tracker.direction(), Some(Direction::Down));
+}
+
+// ── Liquidation Tracker ─────────────────────────────────────────────
+
+#[test]
+fn test_liquidation_sell_pressure() {
+    let mut tracker = LiquidationTracker::new(1000.0, 3000, 10.0);
+    tracker.update("SELL", 5.0, 100); // longs liquidated
+    assert!(tracker.raw() < 0.0, "sell liquidation should be bearish");
+    assert_eq!(tracker.direction(), Some(Direction::Down));
+}
+
+#[test]
+fn test_liquidation_buy_pressure() {
+    let mut tracker = LiquidationTracker::new(1000.0, 3000, 10.0);
+    tracker.update("BUY", 5.0, 100); // shorts squeezed
+    assert!(tracker.raw() > 0.0, "buy liquidation should be bullish");
+    assert_eq!(tracker.direction(), Some(Direction::Up));
+}
+
+#[test]
+fn test_liquidation_staleness() {
+    let mut tracker = LiquidationTracker::new(1000.0, 3000, 10.0);
+    tracker.update("SELL", 5.0, 100);
+    assert!(tracker.is_fresh(2000));
+    assert!(!tracker.is_fresh(4000));
+    assert_eq!(tracker.normalized(4000), 0.0);
+}

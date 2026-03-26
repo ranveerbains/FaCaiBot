@@ -393,6 +393,366 @@ impl RealizedVolTracker {
     }
 }
 
+// ─── 5. CVD Level Tracker ───────────────────────────────────────────────────
+
+/// Absolute cumulative volume delta level from Binance Futures @aggTrade.
+///
+/// Long-window EMA of signed trade volume. Captures persistent flow direction
+/// (net buying/selling) rather than acceleration. Positive → net buying → bullish.
+pub struct CvdLevelTracker {
+    cvd_ema: f64,
+    halflife_ms: f64,
+    last_update_ms: u64,
+    freshness_max_ms: u64,
+    saturation: f64,
+    samples: u32,
+}
+
+impl CvdLevelTracker {
+    pub fn new(halflife_ms: f64, freshness_max_ms: u64, saturation: f64) -> Self {
+        Self {
+            cvd_ema: 0.0,
+            halflife_ms,
+            last_update_ms: 0,
+            freshness_max_ms,
+            saturation,
+            samples: 0,
+        }
+    }
+
+    pub fn update(&mut self, quantity: f64, is_buyer_maker: bool, now_ms: u64) {
+        let signed_qty = if is_buyer_maker { -quantity } else { quantity };
+        if self.samples == 0 {
+            self.cvd_ema = signed_qty;
+        } else {
+            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
+            let alpha = time_alpha(dt, self.halflife_ms);
+            self.cvd_ema = alpha * signed_qty + (1.0 - alpha) * self.cvd_ema;
+        }
+        self.last_update_ms = now_ms;
+        self.samples += 1;
+    }
+
+    pub fn normalized(&self, now_ms: u64) -> f64 {
+        if !self.is_fresh(now_ms) || self.samples < 10 {
+            return 0.0;
+        }
+        normalize(self.cvd_ema, 0.0, self.saturation)
+    }
+
+    pub fn direction(&self) -> Option<Direction> {
+        if self.samples < 10 {
+            return None;
+        }
+        sign_to_direction(self.cvd_ema)
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+    }
+
+    #[allow(dead_code)]
+    pub fn raw(&self) -> f64 {
+        self.cvd_ema
+    }
+}
+
+// ─── 6. OBI Level Tracker ──────────────────────────────────────────────────
+
+/// Absolute order book imbalance level from Binance Spot @depth20.
+///
+/// EMA of raw OBI value (not its velocity). Positive → bid-heavy book → bullish.
+pub struct ObiLevelTracker {
+    obi_ema: f64,
+    halflife_ms: f64,
+    last_update_ms: u64,
+    freshness_max_ms: u64,
+    saturation: f64,
+    initialized: bool,
+}
+
+impl ObiLevelTracker {
+    pub fn new(halflife_ms: f64, freshness_max_ms: u64, saturation: f64) -> Self {
+        Self {
+            obi_ema: 0.0,
+            halflife_ms,
+            last_update_ms: 0,
+            freshness_max_ms,
+            saturation,
+            initialized: false,
+        }
+    }
+
+    pub fn update(&mut self, obi: f64, now_ms: u64) {
+        if !self.initialized {
+            self.obi_ema = obi;
+        } else {
+            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
+            let alpha = time_alpha(dt, self.halflife_ms);
+            self.obi_ema = alpha * obi + (1.0 - alpha) * self.obi_ema;
+        }
+        self.last_update_ms = now_ms;
+        self.initialized = true;
+    }
+
+    pub fn normalized(&self, now_ms: u64) -> f64 {
+        if !self.is_fresh(now_ms) || !self.initialized {
+            return 0.0;
+        }
+        normalize(self.obi_ema, 0.0, self.saturation)
+    }
+
+    pub fn direction(&self) -> Option<Direction> {
+        if !self.initialized {
+            return None;
+        }
+        sign_to_direction(self.obi_ema)
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+    }
+
+    #[allow(dead_code)]
+    pub fn raw(&self) -> f64 {
+        self.obi_ema
+    }
+}
+
+// ─── 7. Basis Level Tracker ────────────────────────────────────────────────
+
+/// Absolute futures-spot basis level in bps.
+///
+/// EMA of basis (not its rate of change). Positive basis (futures premium) → bullish.
+pub struct BasisLevelTracker {
+    futures_mid: f64,
+    spot_mid: f64,
+    basis_ema: f64,
+    halflife_ms: f64,
+    last_update_ms: u64,
+    freshness_max_ms: u64,
+    saturation: f64,
+    initialized: bool,
+}
+
+impl BasisLevelTracker {
+    pub fn new(halflife_ms: f64, freshness_max_ms: u64, saturation: f64) -> Self {
+        Self {
+            futures_mid: 0.0,
+            spot_mid: 0.0,
+            basis_ema: 0.0,
+            halflife_ms,
+            last_update_ms: 0,
+            freshness_max_ms,
+            saturation,
+            initialized: false,
+        }
+    }
+
+    pub fn update_futures_mid(&mut self, bid: f64, ask: f64, now_ms: u64) {
+        self.futures_mid = (bid + ask) / 2.0;
+        self.recompute(now_ms);
+    }
+
+    pub fn update_spot_mid(&mut self, mid: f64, now_ms: u64) {
+        self.spot_mid = mid;
+        self.recompute(now_ms);
+    }
+
+    fn recompute(&mut self, now_ms: u64) {
+        if self.futures_mid <= 0.0 || self.spot_mid <= 0.0 {
+            return;
+        }
+        let basis_bps = ((self.futures_mid - self.spot_mid) / self.spot_mid) * 10_000.0;
+        if !self.initialized {
+            self.basis_ema = basis_bps;
+        } else {
+            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
+            let alpha = time_alpha(dt, self.halflife_ms);
+            self.basis_ema = alpha * basis_bps + (1.0 - alpha) * self.basis_ema;
+        }
+        self.last_update_ms = now_ms;
+        self.initialized = true;
+    }
+
+    pub fn normalized(&self, now_ms: u64) -> f64 {
+        if !self.is_fresh(now_ms) || !self.initialized {
+            return 0.0;
+        }
+        normalize(self.basis_ema, 0.0, self.saturation)
+    }
+
+    pub fn direction(&self) -> Option<Direction> {
+        if !self.initialized {
+            return None;
+        }
+        sign_to_direction(self.basis_ema)
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+    }
+
+    #[allow(dead_code)]
+    pub fn raw(&self) -> f64 {
+        self.basis_ema
+    }
+}
+
+// ─── 8. Spot CVD Tracker ───────────────────────────────────────────────────
+
+/// CVD acceleration from Binance Spot @trade (independent of futures flow).
+///
+/// Same fast/slow EMA pattern as CvdAccelTracker but for spot trades.
+pub struct SpotCvdTracker {
+    cvd_fast_ema: f64,
+    cvd_slow_ema: f64,
+    accel: f64,
+    halflife_fast_ms: f64,
+    halflife_slow_ms: f64,
+    last_update_ms: u64,
+    freshness_max_ms: u64,
+    saturation: f64,
+    samples: u32,
+}
+
+impl SpotCvdTracker {
+    pub fn new(
+        halflife_fast_ms: f64,
+        halflife_slow_ms: f64,
+        freshness_max_ms: u64,
+        saturation: f64,
+    ) -> Self {
+        Self {
+            cvd_fast_ema: 0.0,
+            cvd_slow_ema: 0.0,
+            accel: 0.0,
+            halflife_fast_ms,
+            halflife_slow_ms,
+            last_update_ms: 0,
+            freshness_max_ms,
+            saturation,
+            samples: 0,
+        }
+    }
+
+    pub fn update(&mut self, quantity: f64, is_buyer_maker: bool, now_ms: u64) {
+        let signed_qty = if is_buyer_maker { -quantity } else { quantity };
+        if self.samples == 0 {
+            self.cvd_fast_ema = signed_qty;
+            self.cvd_slow_ema = signed_qty;
+        } else {
+            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
+            let af = time_alpha(dt, self.halflife_fast_ms);
+            let a_s = time_alpha(dt, self.halflife_slow_ms);
+            self.cvd_fast_ema = af * signed_qty + (1.0 - af) * self.cvd_fast_ema;
+            self.cvd_slow_ema = a_s * signed_qty + (1.0 - a_s) * self.cvd_slow_ema;
+        }
+        self.accel = self.cvd_fast_ema - self.cvd_slow_ema;
+        self.last_update_ms = now_ms;
+        self.samples += 1;
+    }
+
+    pub fn normalized(&self, now_ms: u64) -> f64 {
+        if !self.is_fresh(now_ms) || self.samples < 10 {
+            return 0.0;
+        }
+        normalize(self.accel, 0.0, self.saturation)
+    }
+
+    pub fn direction(&self) -> Option<Direction> {
+        if self.samples < 10 {
+            return None;
+        }
+        sign_to_direction(self.accel)
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+    }
+
+    #[allow(dead_code)]
+    pub fn raw(&self) -> f64 {
+        self.accel
+    }
+}
+
+// ─── 9. Liquidation Tracker ────────────────────────────────────────────────
+
+/// Liquidation pressure from Binance Futures @forceOrder.
+///
+/// Tracks net liquidation imbalance: buy liquidations (shorts squeezed) vs
+/// sell liquidations (longs blown out). Net buy liq → bullish, net sell liq → bearish.
+pub struct LiquidationTracker {
+    buy_liq_ema: f64,
+    sell_liq_ema: f64,
+    halflife_ms: f64,
+    last_update_ms: u64,
+    freshness_max_ms: u64,
+    saturation: f64,
+    samples: u32,
+}
+
+impl LiquidationTracker {
+    pub fn new(halflife_ms: f64, freshness_max_ms: u64, saturation: f64) -> Self {
+        Self {
+            buy_liq_ema: 0.0,
+            sell_liq_ema: 0.0,
+            halflife_ms,
+            last_update_ms: 0,
+            freshness_max_ms,
+            saturation,
+            samples: 0,
+        }
+    }
+
+    /// Feed a liquidation event. `side` is "SELL" (longs liquidated) or "BUY" (shorts squeezed).
+    pub fn update(&mut self, side: &str, quantity: f64, now_ms: u64) {
+        if self.last_update_ms > 0 {
+            let dt = now_ms.saturating_sub(self.last_update_ms) as f64;
+            let alpha = time_alpha(dt, self.halflife_ms);
+            // Decay both EMAs
+            self.buy_liq_ema *= 1.0 - alpha;
+            self.sell_liq_ema *= 1.0 - alpha;
+        }
+        match side {
+            "BUY" => self.buy_liq_ema += quantity,
+            "SELL" => self.sell_liq_ema += quantity,
+            _ => {}
+        }
+        self.last_update_ms = now_ms;
+        self.samples += 1;
+    }
+
+    /// Net imbalance: positive = buy liq dominant (bullish), negative = sell liq (bearish).
+    fn net(&self) -> f64 {
+        self.buy_liq_ema - self.sell_liq_ema
+    }
+
+    pub fn normalized(&self, now_ms: u64) -> f64 {
+        if !self.is_fresh(now_ms) || self.samples == 0 {
+            return 0.0;
+        }
+        normalize(self.net(), 0.0, self.saturation)
+    }
+
+    pub fn direction(&self) -> Option<Direction> {
+        if self.samples == 0 {
+            return None;
+        }
+        sign_to_direction(self.net())
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.last_update_ms > 0 && now_ms.saturating_sub(self.last_update_ms) <= self.freshness_max_ms
+    }
+
+    #[allow(dead_code)]
+    pub fn raw(&self) -> f64 {
+        self.net()
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -54,6 +54,34 @@ pub struct FairValueTomlConfig {
     pub obi_freshness_ms: u64,
     pub obi_min: f64,
     pub obi_saturation: f64,
+    // Level-based signal weights
+    pub momentum_weight_cvd_level: f64,
+    pub momentum_weight_obi_level: f64,
+    pub momentum_weight_basis_level: f64,
+    pub momentum_weight_spot_cvd: f64,
+    pub momentum_weight_liquidation: f64,
+    // Level tracker params
+    pub cvd_level_halflife_ms: f64,
+    pub cvd_level_freshness_ms: u64,
+    pub cvd_level_saturation: f64,
+    pub obi_level_halflife_ms: f64,
+    pub obi_level_freshness_ms: u64,
+    pub obi_level_saturation: f64,
+    pub basis_level_halflife_ms: f64,
+    pub basis_level_freshness_ms: u64,
+    pub basis_level_saturation: f64,
+    // Spot CVD tracker
+    pub spot_cvd_fast_halflife_ms: f64,
+    pub spot_cvd_slow_halflife_ms: f64,
+    pub spot_cvd_freshness_ms: u64,
+    pub spot_cvd_saturation: f64,
+    // Liquidation tracker
+    pub liquidation_halflife_ms: f64,
+    pub liquidation_freshness_ms: u64,
+    pub liquidation_saturation: f64,
+    // Momentum mode
+    pub use_logit_momentum: bool,
+    pub momentum_time_decay: bool,
 }
 
 impl Default for FairValueTomlConfig {
@@ -90,6 +118,34 @@ impl Default for FairValueTomlConfig {
             obi_freshness_ms: 120,
             obi_min: 0.0,
             obi_saturation: 0.2,
+            // Level-based signal weights
+            momentum_weight_cvd_level: 0.04,
+            momentum_weight_obi_level: 0.03,
+            momentum_weight_basis_level: 0.05,
+            momentum_weight_spot_cvd: 0.04,
+            momentum_weight_liquidation: 0.03,
+            // Level tracker params
+            cvd_level_halflife_ms: 3000.0,
+            cvd_level_freshness_ms: 500,
+            cvd_level_saturation: 5.0,
+            obi_level_halflife_ms: 1500.0,
+            obi_level_freshness_ms: 300,
+            obi_level_saturation: 0.3,
+            basis_level_halflife_ms: 2000.0,
+            basis_level_freshness_ms: 500,
+            basis_level_saturation: 3.0,
+            // Spot CVD tracker
+            spot_cvd_fast_halflife_ms: 300.0,
+            spot_cvd_slow_halflife_ms: 800.0,
+            spot_cvd_freshness_ms: 300,
+            spot_cvd_saturation: 0.6,
+            // Liquidation tracker
+            liquidation_halflife_ms: 1000.0,
+            liquidation_freshness_ms: 3000,
+            liquidation_saturation: 10.0,
+            // Momentum mode
+            use_logit_momentum: true,
+            momentum_time_decay: true,
         }
     }
 }
