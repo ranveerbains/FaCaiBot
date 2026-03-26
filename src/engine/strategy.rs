@@ -595,12 +595,21 @@ impl V2StrategyEngine {
                         MarketSide::Yes => self.fair_value.yes_fair_value(),
                         MarketSide::No => self.fair_value.no_fair_value(),
                     };
+                    let ask = match side {
+                        MarketSide::Yes => self.state.poly_yes_book.as_ref()
+                            .and_then(|b| b.best_ask()).map(|l| l.price)
+                            .unwrap_or(Decimal::ONE),
+                        MarketSide::No => self.state.poly_no_book.as_ref()
+                            .and_then(|b| b.best_ask()).map(|l| l.price)
+                            .unwrap_or(Decimal::ONE),
+                    };
                     self.quoter.on_order_posted(side, ManagedOrder {
                         order_id,
                         price,
                         size,
                         posted_ms: now,
                         fair_value_at_post: fv,
+                        ask_at_post: ask,
                         size_filled: Decimal::ZERO,
                     });
                 }
@@ -851,16 +860,18 @@ impl V2StrategyEngine {
             let mut actions = Vec::new();
             if yes_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::Yes, yes_target, yes_fv, &yes_token,
-                    &self.position, &self.quoting_config, &self.risk_config,
+                    MarketSide::Yes, yes_target, yes_fv,
+                    yes_best_ask.unwrap_or(Decimal::ONE),
+                    &yes_token, &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
                 actions.push(a);
             }
             if no_postable
                 && let Some(a) = self.quoter.evaluate_side(
-                    MarketSide::No, no_target, no_fv, &no_token,
-                    &self.position, &self.quoting_config, &self.risk_config,
+                    MarketSide::No, no_target, no_fv,
+                    no_best_ask.unwrap_or(Decimal::ONE),
+                    &no_token, &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
                 actions.push(a);
