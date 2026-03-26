@@ -118,6 +118,7 @@ impl V2StrategyEngine {
             vol_min_warmup: fv_toml.vol_min_warmup,
             vol_default: fv_toml.vol_default,
             vol_ticks_per_sec: fv_toml.vol_ticks_per_sec,
+            vol_floor: fv_toml.vol_floor,
             tail_compression_factor: fv_toml.tail_compression_factor,
             stale_data_edge_penalty: fv_toml.stale_data_edge_penalty,
             regime_spike_threshold: fv_toml.regime_spike_threshold,

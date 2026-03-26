@@ -62,6 +62,7 @@ pub struct FairValueConfig {
     pub vol_default: f64,
     pub vol_ticks_per_sec: f64,
     // Model params
+    pub vol_floor: f64,
     pub tail_compression_factor: f64,
     pub stale_data_edge_penalty: f64,
     pub regime_spike_threshold: f64,
@@ -127,7 +128,8 @@ impl Default for FairValueConfig {
             vol_min_warmup: 10,
             vol_default: 0.00003,
             vol_ticks_per_sec: 20.0,
-            tail_compression_factor: 0.85,
+            vol_floor: 0.00002,
+            tail_compression_factor: 0.45,
             stale_data_edge_penalty: 0.01,
             regime_spike_threshold: 2.0,
             regime_spike_penalty: 0.01,
@@ -379,7 +381,11 @@ impl FairValueEstimator {
 
         // ── Base model: corrected binary option ──
         let displacement = (self.current_btc / self.strike_price).ln();
-        let sigma_remaining = self.vol_tracker.scaled_vol(time_remaining_s).max(0.0001);
+        // Use vol floor to prevent overconfidence during calm periods.
+        // BTC can easily move $200 in 5 min — the model must reflect that.
+        let realized = self.vol_tracker.realized_vol().max(self.config.vol_floor);
+        let ticks_remaining = self.config.vol_ticks_per_sec * time_remaining_s;
+        let sigma_remaining = (realized * ticks_remaining.max(1.0).sqrt()).max(0.0001);
         let d = displacement / sigma_remaining;
         let d_adjusted = d * self.config.tail_compression_factor;
         let base_fv = phi(d_adjusted);

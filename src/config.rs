@@ -35,6 +35,7 @@ pub struct FairValueTomlConfig {
     pub vol_default: f64,
     pub vol_ticks_per_sec: f64,
     // Model params
+    pub vol_floor: f64,
     pub tail_compression_factor: f64,
     pub stale_data_edge_penalty: f64,
     pub regime_spike_threshold: f64,
@@ -100,7 +101,8 @@ impl Default for FairValueTomlConfig {
             vol_min_warmup: 10,
             vol_default: 0.00003,
             vol_ticks_per_sec: 20.0,
-            tail_compression_factor: 0.85,
+            vol_floor: 0.00002,
+            tail_compression_factor: 0.45,
             stale_data_edge_penalty: 0.01,
             regime_spike_threshold: 2.0,
             regime_spike_penalty: 0.01,
