@@ -72,7 +72,7 @@ momentum_time_decay = true    # scale momentum by time remaining
 
 [quoting]
 # Edge (minimum profit margin per share)
-min_edge = 0.03
+min_edge = 0.04
 # Requoting
 requote_threshold = 0.01
 # Order sizing
@@ -94,5 +94,5 @@ stale_book_ms = 850
 heartbeat_dead_threshold = 5
 binance_stale_event_ms = 150
 # Buildup guard — weighted composite score with direction consensus + causal ordering
-buildup_go_dark_threshold = 0.35   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
-buildup_go_live_threshold = 0.1    # resume when score drops below this
+buildup_go_dark_threshold = 0.2   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
+buildup_go_live_threshold = 0.05    # resume when score drops below this
