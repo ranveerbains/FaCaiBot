@@ -178,6 +178,7 @@ impl Quoter {
         target_price: Decimal,
         fair_value: Decimal,
         ask_price: Decimal,
+        is_lagging: bool,
         token_id: &str,
         position: &BilateralPosition,
         quoting: &QuotingConfig,
@@ -243,10 +244,12 @@ impl Quoter {
         match resting {
             None => {
                 // Min-edge room check: don't post if the ask is too close to our bid.
-                // Ensures at least min_edge of breathing room to avoid adverse fills.
-                let min_edge_dec = Decimal::try_from(quoting.min_edge).unwrap_or(Decimal::ZERO);
-                if ask_price > Decimal::ZERO && ask_price - target_price < min_edge_dec {
-                    return None; // not enough room — stand down
+                // Skipped for lagging side — getting filled there reduces imbalance.
+                if !is_lagging {
+                    let min_edge_dec = Decimal::try_from(quoting.min_edge).unwrap_or(Decimal::ZERO);
+                    if ask_price > Decimal::ZERO && ask_price - target_price < min_edge_dec {
+                        return None; // not enough room — stand down
+                    }
                 }
 
                 Some(QuoteAction::Post {
@@ -552,7 +555,7 @@ mod tests {
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"),
+            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -566,7 +569,7 @@ mod tests {
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"),
+            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(action.is_none());
@@ -581,7 +584,7 @@ mod tests {
         let (qc, rc) = default_configs();
 
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"),
+            MarketSide::Yes, dec("0.42"), dec("0.45"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(action.is_none());
@@ -605,7 +608,7 @@ mod tests {
 
         // Fair value shifted by 0.02 (> threshold 0.01), 3s elapsed (> 2s min)
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.44"), dec("0.47"), dec("0.50"),
+            MarketSide::Yes, dec("0.44"), dec("0.47"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(matches!(action, Some(QuoteAction::Cancel { .. })));
@@ -629,7 +632,7 @@ mod tests {
 
         // Fair value barely moved (0.005 < threshold 0.01)
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.425"), dec("0.455"), dec("0.50"),
+            MarketSide::Yes, dec("0.425"), dec("0.455"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(action.is_none());
@@ -759,7 +762,7 @@ mod tests {
 
         // YES at $0.45 → pair_cost = 0.60 + 0.45 = 1.05 ≥ 1.00 → blocked
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.45"), dec("0.50"), dec("0.55"),
+            MarketSide::Yes, dec("0.45"), dec("0.50"), dec("0.55"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(action.is_none());
@@ -775,7 +778,7 @@ mod tests {
 
         // YES at $0.39 → pair_cost = 0.60 + 0.39 = 0.99 < 1.00 → allowed
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.39"), dec("0.45"), dec("0.50"),
+            MarketSide::Yes, dec("0.39"), dec("0.45"), dec("0.50"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));
@@ -789,7 +792,7 @@ mod tests {
 
         // No opposite fills → guard skipped → normal post
         let action = quoter.evaluate_side(
-            MarketSide::Yes, dec("0.85"), dec("0.90"), dec("0.95"),
+            MarketSide::Yes, dec("0.85"), dec("0.90"), dec("0.95"), false,
             "yes_token", &position, &qc, &rc,
         );
         assert!(matches!(action, Some(QuoteAction::Post { .. })));

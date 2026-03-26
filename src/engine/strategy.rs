@@ -858,10 +858,13 @@ impl V2StrategyEngine {
 
             // Evaluate each side independently (book health + crossing check)
             let mut actions = Vec::new();
+            let yes_lagging = imbalance < Decimal::ZERO; // Long NO → YES is lagging
+            let no_lagging = imbalance > Decimal::ZERO;  // Long YES → NO is lagging
+
             if yes_postable
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::Yes, yes_target, yes_fv,
-                    yes_best_ask.unwrap_or(Decimal::ONE),
+                    yes_best_ask.unwrap_or(Decimal::ONE), yes_lagging,
                     &yes_token, &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
@@ -870,7 +873,7 @@ impl V2StrategyEngine {
             if no_postable
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::No, no_target, no_fv,
-                    no_best_ask.unwrap_or(Decimal::ONE),
+                    no_best_ask.unwrap_or(Decimal::ONE), no_lagging,
                     &no_token, &self.position, &self.quoting_config, &self.risk_config,
                 )
             {
