@@ -857,11 +857,24 @@ impl V2StrategyEngine {
             }
 
             // Evaluate each side independently (book health + crossing check)
+            // When imbalance >= rebalance_threshold, skip maker on lagging side — taker handles it
             let mut actions = Vec::new();
-            let yes_lagging = imbalance < Decimal::ZERO; // Long NO → YES is lagging
-            let no_lagging = imbalance > Decimal::ZERO;  // Long YES → NO is lagging
+            let yes_lagging = imbalance < Decimal::ZERO;
+            let no_lagging = imbalance > Decimal::ZERO;
+            let taker_will_handle = abs_imbalance >= self.risk_config.rebalance_threshold;
 
-            if yes_postable
+            // Cancel resting maker on lagging side when taker will handle
+            if taker_will_handle {
+                let lagging_side = if imbalance > Decimal::ZERO { MarketSide::No } else { MarketSide::Yes };
+                if let Some(QuoteAction::Cancel { side, order_id }) =
+                    self.quoter.cancel_side_action(lagging_side)
+                {
+                    self.quoter.on_cancel_sent(side);
+                    commands.push(V2ExecutorCommand::CancelOrder { side, order_id });
+                }
+            }
+
+            if yes_postable && !(yes_lagging && taker_will_handle)
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::Yes, yes_target, yes_fv,
                     yes_best_ask.unwrap_or(Decimal::ONE), yes_lagging,
@@ -870,7 +883,7 @@ impl V2StrategyEngine {
             {
                 actions.push(a);
             }
-            if no_postable
+            if no_postable && !(no_lagging && taker_will_handle)
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::No, no_target, no_fv,
                     no_best_ask.unwrap_or(Decimal::ONE), no_lagging,
