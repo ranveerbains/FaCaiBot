@@ -862,7 +862,8 @@ impl V2StrategyEngine {
             let yes_lagging = imbalance < Decimal::ZERO;
             let no_lagging = imbalance > Decimal::ZERO;
 
-            if yes_postable
+            let taker_will_handle = abs_imbalance >= self.risk_config.rebalance_threshold;
+            if yes_postable && !(yes_lagging && taker_will_handle)
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::Yes, yes_target, yes_fv,
                     yes_best_ask.unwrap_or(Decimal::ONE), yes_lagging,
@@ -871,7 +872,7 @@ impl V2StrategyEngine {
             {
                 actions.push(a);
             }
-            if no_postable
+            if no_postable && !(no_lagging && taker_will_handle)
                 && let Some(a) = self.quoter.evaluate_side(
                     MarketSide::No, no_target, no_fv,
                     no_best_ask.unwrap_or(Decimal::ONE), no_lagging,

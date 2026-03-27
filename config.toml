@@ -72,24 +72,24 @@ momentum_time_decay = true    # scale momentum by time remaining
 
 [quoting]
 # Edge (minimum profit margin per share)
-min_edge = 0.02
+min_edge = 0.045
 # Requoting
 requote_threshold = 0.0
 # Order sizing
 max_order_size = 15
 min_order_size = 5
 max_fair_value_extremity = 0.8      # don't quote when either FV > this (pairing infeasible)
-max_batches = 5                      # number of halving batches per side (20 → 10 → 5)
+max_batches = 3                      # number of halving batches per side (20 → 10 → 5)
 
 [risk_v2]
 # Per-side exposure limits
 max_unpaired_shares = 3
 # Timing
-rotation_quiet_ms = 5000
+rotation_quiet_ms = 0
 # Taker rebalance (active imbalance correction)
 rebalance_threshold = 3             # shares imbalance to trigger taker rebalance
 rebalance_size = 30                   # shares per rebalance order
-rebalance_max_pair_cost = 0.98      # max pair cost for rebalance (only rebalance when profitable)
+rebalance_max_pair_cost = 0.99      # max pair cost for rebalance (only rebalance when profitable)
 # Data quality
 stale_book_ms = 850
 heartbeat_dead_threshold = 5
