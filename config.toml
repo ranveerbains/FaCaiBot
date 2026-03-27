@@ -76,17 +76,17 @@ min_edge = 0.04
 # Requoting
 requote_threshold = 0.01
 # Order sizing
-max_order_size = 15
+max_order_size = 20
 min_order_size = 5
 max_fair_value_extremity = 0.78      # don't quote when either FV > this (pairing infeasible)
 
 [risk_v2]
 # Per-side exposure limits
-max_unpaired_shares = 10
+max_unpaired_shares = 7
 # Timing
 rotation_quiet_ms = 10000
 # Taker rebalance (active imbalance correction)
-rebalance_threshold = 4.99             # shares imbalance to trigger taker rebalance
+rebalance_threshold = 3             # shares imbalance to trigger taker rebalance
 rebalance_size = 30                   # shares per rebalance order
 rebalance_max_pair_cost = 0.97      # max pair cost for rebalance (only rebalance when profitable)
 # Data quality
