@@ -23,7 +23,7 @@ ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
 ec2-user@ec2-52-30-254-160.eu-west-1.compute.amazonaws.com
 
 (ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-34-244-199-252.eu-west-1.compute.amazonaws.com
+ ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-52-30-254-160.eu-west-1.compute.amazonaws.com
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
