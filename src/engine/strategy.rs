@@ -938,8 +938,9 @@ impl V2StrategyEngine {
                     .unwrap_or(Decimal::new(96, 2));
 
                 if pair_cost <= max_rebal_cost {
-                    let size = self.risk_config.rebalance_size.min(abs_imbalance);
-                    if size >= Decimal::new(5, 0) {
+                    let clob_min = Decimal::new(5, 0);
+                    let size = self.risk_config.rebalance_size.min(abs_imbalance).max(clob_min);
+                    if size * best_ask.price >= Decimal::ONE {
                         // Cancel resting maker on rebalance side to prevent double-fill
                         if let Some(QuoteAction::Cancel { side, order_id }) =
                             self.quoter.cancel_side_action(rebal_side)
