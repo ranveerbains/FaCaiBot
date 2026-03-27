@@ -46,6 +46,7 @@ pub struct QuotingConfig {
     pub max_order_size: Decimal,
     pub min_order_size: Decimal,
     pub max_fair_value_extremity: f64,
+    pub max_batches: u32,
 }
 
 impl Default for QuotingConfig {
@@ -56,6 +57,7 @@ impl Default for QuotingConfig {
             max_order_size: Decimal::new(100, 0),
             min_order_size: Decimal::new(5, 0),
             max_fair_value_extremity: 0.85,
+            max_batches: 3,
         }
     }
 }
@@ -97,11 +99,11 @@ impl Default for RiskV2Config {
 ///
 /// Example with max=20, min=5: 20 + 10 + 5 = 35
 /// Example with max=10, min=5: 10 + 5 + 5 = 20
-pub fn max_total_shares(max_size: Decimal, min_size: Decimal) -> Decimal {
+pub fn max_total_shares(max_size: Decimal, min_size: Decimal, batches: u32) -> Decimal {
     let two = Decimal::TWO;
     let mut size = max_size;
     let mut total = Decimal::ZERO;
-    for _ in 0..3 {
+    for _ in 0..batches {
         total += size;
         size = (size / two).max(min_size);
     }
@@ -117,11 +119,11 @@ pub fn max_total_shares(max_size: Decimal, min_size: Decimal) -> Decimal {
 /// - 0..14 shares on this side → 15 (batch 1)
 /// - 15..22.4 → 7.5 (batch 2)
 /// - 22.5+ → 5 (batch 3)
-pub fn dynamic_order_size(max_size: Decimal, min_size: Decimal, side_shares: Decimal) -> Decimal {
+pub fn dynamic_order_size(max_size: Decimal, min_size: Decimal, side_shares: Decimal, batches: u32) -> Decimal {
     let two = Decimal::TWO;
     let mut size = max_size;
     let mut threshold = Decimal::ZERO;
-    for _ in 0..3 {
+    for _ in 0..batches {
         threshold += size;
         if side_shares < threshold {
             return size;
@@ -193,7 +195,7 @@ impl Quoter {
             return None;
         }
         // Total shares cap: stop maker orders when either side hits the precalculated limit
-        let total_cap = max_total_shares(quoting.max_order_size, quoting.min_order_size);
+        let total_cap = max_total_shares(quoting.max_order_size, quoting.min_order_size, quoting.max_batches);
         let side_shares = match side {
             MarketSide::Yes => position.yes.total_shares,
             MarketSide::No => position.no.total_shares,
@@ -219,6 +221,7 @@ impl Quoter {
             quoting.max_order_size,
             quoting.min_order_size,
             side_shares,
+            quoting.max_batches,
         );
 
         if target_price <= Decimal::ZERO {
@@ -509,43 +512,43 @@ mod tests {
     #[test]
     fn test_dynamic_size_batch1() {
         // max=10, min=5: 0..9 paired → 10
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("0")), dec("10"));
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("9")), dec("10"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("0"), 3), dec("10"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("9"), 3), dec("10"));
     }
 
     #[test]
     fn test_dynamic_size_batch2() {
         // max=10, min=5: 10..14 paired → 5 (halved, floored at min)
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("10")), dec("5"));
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("14")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("10"), 3), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("14"), 3), dec("5"));
     }
 
     #[test]
     fn test_dynamic_size_batch3() {
         // max=10, min=5: 15+ paired → 5 (stays at min)
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("15")), dec("5"));
-        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("100")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("15"), 3), dec("5"));
+        assert_eq!(dynamic_order_size(dec("10"), dec("5"), dec("100"), 3), dec("5"));
     }
 
     #[test]
     fn test_dynamic_size_larger_max() {
         // max=20, min=5: batch1=20 (0..19), batch2=10 (20..29), batch3=5 (30+)
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("0")), dec("20"));
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("19")), dec("20"));
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("20")), dec("10"));
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("29")), dec("10"));
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("30")), dec("5"));
-        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("100")), dec("5"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("0"), 3), dec("20"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("19"), 3), dec("20"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("20"), 3), dec("10"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("29"), 3), dec("10"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("30"), 3), dec("5"));
+        assert_eq!(dynamic_order_size(dec("20"), dec("5"), dec("100"), 3), dec("5"));
     }
 
     #[test]
     fn test_max_total_shares() {
         // max=10, min=5: 10 + 5 + 5 = 20
-        assert_eq!(max_total_shares(dec("10"), dec("5")), dec("20"));
+        assert_eq!(max_total_shares(dec("10"), dec("5"), 3), dec("20"));
         // max=20, min=5: 20 + 10 + 5 = 35
-        assert_eq!(max_total_shares(dec("20"), dec("5")), dec("35"));
+        assert_eq!(max_total_shares(dec("20"), dec("5"), 3), dec("35"));
         // max=40, min=5: 40 + 20 + 10 = 70
-        assert_eq!(max_total_shares(dec("40"), dec("5")), dec("70"));
+        assert_eq!(max_total_shares(dec("40"), dec("5"), 3), dec("70"));
     }
 
     #[test]

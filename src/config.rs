@@ -160,6 +160,7 @@ pub struct QuotingTomlConfig {
     pub max_order_size: f64,
     pub min_order_size: f64,
     pub max_fair_value_extremity: f64,
+    pub max_batches: u32,
 }
 
 impl Default for QuotingTomlConfig {
@@ -170,6 +171,7 @@ impl Default for QuotingTomlConfig {
             max_order_size: 100.0,
             min_order_size: 5.0,
             max_fair_value_extremity: 0.85,
+            max_batches: 3,
         }
     }
 }

@@ -72,13 +72,14 @@ momentum_time_decay = true    # scale momentum by time remaining
 
 [quoting]
 # Edge (minimum profit margin per share)
-min_edge = 0.0
+min_edge = 0.01
 # Requoting
 requote_threshold = 0.005
 # Order sizing
 max_order_size = 5
 min_order_size = 5
 max_fair_value_extremity = 0.8      # don't quote when either FV > this (pairing infeasible)
+max_batches = 10                      # number of halving batches per side (20 → 10 → 5)
 
 [risk_v2]
 # Per-side exposure limits
