@@ -72,7 +72,7 @@ momentum_time_decay = true    # scale momentum by time remaining
 
 [quoting]
 # Edge (minimum profit margin per share)
-min_edge = 0.04
+min_edge = 0.0
 # Requoting
 requote_threshold = 0.005
 # Order sizing
