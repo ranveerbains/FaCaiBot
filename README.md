@@ -1,8 +1,29 @@
-# FaCaiBot
+# FaCaiBot (v1)
+
+> **Note**: This is the v1 branch. The actively developed version is [v2](../../tree/v2), which uses bilateral accumulation for more structural alpha.
 
 Polymarket arbitrage bot for BTC 5-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [trading_logic/](trading_logic/README.md) for trading logic details.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design.
+
+## How Alpha is Generated (v1)
+
+1. **Spike Detection**: Monitor 6 Binance signals (CVD, spot flow, OBI, basis, liquidations, ATR) for buildup consensus
+2. **Leg 1 Entry**: When signals align, post a maker order on the predicted direction (cheap, before repricing)
+3. **Leg 2 Hedge**: Once Leg 1 fills, immediately post the opposite side at a price that locks in profit
+4. **Resolution**: The pair resolves to $1.00; total cost was < $1.00 → structural profit on each completed trade
+
+Edge is timing-dependent — alpha comes from entering before the market reprices, then completing the hedge quickly.
+
+## Quick Overview
+
+- **Spike-Based Entry**: Composite buildup score from 6 Binance spot + futures signals
+- **Two-Leg Execution**: Directional entry (Leg 1), then hedge (Leg 2) on same market
+- **Lock-Free Pipeline**: Zero-copy crossbeam channels (Ingestor → Engine → Executor)
+- **Real-Time Feeds**: Binance SBE WebSocket (spot depth + futures aggTrades + liquidations)
+- **Simulation Mode**: Full testing without real trades
+- **Remote Control**: Telegram bot for `/status`, `/set params`, `/stop`, `/shutdown`
+- **Analytics**: QuestDB for market analysis and performance tracking
 
 ---
 
@@ -17,13 +38,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design and [trading_logic
 ### Step 2: SSH In
 
 ```bash
-chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
+chmod 400 <YOUR_KEYPAIR>.pem
 
-ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-34-244-231-11.eu-west-1.compute.amazonaws.com
+ssh -i <YOUR_KEYPAIR>.pem ec2-user@<PUBLIC_IP>
 
-(ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-34-244-231-11.eu-west-1.compute.amazonaws.com
+# Forward QuestDB dashboard (optional)
+ssh -i <YOUR_KEYPAIR>.pem -L 9000:localhost:9000 ec2-user@<PUBLIC_IP>
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
