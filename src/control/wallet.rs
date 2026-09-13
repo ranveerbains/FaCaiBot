@@ -94,33 +94,6 @@ fn short_id(id: &str) -> String {
 /// Path to the persistent redemption file (relative to working directory).
 const REDEEMS_FILE: &str = "redeems.txt";
 
-/// Append a condition ID to `redeems.txt` (sync I/O — called from engine thread).
-/// Deduplicates: skips if the ID is already present in the file.
-pub fn append_condition_id_sync(condition_id: &str) {
-    use std::io::Write;
-
-    // Read existing content to check for duplicates.
-    let existing = std::fs::read_to_string(REDEEMS_FILE).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == condition_id) {
-        return;
-    }
-
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(REDEEMS_FILE)
-    {
-        Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{condition_id}") {
-                tracing::warn!(error = %e, "failed to append condition ID to redeems.txt");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open redeems.txt for append");
-        }
-    }
-}
-
 /// Read condition IDs from `redeems.txt` (async). Returns deduplicated, validated IDs.
 async fn read_condition_ids_from_file() -> Vec<String> {
     let content = match tokio::fs::read_to_string(REDEEMS_FILE).await {

@@ -1,29 +1,33 @@
-# FaCaiBot (v1)
+# FaCaiBot (v2)
 
-> **Note**: This is the v1 branch. The actively developed version is [v2](../../tree/v2), which uses bilateral accumulation for more structural alpha.
+> **This is the v2 branch** — a complete rewrite using bilateral accumulation. The original v1 (2-leg reactive) bot is on the [main branch](../../tree/main).
 
-Polymarket arbitrage bot for BTC 5-minute prediction markets. Detects Binance price spikes via SBE binary feeds, enters cheap directional shares on the CLOB before repricing, then hedges the opposite side — locking in a sub-$1.00 pair that resolves to $1.00.
+Polymarket market-making bot for BTC 5-minute prediction markets. Continuously quotes both YES and NO sides using a Binance-derived fair value model, accumulating matched pairs that pay $1.00 on resolution for less than $1.00 total cost.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full system design.
+See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARCHITECTURE.md](ARCHITECTURE.md) for infrastructure details.
 
-## How Alpha is Generated (v1)
+## How Alpha is Generated (v2)
 
-1. **Spike Detection**: Monitor 6 Binance signals (CVD, spot flow, OBI, basis, liquidations, ATR) for buildup consensus
-2. **Leg 1 Entry**: When signals align, post a maker order on the predicted direction (cheap, before repricing)
-3. **Leg 2 Hedge**: Once Leg 1 fills, immediately post the opposite side at a price that locks in profit
-4. **Resolution**: The pair resolves to $1.00; total cost was < $1.00 → structural profit on each completed trade
+Unlike v1's reactive spike-and-hedge approach, v2 generates alpha **structurally** through bilateral accumulation:
 
-Edge is timing-dependent — alpha comes from entering before the market reprices, then completing the hedge quickly.
+1. **Fair Value Estimation**: An 8-signal momentum model (CVD, OBI velocity, basis delta, realized volatility from Binance spot + futures) continuously estimates the true probability of BTC moving up in the next 5 minutes
+2. **Bilateral Quoting**: YES and NO orders are posted simultaneously on both sides of the book, priced at `FV ± edge`. Neither side is directional — the bot makes money regardless of which way BTC moves
+3. **Spread Capture**: When both sides fill (or partial accumulation), the total cost < $1.00 while the payout is always $1.00 at resolution. This spread is the locked-in profit
+4. **Inventory Skewing**: If one side accumulates faster (imbalance), quotes are skewed to encourage the other side to fill — managing inventory without taking directional risk
+5. **No Timing Dependency**: Unlike v1, there's no race between Leg 1 and Leg 2. Partial positions hedge each other, and the model continuously adjusts pricing to keep accumulation balanced
+
+Edge is **structural, not timing-dependent** — the strategy profits from quoting efficiently, not from predicting market moves.
 
 ## Quick Overview
 
-- **Spike-Based Entry**: Composite buildup score from 6 Binance spot + futures signals
-- **Two-Leg Execution**: Directional entry (Leg 1), then hedge (Leg 2) on same market
+- **Bilateral Market-Making**: Quote YES/NO simultaneously, profit on spread > costs
+- **Fair Value Model**: 8-signal momentum model from Binance spot + futures
 - **Lock-Free Pipeline**: Zero-copy crossbeam channels (Ingestor → Engine → Executor)
-- **Real-Time Feeds**: Binance SBE WebSocket (spot depth + futures aggTrades + liquidations)
-- **Simulation Mode**: Full testing without real trades
+- **Real-Time Feeds**: Binance SBE WebSocket (spot depth + futures) + Polymarket
+- **Smart Order Management**: Inventory skewing, pending op guards, per-side requoting
 - **Remote Control**: Telegram bot for `/status`, `/set params`, `/stop`, `/shutdown`
 - **Analytics**: QuestDB for market analysis and performance tracking
+- **Simulation Mode**: Full testing without real trades
 
 ---
 
@@ -102,17 +106,16 @@ cp config.toml /opt/facaibot/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MODE` | Yes | `live` or `simulation` |
 | `BINANCE_ED25519_API_KEY` | Yes | Ed25519 key for Binance SBE binary streams |
 | `PRIVATE_KEY` | Live only | Hex wallet private key (EIP-712 signing) |
 | `POLYMARKET_API_KEY` | Live only | L2 HMAC API key (UUID) |
 | `POLYMARKET_SECRET` | Live only | L2 HMAC secret |
 | `POLYMARKET_PASSPHRASE` | Live only | L2 HMAC passphrase |
-| `TELEGRAM_BOT_TOKEN` | Sim only | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Sim only | Telegram chat ID |
+| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Yes | Telegram chat ID |
 | `TELEGRAM_ALLOWED_USER_ID` | Optional | Enables Telegram bot control (get from `@userinfobot`) |
 
-**`config.toml`** — all tuning parameters (spike detection, capital, entry guards, erosion). Defaults are production-ready.
+**`config.toml`** — all tuning parameters (fair value model, quoting, risk limits). Defaults are production-ready.
 
 ### Step 5b: Recovery of Stuck Positions (One-Time if Applicable)
 
@@ -182,7 +185,45 @@ chronyc tracking
 
 ## Updating
 
-After pushing changes to `main`:
+### v2 branch (manual deploy)
+
+`deploy/deploy.sh` pulls from `main`, so deploy v2 manually:
+
+```bash
+ssh -i <YOUR_KEYPAIR>.pem ec2-user@<PUBLIC_IP>
+
+sudo systemctl stop facaibot
+cd ~/FaCaiBot
+git fetch origin
+git checkout v2
+git pull origin v2
+
+# Copy config + build
+cp config.toml /opt/facaibot/config.toml
+source $HOME/.cargo/env
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cp target/release/facaibot /opt/facaibot/facaibot
+sudo systemctl start facaibot
+journalctl -u facaibot -f
+```                       
+
+
+
+### Switching back to v1 (main)
+
+```bash
+sudo systemctl stop facaibot
+cd ~/FaCaiBot
+git checkout main
+git pull origin main
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+cp target/release/facaibot /opt/facaibot/facaibot
+sudo systemctl start facaibot
+```
+
+### main branch (deploy script)
+
+Once v2 is merged to `main`, use the deploy script:
 
 ```bash
 bash deploy/deploy.sh    # pulls, rebuilds, restarts the service

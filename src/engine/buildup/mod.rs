@@ -1,7 +1,5 @@
-//! Buildup detection — predictive pre-spike entry system.
+//! Buildup metrics — reused by the v2 fair value model.
 //!
-//! - [`metrics`] — 6 individual metric trackers (CVD, spot flow, OBI velocity, basis delta, liq pressure, ATR displacement)
-//! - [`detector`] — `BuildupDetector`: composite score, direction consensus, causal ordering
+//! - [`metrics`] — Individual metric trackers (CVD, OBI velocity, basis delta, realized vol)
 
-pub mod detector;
 pub mod metrics;

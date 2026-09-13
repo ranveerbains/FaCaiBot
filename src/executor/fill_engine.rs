@@ -39,14 +39,6 @@ pub(crate) fn compute_taker_fee(price: Decimal, size: Decimal) -> Decimal {
     size * price * factor * inner * inner
 }
 
-/// Estimated maker rebate for a fill at the given price and size.
-/// Approximation: 20% of fee-equivalent (same formula as taker fee).
-/// Actual rebate depends on daily pool distribution; this is an upper-bound estimate.
-pub(crate) fn compute_maker_rebate(price: Decimal, size: Decimal) -> Decimal {
-    let fee_equivalent = compute_taker_fee(price, size);
-    fee_equivalent * Decimal::new(20, 2) // × 0.20
-}
-
 // ─── Unit Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

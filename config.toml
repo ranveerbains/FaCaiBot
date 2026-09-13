@@ -1,113 +1,99 @@
-
 [rotation]
-# Seconds before expiry to discover and pre-fetch the next market
 prewarm_lead_secs = 20
 
-[entry_guards]
-# No entries within this many seconds of market expiry
-entry_cutoff_secs = 20
-# Max age (ms) of Binance SBE event before discard
-binance_stale_event_ms = 150
-# Max age (ms) of Polymarket book before blocking entry
-stale_book_ms = 850
-# Quiet period (ms) after market rotation before allowing trades
-rotation_quiet_ms = 5000
-# Cooldown (ms) after trade completion or Leg 1 cancel before allowing new entries
-trade_cooldown_ms = 2000
-# Consecutive heartbeat failures before assuming CLOB cancelled resting orders
-heartbeat_dead_threshold = 5
-# Maximum bid-ask spread on directional book to allow Leg 1 entry (prevents entries on illiquid books)
-max_entry_spread = 0.04
-# Maximum combined ask price (leg1_ask + hedge_ask). Rejects entries where
-# the hedge book is already too expensive for a profitable pair.
-max_ask_pair_price = 1.04
-
-[capital]
-# Maximum USDC per leg per trade
-max_alloc_per_trade = 25
-
-[repricing]
-# Target profit for ideal signal and full allocation; may be increased by time amplification.
-reprice_scale = 0.065
-# Minimum model output to enter a trade (0.02 = 2.0%)
-min_reprice_pct = 0.03
-# Phase 1 target dampening (0.8 = target 80% of expected repricing)
-phase1_target_dampen = 1
-# Floor allocation fraction (0.3 = always use at least 30% of max_alloc)
-min_alloc_pct = 0.3
-# Hard reject: YES mid beyond this regardless of model
-hard_skew_cap = 0.9
-# Exponent for time amplification (0.5 = sqrt, 0 = disabled, 1.0 = linear)
-time_exponent = 0.5
-# Maximum time amplification factor (2.0 = time can at most double the output)
-max_time_factor = 2.25
-
-[risk]
-# Phase 1 timeout (ms) — time at profit target before transitioning to Phase 2
-phase1_timeout_ms = 8000
-# Phase 1 breach: pair cost > this triggers immediate FOK exit
-phase1_breach_threshold = 1.05
-# Phase 2 timeout (ms) — time at break-even pursuit before FOK taker exit
-phase2_timeout_ms = 2500
-# Timeout (ms) for favorable maker try before FOK fallback on crosses-book
-favorable_maker_timeout_ms = 2500
-
-[buildup]
-# Entry threshold — composite must exceed to trigger Leg 1 entry
-entry_threshold = 0.6
-# Cancel threshold — cancel unfilled Leg 1 if composite drops below
-cancel_threshold = 0.10
-# Cancel Leg 1 if ask drifts up >= this many $ from posted ask
-ask_drift_cancel_cents = 0.02
-# Maximum Leg 1 repost attempts after crosses-book rejection (0 = no retries)
-max_leg1_retries = 2
-# Maximum cumulative ask chase ($) for ask-drift retries — don't retry if market moved > this from original ask
-max_ask_chase_cents = 0.04
-# Maximum dissenting directional metrics in consensus vote (1 = allow 1 dissenter, 0 = unanimous)
-max_dissenters = 1
-
-# Metric weights (must sum to 1.0)
-# Futures-spot spread expansion — LEADING indicator, futures move 100-500ms before spot
-w_basis = 0.40
-# Net aggressive buying/selling acceleration on futures — SUPPORTING, empirical (no peer review)
-w_cvd = 0.20
-# Rate of change of bid/ask depth imbalance on spot — CONFIRMING, academically validated
-w_obi = 0.20
-# Net aggressive buy vs sell flow on spot trades — CONFIRMING, VPIN-backed but lags futures
-w_spot_flow = 0.10
-# Forced liquidation volume on futures — REACTIVE risk gauge, not predictive
-w_liq = 0.05
-# Spot displacement from EMA normalized by ATR — VOLATILITY only, no direction prediction
-w_atr = 0.05
-
-# Freshness gates (ms) — metric treated as stale after this. Tightened to only include recent data.
-freshness_basis_ms = 150
-freshness_cvd_ms = 150
-freshness_spot_flow_ms = 150
-freshness_obi_ms = 120
-freshness_liq_ms = 2500
-freshness_atr_ms = 120
-
-# Normalization: [min_threshold, saturation] for each metric
-# Higher min_thresholds filter out noise—metrics must show REAL precursor magnitude to count.
-# CVD/spot_flow in BTC units (individual trade qty EMAs); basis in bps/update; OBI velocity in OBI delta/update.
-cvd_min = 0.0
-cvd_saturation = 0.6
-spot_flow_min = 0.0
-spot_flow_saturation = 5
-obi_min = 0.0
-obi_saturation = 0.2
+[fair_value]
+# Momentum signal weights (futures-derived leading indicators)
+momentum_weight_basis = 0.10
+momentum_weight_cvd = 0.05
+momentum_weight_obi = 0.05
+max_momentum_adj = 0.08
+# Edge scaling
+vol_edge_scale = 0.05
+time_edge_scale = 0.01
+baseline_vol = 0.00003
+# Realized vol tracker
+vol_ring_capacity = 600          # ~30s lookback at 20 ticks/sec
+vol_session_capacity = 6000      # full 5-min session
+vol_freshness_ms = 500           # stale if no update in 500ms
+vol_min_warmup = 10              # minimum samples before valid vol
+vol_default = 0.00001            # default vol before warmup (1/3 baseline for reasonable starting edge)
+vol_ticks_per_sec = 20.0         # BinanceTick cadence
+# Model params
+vol_floor = 0.00002              # minimum per-tick vol — prevents overconfidence during calm periods
+tail_compression_factor = 0.75   # compress z-score to fatten tails (lower = fatter tails, more uncertain)
+stale_data_edge_penalty = 0.01   # extra edge per stale momentum feed
+regime_spike_threshold = 2.0     # short_vol / session_vol ratio trigger
+regime_spike_penalty = 0.01      # extra edge during regime spike
+strike_warmup_count = 5          # median of first N ticks for strike
+# Momentum metric tracker params
+basis_halflife_ms = 250
+basis_freshness_ms = 150
 basis_min = 0.0
 basis_saturation = 0.05
-liq_min = 0.0
-liq_saturation = 10.0
-atr_min = 0.0
-atr_saturation = 15.0
-
-# EMA half-lives (ms) — time for old value to decay to 50% weight
-# Time-based: consistent smoothing regardless of data arrival rate
 cvd_fast_halflife_ms = 200
 cvd_slow_halflife_ms = 500
-spot_flow_halflife_ms = 250
-obi_velocity_halflife_ms = 250
-basis_halflife_ms = 250
+cvd_freshness_ms = 150
+cvd_min = 0.0
+cvd_saturation = 0.6
+obi_halflife_ms = 250
+obi_freshness_ms = 120
+obi_min = 0.0
+obi_saturation = 0.2
+# Level-based signal weights (persistent state, not velocity)
+momentum_weight_cvd_level = 0.04
+momentum_weight_obi_level = 0.03
+momentum_weight_basis_level = 0.05
+momentum_weight_spot_cvd = 0.04
+momentum_weight_liquidation = 0.03
+# CVD level tracker (long-EMA of signed volume)
+cvd_level_halflife_ms = 3000
+cvd_level_freshness_ms = 500
+cvd_level_saturation = 5.0
+# OBI level tracker (EMA of raw OBI)
+obi_level_halflife_ms = 1500
+obi_level_freshness_ms = 300
+obi_level_saturation = 0.3
+# Basis level tracker (EMA of absolute basis bps)
+basis_level_halflife_ms = 2000
+basis_level_freshness_ms = 500
+basis_level_saturation = 3.0
+# Spot CVD tracker (spot trade flow acceleration)
+spot_cvd_fast_halflife_ms = 300
+spot_cvd_slow_halflife_ms = 800
+spot_cvd_freshness_ms = 300
+spot_cvd_saturation = 0.6
+# Liquidation tracker
+liquidation_halflife_ms = 1000
+liquidation_freshness_ms = 3000
+liquidation_saturation = 10.0
+# Momentum mode
+use_logit_momentum = true     # apply momentum in log-odds space (more correct)
+momentum_time_decay = true    # scale momentum by time remaining
+
+[quoting]
+# Edge (minimum profit margin per share)
+min_edge = 0.045
+# Requoting
+requote_threshold = 0.0
+# Order sizing
+max_order_size = 15
+min_order_size = 5
+max_fair_value_extremity = 0.8      # don't quote when either FV > this (pairing infeasible)
+max_batches = 3                      # number of halving batches per side (20 → 10 → 5)
+
+[risk_v2]
+# Per-side exposure limits
+max_unpaired_shares = 3
+# Timing
+rotation_quiet_ms = 0
+# Taker rebalance (active imbalance correction)
+rebalance_threshold = 3             # shares imbalance to trigger taker rebalance
+rebalance_size = 30                   # shares per rebalance order
+rebalance_max_pair_cost = 1.01      # max pair cost for rebalance (only rebalance when profitable)
+# Data quality
+stale_book_ms = 850
+heartbeat_dead_threshold = 5
+binance_stale_event_ms = 150
+# Buildup guard — weighted composite score with direction consensus + causal ordering
+buildup_go_dark_threshold = 1   # go dark when composite score >= this (weighted: 0.4×CVD + 0.3×basis + 0.3×OBI)
+buildup_go_live_threshold = 0.05    # resume when score drops below this

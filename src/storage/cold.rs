@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Protocol, Sender as QuestSender, SenderBuilder, TimestampMicros};
-use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use crate::types::BinanceTick;
-use crate::types::order::ExitReason;
 
 // ─── Flush Thresholds ─────────────────────────────────────────────────────────
 
@@ -16,9 +14,6 @@ const TICK_FLUSH_THRESHOLD: usize = 1000;
 /// even at low ingestion rates. 60s is a good balance between durability
 /// and TCP overhead.
 const TICK_FLUSH_INTERVAL_MS: u64 = 60_000;
-
-/// All other tables (book snapshots, signals, trades) flush immediately because
-/// they are rare events and timeliness matters more than throughput.
 
 // ─── Default Ports ────────────────────────────────────────────────────────────
 
@@ -33,7 +28,6 @@ const DEFAULT_ILP_PORT: u16 = 9009;
 /// - A single QuestDB ILP `Sender` writes all tables over one TCP connection.
 /// - `binance_ticks`: batched (buffer up to 1000 rows, flush at threshold).
 /// - All other tables: flushed immediately after each write (low volume).
-/// - Automated partition pruning is handled externally via `prune_old_partitions()`.
 pub struct ColdStorage {
     sender: QuestSender,
     /// Shared write buffer — QuestDB ILP allows mixing multiple tables in one buffer.
@@ -130,253 +124,85 @@ impl ColdStorage {
         Ok(())
     }
 
-    // ─── 2. poly_book_snapshots ───────────────────────────────────────────────
+    // ─── 2. v2_fills ────────────────────────────────────────────────────────────
 
-    /// Write a Polymarket orderbook snapshot to `poly_book_snapshots`.
-    ///
-    /// Intended to be called every 5 seconds for the active market tokens.
-    ///
-    /// Schema:
-    /// - token_id (symbol): Polymarket YES or NO token ID
-    /// - best_bid (f64): best bid price
-    /// - best_ask (f64): best ask price
-    /// - bid_depth (f64): total bid-side depth (USDC)
-    /// - ask_depth (f64): total ask-side depth (USDC)
-    /// - spread (f64): spread percentage
-    /// - timestamp (designated timestamp): wall-clock time of snapshot
-    ///
-    /// Flushes immediately (low volume, one row per 5s per token).
-    pub fn record_book_snapshot(
-        &mut self,
-        token_id: &str,
-        best_bid: Decimal,
-        best_ask: Decimal,
-        bid_depth: Decimal,
-        ask_depth: Decimal,
-        spread: Decimal,
-    ) -> Result<()> {
+    /// Record a fill event to the `v2_fills` table. Flushed immediately (low volume).
+    pub fn record_fill(&mut self, record: &FillRecord) -> Result<()> {
         self.buffer
-            .table("poly_book_snapshots")?
-            .symbol("token_id", token_id)?
-            .column_f64("best_bid", best_bid.try_into().unwrap_or(0.0))?
-            .column_f64("best_ask", best_ask.try_into().unwrap_or(0.0))?
-            .column_f64("bid_depth", bid_depth.try_into().unwrap_or(0.0))?
-            .column_f64("ask_depth", ask_depth.try_into().unwrap_or(0.0))?
-            .column_f64("spread", spread.try_into().unwrap_or(0.0))?
-            .at_now()?;
+            .table("v2_fills")?
+            .symbol("condition_id", &record.condition_id)?
+            .symbol("side", &record.side)?
+            .column_f64("price", record.price)?
+            .column_f64("size", record.size)?
+            .column_bool("was_taker", record.was_taker)?
+            .column_f64("fee", record.fee)?
+            .column_f64("pair_cost", record.pair_cost)?
+            .column_f64("paired", record.paired)?
+            .column_f64("locked_profit", record.locked_profit)?
+            .column_f64("fair_value_yes", record.fair_value_yes)?
+            .column_f64("strike", record.strike)?
+            .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
 
-        // Flush immediately — low volume, timeliness matters.
         self.sender
             .flush(&mut self.buffer)
-            .context("QuestDB flush (poly_book_snapshots) failed")?;
+            .context("QuestDB flush (v2_fills) failed")?;
         Ok(())
     }
 
-    // ─── 3. trade_signals ─────────────────────────────────────────────────────
+    // ─── 3. v2_market_summaries ───────────────────────────────────────────────
 
-    /// Write a trade signal record to the `trade_signals` table.
-    ///
-    /// Called for every signal the engine generates — whether it results in an
-    /// order or not. The `action` field records the outcome.
-    ///
-    /// Schema:
-    /// - market_id (symbol): Polymarket condition ID
-    /// - direction (symbol): "YES" or "NO" (directional entry side)
-    /// - confidence (f64): expected repricing percentage [0.0, 1.0]
-    /// - spike_magnitude (f64): spike size relative to ATR
-    /// - atr (f64): current ATR value at signal time
-    /// - book_depth (f64): Polymarket book depth at signal time (USDC)
-    /// - time_remaining (i64): seconds to market expiry
-    /// - alloc_amount (f64): USDC allocated for this signal
-    /// - action (symbol): "entered" | "aborted_spread" | "aborted_liquidity" |
-    ///                     "unfilled_postonly" | "skipped_reprice"
-    /// - timestamp (designated timestamp): signal generation time
-    ///
-    /// Flushes immediately.
-    pub fn record_signal(
-        &mut self,
-        market_id: &str,
-        direction: &str,
-        confidence: Decimal,
-        spike_magnitude: Decimal,
-        atr: Decimal,
-        book_depth: Decimal,
-        time_remaining_secs: i64,
-        alloc_amount: Decimal,
-        action: &str,
-        spike_detected_ms: u64,
-        composite_score: Decimal,
-        // Metric normalized values [0.0, 1.0]
-        cvd_norm: f64,
-        basis_norm: f64,
-        spot_flow_norm: f64,
-        obi_norm: f64,
-        liq_norm: f64,
-        atr_norm: f64,
-        // Metric freshness (ms since last update)
-        cvd_age_ms: u64,
-        basis_age_ms: u64,
-        spot_flow_age_ms: u64,
-        obi_age_ms: u64,
-        liq_age_ms: u64,
-        atr_age_ms: u64,
-        dissenter_count: u32,
-    ) -> Result<()> {
+    /// Record end-of-market summary to `v2_market_summaries`. Flushed immediately.
+    pub fn record_market_summary(&mut self, record: &MarketSummaryRecord) -> Result<()> {
         self.buffer
-            .table("trade_signals")?
-            .symbol("market_id", market_id)?
-            .symbol("direction", direction)?
-            .symbol("action", action)?
-            .column_f64("confidence", confidence.try_into().unwrap_or(0.0))?
-            .column_f64("spike_magnitude", spike_magnitude.try_into().unwrap_or(0.0))?
-            .column_f64("atr", atr.try_into().unwrap_or(0.0))?
-            .column_f64("book_depth", book_depth.try_into().unwrap_or(0.0))?
-            .column_i64("time_remaining", time_remaining_secs)?
-            .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
-            .column_i64("spike_detected_ms", spike_detected_ms as i64)?
-            .column_f64("composite_score", composite_score.try_into().unwrap_or(0.0))?
-            .column_i64("dissenter_count", i64::from(dissenter_count))?
-            // Metric normalized values (0.0-1.0)
-            .column_f64("cvd_norm", cvd_norm)?
-            .column_f64("basis_norm", basis_norm)?
-            .column_f64("spot_flow_norm", spot_flow_norm)?
-            .column_f64("obi_norm", obi_norm)?
-            .column_f64("liq_norm", liq_norm)?
-            .column_f64("atr_norm", atr_norm)?
-            // Metric freshness (ms since last update)
-            .column_i64("cvd_age_ms", cvd_age_ms as i64)?
-            .column_i64("basis_age_ms", basis_age_ms as i64)?
-            .column_i64("spot_flow_age_ms", spot_flow_age_ms as i64)?
-            .column_i64("obi_age_ms", obi_age_ms as i64)?
-            .column_i64("liq_age_ms", liq_age_ms as i64)?
-            .column_i64("atr_age_ms", atr_age_ms as i64)?
-            .at_now()?;
+            .table("v2_market_summaries")?
+            .symbol("condition_id", &record.condition_id)?
+            .column_f64("yes_shares", record.yes_shares)?
+            .column_f64("no_shares", record.no_shares)?
+            .column_f64("yes_avg", record.yes_avg)?
+            .column_f64("no_avg", record.no_avg)?
+            .column_f64("paired", record.paired)?
+            .column_f64("pair_cost", record.pair_cost)?
+            .column_f64("locked_profit", record.locked_profit)?
+            .column_f64("taker_fees", record.taker_fees)?
+            .column_i64("fill_count", record.fill_count)?
+            .column_f64("strike", record.strike)?
+            .column_f64("final_fv_yes", record.final_fv_yes)?
+            .column_f64("unpaired_yes", record.unpaired_yes)?
+            .column_f64("unpaired_no", record.unpaired_no)?
+            .column_i64("rebalance_count", record.rebalance_count)?
+            .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
 
-        // Flush immediately — signals are rare, we want them durable right away.
         self.sender
             .flush(&mut self.buffer)
-            .context("QuestDB flush (trade_signals) failed")?;
+            .context("QuestDB flush (v2_market_summaries) failed")?;
         Ok(())
     }
 
-    // ─── 4. executed_trades ───────────────────────────────────────────────────
+    // ─── 4. v2_risk_scores ─────────────────────────────────────────────────────
 
-    /// Write a completed live trade record to the `executed_trades` table.
-    ///
-    /// Schema:
-    /// - market_id (symbol): Polymarket condition ID
-    /// - direction (symbol): "YES" or "NO"
-    /// - leg1_price (f64): Leg 1 fill price
-    /// - leg2_price (f64): Leg 2 fill price (0.0 if unhedged)
-    /// - leg1_size (f64): shares filled on Leg 1
-    /// - leg2_size (f64): shares filled on Leg 2 (0.0 if unhedged)
-    /// - pair_cost (f64): leg1_price + leg2_price
-    /// - gross_profit (f64): 1.0 - pair_cost
-    /// - taker_fee (f64): taker fee paid (0 in normal flow; non-zero for emergency FOK)
-    /// - net_profit (f64): gross_profit - taker_fee
-    /// - profit_pct (f64): net_profit / pair_cost * 100
-    /// - confidence (f64): expected repricing percentage
-    /// - profit_tier (symbol): "HIGH" | "MED" | "LOW"
-    /// - alloc_amount (f64): USDC allocated
-    /// - hedge_phase (i64): hedge phase at fill (0=Phase1, 1=Phase2)
-    /// - leg2_was_taker (bool): true if Leg 2 used emergency FOK
-    /// - bot_contested (bool): true if a competitor depth wall was detected
-    /// - favorable_taker (bool): true if Leg 2 filled via favorable taker crossing
-    /// - emergency_maker (bool): true if Leg 2 filled as maker during emergency chase
-    /// - spike_magnitude (f64): spike size relative to ATR at entry
-    /// - maker_rebate (f64): estimated total maker rebate earned (both legs)
-    /// - exit_reason (symbol): "NormalHedge" | "BreakEvenBreach" | "Phase2Timeout" |
-    ///                         "Phase2PriceBreach" | "MarketExpiry" | "FavorableTaker" | "Phase1Breach" | "WhipsawReversal"
-    /// - leg1_order_id (symbol): CLOB order ID for Leg 1
-    /// - leg2_order_id (symbol): CLOB order ID for Leg 2 ("" if unhedged)
-    /// - timestamp (designated timestamp): Leg 1 fill time
-    ///
-    /// Flushes immediately — trades are rare, durability matters more than throughput.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_trade(
-        &mut self,
-        market_id: &str,
-        direction: &str,
-        leg1_price: Decimal,
-        leg2_price: Option<Decimal>,
-        leg1_size: Decimal,
-        leg2_size: Option<Decimal>,
-        pair_cost: Decimal,
-        gross_profit: Decimal,
-        taker_fee: Decimal,
-        net_profit: Decimal,
-        profit_pct: Decimal,
-        confidence: Decimal,
-        profit_tier: &str,
-        alloc_amount: Decimal,
-        hedge_phase: u8,
-        leg2_was_taker: bool,
-        bot_contested: bool,
-        leg1_order_id: &str,
-        leg2_order_id: Option<&str>,
-        leg1_fill_timestamp_ms: u64,
-        exit_reason: Option<ExitReason>,
-        favorable_taker: bool,
-        emergency_maker: bool,
-        spike_magnitude: Decimal,
-        maker_rebate: Decimal,
-    ) -> Result<()> {
-        let leg2_price_f64: f64 = leg2_price.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
-        let leg2_size_f64: f64 = leg2_size.and_then(|d| d.try_into().ok()).unwrap_or(0.0);
-        let leg2_order_id_str = leg2_order_id.unwrap_or("");
-
-        let exit_reason_str = match exit_reason {
-            Some(ExitReason::BreakEvenBreach) => "BreakEvenBreach",
-            Some(ExitReason::Phase2Timeout) => "Phase2Timeout",
-            Some(ExitReason::Phase2PriceBreach) => "Phase2PriceBreach",
-            Some(ExitReason::MarketExpiry) => "MarketExpiry",
-            Some(ExitReason::FavorableTaker) => "FavorableTaker",
-            Some(ExitReason::Phase1Breach) => "Phase1Breach",
-            Some(ExitReason::WhipsawReversal) => "WhipsawReversal",
-            Some(ExitReason::FlowCollapse) => "FlowCollapse",
-            None => "NormalHedge",
-        };
-
+    /// Record a risk score snapshot to `v2_risk_scores`. Flushed immediately.
+    pub fn record_risk_score(&mut self, record: &RiskScoreRecord) -> Result<()> {
         self.buffer
-            .table("executed_trades")?
-            .symbol("market_id", market_id)?
-            .symbol("direction", direction)?
-            .symbol("profit_tier", profit_tier)?
-            .symbol("exit_reason", exit_reason_str)?
-            .symbol("leg1_order_id", leg1_order_id)?
-            .symbol("leg2_order_id", leg2_order_id_str)?
-            .column_f64("leg1_price", leg1_price.try_into().unwrap_or(0.0))?
-            .column_f64("leg2_price", leg2_price_f64)?
-            .column_f64("leg1_size", leg1_size.try_into().unwrap_or(0.0))?
-            .column_f64("leg2_size", leg2_size_f64)?
-            .column_f64("pair_cost", pair_cost.try_into().unwrap_or(0.0))?
-            .column_f64("gross_profit", gross_profit.try_into().unwrap_or(0.0))?
-            .column_f64("taker_fee", taker_fee.try_into().unwrap_or(0.0))?
-            .column_f64("net_profit", net_profit.try_into().unwrap_or(0.0))?
-            .column_f64("profit_pct", profit_pct.try_into().unwrap_or(0.0))?
-            .column_f64("confidence", confidence.try_into().unwrap_or(0.0))?
-            .column_f64("alloc_amount", alloc_amount.try_into().unwrap_or(0.0))?
-            .column_i64("hedge_phase", i64::from(hedge_phase))?
-            .column_bool("leg2_was_taker", leg2_was_taker)?
-            .column_bool("bot_contested", bot_contested)?
-            .column_bool("favorable_taker", favorable_taker)?
-            .column_bool("emergency_maker", emergency_maker)?
-            .column_f64("spike_magnitude", spike_magnitude.try_into().unwrap_or(0.0))?
-            .column_f64("maker_rebate", maker_rebate.try_into().unwrap_or(0.0))?
-            .column_ts(
-                "leg1_fill_time",
-                TimestampMicros::new(leg1_fill_timestamp_ms as i64 * 1000),
-            )?
-            .at_now()?;
+            .table("v2_risk_scores")?
+            .symbol("condition_id", &record.condition_id)?
+            .column_f64("rebalance_risk", record.rebalance_risk)?
+            .column_f64("dynamic_max_post", record.dynamic_max_post)?
+            .column_f64("conviction", record.conviction)?
+            .column_f64("time_pressure", record.time_pressure)?
+            .column_f64("momentum_alignment", record.momentum_alignment)?
+            .column_f64("fv_yes", record.fv_yes)?
+            .column_f64("yes_shares", record.yes_shares)?
+            .column_f64("no_shares", record.no_shares)?
+            .column_f64("paired", record.paired)?
+            .at(TimestampMicros::new(record.timestamp_ms as i64 * 1000))?;
 
-        // Flush immediately — every executed trade is critical data.
         self.sender
             .flush(&mut self.buffer)
-            .context("QuestDB flush (executed_trades) failed")?;
+            .context("QuestDB flush (v2_risk_scores) failed")?;
         Ok(())
     }
 
-    // ─── 5. Explicit Flush ─────────────────────────────────────────────────────
+    // ─── 5. Explicit Flush ──────────────────────────────────────────────────────
 
     /// Flush any remaining buffered `binance_ticks` data.
     ///
@@ -395,6 +221,87 @@ impl Drop for ColdStorage {
             }
         }
     }
+}
+
+// ─── Record Types ────────────────────────────────────────────────────────────
+
+/// A single fill event for QuestDB recording.
+pub struct FillRecord {
+    pub condition_id: String,
+    pub side: String,
+    pub price: f64,
+    pub size: f64,
+    pub was_taker: bool,
+    pub fee: f64,
+    pub pair_cost: f64,
+    pub paired: f64,
+    pub locked_profit: f64,
+    pub fair_value_yes: f64,
+    pub strike: f64,
+    pub timestamp_ms: u64,
+}
+
+/// End-of-market summary for QuestDB recording.
+pub struct MarketSummaryRecord {
+    pub condition_id: String,
+    pub yes_shares: f64,
+    pub no_shares: f64,
+    pub yes_avg: f64,
+    pub no_avg: f64,
+    pub paired: f64,
+    pub pair_cost: f64,
+    pub locked_profit: f64,
+    pub taker_fees: f64,
+    pub fill_count: i64,
+    pub strike: f64,
+    pub final_fv_yes: f64,
+    pub unpaired_yes: f64,
+    pub unpaired_no: f64,
+    pub rebalance_count: i64,
+    pub timestamp_ms: u64,
+}
+
+/// Dynamic risk score snapshot for QuestDB recording (every 5s during quoting).
+pub struct RiskScoreRecord {
+    pub condition_id: String,
+    pub rebalance_risk: f64,
+    pub dynamic_max_post: f64,
+    pub conviction: f64,
+    pub time_pressure: f64,
+    pub momentum_alignment: f64,
+    pub fv_yes: f64,
+    pub yes_shares: f64,
+    pub no_shares: f64,
+    pub paired: f64,
+    pub timestamp_ms: u64,
+}
+
+// ─── Retention Policy ────────────────────────────────────────────────────────
+
+/// Drop QuestDB partitions older than `days` for the given table.
+///
+/// Uses QuestDB's HTTP query endpoint (`/exec`) to issue an ALTER TABLE command.
+/// This is safe to call even if partitions don't exist (QuestDB ignores the no-op).
+pub async fn drop_old_partitions(questdb_http_url: &str, table: &str, days: u32) -> Result<()> {
+    let query = format!(
+        "ALTER TABLE {table} DROP PARTITION WHERE timestamp < dateadd('d', -{days}, now())"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{questdb_http_url}/exec"))
+        .query(&[("query", &query)])
+        .send()
+        .await
+        .context("QuestDB retention HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // "no partitions" errors are expected for fresh/empty tables
+        if !body.contains("no partitions") {
+            anyhow::bail!("QuestDB retention query failed: {body}");
+        }
+    }
+    Ok(())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

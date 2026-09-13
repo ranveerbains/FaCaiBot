@@ -16,34 +16,25 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::control::listener::TelegramCommandListener;
 use crate::control::types::{BotStatus, DrainStatus, NotifyFlags};
-use crate::engine::strategy::StrategyEngine;
+use crate::engine::strategy::V2StrategyEngine;
 use crate::executor::live::LiveExecutor;
 use crate::gateway::binance::{BinanceGateway, FuturesGateway};
 use crate::gateway::polymarket::PolymarketGateway;
 use crate::gateway::polymarket::PolymarketWsGateway;
 use crate::reporting::telegram::TelegramReporter;
 use crate::storage::cold::ColdStorage;
-use crate::types::market::OrderState;
-use crate::types::order::ExecutorFeedback;
-use crate::types::{ExecutorCommand, IngestorEvent};
+use crate::types::order::{V2ExecutorCommand, V2ExecutorFeedback};
+use crate::types::IngestorEvent;
 
-/// Channel capacity between layers. Sized to absorb burst without back-pressure.
 const CHANNEL_CAP: usize = 8192;
-
-/// Minimum interval (ms) between recording Binance ticks to QuestDB.
-/// The engine processes every tick for real-time trading decisions, but QuestDB
-/// only needs periodic snapshots for analytics. 1 tick/sec keeps 7-day storage
-/// under ~600K rows (~30MB) instead of ~18-30M rows at full SBE rate.
 const TICK_RECORD_INTERVAL_MS: u64 = 1_000;
 
 fn main() -> Result<()> {
-    // ── Bootstrap ────────────────────────────────────────────────────
-    // Install the ring crypto provider process-wide before any TLS connections.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -57,8 +48,6 @@ fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    // Build the main tokio runtime with 2 worker threads pinned to cores 1-2.
-    // Core 0 is reserved for the ingestor (dedicated OS thread).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .on_thread_start(|| {
@@ -82,61 +71,48 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let config = Config::load()?;
-    info!(
-        max_alloc_per_trade = %config.max_alloc_per_trade,
-        stale_book_ms = config.bot.entry_guards.stale_book_ms,
-        "FaCaiBot starting"
-    );
+    info!("FaCaiBot v2 starting");
 
-    // ── Lock-free channels ───────────────────────────────────────────
+    // ── Channels ──
     let (ingestor_tx, ingestor_rx): (Sender<IngestorEvent>, Receiver<IngestorEvent>) =
         bounded(CHANNEL_CAP);
-    let (executor_tx, executor_rx): (Sender<ExecutorCommand>, Receiver<ExecutorCommand>) =
+    let (executor_tx, executor_rx): (Sender<V2ExecutorCommand>, Receiver<V2ExecutorCommand>) =
         bounded(CHANNEL_CAP);
-    // Reverse channel: live executor → engine (for CLOB order ID feedback).
-    let (feedback_tx, feedback_rx): (Sender<ExecutorFeedback>, Receiver<ExecutorFeedback>) =
+    let (feedback_tx, feedback_rx): (Sender<V2ExecutorFeedback>, Receiver<V2ExecutorFeedback>) =
         bounded(CHANNEL_CAP);
 
-    // ── Control plane ────────────────────────────────────────────────
+    // ── Control plane ──
     let redeem_notify = Arc::new(tokio::sync::Notify::new());
     let notify_flags = Arc::new(NotifyFlags::new());
     let (status_tx, status_rx) = tokio::sync::watch::channel(BotStatus::default());
     let (drain_status_tx, drain_status_rx) = tokio::sync::watch::channel(DrainStatus::Idle);
     let ingestor_tx_control = ingestor_tx.clone();
 
-    // ── Layer 1: Ingestor (The Ear) ─────────────────────────────────
-    // CPU-pinned to core 0 for minimal context-switch jitter.
+    // ── Layer 1: Ingestor ──
     let ingestor_config = config.clone();
     let ingestor_tx_binance = ingestor_tx.clone();
     let ingestor_tx_poly = ingestor_tx;
 
     let ingestor_handle = std::thread::spawn(move || {
-        // Pin to core 0.
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
         if let Some(core) = core_ids.first() {
             core_affinity::set_for_current(*core);
             info!(core = core.id, "ingestor pinned to CPU core");
         }
 
-        // Build a dedicated single-threaded tokio runtime for the ingestor.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build ingestor runtime");
 
         rt.block_on(async move {
-            // Binance gateway — always active (both modes need price feeds).
             let binance = BinanceGateway::new(
                 ingestor_config.binance_sbe_ws_url.clone(),
                 ingestor_config.binance_ed25519_api_key.clone(),
             );
-
-            // Binance Futures JSON WS — public streams (no auth needed).
             let futures = FuturesGateway::new(
                 ingestor_config.binance_futures_ws_url.clone(),
             );
-
-            // Polymarket WS gateway — always passes live credentials.
             let poly_ws = PolymarketWsGateway::new(
                 Some(ingestor_config.polymarket_api_key.clone()),
                 Some(ingestor_config.polymarket_secret.clone()),
@@ -153,13 +129,11 @@ async fn async_main() -> Result<()> {
             let stale_threshold = ingestor_config.stale_event_threshold_ms;
             let prewarm_lead_ms = ingestor_config.bot.rotation.prewarm_lead_secs * 1_000;
 
-            // Watch channel: rotation manager pushes token IDs → Market WS subscribes.
             let (token_tx, token_rx) = tokio::sync::watch::channel(Vec::<String>::new());
 
-            // Run all ingestor streams concurrently.
             tokio::select! {
                 res = binance.run(tx_binance, stale_threshold) => {
-                    if let Err(e) = res { error!(error = %e, "binance spot SBE stream crashed"); }
+                    if let Err(e) = res { error!(error = %e, "binance spot SBE crashed"); }
                 }
                 res = futures.run(tx_futures, stale_threshold) => {
                     if let Err(e) = res { error!(error = %e, "binance futures WS crashed"); }
@@ -168,138 +142,73 @@ async fn async_main() -> Result<()> {
                     if let Err(e) = res { error!(error = %e, "polymarket market WS crashed"); }
                 }
                 res = poly_ws.run_market_rotation(tx_rotation, token_tx, prewarm_lead_ms) => {
-                    if let Err(e) = res { error!(error = %e, "polymarket market rotation crashed"); }
+                    if let Err(e) = res { error!(error = %e, "market rotation crashed"); }
                 }
                 res = poly_ws.run_user_ws(tx_user_ws) => {
                     if let Err(e) = res { error!(error = %e, "polymarket user WS crashed"); }
                 }
                 res = poly_ws.run_heartbeat(tx_heartbeat) => {
-                    if let Err(e) = res { error!(error = %e, "polymarket heartbeat crashed"); }
+                    if let Err(e) = res { error!(error = %e, "heartbeat crashed"); }
                 }
             }
         });
     });
 
-    // ── Layer 2: Strategy Engine (The Brain) ─────────────────────────
+    // ── Layer 2: V2 Strategy Engine ──
     let engine_config = config.clone();
     let engine_notify_flags = Arc::clone(&notify_flags);
-    // TLS connector + credentials for diagnostic Telegram forwarding from engine loop.
     let diag_tls = crate::reporting::telegram::build_tls_connector();
     let diag_bot_token = config.telegram_bot_token.clone();
     let diag_chat_id = config.telegram_chat_id.clone();
 
-    // Pre-build the Telegram reporter so the engine can send
-    // opportunity alerts, trade-completed messages, market summaries, and
-    // session summaries directly (fills arrive via User WS, not the executor).
     let live_reporter_for_engine = TelegramReporter::new(
         config.telegram_bot_token.clone(),
         config.telegram_chat_id.clone(),
-    )
-    .with_notify_flags(Arc::clone(&notify_flags));
+    );
     live_reporter_for_engine.spawn_cleanup_task();
 
-    // Shared clones for listener, wallet, and diagnostic sends — all share
-    // the same sent_messages tracker and cleanup task via Arc<ReporterInner>.
     let listener_reporter = live_reporter_for_engine.clone();
     let wallet_reporter = live_reporter_for_engine.clone();
     let diag_reporter = live_reporter_for_engine.clone();
 
     let redeem_notify_engine = Arc::clone(&redeem_notify);
     let engine_handle = tokio::task::spawn_blocking(move || {
-        let mut engine = StrategyEngine::new(&engine_config);
-
-        // Attach the Telegram reporter to the engine.
+        let mut engine = V2StrategyEngine::new(&engine_config);
         engine.set_reporter(live_reporter_for_engine);
 
-        // QuestDB analytics — fire-and-forget, not on the execution path.
         let mut cold = match ColdStorage::new(&engine_config.questdb_url) {
             Ok(c) => Some(c),
             Err(e) => {
-                error!(error = %e, "failed to init QuestDB for engine analytics — recording disabled");
+                error!(error = %e, "QuestDB init failed — recording disabled");
                 None
             }
         };
-        let mut last_book_snapshot_ms: u64 = 0;
         let mut last_tick_record_ms: u64 = 0;
         let mut last_status_publish_ms: u64 = 0;
-
-        // Drain state: exit code to use after drain completes.
         let mut pending_exit_code: Option<i32> = None;
 
         while let Ok(event) = ingestor_rx.recv() {
-            // Drain executor feedback (non-blocking). In live mode, the executor
-            // sends CLOB order IDs back so the engine can match User WS fills.
+            // 1. Drain executor feedback
             while let Ok(fb) = feedback_rx.try_recv() {
-                match fb {
-                    ExecutorFeedback::OrderPosted {
-                        is_leg2,
-                        order_id,
-                        price,
-                        size,
-                        fill_method,
-                        already_filled,
-                        order_tag,
-                    } => {
-                        engine.on_order_posted(is_leg2, order_id, price, size, fill_method, already_filled, order_tag);
-                        // Bug 3 fix: if FOK returned Filled synchronously, leg2 is
-                        // already in Filled state. Trigger trade completion now.
-                        if is_leg2 && already_filled
-                            && matches!(engine.state().leg1_state, OrderState::Filled { .. })
-                            && matches!(engine.state().leg2_state, OrderState::Filled { .. })
-                        {
-                            if let Some(ref mut c) = cold
-                                && let Err(e) = engine.record_live_trade(c)
-                            {
-                                warn!(error = %e, "failed to record live trade to QuestDB (FOK already_filled)");
-                            }
-                            engine.on_trade_complete();
-                        }
-                    }
-                    ExecutorFeedback::OrderFailed { is_leg2 } => {
-                        engine.on_order_failed(is_leg2);
-                    }
-                    ExecutorFeedback::CancelResult {
-                        order_id,
-                        was_cancelled,
-                        is_leg2,
-                        size_matched,
-                    } => {
-                        engine.on_cancel_result(order_id, was_cancelled, is_leg2, size_matched);
-                    }
-                    ExecutorFeedback::BalanceExhausted => {
-                        engine.on_balance_exhausted();
-                    }
-                }
+                engine.on_feedback(fb);
             }
 
-            // ── Handle control events (Shutdown / DrainAndRestart) ────
+            // 2. Handle control events
             match event {
                 IngestorEvent::Shutdown => {
                     engine.set_draining();
                     pending_exit_code = Some(0);
                     if engine.has_no_open_position() {
-                        engine.send_live_session_summary();
+                        engine.send_session_summary();
                         let _ = drain_status_tx.send(DrainStatus::Complete {
                             exit_code: 0,
                             summary: "No open positions. Bot stopped.".into(),
                         });
                         break;
                     }
-                    // Reset posted-but-unfilled Leg 1 if applicable.
-                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
-                        engine.reset_leg1_state();
-                        if matches!(engine.state().leg2_state, OrderState::None) {
-                            engine.send_live_session_summary();
-                            let _ = drain_status_tx.send(DrainStatus::Complete {
-                                exit_code: 0,
-                                summary: "Reset unfilled Leg 1. Bot stopped.".into(),
-                            });
-                            break;
-                        }
-                    }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
                         reason: "shutdown".into(),
-                        position_info: "Leg 2 in progress — waiting for position to close".into(),
+                        position_info: "Waiting for market rotation".into(),
                     });
                     continue;
                 }
@@ -307,323 +216,213 @@ async fn async_main() -> Result<()> {
                     engine.set_draining();
                     pending_exit_code = Some(42);
                     if engine.has_no_open_position() {
-                        engine.send_live_session_summary();
+                        engine.send_session_summary();
                         let _ = drain_status_tx.send(DrainStatus::Complete {
                             exit_code: 42,
-                            summary: "No open positions. Restarting with new config...".into(),
+                            summary: "No open positions. Restarting...".into(),
                         });
                         break;
                     }
-                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
-                        engine.reset_leg1_state();
-                        if matches!(engine.state().leg2_state, OrderState::None) {
-                            engine.send_live_session_summary();
-                            let _ = drain_status_tx.send(DrainStatus::Complete {
-                                exit_code: 42,
-                                summary: "Reset unfilled Leg 1. Restarting...".into(),
-                            });
-                            break;
-                        }
-                    }
                     let _ = drain_status_tx.send(DrainStatus::Draining {
                         reason: "config change".into(),
-                        position_info: "Leg 2 in progress — waiting for position to close".into(),
+                        position_info: "Waiting for market rotation".into(),
                     });
                     continue;
                 }
                 IngestorEvent::PauseTrading => {
-                    engine.set_paused(true);
-                    // Reset posted-but-unfilled Leg 1.
-                    if matches!(engine.state().leg1_state, OrderState::Posted { .. }) {
-                        engine.reset_leg1_state();
+                    let cancel_cmds = engine.set_paused(true);
+                    for cmd in cancel_cmds {
+                        if let Err(e) = executor_tx.send(cmd) {
+                            error!(error = %e, "failed to send pause cancel command");
+                        }
                     }
-                    info!("trading PAUSED — new entries blocked, Leg 2 continues if open");
+                    info!("trading PAUSED");
                     continue;
                 }
                 IngestorEvent::ResumeTrading => {
-                    engine.set_paused(false);
+                    let _ = engine.set_paused(false);
                     info!("trading RESUMED");
                     continue;
                 }
                 _ => {}
             }
 
-            // Detect market rotation to notify executor.
-            let rotation_info = if let IngestorEvent::MarketRotation {
-                ref condition_id,
-                ref yes_token_id,
-                ref no_token_id,
-                ..
-            } = event
-            {
-                Some((condition_id.clone(), yes_token_id.clone(), no_token_id.clone()))
-            } else {
-                None
-            };
-
-            // Record Binance ticks to QuestDB (fire-and-forget analytics).
-            // Downsampled: only record ~1 tick/sec to keep 7-day storage manageable.
+            // Record Binance ticks to QuestDB (downsampled)
             if let IngestorEvent::BinanceTick(ref tick) = event {
-                if tick.timestamp_ms.saturating_sub(last_tick_record_ms) >= TICK_RECORD_INTERVAL_MS
-                {
+                if tick.timestamp_ms.saturating_sub(last_tick_record_ms) >= TICK_RECORD_INTERVAL_MS {
                     if let Some(ref mut c) = cold {
                         if let Err(e) = c.record_tick(tick) {
-                            debug!(error = %e, "failed to record tick to QuestDB");
+                            debug!(error = %e, "failed to record tick");
                         }
                     }
                     last_tick_record_ms = tick.timestamp_ms;
                 }
             }
 
-            // Capture outgoing market state BEFORE on_event() overwrites it.
-            // In live mode, also send the market summary now while counters
-            // and trades still reflect the outgoing market.
-            let (outgoing_condition_id, outgoing_end_ms) = if rotation_info.is_some() {
-                let old = (
-                    engine.state().active_condition_id.clone(),
-                    engine.state().market_end_timestamp_ms,
-                );
-                engine.send_live_market_summary();
-                old
-            } else {
-                (None, 0)
-            };
+            // Detect rotation for redeem trigger
+            let is_rotation = matches!(event, IngestorEvent::MarketRotation { .. });
 
+            // 3. Process event (updates fair value, books, phase transitions)
             engine.on_event(event);
 
-            // Record Polymarket book snapshots every 5 seconds.
-            let now_ms = epoch_ms();
-            if now_ms.saturating_sub(last_book_snapshot_ms) >= 5_000 {
-                if let Some(ref mut c) = cold {
-                    // Snapshot YES book.
-                    if let Some(ref book) = engine.state().poly_yes_book {
-                        let best_bid = book.best_bid().map(|l| l.price).unwrap_or_default();
-                        let best_ask = book.best_ask().map(|l| l.price).unwrap_or_default();
-                        let bid_depth = book.total_bid_depth();
-                        let ask_depth = book.total_ask_depth();
-                        let spread = best_ask - best_bid;
-                        if let Err(e) = c.record_book_snapshot(
-                            &book.asset_id,
-                            best_bid,
-                            best_ask,
-                            bid_depth,
-                            ask_depth,
-                            spread,
-                        ) {
-                            debug!(error = %e, "failed to record YES book snapshot");
-                        }
-                    }
-                    // Snapshot NO book.
-                    if let Some(ref book) = engine.state().poly_no_book {
-                        let best_bid = book.best_bid().map(|l| l.price).unwrap_or_default();
-                        let best_ask = book.best_ask().map(|l| l.price).unwrap_or_default();
-                        let bid_depth = book.total_bid_depth();
-                        let ask_depth = book.total_ask_depth();
-                        let spread = best_ask - best_bid;
-                        if let Err(e) = c.record_book_snapshot(
-                            &book.asset_id,
-                            best_bid,
-                            best_ask,
-                            bid_depth,
-                            ask_depth,
-                            spread,
-                        ) {
-                            debug!(error = %e, "failed to record NO book snapshot");
-                        }
-                    }
+            // 4. Drain pending engine commands (rotation forwarding, tick size change)
+            for cmd in engine.take_pending_commands() {
+                if let Err(e) = executor_tx.send(cmd) {
+                    error!(error = %e, "failed to send pending command to executor");
                 }
-                last_book_snapshot_ms = now_ms;
             }
-
-            // Drain rotation emergency signals (Leg 2 FOK for open positions)
-            // BEFORE sending MarketRotation so the executor hedges the old
-            // position before cleaning up the old market's state.
-            for emergency_signal in engine.take_rotation_emergencies() {
-                if let Err(e) = executor_tx.send(ExecutorCommand::Signal(emergency_signal)) {
-                    error!(error = %e, "failed to send rotation emergency to executor");
-                    break;
+            if let Some(tick_cmd) = engine.take_tick_size_change() {
+                if let Err(e) = executor_tx.send(tick_cmd) {
+                    error!(error = %e, "failed to send tick size change");
                 }
             }
 
-            // Notify executor of market rotation (before evaluating signals,
-            // so the executor can close positions before receiving new ones).
-            if let Some((cond_id, yes_id, no_id)) = rotation_info {
-                if let Err(e) = executor_tx.send(ExecutorCommand::MarketRotation {
-                    condition_id: cond_id,
-                    yes_token_id: yes_id,
-                    no_token_id: no_id,
-                    tick_size: engine.state().tick_size,
-                    outgoing_condition_id,
-                    outgoing_end_timestamp_ms: outgoing_end_ms,
-                }) {
-                    error!(error = %e, "failed to send MarketRotation to executor");
-                    break;
-                }
-                // Trigger auto-redeem ~60s after rotation.
+            // Trigger auto-redeem on rotation
+            if is_rotation {
                 redeem_notify_engine.notify_one();
             }
 
-            // Drain tick size change (forward to executor to update SDK cache).
-            if let Some(tick_cmd) = engine.take_tick_size_change()
-                && let Err(e) = executor_tx.send(tick_cmd)
-            {
-                error!(error = %e, "failed to send tick size change to executor");
-            }
-
-            // Drain Leg 1 cancel (flow-based sustain failure or timeout).
-            if let Some(cancel_cmd) = engine.take_leg1_cancel()
-                && let Err(e) = executor_tx.send(cancel_cmd)
-            {
-                error!(error = %e, "failed to send Leg 1 cancel to executor");
-            }
-
-            // Drain heartbeat-dead cancel (proactive state reset).
-            if let Some(hb_cmd) = engine.take_heartbeat_cancel()
-                && let Err(e) = executor_tx.send(hb_cmd)
-            {
-                error!(error = %e, "failed to send heartbeat cancel to executor");
-            }
-
-            // Evaluate Leg 1 signals.
-            if let Some(signal) = engine.evaluate() {
-                if let Err(e) = executor_tx.send(ExecutorCommand::Signal(signal)) {
-                    error!(error = %e, "failed to send Leg 1 signal to executor");
-                    break;
-                }
-            }
-
-            // Evaluate Leg 2 signals (erosion cascade, emergency hedge).
-            if let Some(signal) = engine.evaluate_leg2() {
-                // Phase2Alongside: send as PostLeg2Phase2 (cancel Phase 1, then post Phase 2).
-                let cmd = if engine.take_phase2_alongside_flag() {
-                    ExecutorCommand::PostLeg2Phase2 { signal }
-                } else {
-                    ExecutorCommand::Signal(signal)
-                };
+            // 5. Quoting decisions
+            for cmd in engine.quote_tick() {
                 if let Err(e) = executor_tx.send(cmd) {
-                    error!(error = %e, "failed to send Leg 2 signal to executor");
+                    error!(error = %e, "failed to send quote command");
                     break;
                 }
             }
 
-            // Detect trade completion (both legs filled via User WS).
-            if matches!(engine.state().leg1_state, OrderState::Filled { .. })
-                && matches!(engine.state().leg2_state, OrderState::Filled { .. })
-            {
-                // Diagnostic: warn if Leg 2 fill size is significantly less than Leg 1.
-                if let (
-                    OrderState::Filled { size: l1_size, .. },
-                    OrderState::Filled { size: l2_size, .. },
-                ) = (&engine.state().leg1_state, &engine.state().leg2_state)
-                {
-                    let ratio = if !l1_size.is_zero() {
-                        (*l2_size * rust_decimal::Decimal::ONE_HUNDRED) / *l1_size
+            // Check drain completion
+            if let Some(exit_code) = pending_exit_code {
+                if engine.has_no_open_position() {
+                    engine.send_session_summary();
+                    let summary = if exit_code == 0 {
+                        "Bot stopped.".to_string()
                     } else {
-                        rust_decimal::Decimal::ONE_HUNDRED
+                        "Restarting with new config...".to_string()
                     };
-                    if ratio < rust_decimal::Decimal::new(80, 0) {
-                        warn!(
-                            l1_size = %l1_size, l2_size = %l2_size, ratio = %ratio,
-                            "Leg 2 fill size < 80% of Leg 1 — possible incomplete hedge"
-                        );
-                    }
+                    let _ = drain_status_tx.send(DrainStatus::Complete { exit_code, summary });
+                    break;
                 }
-                // Record to QuestDB before state reset.
-                if let Some(ref mut c) = cold
-                    && let Err(e) = engine.record_live_trade(c)
-                {
-                    warn!(error = %e, "failed to record live trade to QuestDB");
-                }
-                engine.on_trade_complete();
             }
 
-            // Check drain completion: position fully closed after drain was activated.
-            if let Some(exit_code) = pending_exit_code
-                && engine.has_no_open_position()
-            {
-                engine.send_live_session_summary();
-                let summary = if exit_code == 0 {
-                    "Position closed. Bot stopped.".to_string()
-                } else {
-                    "Position closed. Restarting with new config...".to_string()
-                };
-                let _ = drain_status_tx.send(DrainStatus::Complete { exit_code, summary });
-                break;
-            }
-
+            // 7. Diagnostics
             engine.check_diagnostic();
-            if let Some(diag_msg) = engine.take_pending_telegram_diag()
-                && engine_notify_flags.diagnostics_on()
-            {
-                let tls = diag_tls.clone();
-                let token = diag_bot_token.clone();
-                let chat = diag_chat_id.clone();
-                let rep = diag_reporter.clone();
-                tokio::spawn(async move {
-                    if let Ok(Some(id)) = crate::reporting::telegram::post_telegram_message(
-                        &tls, &token, &chat, &diag_msg,
-                    )
-                    .await
-                    {
-                        rep.track_msg_id(id).await;
-                    }
-                });
+            if let Some(diag_msg) = engine.take_pending_telegram_diag() {
+                if engine_notify_flags.diagnostics_on() {
+                    let tls = diag_tls.clone();
+                    let token = diag_bot_token.clone();
+                    let chat = diag_chat_id.clone();
+                    let rep = diag_reporter.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Some(id)) = crate::reporting::telegram::post_telegram_message(
+                            &tls, &token, &chat, &diag_msg,
+                        ).await {
+                            rep.track_msg_id(id).await;
+                        }
+                    });
+                }
             }
 
-            // Publish engine status every 5 seconds for /status command.
-            if now_ms.saturating_sub(last_status_publish_ms) >= 5_000 {
-                let mut status = engine.build_status("live");
+            // 8. Fill notifications (gated by trades_enabled)
+            for fill_msg in engine.take_pending_fill_messages() {
+                if engine_notify_flags.trades_on() {
+                    let tls = diag_tls.clone();
+                    let token = diag_bot_token.clone();
+                    let chat = diag_chat_id.clone();
+                    let rep = diag_reporter.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Some(id)) = crate::reporting::telegram::post_telegram_message(
+                            &tls, &token, &chat, &fill_msg,
+                        ).await {
+                            rep.track_msg_id(id).await;
+                        }
+                    });
+                }
+            }
+
+            // 9. Market report (gated by summary_enabled)
+            if let Some(report) = engine.take_pending_market_report() {
+                if engine_notify_flags.summary_on() {
+                    if let Some(reporter) = engine.reporter() {
+                        reporter.fire_critical(report);
+                    }
+                }
+            }
+
+            // 10. QuestDB fill records
+            for record in engine.take_pending_fill_records() {
+                if let Some(ref mut c) = cold {
+                    if let Err(e) = c.record_fill(&record) {
+                        debug!(error = %e, "failed to record fill to QuestDB");
+                    }
+                }
+            }
+
+            // 11. QuestDB market summary
+            if let Some(summary) = engine.take_pending_market_summary() {
+                if let Some(ref mut c) = cold {
+                    if let Err(e) = c.record_market_summary(&summary) {
+                        debug!(error = %e, "failed to record market summary to QuestDB");
+                    }
+                }
+            }
+
+            // 12. QuestDB risk score records
+            for record in engine.take_pending_risk_records() {
+                if let Some(ref mut c) = cold {
+                    if let Err(e) = c.record_risk_score(&record) {
+                        debug!(error = %e, "failed to record risk score to QuestDB");
+                    }
+                }
+            }
+
+            // Publish status every 5s
+            let now = crate::utils::time::epoch_ms();
+            if now.saturating_sub(last_status_publish_ms) >= 5_000 {
+                let mut status = engine.build_status("v2-live");
                 status.trades_enabled = engine_notify_flags.trades_on();
                 status.summary_enabled = engine_notify_flags.summary_on();
                 let _ = status_tx.send(status);
-                last_status_publish_ms = now_ms;
+                last_status_publish_ms = now;
             }
         }
-        // Flush any remaining buffered ticks before exiting.
+
+        // Dispatch pending session summary (gated by summary_enabled)
+        if let Some(summary_text) = engine.take_pending_session_summary() {
+            if engine_notify_flags.summary_on() {
+                if let Some(reporter) = engine.reporter() {
+                    reporter.fire_critical(summary_text);
+                }
+            }
+        }
+
         if let Some(ref mut c) = cold {
             if let Err(e) = c.flush() {
-                error!(error = %e, "failed to flush QuestDB on engine shutdown");
+                error!(error = %e, "failed to flush QuestDB on shutdown");
             }
         }
-        info!("engine loop exited");
+        info!("v2 engine loop exited");
     });
 
-    // ── Layer 3: Executor (The Hand) ─────────────────────────────────
+    // ── Layer 3: V2 Executor ──
     let executor_config = config.clone();
-    let executor_notify_flags = Arc::clone(&notify_flags);
     let executor_handle = tokio::spawn(async move {
-        info!("starting live executor");
+        info!("starting v2 executor");
 
         let poly = PolymarketGateway::new(executor_config.clone()).await;
-        let cold = match ColdStorage::new(&executor_config.questdb_url) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!(error = %e, "QuestDB unavailable for live executor — analytics recording disabled");
-                None
-            }
-        };
         let reporter = TelegramReporter::new(
             executor_config.telegram_bot_token.clone(),
             executor_config.telegram_chat_id.clone(),
-        )
-        .with_notify_flags(Arc::clone(&executor_notify_flags));
+        );
         reporter.spawn_cleanup_task();
 
-        let live_executor = LiveExecutor::new(
-            poly,
-            feedback_tx,
-            reporter,
-            cold,
-            config.bot.risk.favorable_maker_timeout_ms,
-        );
+        let live_executor = LiveExecutor::new(poly, feedback_tx, reporter);
 
         if let Err(e) = live_executor.run(executor_rx).await {
-            error!(error = %e, "live executor crashed");
+            error!(error = %e, "v2 executor crashed");
         }
     });
 
-    // ── Command Listener (optional) ─────────────────────────────────
-    // Spawned only if TELEGRAM_ALLOWED_USER_ID is configured.
+    // ── Command Listener ──
     if let Some(user_id) = config.telegram_allowed_user_id {
         let tls_connector = crate::reporting::telegram::build_tls_connector();
         let listener = TelegramCommandListener::new(
@@ -641,7 +440,7 @@ async fn async_main() -> Result<()> {
         info!(user_id, "command listener spawned");
     }
 
-    // ── Auto-Redeem (on rotation, ~60s delay) ──────────────────────────
+    // ── Auto-Redeem ──
     {
         let redeem_tls = crate::reporting::telegram::build_tls_connector();
         let redeem_bot_token = config.telegram_bot_token.clone();
@@ -655,15 +454,29 @@ async fn async_main() -> Result<()> {
         ));
     }
 
-    // ── Wait ─────────────────────────────────────────────────────────
-    // The ingestor runs on a dedicated OS thread; the other two are tokio tasks.
+    // ── QuestDB Retention (drop old partitions every 24h, keep 7 days) ──
+    {
+        let retention_url = config.questdb_http_url.clone();
+        tokio::spawn(async move {
+            let tables = ["binance_ticks", "v2_fills", "v2_market_summaries"];
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+                for table in &tables {
+                    if let Err(e) = crate::storage::cold::drop_old_partitions(&retention_url, table, 7).await {
+                        error!(table, error = %e, "QuestDB retention failed");
+                    } else {
+                        info!(table, "QuestDB retention: dropped partitions >7d");
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Wait ──
     let _ = engine_handle.await;
     let _ = executor_handle.await;
     let _ = ingestor_handle.join();
 
-    info!("FaCaiBot shutdown complete");
+    info!("FaCaiBot v2 shutdown complete");
     Ok(())
 }
-
-/// Current epoch milliseconds.
-use crate::utils::time::epoch_ms;

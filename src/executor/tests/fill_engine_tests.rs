@@ -31,9 +31,3 @@ fn test_compute_taker_fee() {
     assert_eq!(fee, d("0.78125"));
 }
 
-#[test]
-fn test_compute_maker_rebate() {
-    let rebate = compute_maker_rebate(d("0.50"), d("100.00"));
-    // 20% of taker fee: 0.78125 * 0.20 = 0.15625
-    assert_eq!(rebate, d("0.156250"));
-}
