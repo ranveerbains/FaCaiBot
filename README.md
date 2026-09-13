@@ -1,8 +1,33 @@
-# FaCaiBot
+# FaCaiBot (v2)
 
-Polymarket market-making bot for BTC 5-minute prediction markets. Uses bilateral accumulation — continuously quoting both YES and NO sides using a Binance-derived fair value model, accumulating matched pairs that pay $1.00 on resolution for less than $1.00 total cost.
+> **This is the v2 branch** — a complete rewrite using bilateral accumulation. The original v1 (2-leg reactive) bot is on the [main branch](../../tree/main).
+
+Polymarket market-making bot for BTC 5-minute prediction markets. Continuously quotes both YES and NO sides using a Binance-derived fair value model, accumulating matched pairs that pay $1.00 on resolution for less than $1.00 total cost.
 
 See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARCHITECTURE.md](ARCHITECTURE.md) for infrastructure details.
+
+## How Alpha is Generated (v2)
+
+Unlike v1's reactive spike-and-hedge approach, v2 generates alpha **structurally** through bilateral accumulation:
+
+1. **Fair Value Estimation**: An 8-signal momentum model (CVD, OBI velocity, basis delta, realized volatility from Binance spot + futures) continuously estimates the true probability of BTC moving up in the next 5 minutes
+2. **Bilateral Quoting**: YES and NO orders are posted simultaneously on both sides of the book, priced at `FV ± edge`. Neither side is directional — the bot makes money regardless of which way BTC moves
+3. **Spread Capture**: When both sides fill (or partial accumulation), the total cost < $1.00 while the payout is always $1.00 at resolution. This spread is the locked-in profit
+4. **Inventory Skewing**: If one side accumulates faster (imbalance), quotes are skewed to encourage the other side to fill — managing inventory without taking directional risk
+5. **No Timing Dependency**: Unlike v1, there's no race between Leg 1 and Leg 2. Partial positions hedge each other, and the model continuously adjusts pricing to keep accumulation balanced
+
+Edge is **structural, not timing-dependent** — the strategy profits from quoting efficiently, not from predicting market moves.
+
+## Quick Overview
+
+- **Bilateral Market-Making**: Quote YES/NO simultaneously, profit on spread > costs
+- **Fair Value Model**: 8-signal momentum model from Binance spot + futures
+- **Lock-Free Pipeline**: Zero-copy crossbeam channels (Ingestor → Engine → Executor)
+- **Real-Time Feeds**: Binance SBE WebSocket (spot depth + futures) + Polymarket
+- **Smart Order Management**: Inventory skewing, pending op guards, per-side requoting
+- **Remote Control**: Telegram bot for `/status`, `/set params`, `/stop`, `/shutdown`
+- **Analytics**: QuestDB for market analysis and performance tracking
+- **Simulation Mode**: Full testing without real trades
 
 ---
 
@@ -17,13 +42,12 @@ See [V2_SYSTEM.md](V2_SYSTEM.md) for the complete trading system design and [ARC
 ### Step 2: SSH In
 
 ```bash
-chmod 400 /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem
+chmod 400 <YOUR_KEYPAIR>.pem
 
-ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-ec2-user@ec2-52-30-254-160.eu-west-1.compute.amazonaws.com
+ssh -i <YOUR_KEYPAIR>.pem ec2-user@<PUBLIC_IP>
 
-(ec2questdb)
- ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem -L 9000:localhost:9000 ec2-user@ec2-52-30-254-160.eu-west-1.compute.amazonaws.com
+# Forward QuestDB dashboard (optional)
+ssh -i <YOUR_KEYPAIR>.pem -L 9000:localhost:9000 ec2-user@<PUBLIC_IP>
 ```
 
 > `-A` forwards your local GitHub SSH key so you can clone without adding a key to the server
@@ -166,8 +190,7 @@ chronyc tracking
 `deploy/deploy.sh` pulls from `main`, so deploy v2 manually:
 
 ```bash
-ssh -i /Users/ranveerbains/Documents/keypairs/facaibotkeypair.pem \
-  ec2-user@ec2-3-250-67-38.eu-west-1.compute.amazonaws.com
+ssh -i <YOUR_KEYPAIR>.pem ec2-user@<PUBLIC_IP>
 
 sudo systemctl stop facaibot
 cd ~/FaCaiBot
@@ -182,19 +205,6 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 cp target/release/facaibot /opt/facaibot/facaibot
 sudo systemctl start facaibot
 journalctl -u facaibot -f
-```
-
-to deploy once u update the code pushed
-```bash 
-cd /home/ec2-user/FaCaiBot            
-git fetch origin                             
-git checkout v2                       
-git pull origin v2     
-RUSTFLAGS="-C target-cpu=native" cargo build --release  
-sudo systemctl stop facaibot 
-cp target/release/facaibot /opt/facaibot/facaibot
-cp config.toml /opt/facaibot/config.toml                     
-sudo systemctl start facaibot
 ```                       
 
 
